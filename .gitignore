@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Runtime logs
+*.log
+backend-runtime.*.log
+dev-server.log
+compile.log
+terminal_compile.log
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# Local caches/state
+.cache/
+backend/.cache/
+.vite/
+
+# Editor/agent local state
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# MT5 compiled artifacts and local exports
+*.ex5
+*.ex4
+*.sql

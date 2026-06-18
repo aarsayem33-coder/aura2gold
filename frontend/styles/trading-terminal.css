@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #f6f8fc;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #eef2f7;
+  --accent-gold: #f59e0b;
+  --buy-green: #10b981;
+  --sell-red: #ef4444;
+}
+
+@layer base {
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background-color: #f6f8fc;
+    color: #0f172a;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+.terminal-page {
+  background:
+    radial-gradient(circle at 15% 10%, rgba(245, 158, 11, 0.08), transparent 32rem),
+    radial-gradient(circle at 90% 20%, rgba(59, 130, 246, 0.05), transparent 28rem),
+    linear-gradient(135deg, #f7f9fd 0%, #f5f7fb 52%, #edf2f7 100%);
+  color: #0f172a;
+}
+
+.terminal-page select,
+.terminal-page button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.light-card {
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.06);
+  backdrop-filter: blur(18px);
+}
