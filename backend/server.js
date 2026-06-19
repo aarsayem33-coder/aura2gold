@@ -21,6 +21,7 @@ import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance } from './signalEngine.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini } from './geminiEngine.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
+import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
 import { computeProjections } from './projectionEngine.js';
 import { evaluateTrackedProjection, extractInvalidationPrice } from './trackedProjectionEngine.js';
 import { setEconomicEvents, upsertEvents, getEconomicEvents, getStore as getCalendarStore, getUpcomingForSymbol, startCalendarFallback, fetchTradingEconomicsOnce } from './economicCalendar.js';
@@ -623,6 +624,74 @@ async function initializeDatabase() {
           KEY idx_sslog_emailed (emailed)
         )
       `);
+
+      // Execution forecasts: one CURRENT forecast row per (symbol, timeframe),
+      // upserted each hourly scan. Predicts WHEN a favorable setup becomes
+      // executable. Deliberately compact (no LONGTEXT blob) and retention-pruned
+      // so it never re-bloats the DB like mt5_account_snapshots did.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_execution_forecasts (
+          id VARCHAR(96) PRIMARY KEY,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          scan_time DATETIME(3) NOT NULL,
+          current_status VARCHAR(32) NOT NULL,
+          execution_status VARCHAR(32) NOT NULL,
+          decision VARCHAR(16) NULL,
+          setup_score DECIMAL(5,1) NOT NULL,
+          score_change DECIMAL(6,1) NULL,
+          trend_strength DECIMAL(5,1) NULL,
+          momentum DECIMAL(5,1) NULL,
+          volatility DECIMAL(5,1) NULL,
+          liquidity DECIMAL(5,1) NULL,
+          session VARCHAR(64) NULL,
+          regime VARCHAR(32) NULL,
+          execution_probability DECIMAL(5,1) NULL,
+          forecast_confidence DECIMAL(5,1) NULL,
+          forecast_basis VARCHAR(48) NULL,
+          expected_execution_time DATETIME(3) NULL,
+          prev_execution_time DATETIME(3) NULL,
+          status VARCHAR(16) NOT NULL DEFAULT 'FORECASTED',
+          reforecast_count INT NOT NULL DEFAULT 0,
+          reason VARCHAR(255) NULL,
+          entry_price DOUBLE NULL,
+          stop_loss DOUBLE NULL,
+          take_profit_1 DOUBLE NULL,
+          original_execution_time DATETIME(3) NULL,
+          original_score DECIMAL(5,1) NULL,
+          calibrated BOOLEAN NOT NULL DEFAULT 0,
+          news_imminent BOOLEAN NOT NULL DEFAULT 0,
+          news_event VARCHAR(160) NULL,
+          news_event_time DATETIME(3) NULL,
+          news_tier VARCHAR(2) NULL,
+          email_created BOOLEAN NOT NULL DEFAULT 0,
+          email_reminder1 BOOLEAN NOT NULL DEFAULT 0,
+          email_reminder2 BOOLEAN NOT NULL DEFAULT 0,
+          email_execution BOOLEAN NOT NULL DEFAULT 0,
+          actual_execution_time DATETIME(3) NULL,
+          forecast_accuracy DECIMAL(5,1) NULL,
+          timing_accuracy DECIMAL(5,1) NULL,
+          score_accuracy DECIMAL(5,1) NULL,
+          resolved_at DATETIME(3) NULL,
+          created_at DATETIME(3) NOT NULL,
+          updated_at DATETIME(3) NOT NULL,
+          KEY idx_fc_status (status),
+          KEY idx_fc_symbol_tf (symbol, timeframe),
+          KEY idx_fc_eta (expected_execution_time)
+        )
+      `);
+      // Phase 5 columns (the table may already exist from Phase 1 on the live DB).
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'original_execution_time', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'original_score', 'DECIMAL(5,1) NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'calibrated', 'BOOLEAN NOT NULL DEFAULT 0');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'news_imminent', 'BOOLEAN NOT NULL DEFAULT 0');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'news_event', 'VARCHAR(160) NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'news_event_time', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'news_tier', 'VARCHAR(2) NULL');
+      // Directional lean (BUY/SELL/NEUTRAL) — the tilt of a still-Building setup
+      // before its decision commits off HOLD. Compact; heeds Trap #6.
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'lean', "VARCHAR(8) NULL");
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'lean_conviction', 'DECIMAL(6,1) NULL');
 
       return pool;
     })().catch((error) => {
@@ -6716,13 +6785,14 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   postNewsFixed: true,
   highImpactNews: true,
   aiTracked: false,
+  forecast: true,
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
   postNewsForexMinGrade: 'A_NEWS_SETUP',
   postNewsFixedMinTier: 'QUALITY_SIGNAL',
 };
-const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked'];
+const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast'];
 const EMAIL_SELECT_SETTING_VALUES = {
   forexMinGrade: ['B_SETUP', 'A_SETUP', 'A_PLUS_SETUP'],
   forexMinQuality: ['B_SIGNAL', 'A_SIGNAL', 'A_PLUS_SIGNAL'],
@@ -7968,6 +8038,8 @@ async function runScanCycle() {
     }
     await maybeSendForexDailyBestEmail(new Date());
     refreshPostNewsSignals(Date.now());
+    await reforecastActiveForecasts();
+    await scanNewsReactions();
     pruneAlerts();
   } catch (err) {
     console.error('[Scanner] cycle error:', err.message);
@@ -7985,6 +8057,947 @@ function startBackgroundScanner() {
   console.log(`[Scanner] Background scanner started. TFs=${SCAN_TIMEFRAMES.join(',')} expiries=${FTT_EXPIRIES.join(',')} every ${SCANNER_INTERVAL_MS / 1000}s. AI on >=${process.env.SIGNAL_ALERT_MIN_GRADE || 'B Setup'}. Alerts->${SIGNAL_ALERT_EMAIL_TO || 'disabled'}`);
 }
 startBackgroundScanner();
+
+
+// ── Execution Forecast scan (Phase 1: hourly, deterministic) ─────────────────
+// Predicts WHEN a favorable-but-not-yet-executable setup becomes executable.
+// Reuses aggregateSignals so there is ZERO scoring drift from the live scanner.
+// Confidence values are uncalibrated model estimates until Phase 5.
+const FORECAST_SCAN_INTERVAL_MS = Math.max(5 * 60 * 1000, Number(process.env.FORECAST_SCAN_INTERVAL_MS || 60 * 60 * 1000));
+const FORECAST_RETENTION_DAYS = Math.max(1, Number(process.env.FORECAST_RETENTION_DAYS || 14));
+const FORECAST_ENABLED = String(process.env.FORECAST_ENABLED || 'true').toLowerCase() !== 'false';
+let forecastScanRunning = false;
+const lastForecastByKey = new Map(); // symbol|tf -> last engine output (slope + reforecast)
+
+// News-aware forecasting windows (user choice: 15m pre / 10m post).
+const NEWS_PRE_WINDOW_MIN = Math.max(1, Number(process.env.NEWS_PRE_WINDOW_MIN || 15));
+const NEWS_POST_WINDOW_MIN = Math.max(1, Number(process.env.NEWS_POST_WINDOW_MIN || 10));
+const NEWS_REACTION_MIN_BODY = Math.max(0.2, Number(process.env.NEWS_REACTION_MIN_BODY || 0.5));
+const newsReactionSent = new Map(); // `${eventId}|${symbol}|${tier}` -> ts (dedup reaction signals)
+
+// Nearest HIGH-impact event for a symbol within the pre-window (upcoming) or
+// post-window (just released). Returns { event, isUpcoming, isReacting } | null.
+function nearestHighImpactEvent(symbol, nowMs) {
+  let events;
+  try { events = getUpcomingForSymbol(symbol, nowMs, 12); } catch { return null; }
+  if (!events || !events.length) return null;
+  const preMs = NEWS_PRE_WINDOW_MIN * 60 * 1000;
+  const postMs = NEWS_POST_WINDOW_MIN * 60 * 1000;
+  let best = null;
+  for (const e of events) {
+    if (String(e.impact).toUpperCase() !== 'HIGH') continue;
+    const dt = e.timestampUtc - nowMs;
+    if (dt >= -postMs && dt <= preMs) {
+      if (!best || Math.abs(dt) < Math.abs(best.event.timestampUtc - nowMs)) {
+        best = { event: e, isUpcoming: dt >= 0, isReacting: dt < 0 && dt >= -postMs };
+      }
+    }
+  }
+  return best;
+}
+
+async function persistExecutionForecast(fc, transition) {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  const now = new Date();
+  const eta = Number.isFinite(fc.expectedExecutionMs) ? new Date(fc.expectedExecutionMs) : null;
+  const prevEta = transition && Number.isFinite(transition.prevExecutionMs) ? new Date(transition.prevExecutionMs) : null;
+  await pool.execute(
+    `INSERT INTO mt5_execution_forecasts (
+       id, symbol, timeframe, scan_time, current_status, execution_status, decision,
+       lean, lean_conviction,
+       setup_score, score_change, trend_strength, momentum, volatility, liquidity,
+       session, regime, execution_probability, forecast_confidence, forecast_basis,
+       expected_execution_time, prev_execution_time, status, reforecast_count, reason,
+       entry_price, stop_loss, take_profit_1, original_execution_time, original_score, calibrated,
+       news_imminent, news_event, news_event_time, news_tier,
+       created_at, updated_at
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE
+       scan_time=VALUES(scan_time), current_status=VALUES(current_status),
+       execution_status=VALUES(execution_status), decision=VALUES(decision),
+       lean=VALUES(lean), lean_conviction=VALUES(lean_conviction),
+       setup_score=VALUES(setup_score), score_change=VALUES(score_change),
+       trend_strength=VALUES(trend_strength), momentum=VALUES(momentum),
+       volatility=VALUES(volatility), liquidity=VALUES(liquidity),
+       session=VALUES(session), regime=VALUES(regime),
+       execution_probability=VALUES(execution_probability),
+       forecast_confidence=VALUES(forecast_confidence), forecast_basis=VALUES(forecast_basis),
+       expected_execution_time=VALUES(expected_execution_time),
+       prev_execution_time=VALUES(prev_execution_time), status=VALUES(status),
+       reforecast_count=VALUES(reforecast_count), reason=VALUES(reason),
+       entry_price=VALUES(entry_price), stop_loss=VALUES(stop_loss),
+       take_profit_1=VALUES(take_profit_1), calibrated=VALUES(calibrated),
+       news_imminent=VALUES(news_imminent), news_event=VALUES(news_event),
+       news_event_time=VALUES(news_event_time), news_tier=VALUES(news_tier),
+       updated_at=VALUES(updated_at)`,
+    [
+      fc.id, fc.symbol, fc.timeframe, toMysqlDate(now), fc.currentStatus, fc.executionStatus, fc.decision,
+      fc.lean || null, fc.leanConviction ?? null,
+      fc.setupScore, fc.scoreChange, fc.trendStrength, fc.momentum, fc.volatility, fc.liquidity,
+      fc.session || null, fc.regime, fc.executionProbability, fc.forecastConfidence, fc.forecastBasis,
+      eta ? toMysqlDate(eta) : null, prevEta ? toMysqlDate(prevEta) : null,
+      transition ? transition.status : 'FORECASTED', transition ? transition.reforecastCount : 0, fc.reason,
+      fc.entryPrice, fc.stopLoss, fc.takeProfit1,
+      eta ? toMysqlDate(eta) : null, fc.setupScore, fc.calibrated ? 1 : 0,
+      fc.newsImminent ? 1 : 0,
+      fc.newsEvent ? `${fc.newsEvent.currency || ''} ${fc.newsEvent.title || ''}`.trim().slice(0, 160) : null,
+      fc.newsEvent && fc.newsEvent.timeIso ? toMysqlDate(new Date(fc.newsEvent.timeIso)) : null,
+      fc.newsTier || null,
+      toMysqlDate(now), toMysqlDate(now),
+    ],
+  );
+}
+
+// Build the SSE payload for a forecast — identical shape to normalizeForecastRow
+// so the frontend handles one type whether it arrives by fetch or by stream.
+function emitForecast(fc, transition) {
+  sendStreamEvent('execution_forecast', {
+    id: fc.id, symbol: fc.symbol, timeframe: fc.timeframe,
+    scanTime: new Date(fc.scanTimeMs || Date.now()).toISOString(),
+    currentStatus: fc.currentStatus, executionStatus: fc.executionStatus, decision: fc.decision,
+    lean: fc.lean || null, leanConviction: fc.leanConviction ?? null,
+    setupScore: fc.setupScore, scoreChange: fc.scoreChange,
+    trendStrength: fc.trendStrength, momentum: fc.momentum, volatility: fc.volatility, liquidity: fc.liquidity,
+    session: fc.session || null, regime: fc.regime,
+    executionProbability: fc.executionProbability, forecastConfidence: fc.forecastConfidence,
+    forecastBasis: fc.forecastBasis,
+    expectedExecutionTime: Number.isFinite(fc.expectedExecutionMs) ? new Date(fc.expectedExecutionMs).toISOString() : null,
+    prevExecutionTime: transition && Number.isFinite(transition.prevExecutionMs) ? new Date(transition.prevExecutionMs).toISOString() : null,
+    status: transition ? transition.status : 'FORECASTED',
+    reforecastCount: transition ? transition.reforecastCount : 0,
+    reason: fc.reason,
+    entryPrice: fc.entryPrice, stopLoss: fc.stopLoss, takeProfit1: fc.takeProfit1,
+    newsImminent: Boolean(fc.newsImminent),
+    newsEvent: fc.newsEvent ? `${fc.newsEvent.currency || ''} ${fc.newsEvent.title || ''}`.trim() : null,
+    newsEventTime: fc.newsEvent && fc.newsEvent.timeIso ? fc.newsEvent.timeIso : null,
+    newsTier: fc.newsTier || null,
+    calibrated: Boolean(fc.calibrated),
+  });
+}
+
+async function runExecutionForecastScan() {
+  if (!FORECAST_ENABLED || forecastScanRunning) return;
+  forecastScanRunning = true;
+  try {
+    await refreshForecastCalibration();
+    const status = getMt5Status();
+    const symbols = getCuratedSymbols(status.symbols);
+    if (!symbols.length) return;
+    let written = 0;
+    for (const symbol of symbols) {
+      const newsHit = nearestHighImpactEvent(symbol, Date.now());
+      const upcomingEvent = newsHit && newsHit.isUpcoming ? newsHit.event : null;
+      for (const tf of FORECAST_TIMEFRAMES) {
+        try {
+          const candleList = getRecentCandles(symbol, tf, 200);
+          if (!candleList || candleList.length < 20) continue;
+          const latest = candleList[candleList.length - 1];
+          if (!isCandleCurrent(latest, tf)) continue; // can't forecast on stale data
+          const { adr, dailyHighLow } = computeAdrDaily(symbol);
+          const summary = aggregateSignals({
+            symbol, timeframe: tf, candles: candleList,
+            indicators: getRecentIndicators(symbol, tf, 500),
+            marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
+            h4Candles: getRecentCandles(symbol, 'H4', 150),
+            h1Candles: getRecentCandles(symbol, 'H1', 150),
+          });
+          const sd = summary.systemDecision;
+          const key = `${symbol}|${tf}`;
+          const prev = lastForecastByKey.get(key) || null;
+          const fc = buildExecutionForecast({
+            symbol, timeframe: tf, systemDecision: sd, nowMs: Date.now(),
+            prevForecast: prev, scanIntervalMs: FORECAST_SCAN_INTERVAL_MS,
+            newsEvent: upcomingEvent, newsPreWindowMs: NEWS_PRE_WINDOW_MIN * 60 * 1000,
+          });
+          if (!fc) {
+            // No longer a candidate — cancel any forecast we were tracking.
+            if (prev) {
+              const transition = reforecastExecution(prev, null);
+              const cancelled = { ...prev, reason: transition.reason };
+              await persistExecutionForecast(cancelled, transition);
+              emitForecast(cancelled, transition);
+              lastForecastByKey.delete(key);
+            }
+            continue;
+          }
+          fc.session = sd?.sessionContext?.reason ? String(sd.sessionContext.reason).slice(0, 60) : null;
+          applyForecastCalibration(fc);
+          const transition = prev
+            ? reforecastExecution(prev, fc)
+            : { status: 'FORECASTED', reason: fc.reason, prevExecutionMs: null, reforecastCount: 0 };
+          await persistExecutionForecast(fc, transition);
+          emitForecast(fc, transition);
+          lastForecastByKey.set(key, { ...fc, reforecastCount: transition.reforecastCount, status: transition.status });
+          written++;
+        } catch (e) { /* per-symbol resilience */ }
+      }
+    }
+    if (written) console.log(`[Forecast] Scan complete — ${written} forecasts across ${symbols.length} symbols x ${FORECAST_TIMEFRAMES.length} TFs.`);
+  } catch (err) {
+    console.error('[Forecast] Scan error:', err.message);
+  } finally {
+    forecastScanRunning = false;
+  }
+}
+
+async function pruneOldExecutionForecasts() {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `DELETE FROM mt5_execution_forecasts
+        WHERE status IN ('CANCELLED','EXPIRED','EXECUTED')
+          AND updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+        LIMIT 5000`,
+      [FORECAST_RETENTION_DAYS],
+    );
+  } catch (e) {
+    console.error('[Forecast] Prune failed:', e.message);
+  }
+}
+
+// Lightweight reforecast pass run from the 60s scanner. Only re-evaluates
+// in-memory active forecasts approaching/just past their ETA — implements the
+// "2:50 / 2:55 / 2:59" re-check logic and streams Delayed/Cancelled/Ready/Expired.
+const FORECAST_REFORECAST_WINDOW_MS = Math.max(60000, Number(process.env.FORECAST_REFORECAST_WINDOW_MS || 20 * 60 * 1000));
+
+async function reforecastActiveForecasts() {
+  if (!FORECAST_ENABLED || !lastForecastByKey.size) return;
+  const nowMs = Date.now();
+  const pool = await initializeDatabase();
+  for (const [key, prev] of [...lastForecastByKey.entries()]) {
+    try {
+      const eta = Number.isFinite(prev.expectedExecutionMs) ? prev.expectedExecutionMs : null;
+      // Skip forecasts whose ETA is still comfortably in the future — keeps the tick cheap.
+      if (eta !== null && (eta - nowMs) > FORECAST_REFORECAST_WINDOW_MS) continue;
+      const [symbol, tf] = key.split('|');
+      const candleList = getRecentCandles(symbol, tf, 200);
+      if (!candleList || candleList.length < 20) continue;
+      const latest = candleList[candleList.length - 1];
+      if (!isCandleCurrent(latest, tf)) continue;
+      const { adr, dailyHighLow } = computeAdrDaily(symbol);
+      const summary = aggregateSignals({
+        symbol, timeframe: tf, candles: candleList,
+        indicators: getRecentIndicators(symbol, tf, 500),
+        marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
+        h4Candles: getRecentCandles(symbol, 'H4', 150), h1Candles: getRecentCandles(symbol, 'H1', 150),
+      });
+      const sd = summary.systemDecision;
+      const reHit = nearestHighImpactEvent(symbol, nowMs);
+      const reUpcoming = reHit && reHit.isUpcoming ? reHit.event : null;
+      const fresh = buildExecutionForecast({
+        symbol, timeframe: tf, systemDecision: sd, nowMs, prevForecast: prev, scanIntervalMs: SCANNER_INTERVAL_MS,
+        newsEvent: reUpcoming, newsPreWindowMs: NEWS_PRE_WINDOW_MIN * 60 * 1000,
+      });
+      if (!fresh) {
+        // Setup invalidated → CANCELLED (counts as a miss in calibration).
+        const transition = reforecastExecution(prev, null);
+        const cancelled = { ...prev, reason: transition.reason };
+        await persistExecutionForecast(cancelled, transition);
+        if (pool) await resolveForecastRow(pool, prev.id, 'CANCELLED', nowMs, null);
+        emitForecast(cancelled, transition);
+        lastForecastByKey.delete(key);
+        continue;
+      }
+      fresh.session = sd?.sessionContext?.reason ? String(sd.sessionContext.reason).slice(0, 60) : null;
+      applyForecastCalibration(fresh);
+      let transition = reforecastExecution(prev, fresh);
+      // Expire forecasts whose ETA passed by > 1 bar and never became ready.
+      if (transition.status !== 'READY' && eta !== null && (nowMs - eta) > forecastTfSeconds(tf) * 1000) {
+        transition = { status: 'EXPIRED', reason: 'Execution window passed without becoming executable.', prevExecutionMs: eta, reforecastCount: (prev.reforecastCount || 0) + 1 };
+      }
+
+      if (transition.status === 'READY') {
+        // Became executable → this IS the execution moment: full-detail email + resolve.
+        await persistExecutionForecast(fresh, transition);
+        await sendForecastReadyEmail(pool, fresh.id, symbol, tf, sd);
+        if (pool) await resolveForecastRow(pool, fresh.id, 'EXECUTED', nowMs, fresh.setupScore);
+        emitForecast(fresh, { ...transition, status: 'EXECUTED' });
+        lastForecastByKey.delete(key);
+      } else if (transition.status === 'EXPIRED') {
+        await persistExecutionForecast(fresh, transition);
+        if (pool) await resolveForecastRow(pool, fresh.id, 'EXPIRED', nowMs, null);
+        emitForecast(fresh, transition);
+        lastForecastByKey.delete(key);
+      } else {
+        await persistExecutionForecast(fresh, transition);
+        emitForecast(fresh, transition);
+        lastForecastByKey.set(key, { ...fresh, reforecastCount: transition.reforecastCount, status: transition.status });
+      }
+    } catch (e) { /* per-forecast resilience */ }
+  }
+}
+
+// ── News reaction scanner (two-tier) — runs on the 60s scanner ───────────────
+// Reacts to ACTUAL post-release price (never predicts the number). Tier A = the
+// first decisive candle (the spike, aggressive); Tier B = confirmed follow-through.
+const NEWS_REACTION_TF = (process.env.NEWS_REACTION_TF || 'M5').toUpperCase();
+
+async function sendNewsReactionEmail(fc, event, reaction, levels) {
+  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forecast')) return;
+  const sym = fc.symbol;
+  const tierLabel = reaction.tier === 'B' ? 'CONFIRMED REACTION' : 'SPIKE (aggressive)';
+  const dirColor = fc.decision === 'BUY' ? '#047857' : '#b91c1c';
+  const warn = reaction.tier === 'A'
+    ? 'Tier A spike — entered on the FIRST candle. Spreads are wide and reversals common; size down and use the stop.'
+    : 'Tier B — direction confirmed by follow-through. Still a volatile news move; manage risk.';
+  const subject = `[NEWS ${tierLabel}] ${fc.decision} ${sym} ${NEWS_REACTION_TF} · ${event.currency} ${event.title}`;
+  const text = [
+    `AURA GOLD - NEWS REACTION (${tierLabel})`,
+    `${sym} ${NEWS_REACTION_TF} | ${fc.decision} | driver: ${event.currency} ${event.title}`,
+    `Entry ${px(levels.entry, sym)}  SL ${px(levels.stopLoss, sym)}  TP1 ${px(levels.takeProfit1, sym)}  TP2 ${px(levels.takeProfit2, sym)}  TP3 ${px(levels.takeProfit3, sym)}  (ATR-scaled, RR 1:1/1:2/1:3)`,
+    `Direction is from the ACTUAL price reaction, not a prediction of the release.`,
+    warn,
+    'Advisory only — not financial advice.',
+  ].join('\n');
+  const html = `<div style="font-family:Arial,sans-serif;max-width:640px">
+    <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#b45309;text-transform:uppercase">News Reaction · ${tierLabel}</p>
+    <h2 style="margin:0 0 4px;color:${dirColor}">${fc.decision} ${sym} <span style="font-size:13px;color:#64748b">${NEWS_REACTION_TF}</span></h2>
+    <p style="font-size:13px;color:#0f172a">Driver: <b>${event.currency} ${event.title}</b></p>
+    <table style="font-size:13px;border-collapse:collapse">
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Entry</td><td><b>${px(levels.entry, sym)}</b></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Stop Loss</td><td style="color:#b91c1c">${px(levels.stopLoss, sym)}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP1 / TP2 / TP3</td><td style="color:#047857">${px(levels.takeProfit1, sym)} / ${px(levels.takeProfit2, sym)} / ${px(levels.takeProfit3, sym)}</td></tr>
+    </table>
+    <p style="font-size:12px;color:#b45309;margin:8px 0 0">${warn}</p>
+    <p style="font-size:12px;color:#475569;margin:4px 0 0">Direction is from the <b>actual price reaction</b>, not a pre-release guess. ATR-scaled levels.</p>
+    <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory only — not financial advice. — Aura Gold News Reaction</p></div>`;
+  try {
+    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `newsreact:${event.id}:${sym}:${reaction.tier}` });
+    console.log(`[Forecast] Emailed NEWS ${tierLabel} ${fc.decision} ${sym} (${event.title})`);
+  } catch (e) {
+    console.error('[Forecast] News reaction email failed:', e.message);
+  }
+}
+
+async function scanNewsReactions() {
+  if (!FORECAST_ENABLED) return;
+  const nowMs = Date.now();
+  const symbols = getCuratedSymbols(getMt5Status().symbols);
+  if (!symbols.length) return;
+  const pool = await initializeDatabase();
+  // Expire stale READY reaction rows whose post-window has closed (keeps the table clean).
+  if (pool) {
+    try {
+      await pool.execute(
+        `UPDATE mt5_execution_forecasts SET status='EXPIRED', resolved_at=?, updated_at=?
+          WHERE news_tier IS NOT NULL AND status='READY'
+            AND news_event_time < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)`,
+        [toMysqlDate(new Date()), toMysqlDate(new Date()), NEWS_POST_WINDOW_MIN],
+      );
+    } catch { /* non-fatal */ }
+  }
+  for (const symbol of symbols) {
+    try {
+      const hit = nearestHighImpactEvent(symbol, nowMs);
+      if (!hit || !hit.isReacting) continue;
+      const event = hit.event;
+      const candles = getRecentCandles(symbol, NEWS_REACTION_TF, 60);
+      if (!candles || candles.length < 16) continue;
+      const reaction = detectNewsReaction({
+        candles, eventMs: event.timestampUtc,
+        postWindowMs: NEWS_POST_WINDOW_MIN * 60 * 1000, minBodyPct: NEWS_REACTION_MIN_BODY,
+      });
+      if (!reaction) continue;
+      const dedupKey = `${event.id}|${symbol}|${reaction.tier}`;
+      if (newsReactionSent.has(dedupKey)) continue;
+      const levels = buildNewsReactionLevels({ candles, direction: reaction.direction });
+      if (!levels) continue;
+      newsReactionSent.set(dedupKey, nowMs);
+      const id = `fc:${symbol.toUpperCase()}|NEWS|${event.id}`;
+      const fc = {
+        id, symbol: symbol.toUpperCase(), timeframe: NEWS_REACTION_TF, scanTimeMs: nowMs,
+        currentStatus: 'Good Condition', executionStatus: 'EXECUTABLE',
+        decision: reaction.direction, lean: reaction.direction, leanConviction: null,
+        regime: 'news', setupScore: reaction.tier === 'B' ? 78 : 72, scoreChange: null,
+        trendStrength: null, momentum: null, volatility: null, liquidity: null,
+        executionProbability: reaction.tier === 'B' ? 72 : 58,
+        forecastConfidence: reaction.tier === 'B' ? 70 : 50,
+        forecastBasis: 'NEWS', expectedExecutionMs: nowMs,
+        reason: `News reaction Tier ${reaction.tier} — ${reaction.direction} after ${event.currency} ${event.title} (${reaction.candles} candle${reaction.candles > 1 ? 's' : ''}).`,
+        entryPrice: levels.entry, stopLoss: levels.stopLoss, takeProfit1: levels.takeProfit1,
+        newsImminent: true,
+        newsEvent: { title: event.title, currency: event.currency, impact: event.impact, timeIso: event.timeIso },
+        newsTier: reaction.tier, calibrated: false,
+      };
+      const transition = { status: 'READY', reason: fc.reason, prevExecutionMs: null, reforecastCount: 0 };
+      await persistExecutionForecast(fc, transition);
+      emitForecast(fc, transition);
+      await sendNewsReactionEmail(fc, event, reaction, levels);
+    } catch (e) { /* per-symbol resilience */ }
+  }
+}
+
+// ── Forecast email workflow (Phase 3) ───────────────────────────────────────
+// Four one-shot stages per forecast row: Created, T-10m, T-5m, at-ETA. Reuses
+// sendNotificationEmail, the 'forecast' email-system toggle, SIGNAL_ALERT_EMAIL_TO,
+// and natural dedup via the email_* boolean flags on the row.
+const FORECAST_EMAIL_MIN_SCORE = Number(process.env.FORECAST_EMAIL_MIN_SCORE || 75);
+// The "now executable" READY email fires at the executable threshold — a setup
+// is, by definition, ready at EXECUTABLE_SCORE. Gating it at the higher
+// FORECAST_EMAIL_MIN_SCORE (75) silently dropped ready setups in the 70-74.9
+// band (they resolved EXECUTED with no direction emailed). The pre-execution
+// reminders keep the higher FORECAST_EMAIL_MIN_SCORE bar.
+const FORECAST_READY_EMAIL_MIN_SCORE = Number(process.env.FORECAST_READY_EMAIL_MIN_SCORE || FC_EXECUTABLE_SCORE);
+const FORECAST_BASIS_LABELS = {
+  IMMEDIATE: 'Ready now', NEXT_CANDLE: 'Next candle', PULLBACK: 'Pullback',
+  SCORE_SLOPE: 'Score rising', SESSION: 'Session open', UNKNOWN: 'No clear path',
+};
+const FORECAST_STAGE_LABELS = {
+  created: 'Forecast created', reminder1: 'Reminder · ~10 min to execution',
+  reminder2: 'Reminder · ~5 min to execution', execution: 'Execution window reached',
+};
+
+function buildForecastEmail(row, stage, etaMs) {
+  const dir = row.decision && row.decision !== 'HOLD' ? String(row.decision).replace('_', ' ') : '—';
+  const etaClock = etaMs ? `${formatAppDateTime(etaMs)} BDT` : 'n/a';
+  const basis = FORECAST_BASIS_LABELS[row.forecast_basis] || row.forecast_basis || '—';
+  const stageLabel = FORECAST_STAGE_LABELS[stage] || stage;
+  const dirColor = String(row.decision || '').includes('BUY') ? '#047857' : String(row.decision || '').includes('SELL') ? '#b91c1c' : '#334155';
+  const subject = `[FORECAST | ${stageLabel}] ${dir} ${row.symbol} ${row.timeframe} · ETA ${etaClock} · score ${row.setup_score}`;
+  const text = [
+    `AURA GOLD - EXECUTION FORECAST (${stageLabel})`,
+    `${row.symbol} ${row.timeframe} | ${dir} | ${row.current_status}`,
+    `Expected execution: ${etaClock} (${basis})`,
+    `Setup score: ${row.setup_score}${row.score_change !== null && row.score_change !== undefined ? ` (${Number(row.score_change) >= 0 ? '+' : ''}${row.score_change})` : ''}`,
+    `Execution probability: ${row.execution_probability ?? 'n/a'}%`,
+    `Forecast confidence: ${row.forecast_confidence ?? 'n/a'}% (uncalibrated model estimate — not a guarantee)`,
+    row.entry_price !== null && row.entry_price !== undefined ? `Reference levels — Entry ${px(row.entry_price, row.symbol)} · SL ${px(row.stop_loss, row.symbol)} · TP1 ${px(row.take_profit_1, row.symbol)}` : '',
+    row.reason ? `Why: ${row.reason}` : '',
+    row.session ? `Session: ${row.session}` : '',
+    '',
+    'This is a TIMING FORECAST, not a live trade signal. Confirm the setup on the chart before acting.',
+    'Advisory only — not financial advice. Manage your own risk.',
+  ].filter(Boolean).join('\n');
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:640px">
+      <p style="margin:0 0 8px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#b45309;text-transform:uppercase">Execution Forecast · ${stageLabel}</p>
+      <h2 style="margin:0 0 4px;color:${dirColor}">${dir} ${row.symbol} <span style="font-size:13px;color:#64748b">${row.timeframe}</span></h2>
+      <p style="margin:0 0 8px;font-size:13px;color:#0f172a"><b>Expected execution ${etaClock}</b> · ${basis} · ${row.current_status}</p>
+      <table style="font-size:13px;border-collapse:collapse">
+        <tr><td style="padding:2px 12px 2px 0;color:#64748b">Setup score</td><td><b>${row.setup_score}</b>${row.score_change !== null && row.score_change !== undefined ? ` <span style="color:${Number(row.score_change) >= 0 ? '#047857' : '#b91c1c'}">(${Number(row.score_change) >= 0 ? '+' : ''}${row.score_change})</span>` : ''}</td></tr>
+        <tr><td style="padding:2px 12px 2px 0;color:#64748b">Execution probability</td><td><b>${row.execution_probability ?? 'n/a'}%</b></td></tr>
+        <tr><td style="padding:2px 12px 2px 0;color:#64748b">Forecast confidence</td><td>${row.forecast_confidence ?? 'n/a'}% <span style="color:#94a3b8">· est. (uncalibrated)</span></td></tr>
+        ${row.entry_price !== null && row.entry_price !== undefined ? `<tr><td style="padding:2px 12px 2px 0;color:#64748b">Reference</td><td>Entry ${px(row.entry_price, row.symbol)} · SL <span style="color:#b91c1c">${px(row.stop_loss, row.symbol)}</span> · TP1 <span style="color:#047857">${px(row.take_profit_1, row.symbol)}</span></td></tr>` : ''}
+      </table>
+      ${row.reason ? `<p style="font-size:12px;color:#475569;margin:8px 0 0">${row.reason}</p>` : ''}
+      ${row.session ? `<p style="font-size:12px;color:#475569;margin:2px 0 0">Session: ${row.session}</p>` : ''}
+      <p style="font-size:12px;color:#b45309;margin:10px 0 0">This is a <b>timing forecast</b>, not a live trade signal — confirm on the chart before acting.</p>
+      <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory only — not financial advice. — Aura Gold Forecast</p>
+    </div>`;
+  return { subject, text, html };
+}
+
+// Full-detail "now executable" email sent at the READY transition — the complete
+// trade ticket (TP1/2/3, RR, risk plan, confluences), same depth as the Signals
+// dashboard / forex alert, built from the live systemDecision.
+function buildForecastReadyEmail(symbol, timeframe, sd) {
+  const money = (v) => (v === null || v === undefined ? 'n/a' : `$${Number(v).toFixed(2)}`);
+  const dir = String(sd.decision || '').replace('_', ' ');
+  const dirColor = String(sd.decision || '').includes('BUY') ? '#047857' : String(sd.decision || '').includes('SELL') ? '#b91c1c' : '#334155';
+  const quality = sd.signalQuality || setupLabel(sd.grade);
+  const risk = sd.riskPlan;
+  const conf = sd.confluences || [];
+  const subject = `[FORECAST READY → EXECUTE] ${dir} ${symbol} ${timeframe} · ${quality} · score ${Math.round(sd.confidence)}`;
+  const text = [
+    `AURA GOLD - FORECAST NOW EXECUTABLE`,
+    `${symbol} ${timeframe} | ${dir} | ${quality} | Grade ${sd.grade} | Score ${Math.round(sd.confidence)}/100`,
+    `Entry ${px(sd.entryPrice, symbol)}  SL ${px(sd.stopLoss, symbol)}  TP1 ${px(sd.takeProfit1, symbol)}  TP2 ${px(sd.takeProfit2, symbol)}  TP3 ${px(sd.takeProfit3, symbol)}`,
+    `RR ${sd.riskRewardRatio ?? 'n/a'} | Trigger ${sd.entryTrigger || 'IMMEDIATE'} | ${sd.timingTip || ''}`,
+    risk ? `Risk ${risk.riskPercent}% · Max loss ${money(risk.amountToRisk ?? risk.riskAmount ?? risk.maxLoss)} · Lot ${risk.suggestedLotSize ?? 'n/a'} · Margin ${money(risk.marginRequired ?? risk.amountToInvestApprox)}` : '',
+    risk ? `Profit @ TP1 ${money(risk.profitAtTp1)} · TP2 ${money(risk.profitAtTp2)} · TP3 ${money(risk.profitAtTp3)}` : '',
+    sd.sessionContext ? `Session: ${sd.sessionContext.reason}` : '',
+    `Confluences: ${conf.map((c) => `${c.name}+${c.points}`).join(', ') || 'none'}`,
+    '',
+    'This setup was forecast and is NOW executable. Advisory only — not financial advice; manage your own risk.',
+  ].filter(Boolean).join('\n');
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:680px">
+      <p style="margin:0 0 8px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#b45309;text-transform:uppercase">Forecast Ready → Execute Now</p>
+      <h2 style="margin:0 0 4px;color:${dirColor}">${dir} ${symbol} <span style="font-size:13px;color:#64748b">${timeframe}</span></h2>
+      <p style="margin:0 0 8px"><b>${quality}</b> · ${sd.grade} · ${sd.strategyType || 'SYSTEM_CONFLUENCE'} · Score ${Math.round(sd.confidence)}/100 · RR ${sd.riskRewardRatio ?? 'n/a'} · ${sd.entryTrigger || 'IMMEDIATE'}</p>
+      <table style="font-size:13px;border-collapse:collapse">
+        <tr><td style="padding:2px 10px 2px 0;color:#64748b">Entry</td><td><b>${px(sd.entryPrice, symbol)}</b></td></tr>
+        <tr><td style="padding:2px 10px 2px 0;color:#64748b">Stop Loss</td><td style="color:#b91c1c">${px(sd.stopLoss, symbol)}</td></tr>
+        <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP1 / TP2 / TP3</td><td style="color:#047857">${px(sd.takeProfit1, symbol)} / ${px(sd.takeProfit2, symbol)} / ${px(sd.takeProfit3, symbol)}</td></tr>
+      </table>
+      ${risk ? `<div style="margin:10px 0;padding:10px;border:1px solid #fde68a;background:#fffbeb;border-radius:10px"><p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#92400e;text-transform:uppercase">Position Plan</p><p style="font-size:13px;margin:2px 0">Risk <b>${risk.riskPercent}%</b> · Max loss <b>${money(risk.amountToRisk ?? risk.riskAmount ?? risk.maxLoss)}</b> · Lot <b>${risk.suggestedLotSize ?? 'n/a'}</b> · Margin <b>${money(risk.marginRequired ?? risk.amountToInvestApprox)}</b></p><p style="font-size:13px;margin:6px 0 0;color:#047857">TP1 ${money(risk.profitAtTp1)} · TP2 ${money(risk.profitAtTp2)} · TP3 ${money(risk.profitAtTp3)}</p></div>` : ''}
+      ${sd.sessionContext ? `<p style="font-size:12px;color:#475569">Session: ${sd.sessionContext.reason}</p>` : ''}
+      <p style="font-size:12px;color:#64748b">Confluences: ${conf.map((c) => `${c.name} +${c.points}`).join(', ') || 'none'}</p>
+      <p style="font-size:12px;color:#b45309;margin:8px 0 0">This setup was forecast and is <b>now executable</b>.</p>
+      <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory only — not financial advice. — Aura Gold Forecast</p>
+    </div>`;
+  return { subject, text, html };
+}
+
+async function sendForecastReadyEmail(pool, id, symbol, timeframe, sd) {
+  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forecast')) return;
+  if ((Number(sd?.confidence) || 0) < FORECAST_READY_EMAIL_MIN_SCORE) return;
+  try {
+    const { subject, text, html } = buildForecastReadyEmail(symbol, timeframe, sd);
+    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `forecast:${id}:ready` });
+    if (pool) await pool.execute('UPDATE mt5_execution_forecasts SET email_execution = 1, updated_at = ? WHERE id = ?', [toMysqlDate(new Date()), id]);
+    console.log(`[Forecast] Emailed READY (full detail) ${symbol} ${timeframe} score ${Math.round(sd.confidence)}`);
+  } catch (e) {
+    console.error(`[Forecast] READY email failed for ${id}:`, e.message);
+  }
+}
+
+let forecastEmailRunning = false;
+async function processForecastEmails() {
+  if (!FORECAST_ENABLED || forecastEmailRunning) return;
+  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forecast')) return;
+  forecastEmailRunning = true;
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const nowMs = Date.now();
+    // Active forecasts that still have at least one email stage pending, above the score gate.
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_execution_forecasts
+        WHERE status IN ('FORECASTED','DELAYED','READY')
+          AND email_execution = 0
+          AND setup_score >= ?
+        ORDER BY expected_execution_time ASC
+        LIMIT 200`,
+      [FORECAST_EMAIL_MIN_SCORE],
+    );
+    for (const row of rows) {
+      // News blackout: don't send generic reminders into a high-impact release —
+      // the two-tier news-reaction emails cover that window instead.
+      if (row.news_imminent) continue;
+      const etaMs = row.expected_execution_time ? new Date(row.expected_execution_time).getTime() : null;
+      const toEta = etaMs !== null ? etaMs - nowMs : null;
+      // Only the PRE-EXECUTION reminders (~10m and ~5m). No "created" email, and the
+      // at-execution email is the FULL-detail "now executable" one sent at the READY
+      // transition (in reforecastActiveForecasts), where the live systemDecision exists.
+      const stages = [];
+      if (etaMs !== null) {
+        if (!row.email_reminder1 && toEta <= 10 * 60 * 1000 && toEta > 5 * 60 * 1000) stages.push('reminder1');
+        if (!row.email_reminder2 && toEta <= 5 * 60 * 1000 && toEta > 0) stages.push('reminder2');
+      }
+      if (!stages.length) continue;
+      for (const stage of stages) {
+        try {
+          const { subject, text, html } = buildForecastEmail(row, stage, etaMs);
+          await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `forecast:${row.id}:${stage}` });
+          const col = { reminder1: 'email_reminder1', reminder2: 'email_reminder2' }[stage];
+          await pool.execute(`UPDATE mt5_execution_forecasts SET ${col} = 1, updated_at = ? WHERE id = ?`, [toMysqlDate(new Date()), row.id]);
+          // keep the in-memory copy in sync so the next cycle doesn't re-pick the stage
+          row[col] = 1;
+          console.log(`[Forecast] Emailed ${stage} ${row.symbol} ${row.timeframe} (score ${row.setup_score})`);
+        } catch (e) {
+          console.error(`[Forecast] Email ${stage} failed for ${row.id}:`, e.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Forecast] Email workflow error:', err.message);
+  } finally {
+    forecastEmailRunning = false;
+  }
+}
+
+// ── Phase 5: post-execution calibration ─────────────────────────────────────
+// Measured accuracy of resolved forecasts, grouped by ETA basis. Once a basis
+// has enough resolved samples, the live forecast's confidence is FLIPPED from
+// the heuristic estimate to this measured timing accuracy (calibrated=true).
+const FORECAST_CALIBRATION_MIN_SAMPLE = Math.max(5, Number(process.env.FORECAST_CALIBRATION_MIN_SAMPLE || 20));
+const forecastCalibrationByBasis = new Map(); // basis -> { samples, hitRate, avgTiming }
+
+// Confidence-in-timing for an executed forecast: how close actual was to the
+// ORIGINAL predicted ETA, within a tolerance window scaled to the timeframe.
+function computeForecastAccuracy(row, outcome, nowMs, realizedScore) {
+  const executed = outcome === 'EXECUTED';
+  const forecastAccuracy = executed ? 100 : 0;
+  let timingAccuracy = null;
+  let scoreAccuracy = null;
+  if (executed) {
+    const origEta = row.original_execution_time ? new Date(row.original_execution_time).getTime() : null;
+    if (origEta !== null) {
+      const tol = Math.max(forecastTfSeconds(row.timeframe) * 1000, 30 * 60 * 1000);
+      const err = Math.abs(nowMs - origEta);
+      timingAccuracy = Math.max(0, Math.round((1 - err / tol) * 1000) / 10);
+    }
+    if (Number.isFinite(realizedScore)) {
+      // We forecast the score crossing the executable threshold; reward decisiveness.
+      scoreAccuracy = Math.max(0, Math.min(100, Math.round((100 - Math.abs(realizedScore - FC_EXECUTABLE_SCORE)) * 10) / 10));
+    }
+  }
+  return { forecastAccuracy, timingAccuracy, scoreAccuracy };
+}
+
+async function resolveForecastRow(pool, id, outcome, nowMs, realizedScore) {
+  const [rows] = await pool.query('SELECT * FROM mt5_execution_forecasts WHERE id = ? LIMIT 1', [id]);
+  if (!rows.length) return;
+  const acc = computeForecastAccuracy(rows[0], outcome, nowMs, realizedScore);
+  const stamp = toMysqlDate(new Date(nowMs));
+  await pool.execute(
+    `UPDATE mt5_execution_forecasts
+       SET status=?, actual_execution_time=?, forecast_accuracy=?, timing_accuracy=?, score_accuracy=?, resolved_at=?, updated_at=?
+       WHERE id=?`,
+    [outcome, outcome === 'EXECUTED' ? stamp : null, acc.forecastAccuracy, acc.timingAccuracy, acc.scoreAccuracy, stamp, stamp, id],
+  );
+}
+
+// Flip the heuristic confidence to the measured timing accuracy when the basis
+// has a usable resolved sample. Honest: otherwise leaves it as an estimate.
+function applyForecastCalibration(fc) {
+  if (!fc) return fc;
+  const cal = forecastCalibrationByBasis.get(fc.forecastBasis);
+  if (cal && cal.samples >= FORECAST_CALIBRATION_MIN_SAMPLE && Number.isFinite(cal.avgTiming)) {
+    fc.forecastConfidence = cal.avgTiming;
+    fc.calibrated = true;
+  }
+  return fc;
+}
+
+function summarizeForecastCalibration(rows) {
+  const byBasis = new Map();
+  const overall = { samples: 0, executed: 0, expired: 0, cancelled: 0, timingSum: 0, timingN: 0, scoreSum: 0, scoreN: 0 };
+  for (const r of rows) {
+    const basis = r.forecast_basis || 'UNKNOWN';
+    if (!byBasis.has(basis)) byBasis.set(basis, { basis, samples: 0, executed: 0, expired: 0, cancelled: 0, timingSum: 0, timingN: 0, scoreSum: 0, scoreN: 0 });
+    const b = byBasis.get(basis);
+    const status = String(r.status || '').toUpperCase();
+    for (const acc of [b, overall]) {
+      acc.samples += 1;
+      if (status === 'EXECUTED') acc.executed += 1;
+      else if (status === 'EXPIRED') acc.expired += 1;
+      else if (status === 'CANCELLED') acc.cancelled += 1;
+      if (r.timing_accuracy !== null && r.timing_accuracy !== undefined) { acc.timingSum += Number(r.timing_accuracy); acc.timingN += 1; }
+      if (r.score_accuracy !== null && r.score_accuracy !== undefined) { acc.scoreSum += Number(r.score_accuracy); acc.scoreN += 1; }
+    }
+  }
+  const finalize = (b) => ({
+    basis: b.basis,
+    samples: b.samples,
+    executed: b.executed,
+    expired: b.expired,
+    cancelled: b.cancelled,
+    hitRate: b.samples ? Math.round((b.executed / b.samples) * 1000) / 10 : null,
+    avgTimingAccuracy: b.timingN ? Math.round((b.timingSum / b.timingN) * 10) / 10 : null,
+    avgScoreAccuracy: b.scoreN ? Math.round((b.scoreSum / b.scoreN) * 10) / 10 : null,
+    confidence: sampleConfidence(b.samples),
+  });
+  return {
+    overall: finalize({ ...overall, basis: 'ALL' }),
+    byBasis: [...byBasis.values()].map(finalize).sort((a, b) => b.samples - a.samples),
+  };
+}
+
+// Refresh the in-memory calibration cache from resolved forecasts (last 90 days).
+async function refreshForecastCalibration() {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  try {
+    const [rows] = await pool.query(
+      `SELECT forecast_basis, status, timing_accuracy, score_accuracy
+         FROM mt5_execution_forecasts
+        WHERE resolved_at IS NOT NULL AND resolved_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 90 DAY)`,
+    );
+    const summary = summarizeForecastCalibration(rows);
+    forecastCalibrationByBasis.clear();
+    for (const b of summary.byBasis) {
+      forecastCalibrationByBasis.set(b.basis, { samples: b.samples, hitRate: b.hitRate, avgTiming: b.avgTimingAccuracy });
+    }
+  } catch (e) {
+    console.error('[Forecast] Calibration refresh failed:', e.message);
+  }
+}
+
+// Walk-forward backtest of the deterministic forecaster over stored candles.
+// Validates timing accuracy on history BEFORE the live numbers are trusted.
+// Self-contained on candles (no historical indicators) — engine's internal ADX
+// fallback keeps regime tuning live, matching the FTT replay harness approach.
+function runForecastReplay({ symbol, timeframe, candles, maxEvals = 300 }) {
+  if (!candles || candles.length < 80) return { valid: false, reason: 'Not enough candles (need 80+).' };
+  const tfSec = forecastTfSeconds(timeframe);
+  const horizonBars = 24; // look up to 24 bars ahead for actual execution
+  const warmup = 50;
+  const step = Math.max(1, Math.floor((candles.length - warmup - horizonBars) / maxEvals));
+  let forecasts = 0, executed = 0, timingSum = 0, timingN = 0;
+  const tolMs = Math.max(tfSec * 1000, 30 * 60 * 1000);
+
+  for (let i = warmup; i < candles.length - horizonBars; i += step) {
+    const slice = candles.slice(0, i + 1);
+    let sd;
+    try {
+      sd = aggregateSignals({ symbol, timeframe, candles: slice, indicators: [], marketLevels, accountSnapshot: null }).systemDecision;
+    } catch { continue; }
+    const nowMs = new Date(slice[slice.length - 1].time).getTime();
+    const fc = buildExecutionForecast({ symbol, timeframe, systemDecision: sd, nowMs });
+    if (!fc || !Number.isFinite(fc.expectedExecutionMs)) continue;
+    if (fc.executionStatus === 'EXECUTABLE') continue; // already executable, not a forecast
+    forecasts += 1;
+    // Find the first future bar where the setup actually becomes executable.
+    let actualMs = null;
+    for (let j = i + 1; j <= i + horizonBars && j < candles.length; j++) {
+      let sd2;
+      try {
+        sd2 = aggregateSignals({ symbol, timeframe, candles: candles.slice(0, j + 1), indicators: [], marketLevels, accountSnapshot: null }).systemDecision;
+      } catch { continue; }
+      const score = Number(sd2?.confidence) || 0;
+      const dec = String(sd2?.decision || 'HOLD').toUpperCase();
+      if (dec !== 'HOLD' && score >= FC_EXECUTABLE_SCORE && sd2.entryTimingInstruction === 'IMMEDIATE_ENTRY') {
+        actualMs = new Date(candles[j].time).getTime();
+        break;
+      }
+    }
+    if (actualMs !== null) {
+      executed += 1;
+      const err = Math.abs(actualMs - fc.expectedExecutionMs);
+      timingSum += Math.max(0, (1 - err / tolMs) * 100);
+      timingN += 1;
+    }
+  }
+  return {
+    valid: true,
+    symbol, timeframe,
+    forecasts,
+    executed,
+    hitRate: forecasts ? Math.round((executed / forecasts) * 1000) / 10 : null,
+    avgTimingAccuracy: timingN ? Math.round((timingSum / timingN) * 10) / 10 : null,
+    confidence: sampleConfidence(forecasts),
+    note: 'Backtest of the deterministic forecaster on historical candles. Hit-rate = share of forecasts whose setup actually became executable within 24 bars; timing accuracy = closeness to the predicted ETA. Not a guarantee of live results.',
+  };
+}
+
+function normalizeForecastRow(row) {
+  const num = (v) => (v === null || v === undefined ? null : Number(v));
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    timeframe: row.timeframe,
+    scanTime: row.scan_time ? new Date(row.scan_time).toISOString() : null,
+    currentStatus: row.current_status,
+    executionStatus: row.execution_status,
+    decision: row.decision,
+    lean: row.lean || null,
+    leanConviction: num(row.lean_conviction),
+    setupScore: num(row.setup_score),
+    scoreChange: num(row.score_change),
+    trendStrength: num(row.trend_strength),
+    momentum: num(row.momentum),
+    volatility: num(row.volatility),
+    liquidity: num(row.liquidity),
+    session: row.session,
+    regime: row.regime,
+    executionProbability: num(row.execution_probability),
+    forecastConfidence: num(row.forecast_confidence),
+    forecastBasis: row.forecast_basis,
+    expectedExecutionTime: row.expected_execution_time ? new Date(row.expected_execution_time).toISOString() : null,
+    prevExecutionTime: row.prev_execution_time ? new Date(row.prev_execution_time).toISOString() : null,
+    status: row.status,
+    reforecastCount: num(row.reforecast_count),
+    reason: row.reason,
+    entryPrice: num(row.entry_price),
+    stopLoss: num(row.stop_loss),
+    takeProfit1: num(row.take_profit_1),
+    actualExecutionTime: row.actual_execution_time ? new Date(row.actual_execution_time).toISOString() : null,
+    forecastAccuracy: num(row.forecast_accuracy),
+    timingAccuracy: num(row.timing_accuracy),
+    scoreAccuracy: num(row.score_accuracy),
+    resolvedAt: row.resolved_at ? new Date(row.resolved_at).toISOString() : null,
+    newsImminent: row.news_imminent === 1 || row.news_imminent === true,
+    newsEvent: row.news_event || null,
+    newsEventTime: row.news_event_time ? new Date(row.news_event_time).toISOString() : null,
+    newsTier: row.news_tier || null,
+    calibrated: row.calibrated === 1 || row.calibrated === true,
+  };
+}
+
+function startExecutionForecastScanner() {
+  if (!FORECAST_ENABLED) { console.log('[Forecast] Disabled via FORECAST_ENABLED=false.'); return; }
+  const timer = setInterval(() => void runExecutionForecastScan(), FORECAST_SCAN_INTERVAL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  setTimeout(() => void runExecutionForecastScan(), 20000); // warm shortly after boot
+  const pruneTimer = setInterval(() => void pruneOldExecutionForecasts(), 6 * 60 * 60 * 1000);
+  if (typeof pruneTimer.unref === 'function') pruneTimer.unref();
+  console.log(`[Forecast] Execution forecast scanner started. TFs=${FORECAST_TIMEFRAMES.join(',')} every ${Math.round(FORECAST_SCAN_INTERVAL_MS / 60000)}m.`);
+}
+startExecutionForecastScanner();
+
+// GET /api/forecasts — active execution forecasts (Phase 1 read API).
+// Confidence numbers are UNCALIBRATED model estimates until Phase 5 calibration.
+app.get('/api/forecasts', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_execution_forecasts
+        WHERE status IN ('FORECASTED','DELAYED','READY')
+        ORDER BY expected_execution_time IS NULL, expected_execution_time ASC
+        LIMIT 200`,
+    );
+    res.json({
+      forecasts: rows.map(normalizeForecastRow),
+      calibrated: false,
+      note: 'Forecast confidence is an uncalibrated model estimate until enough forecasts resolve (Phase 5). Not a guarantee.',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Deterministic "Analyze Execution Opportunity" — TRADE / WAIT / SKIP.
+// Re-runs aggregateSignals on the freshest candles so the verdict is current.
+// Server-side LLM is not wired (the existing AI-analysis path is rule-based too),
+// so this is the deterministic engine; honest source label, zero token cost.
+function relMinsServer(ms) {
+  const m = Math.round(Math.abs(ms) / 60000);
+  if (m <= 0) return 'now';
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function analyzeForecastDeterministic(sd, fresh, nowMs, tf) {
+  const reasoning = [];
+  const score = Number(sd?.confidence) || 0;
+  const decision = String(sd?.decision || 'HOLD').toUpperCase();
+  const news = sd?.newsRisk;
+  const etaMs = fresh && Number.isFinite(fresh.expectedExecutionMs) ? fresh.expectedExecutionMs : null;
+  const toEta = etaMs !== null ? etaMs - nowMs : null;
+  const tfMs = forecastTfSeconds(tf) * 1000;
+
+  if (fresh) {
+    if (fresh.momentum !== null) reasoning.push(`Momentum ${fresh.momentum >= 60 ? 'strong' : fresh.momentum >= 40 ? 'building' : 'weak'} (${fresh.momentum}/100)`);
+    if (fresh.trendStrength !== null) reasoning.push(`Trend strength ${fresh.trendStrength}/100 (${sd.regime || 'n/a'} regime)`);
+    reasoning.push(fresh.liquidity !== null ? `Liquidity ${fresh.liquidity >= 50 ? 'sufficient' : 'thin'} (${fresh.liquidity}/100)` : 'Liquidity: no volume feed on this symbol');
+    if (fresh.scoreChange !== null && fresh.scoreChange !== 0) reasoning.push(`Setup score ${fresh.scoreChange > 0 ? 'rising' : 'falling'} (${fresh.scoreChange > 0 ? '+' : ''}${fresh.scoreChange}/scan)`);
+    if (toEta !== null) reasoning.push(toEta <= 0 ? 'Execution window is open now' : `Execution window expected within ~${relMinsServer(toEta)}`);
+  }
+  if (news && (news.block || news.caution)) reasoning.push(`News ${news.block ? 'BLOCK' : 'caution'}: ${news.reason}`);
+
+  let recommendation;
+  let confidence;
+  if (!fresh || (decision === 'HOLD' && score < FC_WATCH_FLOOR) || (news && news.block)) {
+    recommendation = 'SKIP';
+    confidence = 70;
+    if (!reasoning.length) reasoning.push('Setup is no longer favorable.');
+  } else if (fresh.executionStatus === 'EXECUTABLE' || (score >= FC_EXECUTABLE_SCORE && toEta !== null && toEta <= tfMs)) {
+    recommendation = 'TRADE';
+    confidence = Math.round(fresh.executionProbability ?? score);
+  } else {
+    recommendation = 'WAIT';
+    confidence = Math.round(fresh.forecastConfidence ?? 50);
+  }
+  return { recommendation, confidence, reasoning };
+}
+
+// POST /api/forecasts/:id/analyze
+app.post('/api/forecasts/:id/analyze', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const id = String(req.params.id);
+    // Resolve symbol/timeframe from the row, falling back to the id pattern fc:SYMBOL|TF.
+    let symbol = null;
+    let tf = null;
+    const [rows] = await pool.query('SELECT symbol, timeframe FROM mt5_execution_forecasts WHERE id = ? LIMIT 1', [id]);
+    if (rows.length) { symbol = rows[0].symbol; tf = rows[0].timeframe; }
+    else {
+      const m = id.match(/^fc:(.+)\|(.+)$/);
+      if (m) { symbol = m[1]; tf = m[2]; }
+    }
+    if (!symbol || !tf) return res.status(404).json({ error: 'Forecast not found.' });
+
+    const candleList = getRecentCandles(symbol, tf, 200);
+    if (!candleList || candleList.length < 20) return res.status(409).json({ error: 'Not enough candle data to analyze right now.' });
+    const { adr, dailyHighLow } = computeAdrDaily(symbol);
+    const summary = aggregateSignals({
+      symbol, timeframe: tf, candles: candleList,
+      indicators: getRecentIndicators(symbol, tf, 500),
+      marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
+      h4Candles: getRecentCandles(symbol, 'H4', 150), h1Candles: getRecentCandles(symbol, 'H1', 150),
+    });
+    const sd = summary.systemDecision;
+    const nowMs = Date.now();
+    const fresh = buildExecutionForecast({ symbol, timeframe: tf, systemDecision: sd, nowMs, scanIntervalMs: FORECAST_SCAN_INTERVAL_MS });
+    const verdict = analyzeForecastDeterministic(sd, fresh, nowMs, tf);
+
+    // Full trade ticket from the live systemDecision — same depth as the Signals dashboard.
+    const risk = sd?.riskPlan || null;
+    const plan = {
+      decision: sd?.decision || null,
+      grade: sd?.grade || null,
+      strategyType: sd?.strategyType || null,
+      signalQuality: sd?.signalQuality || null,
+      entryPrice: Number.isFinite(sd?.entryPrice) ? sd.entryPrice : null,
+      stopLoss: Number.isFinite(sd?.stopLoss) ? sd.stopLoss : null,
+      takeProfit1: Number.isFinite(sd?.takeProfit1) ? sd.takeProfit1 : null,
+      takeProfit2: Number.isFinite(sd?.takeProfit2) ? sd.takeProfit2 : null,
+      takeProfit3: Number.isFinite(sd?.takeProfit3) ? sd.takeProfit3 : null,
+      riskRewardRatio: sd?.riskRewardRatio ?? null,
+      entryTrigger: sd?.entryTrigger || null,
+      timingTip: sd?.timingTip || null,
+      regime: sd?.regime || null,
+      session: sd?.sessionContext?.reason || null,
+      lotSize: risk?.suggestedLotSize ?? null,
+      maxLoss: risk?.amountToRisk ?? risk?.riskAmount ?? risk?.maxLoss ?? null,
+      investment: risk?.marginRequired ?? risk?.amountToInvestApprox ?? null,
+      riskPercent: risk?.riskPercent ?? null,
+      profitAtTp1: risk?.profitAtTp1 ?? null,
+      profitAtTp2: risk?.profitAtTp2 ?? null,
+      profitAtTp3: risk?.profitAtTp3 ?? null,
+      confluences: (sd?.confluences || []).slice(0, 10).map((c) => ({ name: c.name, points: c.points })),
+    };
+    res.json({
+      ok: true,
+      id, symbol, timeframe: tf,
+      ...verdict,
+      source: 'deterministic',
+      expectedExecutionTime: fresh && Number.isFinite(fresh.expectedExecutionMs) ? new Date(fresh.expectedExecutionMs).toISOString() : null,
+      forecastBasis: fresh ? fresh.forecastBasis : null,
+      setupScore: fresh ? fresh.setupScore : Math.round(Number(sd?.confidence) || 0),
+      executionStatus: fresh ? fresh.executionStatus : 'NOT_EXECUTABLE',
+      plan,
+      note: 'Deterministic engine verdict — not a guarantee. Confirm on the chart before acting.',
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/reports/forecast-calibration — measured accuracy of resolved forecasts.
+// This is the honest payoff: it flips live confidence from estimate → measured.
+app.get('/api/reports/forecast-calibration', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const days = Math.max(1, Math.min(Number(req.query.days) || 90, 3650));
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_execution_forecasts
+        WHERE resolved_at IS NOT NULL AND resolved_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+        ORDER BY resolved_at DESC LIMIT 1000`,
+      [days],
+    );
+    res.json({
+      calibration: summarizeForecastCalibration(rows),
+      resolved: rows.slice(0, 200).map(normalizeForecastRow),
+      minSampleToCalibrate: FORECAST_CALIBRATION_MIN_SAMPLE,
+      note: 'Once a basis reaches the minimum resolved sample, live forecast confidence switches from heuristic estimate to this measured timing accuracy. Not a guarantee.',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/reports/forecast-replay?symbol=&timeframe=&bars= — backtest the forecaster.
+app.get('/api/reports/forecast-replay', async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || '').toUpperCase();
+    const timeframe = String(req.query.timeframe || 'M15').toUpperCase();
+    if (!symbol) return res.status(400).json({ error: 'symbol is required' });
+    const bars = Math.max(200, Math.min(Number(req.query.bars) || 1500, 5000));
+    const candles = getRecentCandles(symbol, timeframe, bars);
+    res.json(runForecastReplay({ symbol, timeframe, candles }));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 
 let reminderSchedulerRunning = false;
@@ -8513,6 +9526,11 @@ async function processAllRemindersAndSavedProjections() {
     await pruneOldAccountSnapshots();
   } catch (err) {
     console.error('[Scheduler] Error in pruneOldAccountSnapshots:', err.message);
+  }
+  try {
+    await processForecastEmails();
+  } catch (err) {
+    console.error('[Scheduler] Error in processForecastEmails:', err.message);
   }
   reminderSchedulerRunning = false;
 }

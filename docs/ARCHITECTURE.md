@@ -12,6 +12,7 @@ How the pieces fit together. Read [`../AGENTS.md`](../AGENTS.md) first for the c
 | Backend | `backend/server.js` | Node + Express + ws + mysql2 | 5000 |
 | Signal engine | `backend/signalEngine.js` | pure JS (SMC scoring) | — |
 | FTT engine | `backend/fttEngine.js` | pure JS (fixed-time prediction) | — |
+| Forecast engine | `backend/executionForecastEngine.js` | pure JS (execution-timing forecast) | — |
 | Gemini engine | `backend/geminiEngine.js` | Vertex AI REST | — |
 | Frontend | `frontend/` | React + Vite + lightweight-charts | 5173 |
 
@@ -74,6 +75,38 @@ filters (RSI slope, MACD histogram, price-vs-EMA9, candle body, volume), weighte
 
 ---
 
+## Execution Forecast engine (`executionForecastEngine.js`)
+
+Predicts **when** a favorable-but-not-yet-executable setup becomes executable (ETA + probability),
+on the Future Predictions page. Pure/deterministic — reuses `aggregateSignals`'s `systemDecision`, so
+no scoring drift from the live scanner.
+
+- **ETA basis** (always named): `IMMEDIATE` (executable now), `NEXT_CANDLE` (uses `remainingSeconds`),
+  `PULLBACK` (~1.5 bars), `SCORE_SLOPE` (projects score crossing the executable threshold from its
+  slope), `SESSION` (next London/NY open).
+- **Schedulers** (in `server.js`): hourly `runExecutionForecastScan()` over curated symbols ×
+  `M5,M15,M30,H1,H4,D1`; `reforecastActiveForecasts()` on the 60s scanner re-evaluates forecasts within
+  `FORECAST_REFORECAST_WINDOW_MS` of ETA → READY / DELAYED / CANCELLED / EXPIRED (SSE `execution_forecast`).
+- **Resolution + calibration**: on terminal transition, `resolveForecastRow` stores forecast/timing/score
+  accuracy vs the **original** prediction. `refreshForecastCalibration` (each hourly scan) aggregates
+  resolved forecasts by basis; `applyForecastCalibration` flips live `forecast_confidence` from heuristic
+  → measured timing accuracy once a basis hits `FORECAST_CALIBRATION_MIN_SAMPLE`. Until then it is an
+  honestly-labeled **uncalibrated estimate** (never a guarantee).
+- **Emails**: pre-execution reminders (**T-10m, T-5m**) via `processForecastEmails` (30s scheduler) +
+  a **full-detail "now executable" email at the READY transition** (`sendForecastReadyEmail`, complete
+  ticket from the live systemDecision). **No "created" email.** BDT times, gated by the `forecast`
+  toggle + `setup_score >= 75`.
+- **Analyze button**: `POST /api/forecasts/:id/analyze` → TRADE / WAIT / SKIP **+ full trade ticket**
+  (`plan`), **deterministic** (no server-side LLM; honestly labeled). `runForecastReplay` walk-forward
+  backtests the forecaster on stored candles (self-contained: `indicators:[]`, internal ADX) — the
+  methodology guard.
+- **Endpoints**: `GET /api/forecasts`, `POST /api/forecasts/:id/analyze`,
+  `GET /api/reports/forecast-calibration`, `GET /api/reports/forecast-replay`.
+- **UI**: "Upcoming Executions" compact table (Future Predictions) + **Reports → Forecasts** route.
+  Forecasts are **forex-only** (no FTT variant).
+
+---
+
 ## Gemini engine (`geminiEngine.js`)
 
 Calls Vertex AI (`gemini-2.5-flash`) with a multi-timeframe-analysis prompt. Requires ADC
@@ -87,7 +120,13 @@ UI selects which path is authoritative.
 
 Tables: `mt5_candles`, `mt5_indicators`, `mt5_signals`, `mt5_trades`, `mt5_account_snapshots`,
 `mt5_ai_decisions`, `mt5_ftt_predictions`, `mt5_signal_rules`, `mt5_market_levels`,
-`mt5_trade_journal`, `mt5_delivery_logs`.
+`mt5_trade_journal`, `mt5_delivery_logs`, `mt5_system_signal_log`, `mt5_execution_forecasts`.
+
+- **`mt5_execution_forecasts`** is one compact row per `symbol|timeframe` (upserted each scan), no
+  JSON blob, pruned by `pruneOldExecutionForecasts` (default 14 days). Phase-5 columns
+  (`original_execution_time`, `original_score`, `calibrated`) are added on boot via `addColumnIfMissing`
+  — these are skipped if the DB is read-only over quota (see AGENTS.md Trap #6), so restart after the
+  quota clears.
 
 - **Candles do NOT store `raw_json`** (we write `'{}'`) — it roughly halved table growth.
 - **Auto-retention**: a background job (`runCandleRetention`, every 6h + 90s after boot) caps each
@@ -113,6 +152,12 @@ Tables: `mt5_candles`, `mt5_indicators`, `mt5_signals`, `mt5_trades`, `mt5_accou
 | `MT5_DB_CANDLES_PER_SERIES` | DB retention cap per series (default 5000) |
 | `MT5_RETENTION_INTERVAL_MS` | retention cadence (default 6h) |
 | `GEMINI_MODEL` | `gemini-2.5-flash` |
+| `FORECAST_ENABLED` | enable the execution-forecast engine (default true) |
+| `FORECAST_SCAN_INTERVAL_MS` | hourly forecast scan cadence (default 1h) |
+| `FORECAST_RETENTION_DAYS` | forecast row retention (default 14) |
+| `FORECAST_REFORECAST_WINDOW_MS` | re-evaluate forecasts within this window of ETA (default 20m) |
+| `FORECAST_EMAIL_MIN_SCORE` | min setup score to email a forecast / send the READY email (default 75) |
+| `FORECAST_CALIBRATION_MIN_SAMPLE` | resolved forecasts per basis before confidence is "measured" (default 20) |
 
 > Note: `.env.local` uses `//` comment lines; they are loaded fine because Node's `--env-file`
 > ignores lines without `=`.

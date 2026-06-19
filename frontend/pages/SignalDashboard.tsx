@@ -193,12 +193,24 @@ function getForexSuggestedEntry(system?: ScanResult['systemDecision']) {
   const rawSummary = `Direction: ${direction}. Timing: ${system?.entryTimingInstruction || 'n/a'}. Trigger: ${system?.entryTrigger || 'n/a'}.`;
 
   if (!system || direction === 'HOLD' || system.newsRisk?.block || !validTradePlan) {
+    // A HOLD is usually a precision-gate veto, not "nothing here". Surface the
+    // actual blocking reason + directional lean + net conviction right on the
+    // collapsed card, so a good-score / no-direction setup explains itself
+    // without the user having to expand the row.
+    const reasons = system?.rejectionReasons || [];
+    const bs = Number(system?.buyScore || 0), ss = Number(system?.sellScore || 0);
+    const lean = bs > ss ? 'BUY' : ss > bs ? 'SELL' : null;
+    const headTip = (system?.newsRisk?.block && system?.newsRisk?.reason)
+      ? system.newsRisk.reason
+      : reasons.length
+        ? `Blocked: ${reasons.slice(0, 2).join('; ')}${lean ? ` · leaning ${lean} (net ${system?.netConviction ?? Math.abs(bs - ss)})` : ''}`
+        : (system?.timingTip || (!validTradePlan ? 'No complete entry/SL/TP plan from backend.' : 'No active Forex setup.'));
     return {
-      label: 'No Trade',
+      label: reasons.length ? 'No Trade — gated' : 'No Trade',
       directionLabel,
       directionClass,
       className: 'border-slate-200 bg-slate-50 text-slate-400',
-      tip: [system?.newsRisk?.reason || system?.timingTip || (!validTradePlan ? 'No complete entry/SL/TP plan from backend.' : 'No active Forex setup.'), raw ? `Raw timing: ${raw}` : null, rawSummary].filter(Boolean).join(' '),
+      tip: [headTip, raw ? `Raw timing: ${raw}` : null, rawSummary].filter(Boolean).join(' '),
     };
   }
 

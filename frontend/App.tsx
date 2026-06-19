@@ -23,6 +23,7 @@ import ForexOutcomes from './pages/reports/ForexOutcomes.tsx';
 import FixedOutcomes from './pages/reports/FixedOutcomes.tsx';
 import SignalLog from './pages/reports/SignalLog.tsx';
 import CalibrationReport from './pages/reports/CalibrationReport.tsx';
+import ForecastsReport from './pages/reports/ForecastsReport.tsx';
 import BacktestReport from './pages/reports/BacktestReport.tsx';
 import Admin from './pages/Admin.tsx';
 import HistoricalData from './pages/HistoricalData.tsx';
@@ -94,6 +95,7 @@ export default function App() {
           <Route path="reports/fixed" element={<FixedOutcomes />} />
           <Route path="reports/signals" element={<SignalLog />} />
           <Route path="reports/calibration" element={<CalibrationReport />} />
+          <Route path="reports/forecasts" element={<ForecastsReport />} />
           <Route path="reports/backtest" element={<BacktestReport />} />
           <Route path="data" element={<HistoricalData />} />
           <Route path="ai-signals" element={<AiSignals />} />

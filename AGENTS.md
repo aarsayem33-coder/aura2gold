@@ -24,6 +24,7 @@ MT5 Terminal (Exness)                Node.js backend                 React front
                                           │
                                           ├─ signalEngine.js  (system signals, SMC scoring)
                                           ├─ fttEngine.js     (fixed-time-trade predictions)
+                                          ├─ executionForecastEngine.js (WHEN a setup becomes executable)
                                           └─ geminiEngine.js  (Vertex AI / Gemini analysis)
 ```
 
@@ -112,11 +113,67 @@ gates away to produce more signals — fewer, higher-quality signals is the desi
 
 ---
 
+## Execution Forecast engine (Future Predictions page)
+
+`backend/executionForecastEngine.js` predicts **WHEN** a favorable-but-not-yet-executable setup will
+become executable (ETA + probability), distinct from the live BUY/SELL/HOLD call. It is **deterministic
+and pure** — it reuses the same `systemDecision` from `aggregateSignals`, so there is **zero scoring
+drift** from the live scanner. Five phases, all shipped:
+
+- **Scan**: `runExecutionForecastScan()` runs **hourly** over curated symbols × `M5,M15,M30,H1,H4,D1`.
+  A lighter `reforecastActiveForecasts()` runs on the 60s scanner for forecasts within ~20m of their ETA
+  (the "2:50/2:55/2:59" re-check) → READY / DELAYED / CANCELLED / EXPIRED, streamed via SSE event
+  `execution_forecast`.
+- **ETA always has a named cause** (`forecast_basis`): IMMEDIATE / NEXT_CANDLE / PULLBACK / SCORE_SLOPE
+  / SESSION. No black box.
+- **Email**: pre-execution reminders only (**T-10m, T-5m** via `processForecastEmails` on the 30s
+  scheduler) **plus a full-detail "now executable" email at the READY transition** (`sendForecastReadyEmail`,
+  built from the live `systemDecision` → TP1/2/3, RR, risk plan, confluences — same depth as the forex
+  alert). **No "created" email.** Gated by the `forecast` toggle (default on), `SIGNAL_ALERTS_ENABLED`,
+  `SIGNAL_ALERT_EMAIL_TO`, and `setup_score >= FORECAST_EMAIL_MIN_SCORE` (**default 75**). Times in **BDT**.
+- **Analyze button**: `POST /api/forecasts/:id/analyze` → TRADE / WAIT / SKIP **plus the full trade
+  ticket** (`plan`: TP1/2/3, RR, lot/investment/max-loss, confluences) from the live systemDecision.
+  **Deterministic** — no server-side LLM here (the existing "AI analysis" endpoint is itself rule-based;
+  real Gemini runs client-side via the Vertex proxy). Source is honestly labeled `deterministic`.
+- **Calibration is the honest payoff**: forecasts **resolve** (READY→EXECUTED, ETA-passed→EXPIRED,
+  invalidated→CANCELLED) and store forecast/timing/score accuracy vs the **original** prediction.
+  `applyForecastCalibration` then **flips** live `forecast_confidence` from heuristic estimate →
+  measured timing accuracy once a basis has ≥ `FORECAST_CALIBRATION_MIN_SAMPLE` (20) resolved forecasts.
+  **Until then the UI/email label it an "uncalibrated estimate" — never a guarantee** (see the
+  Reality-check rule; same honesty stance as the projection track-record).
+
+- **News-aware (timing only, never a pre-release direction guess)**: when a high-impact event for the
+  symbol's currency is within the **pre-window (15m)**, the forecast ETA anchors to the event time
+  (`NEWS` basis) and the row is flagged `newsImminent` (blackout: generic reminders suppressed). After
+  the print, `scanNewsReactions()` (60s) emits **two-tier reaction signals** off the ACTUAL price:
+  **Tier A** = first decisive candle (spike, aggressive), **Tier B** = 2+ confirming candles
+  (follow-through), each with ATR-scaled SL/TP and its own email (`detectNewsReaction` /
+  `buildNewsReactionLevels`, `NEWS_POST_WINDOW_MIN` 10m). The existing post-news engine
+  (`refreshPostNewsSignals`, 30m blackout) is **left untouched** — these reaction tiers are additive.
+
+Tables/endpoints: table `mt5_execution_forecasts` (compact, retention-pruned — heeds Trap #6 bloat).
+`GET /api/forecasts`, `POST /api/forecasts/:id/analyze`, `GET /api/reports/forecast-calibration`,
+`GET /api/reports/forecast-replay?symbol&timeframe&bars`. UI: "Upcoming Executions" table on the
+Future Predictions page + the **Reports → Forecasts** sub-route. Forecasts are **forex-only** (no FTT
+variant). Env: `FORECAST_ENABLED`, `FORECAST_SCAN_INTERVAL_MS` (1h), `FORECAST_RETENTION_DAYS` (14),
+`FORECAST_REFORECAST_WINDOW_MS` (20m), `FORECAST_EMAIL_MIN_SCORE` (75), `FORECAST_CALIBRATION_MIN_SAMPLE` (20),
+`NEWS_PRE_WINDOW_MIN` (15), `NEWS_POST_WINDOW_MIN` (10), `NEWS_REACTION_MIN_BODY` (0.5), `NEWS_REACTION_TF` (M5).
+
+> **Migration note:** Phase-5 columns (`original_execution_time`, `original_score`, `calibrated`) are
+> added on boot via `addColumnIfMissing`. If the DB is in the read-only/over-quota state (Trap #6),
+> the `ALTER`s are skipped — clear the quota, then restart so the columns get added.
+
+---
+
 ## Golden rules for changes
 1. **EA changes** → edit + compile in `MQL5\Experts\`, tell the user to remove/re-drag, verify via the
    MT5 Experts log (no 4302 errors, snapshots show non-zero candle counts).
 2. **Backend changes** → `node --check backend/server.js`; nodemon auto-restarts. Verify endpoints.
 3. **Frontend changes** → `npm run build --prefix frontend` to catch errors; Vite hot-reloads dev.
+   (There is **no `tsconfig.json`** — type-checking happens via the Vite/esbuild build, not a `tsc` step.)
 4. **DB destructive ops** → confirm with the user, batch under 120s, `ALTER` to reclaim, verify size.
 5. **Verify, don't assume** → after any fix, sample the live data (e.g., does `received_at` advance
    second-to-second?) before declaring success.
+6. **New persisted tables** → keep them compact (no big JSON blobs) and add retention pruning. The
+   `mt5_account_snapshots` blob bloat blew the DB past quota; `mt5_execution_forecasts` is the model
+   to copy (compact rows + pruner).

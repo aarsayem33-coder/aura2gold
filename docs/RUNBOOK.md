@@ -119,7 +119,35 @@ back to the rule-based `system` decision (expected, not a bug).
 
 ---
 
-## 7. Post-change verification checklist
+## 7. Execution forecasts (Future Predictions)
+
+Predicts WHEN a favorable setup becomes executable. Deterministic, forex-only, on the Future
+Predictions page + Reports → Forecasts. See AGENTS.md "Execution Forecast engine".
+
+```powershell
+# Active forecasts (uncalibrated confidence until enough resolve)
+Invoke-RestMethod http://127.0.0.1:5000/api/forecasts
+# Measured accuracy / calibration of resolved forecasts (the honest payoff)
+Invoke-RestMethod "http://127.0.0.1:5000/api/reports/forecast-calibration?days=90"
+# Backtest the forecaster on stored candles (methodology guard)
+Invoke-RestMethod "http://127.0.0.1:5000/api/reports/forecast-replay?symbol=XAUUSDm&timeframe=M15"
+```
+
+Operational notes:
+- After deploying Phase 5, **restart the backend** so the new columns (`original_execution_time`,
+  `original_score`, `calibrated`) get added via `addColumnIfMissing`. If the DB is read-only over quota
+  (section 5), those `ALTER`s are skipped — clear the quota first, then restart.
+- Forecast emails are an **additive** stream: pre-execution reminders (T-10m, T-5m) + a full-detail
+  "now executable" email at the READY moment (no "created" email), only for `setup_score >= 75`. Toggle
+  on the Notifications page ("Execution Forecast Emails", default on). They never touch live signal emails.
+- Calibration/accuracy numbers are **empty until forecasts resolve** over days/weeks — this is by design
+  (uncalibrated → measured). The backtest works immediately on existing candle history.
+- The table (`mt5_execution_forecasts`) is compact + auto-pruned (`FORECAST_RETENTION_DAYS`, default 14);
+  it should never contribute to quota bloat.
+
+---
+
+## 8. Post-change verification checklist
 - [ ] `node --check backend/server.js` passes.
 - [ ] `npm run build --prefix frontend` passes.
 - [ ] EA compiled in `MQL5\Experts\` with 0 errors; user reattached.
@@ -127,3 +155,5 @@ back to the rule-based `system` decision (expected, not a bug).
 - [ ] `/api/mt5/status` → `connected:true`.
 - [ ] Gold `received_at` advances second-to-second (sampled twice with `timezone:'Z'`).
 - [ ] DB write test (INSERT+DELETE) succeeds.
+- [ ] `/api/forecasts` responds (forecast engine alive); after a Phase-5 deploy, confirm the new
+      columns exist (no SQL errors in `dev-server.log`).

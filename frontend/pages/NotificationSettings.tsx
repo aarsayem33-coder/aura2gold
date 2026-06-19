@@ -12,6 +12,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   postNewsFixed: true,
   highImpactNews: true,
   aiTracked: false,
+  forecast: true,
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
@@ -19,7 +20,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   postNewsFixedMinTier: 'QUALITY_SIGNAL',
 };
 
-type EmailRouteKey = 'forexScanner' | 'fixedTime' | 'postNewsForex' | 'postNewsFixed' | 'highImpactNews' | 'aiTracked';
+type EmailRouteKey = 'forexScanner' | 'fixedTime' | 'postNewsForex' | 'postNewsFixed' | 'highImpactNews' | 'aiTracked' | 'forecast';
 type EmailSelectKey = 'forexMinGrade' | 'forexMinQuality' | 'fixedTimeMinTier' | 'postNewsForexMinGrade' | 'postNewsFixedMinTier';
 
 const emailSignalOptions: Array<{ key: EmailRouteKey; title: string; description: string; note: string }> = [
@@ -29,6 +30,7 @@ const emailSignalOptions: Array<{ key: EmailRouteKey; title: string; description
   { key: 'postNewsFixed', title: 'Post-News Fixed-Time Signals', description: 'Fixed-time variants of post-news entries.', note: 'QUALITY_SIGNAL only' },
   { key: 'highImpactNews', title: 'High Impact News Reminders', description: 'Pre-release and actual-value economic news emails.', note: 'Calendar/news alerts' },
   { key: 'aiTracked', title: 'AI Tracked Projection Emails', description: 'Emails when tracked AI entry projections trigger.', note: 'Tracked entries only' },
+  { key: 'forecast', title: 'Execution Forecast Emails', description: 'When a favorable setup is forecast to become executable: created + ~10m, ~5m, and at the predicted time.', note: 'Timing forecast · score ≥ 60 · times in BDT' },
 ];
 
 const forexGradeOptions = [

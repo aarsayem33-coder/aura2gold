@@ -45,6 +45,11 @@ import type {
   TradeNewsFixedSignal,
   TradeNewsForexSignal,
   TradeNewsResponse,
+  ExecutionForecast,
+  ForecastResponse,
+  ForecastAnalysis,
+  ForecastCalibrationResponse,
+  ForecastReplayResponse,
 } from './types';
 import { playAlertSound, showBrowserNotification } from './utils/notifications';
 
@@ -336,6 +341,31 @@ export async function fetchLatestForexSignals(): Promise<{ signals: ScanResult[]
   return fetchJson<{ signals: ScanResult[]; count: number; generatedAt: string }>('/api/signals/latest');
 }
 
+export async function fetchForecasts(): Promise<ForecastResponse> {
+  return fetchJson<ForecastResponse>('/api/forecasts');
+}
+
+export async function fetchForecastCalibration(days = 90): Promise<ForecastCalibrationResponse> {
+  return fetchJson<ForecastCalibrationResponse>(`/api/reports/forecast-calibration?days=${days}`);
+}
+
+export async function fetchForecastReplay(symbol: string, timeframe: string, bars = 1500): Promise<ForecastReplayResponse> {
+  return fetchJson<ForecastReplayResponse>(`/api/reports/forecast-replay?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&bars=${bars}`);
+}
+
+export async function analyzeForecast(id: string): Promise<ForecastAnalysis> {
+  const response = await fetch(`/api/forecasts/${encodeURIComponent(id)}/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error?.error || `Analysis failed: ${response.status}`);
+  }
+  return (await response.json()) as ForecastAnalysis;
+}
+
 export async function fetchTrackedAiProjections(): Promise<TrackedAiProjectionResponse> {
   const response = await fetchTrackedJson('/api/ai-signals/tracked');
   if (!response.ok) {
@@ -404,6 +434,7 @@ interface Mt5StreamContextType {
   trackedAiProjections: TrackedAiProjection[];
   account: Mt5AccountSnapshot | null;
   postNewsSignals: PostNewsSignal[];
+  executionForecasts: ExecutionForecast[];
   topbarAlerts: TopbarMarketAlert[];
   addTopbarAlert: (alert: TopbarMarketAlert, playSound?: boolean) => void;
   status: Mt5Status;
@@ -424,6 +455,7 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
   const [account, setAccount] = useState<Mt5AccountSnapshot | null>(null);
   const [fttPredictions, setFttPredictions] = useState<FttPrediction[]>([]);
   const [postNewsSignals, setPostNewsSignals] = useState<PostNewsSignal[]>([]);
+  const [executionForecasts, setExecutionForecasts] = useState<ExecutionForecast[]>([]);
   const [topbarAlerts, setTopbarAlerts] = useState<TopbarMarketAlert[]>([]);
   const topbarAlertIds = useRef(new Set<string>());
   const [status, setStatus] = useState<Mt5Status>(emptyStatus);
@@ -446,6 +478,7 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
       fetchFttHistory(undefined, 200).then((r) => setFttPredictions(r.predictions)).catch(() => {});
       fetchPostNewsSignals().then((r) => setPostNewsSignals(r.signals)).catch(() => {});
       fetchTrackedAiProjections().then((r) => setTrackedAiProjections(r.tracked)).catch(() => {});
+      fetchForecasts().then((r) => setExecutionForecasts(r.forecasts)).catch(() => {});
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : 'Failed to load MT5 data');
     }
@@ -676,6 +709,20 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
       }
     });
 
+    source.addEventListener('execution_forecast', (event) => {
+      try {
+        const fc = JSON.parse((event as MessageEvent).data) as ExecutionForecast;
+        setExecutionForecasts((prev) => {
+          const rest = prev.filter((f) => f.id !== fc.id);
+          // Drop terminal forecasts from the live list; keep active ones.
+          if (['CANCELLED', 'EXPIRED', 'EXECUTED'].includes(fc.status)) return rest;
+          return [fc, ...rest].slice(0, 300);
+        });
+      } catch {
+        setError('Failed to parse execution forecast');
+      }
+    });
+
     source.addEventListener('account', (event) => {
       try {
         setAccount(JSON.parse((event as MessageEvent).data) as Mt5AccountSnapshot);
@@ -713,13 +760,14 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
     trackedAiProjections,
     account,
     postNewsSignals,
+    executionForecasts,
     topbarAlerts,
     addTopbarAlert,
     status,
     logs,
     error,
     refresh
-  }), [signals, candles, trades, indicators, aiDecisions, fttPredictions, trackedAiProjections, account, postNewsSignals, topbarAlerts, status, logs, error]);
+  }), [signals, candles, trades, indicators, aiDecisions, fttPredictions, trackedAiProjections, account, postNewsSignals, executionForecasts, topbarAlerts, status, logs, error]);
 
   return React.createElement(Mt5StreamContext.Provider, { value }, children);
 }

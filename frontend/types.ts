@@ -379,6 +379,7 @@ export interface EmailAlertSettings {
   postNewsFixed: boolean;
   highImpactNews: boolean;
   aiTracked: boolean;
+  forecast: boolean;
   forexMinGrade: 'B_SETUP' | 'A_SETUP' | 'A_PLUS_SETUP';
   forexMinQuality: 'B_SIGNAL' | 'A_SIGNAL' | 'A_PLUS_SIGNAL';
   fixedTimeMinTier: 'QUALITY_SIGNAL' | 'TRADE_SIGNAL';
@@ -559,6 +560,134 @@ export interface TopbarMarketAlert {
 export interface FttHistoryResponse {
   predictions: FttPrediction[];
   status: Mt5Status;
+}
+
+
+// ─── Execution Forecasts (predict WHEN a setup becomes executable) ──────────
+
+export type ForecastStatus = 'FORECASTED' | 'DELAYED' | 'CANCELLED' | 'READY' | 'EXECUTED' | 'EXPIRED';
+export type ForecastBasis = 'IMMEDIATE' | 'NEXT_CANDLE' | 'NEWS' | 'PULLBACK' | 'SCORE_SLOPE' | 'SESSION' | 'UNKNOWN';
+
+export interface ExecutionForecast {
+  id: string;
+  symbol: string;
+  timeframe: string;
+  scanTime: string | null;
+  currentStatus: string;           // Good Condition / Building / Weak
+  executionStatus: 'EXECUTABLE' | 'NOT_EXECUTABLE';
+  decision: string | null;
+  lean?: 'BUY' | 'SELL' | 'NEUTRAL' | null;   // directional tilt while still Building (not a committed signal)
+  leanConviction?: number | null;             // |buyScore - sellScore|
+  setupScore: number | null;
+  scoreChange: number | null;
+  trendStrength: number | null;
+  momentum: number | null;
+  volatility: number | null;
+  liquidity: number | null;
+  session: string | null;
+  regime: string | null;
+  executionProbability: number | null;
+  forecastConfidence: number | null;   // UNCALIBRATED model estimate until Phase 5
+  forecastBasis: ForecastBasis;
+  expectedExecutionTime: string | null;
+  prevExecutionTime: string | null;
+  status: ForecastStatus;
+  reforecastCount: number | null;
+  reason: string | null;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  actualExecutionTime?: string | null;
+  forecastAccuracy?: number | null;
+  timingAccuracy?: number | null;
+  scoreAccuracy?: number | null;
+  resolvedAt?: string | null;
+  newsImminent?: boolean;
+  newsEvent?: string | null;       // e.g. "USD CPI"
+  newsEventTime?: string | null;
+  newsTier?: 'A' | 'B' | null;     // A = immediate spike, B = confirmed reaction
+  calibrated: boolean;
+}
+
+export interface ForecastCalibrationBucket {
+  basis: string;
+  samples: number;
+  executed: number;
+  expired: number;
+  cancelled: number;
+  hitRate: number | null;
+  avgTimingAccuracy: number | null;
+  avgScoreAccuracy: number | null;
+  confidence: 'weak' | 'early' | 'usable' | 'strong';
+}
+
+export interface ForecastCalibrationResponse {
+  calibration: { overall: ForecastCalibrationBucket; byBasis: ForecastCalibrationBucket[] };
+  resolved: ExecutionForecast[];
+  minSampleToCalibrate: number;
+  note: string;
+}
+
+export interface ForecastReplayResponse {
+  valid: boolean;
+  reason?: string;
+  symbol?: string;
+  timeframe?: string;
+  forecasts?: number;
+  executed?: number;
+  hitRate?: number | null;
+  avgTimingAccuracy?: number | null;
+  confidence?: 'weak' | 'early' | 'usable' | 'strong';
+  note?: string;
+}
+
+export interface ForecastResponse {
+  forecasts: ExecutionForecast[];
+  calibrated: boolean;
+  note: string;
+}
+
+export interface ForecastPlan {
+  decision: string | null;
+  grade: string | null;
+  strategyType: string | null;
+  signalQuality: string | null;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  takeProfit3: number | null;
+  riskRewardRatio: number | null;
+  entryTrigger: string | null;
+  timingTip: string | null;
+  regime: string | null;
+  session: string | null;
+  lotSize: number | null;
+  maxLoss: number | null;
+  investment: number | null;
+  riskPercent: number | null;
+  profitAtTp1: number | null;
+  profitAtTp2: number | null;
+  profitAtTp3: number | null;
+  confluences: Array<{ name: string; points: number }>;
+}
+
+export interface ForecastAnalysis {
+  ok: boolean;
+  id: string;
+  symbol: string;
+  timeframe: string;
+  recommendation: 'TRADE' | 'WAIT' | 'SKIP';
+  confidence: number;
+  reasoning: string[];
+  source: 'deterministic' | 'ai';
+  expectedExecutionTime: string | null;
+  forecastBasis: ForecastBasis | null;
+  setupScore: number | null;
+  executionStatus: 'EXECUTABLE' | 'NOT_EXECUTABLE';
+  plan: ForecastPlan;
+  note: string;
+  generatedAt: string;
 }
 
 

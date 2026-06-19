@@ -25,6 +25,7 @@ import {
   Sparkles,
   ClipboardList,
   FlaskConical,
+  CalendarClock,
   ChevronDown,
   X
 } from 'lucide-react';
@@ -293,6 +294,7 @@ export default function Layout({ onLogout }: LayoutProps) {
         { path: '/reports/fixed', icon: Timer, label: 'Fixed Outcomes' },
         { path: '/reports/signals', icon: ClipboardList, label: 'Signal Log' },
         { path: '/reports/calibration', icon: Activity, label: 'Calibration' },
+        { path: '/reports/forecasts', icon: CalendarClock, label: 'Forecasts' },
         { path: '/reports/backtest', icon: FlaskConical, label: 'Backtest' },
       ],
     },
