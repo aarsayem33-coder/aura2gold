@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
 import { 
   LayoutDashboard,
@@ -113,14 +113,38 @@ function alertAgeLabel(alert: TopbarMarketAlert) {
 
 function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
   const [open, setOpen] = useState(false);
+  const [dismissedId, setDismissedId] = useState<string | null>(null);
   const recentAlerts = alerts.filter((alert) => alertAgeMs(alert) <= ALERT_HISTORY_MS);
   const latest = recentAlerts[0];
-  const popupAlert = latest && alertAgeMs(latest) <= ALERT_POPUP_MS ? latest : null;
+  // Auto-popup for fresh alerts — suppressed once the user dismisses that alert via X.
+  const popupAlert = latest && latest.id !== dismissedId && alertAgeMs(latest) <= ALERT_POPUP_MS ? latest : null;
   const displayAlert = open ? latest : popupAlert;
   const isFresh = latest ? alertAgeMs(latest) < ALERT_FRESH_MS : false;
+  const closePopup = () => {
+    if (displayAlert) setDismissedId(displayAlert.id);
+    setOpen(false);
+  };
+
+  // Close the popup on any click outside it (or Escape) — anytime it is visible.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const isShown = Boolean((open || popupAlert) && displayAlert);
+  useEffect(() => {
+    if (!isShown) return;
+    const handlePointer = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) closePopup();
+    };
+    const handleKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closePopup(); };
+    document.addEventListener('mousedown', handlePointer);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handlePointer);
+      document.removeEventListener('keydown', handleKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isShown, displayAlert?.id]);
 
   return (
-    <div className="relative">
+    <div className="relative" ref={containerRef}>
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
@@ -138,7 +162,7 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
               <h3 className="mt-1 text-base font-black text-slate-950">{alertTitle(displayAlert)}</h3>
               <p className="text-xs font-bold text-slate-500">{displayAlert.symbol} {displayAlert.timeframe || displayAlert.expiry || ''} · {displayAlert.confidence}/100 · {alertAgeLabel(displayAlert)}</p>
             </div>
-            <button type="button" onClick={() => setOpen(false)} className="rounded-full p-1 text-slate-400 hover:bg-white hover:text-slate-700">
+            <button type="button" onClick={closePopup} className="rounded-full p-1 text-slate-400 hover:bg-white hover:text-slate-700">
               <X size={15} />
             </button>
           </div>
@@ -400,7 +424,7 @@ export default function Layout({ onLogout }: LayoutProps) {
 
         {/* Page Content */}
         <main className="flex-1 overflow-y-auto p-6 lg:p-10">
-          <div className="mx-auto max-w-7xl">
+          <div className={location.pathname === '/signals' ? 'flex min-h-full w-full max-w-none flex-col' : 'mx-auto max-w-7xl'}>
             <Outlet />
           </div>
         </main>

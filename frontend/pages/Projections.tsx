@@ -14,10 +14,11 @@ import {
   fetchSavedProjections,
   updateSavedProjectionOutcome,
   deleteSavedProjection,
+  fetchProjectionTrackRecord,
 } from '../mt5Api';
 import type {
   ProjectionSymbolResult, ProjectionItem, ProjectionAiResult, ProjectionAiValidation,
-  ProjectionReminder, SavedProjection,
+  ProjectionReminder, SavedProjection, ProjectionTrackRecord, ProjectionTrackBucket,
 } from '../types';
 
 const TIMEFRAMES = ['M5', 'M15', 'M30', 'H1'];
@@ -101,6 +102,7 @@ export default function Projections() {
   // Reminders & Saved observation states
   const [activeReminders, setActiveReminders] = useState<{ id: string; projection_id: string }[]>([]);
   const [savedProjections, setSavedProjections] = useState<SavedProjection[]>([]);
+  const [trackRecord, setTrackRecord] = useState<ProjectionTrackRecord | null>(null);
   const [reminderModalProjection, setReminderModalProjection] = useState<ProjectionItem | null>(null);
   const [reminderEmail, setReminderEmail] = useState(() => localStorage.getItem('alert_email') || 'aarsayem002@gmail.com');
   const [schedulingReminder, setSchedulingReminder] = useState(false);
@@ -117,10 +119,20 @@ export default function Projections() {
       if (savedRes.ok) {
         setSavedProjections(savedRes.savedProjections || []);
       }
+
+      const tr = await fetchProjectionTrackRecord();
+      if (tr.ok) setTrackRecord(tr);
     } catch (e) {
       console.error('Failed to load reminders or saved projections:', e);
     }
   }, []);
+
+  // Measured hit-rate per grade, for honest per-projection probability labels.
+  const gradeHitRate = useMemo(() => {
+    const map = new Map<string, ProjectionTrackBucket>();
+    for (const b of trackRecord?.byGrade || []) map.set(b.value, b);
+    return map;
+  }, [trackRecord]);
 
   useEffect(() => {
     void loadRemindersAndSaved();
@@ -361,6 +373,19 @@ export default function Projections() {
           {p.suitability.forex && <span className="rounded-md bg-sky-50 px-2 py-0.5 text-[10px] font-black uppercase text-sky-700">Forex Limit</span>}
           {p.suitability.ftt && <span className="rounded-md bg-indigo-50 px-2 py-0.5 text-[10px] font-black uppercase text-indigo-700">FTT · {p.suitability.fttExpiry} expiry</span>}
           <span className="rounded-md bg-slate-50 px-2 py-0.5 text-[10px] font-black uppercase text-slate-600">R:R {p.riskReward}</span>
+          {(() => {
+            const tr = p.grade ? gradeHitRate.get(p.grade) : undefined;
+            if (!tr || tr.hitRate === null || tr.settled < 1) return null;
+            return (
+              <span
+                title={`Measured: ${tr.wins} win / ${tr.losses} loss settled · ${tr.confidence} sample. Historical hit-rate of "${p.grade}" projections — not a guarantee.`}
+                className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2 py-0.5 text-[10px] font-black text-white"
+              >
+                <Trophy size={11} className="text-amber-400" /> {tr.hitRate}% hist
+                <span className="font-semibold text-slate-300">({tr.settled})</span>
+              </span>
+            );
+          })()}
           <span className="ml-auto inline-flex items-center gap-1 text-[11px] font-bold text-slate-500">
             <Gauge size={13} /> Math <b className={confColor(p.mathConfidence)}>{p.mathConfidence}</b>
           </span>
@@ -654,6 +679,48 @@ export default function Projections() {
           {loading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} Refresh Math
         </button>
       </div>
+
+      {/* Track record — measured hit-rate of saved projections (honest, never a guarantee) */}
+      {trackRecord && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <Trophy size={16} className="text-amber-500" />
+              <span className="text-xs font-black uppercase tracking-[0.18em] text-slate-500">Track Record</span>
+            </div>
+            <div className="flex items-baseline gap-2">
+              <span className="text-2xl font-black text-slate-900">{trackRecord.overall.hitRate !== null ? `${trackRecord.overall.hitRate}%` : '—'}</span>
+              <span className="text-xs font-bold text-slate-400">measured hit-rate</span>
+            </div>
+            <div className="flex items-center gap-3 text-xs font-bold text-slate-500">
+              <span className="text-emerald-600">{trackRecord.overall.wins}W</span>
+              <span className="text-rose-600">{trackRecord.overall.losses}L</span>
+              <span>{trackRecord.overall.settled} settled</span>
+              <span className="text-slate-400">{trackRecord.overall.pending} pending · {trackRecord.overall.expired} expired</span>
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-black uppercase ${
+                trackRecord.overall.confidence === 'strong' ? 'bg-emerald-100 text-emerald-700' :
+                trackRecord.overall.confidence === 'usable' ? 'bg-blue-100 text-blue-700' :
+                trackRecord.overall.confidence === 'early' ? 'bg-amber-100 text-amber-700' :
+                'bg-slate-100 text-slate-500'
+              }`}>{trackRecord.overall.confidence} sample</span>
+            </div>
+          </div>
+          {trackRecord.byGrade.some((g) => g.settled > 0) && (
+            <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+              {trackRecord.byGrade.filter((g) => g.settled > 0).map((g) => (
+                <span key={g.value} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-bold text-slate-600" title={`${g.wins}W/${g.losses}L · ${g.confidence} sample`}>
+                  <span className="font-black text-slate-800">{g.value}</span>
+                  <span className={`font-black ${g.hitRate !== null && g.hitRate >= 55 ? 'text-emerald-600' : g.hitRate !== null && g.hitRate < 45 ? 'text-rose-600' : 'text-slate-600'}`}>{g.hitRate}%</span>
+                  <span className="text-slate-400">({g.settled})</span>
+                </span>
+              ))}
+            </div>
+          )}
+          <p className="mt-2 flex items-start gap-1.5 text-[11px] font-semibold text-slate-400">
+            <Info size={12} className="mt-0.5 shrink-0" /> {trackRecord.note}
+          </p>
+        </div>
+      )}
 
       {aiOn && (
         <div className="flex items-start gap-2 rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-sm font-semibold text-violet-800">

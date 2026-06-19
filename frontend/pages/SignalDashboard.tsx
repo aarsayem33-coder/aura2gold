@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Bot, RefreshCcw, Layers, Zap, Loader2, ArrowRight, Activity, TrendingUp, TrendingDown, HelpCircle, Timer, AlertTriangle, CalendarClock } from 'lucide-react';
+import { Bot, RefreshCcw, Layers, Zap, Loader2, ArrowRight, Activity, TrendingUp, TrendingDown, HelpCircle, Timer, AlertTriangle, CalendarClock, Copy } from 'lucide-react';
 import SignalGrid from '../components/SignalGrid';
 import { useMt5Stream, triggerAllSymbolsScan, triggerFttScan, triggerFttPrediction, fetchMt5CandleCoverage } from '../mt5Api';
 import type { ScanResult, FttScanResult, Mt5CandleCoverageRow, TopbarMarketAlert } from '../types';
@@ -156,7 +156,7 @@ function renderGradeBadge(grade?: string | null) {
   }
   
   return (
-    <span className={`inline-flex rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase tracking-wider border shadow-sm ${badgeClass}`}>
+    <span className={`inline-flex rounded-full px-2 py-0.5 text-[9px] font-black uppercase tracking-wider border shadow-sm ${badgeClass}`}>
       {displayLabel}
     </span>
   );
@@ -170,7 +170,7 @@ function renderSignalQualityBadge(quality?: string | null) {
   else if (q === 'B SIGNAL') badgeClass = 'bg-blue-50 text-blue-800 border-blue-200';
 
   return (
-    <span className={`inline-flex rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase tracking-wider border shadow-sm ${badgeClass}`}>
+    <span className={`inline-flex rounded-full px-2 py-0.5 text-[9px] font-black uppercase tracking-wider border shadow-sm ${badgeClass}`}>
       {q}
     </span>
   );
@@ -564,6 +564,65 @@ function TimeAgo({ date }: { date: Date | null }) {
   return <>{secondsAgo(date)}</>;
 }
 
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  textarea.style.top = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
+function CopyPriceButton({ value, label }: { value?: number | string | null; label: string }) {
+  const [copied, setCopied] = useState(false);
+  const disabled = value === null || value === undefined || value === 'n/a';
+
+  const handleCopy = async (event: React.MouseEvent) => {
+    event.stopPropagation();
+    if (disabled) return;
+    try {
+      await copyTextToClipboard(String(value));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1100);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      disabled={disabled}
+      className={`inline-flex h-6 items-center justify-center rounded-md border bg-white shadow-sm transition disabled:cursor-not-allowed disabled:opacity-35 ${copied ? 'w-auto border-emerald-200 px-1.5 text-[10px] font-black text-emerald-700' : 'w-6 border-slate-200 text-slate-400 hover:border-amber-300 hover:bg-amber-50 hover:text-amber-700'}`}
+      title={copied ? `${label} copied` : `Copy ${label}`}
+      aria-label={copied ? `${label} copied` : `Copy ${label}`}
+    >
+      {copied ? 'Copied' : <Copy size={11} />}
+    </button>
+  );
+}
+
+function PriceWithCopy({ value, label, className = '', prefix = '' }: { value?: number | null; label: string; className?: string; prefix?: string }) {
+  const formatted = price(value);
+  return (
+    <span className={`inline-flex items-center gap-1.5 ${className}`}>
+      {prefix && <span className="font-sans text-[10px] font-black text-slate-400">{prefix}</span>}
+      <span>{formatted}</span>
+      <CopyPriceButton value={formatted} label={label} />
+    </span>
+  );
+}
+
 // The only time-sensitive cell in an FTT row (live entry-window countdown). Self-ticks
 // so the surrounding row/table doesn't re-render every second.
 function FttSuggestedEntryCell({ result }: { result: FttScanResult }) {
@@ -595,6 +654,113 @@ function handleRowKey(event: React.KeyboardEvent, toggle: () => void) {
     event.preventDefault();
     toggle();
   }
+}
+
+function ForexNewsFilterStrip({ results }: { results: ScanResult[] }) {
+  const blocked = results.filter((r) => r.systemDecision?.newsRisk?.block);
+  const cautions = results.filter((r) => !r.systemDecision?.newsRisk?.block && r.systemDecision?.newsRisk?.caution);
+  if (!blocked.length && !cautions.length) return null;
+
+  const affectedSymbols = [...blocked, ...cautions].map((r) => r.symbol);
+  const hardBlock = blocked.length > 0;
+  const title = [
+    blocked.length ? `${blocked.length} blocked: ${blocked.map((r) => r.symbol).join(', ')}` : null,
+    cautions.length ? `${cautions.length} caution: ${cautions.map((r) => r.symbol).join(', ')}` : null,
+  ].filter(Boolean).join(' | ');
+
+  return (
+    <div className={`shrink-0 overflow-hidden rounded-xl border shadow-sm ${hardBlock ? 'border-red-200 bg-red-50 text-red-700' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+      <div className="flex items-center gap-2 px-3 py-2.5 text-xs font-black">
+        <AlertTriangle size={15} className="shrink-0" />
+        <span className="shrink-0 uppercase tracking-wider">News Filter</span>
+        <span className="min-w-0 truncate font-bold" title={title}>
+          {blocked.length ? `${blocked.length} forced HOLD` : 'No forced HOLD'}
+          {cautions.length ? ` · ${cautions.length} caution` : ''}
+          {' · '}{affectedSymbols.join(', ')}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ForexTableColGroup() {
+  return (
+    <colgroup>
+      <col className="w-[88px]" />
+      <col className="w-[52px]" />
+      <col className="w-[108px]" />
+      <col className="w-[72px]" />
+      <col className="w-[120px]" />
+      <col className="w-[96px]" />
+      <col className="w-[112px]" />
+      <col className="w-[88px]" />
+      <col className="w-[96px]" />
+      <col className="w-[96px]" />
+      <col className="w-[96px]" />
+      <col className="w-[96px]" />
+      <col className="w-[56px]" />
+      <col className="w-[56px]" />
+    </colgroup>
+  );
+}
+
+function ForexTableHead() {
+  return (
+    <thead className="bg-white text-xs uppercase tracking-[0.16em] text-slate-500">
+      <tr>
+        <th className="px-2 py-2.5 text-left">Symbol</th>
+        <th className="px-2 py-2.5 text-left">TF</th>
+        <th className="px-2 py-2.5 text-center">System Advisor</th>
+        <th className="px-2 py-2.5 text-center">Score</th>
+        <th className="px-2 py-2.5 text-center">Setup</th>
+        <th className="px-2 py-2.5 text-left">Entry Price</th>
+        <th className="px-2 py-2.5 text-left">Suggested Entry</th>
+        <th className="px-2 py-2.5 text-left">SL Target</th>
+        <th className="px-2 py-2.5 text-left">TP Plan</th>
+        <th className="px-2 py-2.5 text-left">Position</th>
+        <th className="px-2 py-2.5 text-left">Risk</th>
+        <th className="px-2 py-2.5 text-left">Profit Plan</th>
+        <th className="px-2 py-2.5 text-left">ADR</th>
+        <th className="px-2 py-2.5 text-center">News</th>
+      </tr>
+    </thead>
+  );
+}
+
+function FttTableColGroup() {
+  return (
+    <colgroup>
+      <col className="w-[88px]" />
+      <col className="w-[64px]" />
+      <col className="w-[88px]" />
+      <col className="w-[108px]" />
+      <col className="w-[72px]" />
+      <col className="w-[120px]" />
+      <col className="w-[96px]" />
+      <col className="w-[96px]" />
+      <col className="w-[112px]" />
+      <col className="w-[96px]" />
+    </colgroup>
+  );
+}
+
+function FttTableHead() {
+  return (
+    <thead className="bg-white text-xs uppercase tracking-[0.16em] text-slate-500">
+      <tr>
+        <th className="px-2 py-2.5 text-left">Symbol</th>
+        <th className="px-2 py-2.5 text-left">Expiry</th>
+        <th className="px-2 py-2.5 text-left">Trade Time</th>
+        <th className="px-2 py-2.5 text-center">System Advisor</th>
+        <th className="px-2 py-2.5 text-center">Score</th>
+        <th className="px-2 py-2.5 text-center">FTT Grade</th>
+        <th className="px-2 py-2.5 text-center">AI Advisor</th>
+        <th className="px-2 py-2.5 text-left">Entry Price</th>
+        <th className="px-2 py-2.5 text-left">Suggested Entry</th>
+        <th className="px-2 py-2.5 text-right">Actions</th>
+      </tr>
+    </thead>
+  );
 }
 
 export default function SignalDashboard() {
@@ -764,148 +930,115 @@ export default function SignalDashboard() {
   }
 
   return (
-    <div className="terminal-page -m-6 min-h-screen space-y-6 p-6 lg:-m-10 lg:p-10">
-      {/* Page Header */}
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <p className="text-xs font-black uppercase tracking-[0.32em] text-amber-600">Scanner</p>
-          <h1 className="mt-2 text-4xl font-black tracking-tight text-slate-900">Market Opportunity Scanner</h1>
-          <p className="mt-2 text-sm font-semibold text-slate-500">
-            Real-time quantitative scanner across Exness MT5 instruments. Sorted by strongest System Confidence.
-          </p>
-          <div className="mt-3 inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-black text-emerald-700">
-            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-            Live streaming cached scanner · updated <TimeAgo date={lastLiveUpdateAt} />
-            {isLiveUpdating && <Loader2 size={12} className="animate-spin" />}
+    <div className="terminal-page -mx-6 flex min-h-full flex-1 flex-col gap-3 px-1 pb-3 pt-1 sm:px-1.5 lg:-mx-10 lg:px-2 lg:pb-4 lg:pt-1">
+      <div className="shrink-0 overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-sm">
+        <div className="flex flex-col gap-2 px-2 py-1.5 xl:flex-row xl:items-center xl:justify-between xl:px-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <button
+              onClick={() => setActiveTab('forex')}
+              className={`inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm font-black transition ${
+                activeTab === 'forex'
+                  ? 'border-amber-300 bg-amber-50 text-slate-950 shadow-sm'
+                  : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-800'
+              }`}
+            >
+              <Activity size={15} />
+              Forex Signals
+              <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-black text-slate-500">{scanResults.length}</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('ftt')}
+              className={`inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm font-black transition ${
+                activeTab === 'ftt'
+                  ? 'border-amber-300 bg-amber-50 text-slate-950 shadow-sm'
+                  : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-800'
+              }`}
+            >
+              <Timer size={15} />
+              Fixed-Time Signals
+              <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-black text-slate-500">{fttScanResults.length}</span>
+            </button>
+            <div className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-black text-emerald-700">
+              <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+              Live · updated <TimeAgo date={lastLiveUpdateAt} />
+              {isLiveUpdating && <Loader2 size={12} className="animate-spin" />}
+            </div>
           </div>
+
+          {activeTab === 'forex' ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">TF</span>
+              <select
+                value={scanTimeframe}
+                onChange={(event) => setScanTimeframe(event.target.value)}
+                className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-sm font-bold text-slate-900 outline-none focus:border-amber-400"
+              >
+                {timeframes.map((item) => <option key={item}>{item}</option>)}
+              </select>
+              <button
+                onClick={handleScan}
+                disabled={isScanning}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-950 px-3 text-sm font-black text-white shadow-md shadow-slate-900/15 transition hover:bg-amber-600 disabled:opacity-50"
+              >
+                {isScanning ? <Loader2 size={15} className="animate-spin" /> : <RefreshCcw size={15} />}
+                Manual Refresh
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Expiry</span>
+              <select
+                value={fttScanExpiry}
+                onChange={(event) => setFttScanExpiry(event.target.value)}
+                className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-sm font-bold text-slate-900 outline-none focus:border-amber-400"
+              >
+                <option value="1m">1 min</option>
+                <option value="2m">2 min</option>
+                <option value="3m">3 min</option>
+                <option value="4m">4 min</option>
+                <option value="5m">5 min</option>
+                <option value="10m">10 min</option>
+                <option value="15m">15 min</option>
+                <option value="20m">20 min</option>
+                <option value="30m">30 min</option>
+                <option value="40m">40 min</option>
+                <option value="1h">1 hour</option>
+              </select>
+              <button
+                onClick={handleFttScan}
+                disabled={isScanning}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-950 px-3 text-sm font-black text-white shadow-md shadow-slate-900/15 transition hover:bg-amber-600 disabled:opacity-50"
+              >
+                {isScanning ? <Loader2 size={15} className="animate-spin" /> : <RefreshCcw size={15} />}
+                Manual Refresh
+              </button>
+            </div>
+          )}
         </div>
-        
-        {activeTab === 'forex' ? (
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-xs font-bold text-slate-400">Scan Timeframe:</span>
-            <select 
-              value={scanTimeframe} 
-              onChange={(event) => setScanTimeframe(event.target.value)} 
-              className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-bold text-slate-900 outline-none focus:border-amber-400"
-            >
-              {timeframes.map((item) => <option key={item}>{item}</option>)}
-            </select>
-            <button
-              onClick={handleScan}
-              disabled={isScanning}
-              className="inline-flex items-center gap-2 rounded-xl bg-amber-500 hover:bg-amber-600 px-5 py-2.5 text-sm font-bold text-white transition disabled:opacity-50 shadow-md shadow-amber-500/20"
-            >
-              {isScanning ? <Loader2 size={16} className="animate-spin" /> : <RefreshCcw size={16} />}
-              Manual Refresh
-            </button>
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-xs font-bold text-slate-400">Scan Expiry:</span>
-            <select 
-              value={fttScanExpiry} 
-              onChange={(event) => setFttScanExpiry(event.target.value)} 
-              className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-bold text-slate-900 outline-none focus:border-amber-400"
-            >
-              <option value="1m">1 min</option>
-              <option value="2m">2 min</option>
-              <option value="3m">3 min</option>
-              <option value="4m">4 min</option>
-              <option value="5m">5 min</option>
-              <option value="10m">10 min</option>
-              <option value="15m">15 min</option>
-              <option value="20m">20 min</option>
-              <option value="30m">30 min</option>
-              <option value="40m">40 min</option>
-              <option value="1h">1 hour</option>
-            </select>
-            <button
-              onClick={handleFttScan}
-              disabled={isScanning}
-              className="inline-flex items-center gap-2 rounded-xl bg-amber-500 hover:bg-amber-600 px-5 py-2.5 text-sm font-bold text-white transition disabled:opacity-50 shadow-md shadow-amber-500/20"
-            >
-              {isScanning ? <Loader2 size={16} className="animate-spin" /> : <RefreshCcw size={16} />}
-              Manual Refresh
-            </button>
-          </div>
-        )}
       </div>
 
       {scanError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">
+        <div className="shrink-0 rounded-xl border border-red-200 bg-red-50 p-3 text-sm font-semibold text-red-700">
           {scanError}
         </div>
       )}
 
-      {activeTab === 'forex' && scanResults.some((r) => r.systemDecision?.newsRisk?.block) && (
-        <div className="flex items-center gap-3 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">
-          <AlertTriangle size={18} />
-          <span>
-            {scanResults.filter((r) => r.systemDecision?.newsRisk?.block).length} symbol(s) are under a high-impact news block ({scanResults.filter((r) => r.systemDecision?.newsRisk?.block).map((r) => r.symbol).join(', ')}). The System engine forces HOLD around these releases.
-          </span>
-        </div>
-      )}
+      {/* News filter — static row above table; never sticky, never inside scroll */}
+      {activeTab === 'forex' && <ForexNewsFilterStrip results={scanResults} />}
 
       {/* Scanner Results Table */}
-      <section className="light-card rounded-3xl p-6">
-        {/* Tab Selection */}
-        <div className="flex border-b border-slate-100 mb-6">
-          <button
-            onClick={() => setActiveTab('forex')}
-            className={`flex items-center gap-2 px-6 py-3 text-sm font-black tracking-tight border-b-2 transition ${
-              activeTab === 'forex'
-                ? 'border-amber-500 text-slate-900 bg-amber-50/10'
-                : 'border-transparent text-slate-400 hover:text-slate-600'
-            }`}
-          >
-            <Activity size={16} />
-            Forex Signals
-          </button>
-          <button
-            onClick={() => setActiveTab('ftt')}
-            className={`flex items-center gap-2 px-6 py-3 text-sm font-black tracking-tight border-b-2 transition ${
-              activeTab === 'ftt'
-                ? 'border-amber-500 text-slate-900 bg-amber-50/10'
-                : 'border-transparent text-slate-400 hover:text-slate-600'
-            }`}
-          >
-            <Timer size={16} />
-            Fixed-Time Signals
-          </button>
-        </div>
-
+      <section className="light-card flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200/80 p-0 shadow-sm">
         {activeTab === 'forex' ? (
           <>
-            <div className="mb-4 flex items-center justify-between">
-              <div className="flex items-center gap-3 text-slate-900">
-                <Activity className="text-amber-500" size={20} />
-                <h2 className="text-xl font-black">Forex Scan Results ({scanResults.length})</h2>
-              </div>
-              <span className="text-xs font-bold text-slate-400">
-                Click any row to load its detailed indicator grid below
-              </span>
+            <div className="shrink-0 overflow-x-auto border-b border-slate-200 bg-white">
+              <table className="w-full min-w-[1280px] table-fixed text-left text-sm">
+                <ForexTableColGroup />
+                <ForexTableHead />
+              </table>
             </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[1500px] text-left text-sm">
-                <thead className="text-xs uppercase tracking-[0.18em] text-slate-500 border-b border-slate-100 pb-3">
-                  <tr>
-                    <th className="p-3">Symbol</th>
-                    <th className="p-3">TF</th>
-                    <th className="p-3 text-center">System Advisor</th>
-                    <th className="p-3 text-center">Score</th>
-                    <th className="p-3 text-center">Setup</th>
-                    <th className="p-3">Entry Price</th>
-                    <th className="p-3">Suggested Entry</th>
-                    <th className="p-3">SL Target</th>
-                    <th className="p-3">TP Plan</th>
-                    <th className="p-3">Position</th>
-                    <th className="p-3">Risk</th>
-                    <th className="p-3">Profit Plan</th>
-                    <th className="p-3">ADR Usage</th>
-                    <th className="p-3 text-center">News</th>
-                  </tr>
-                </thead>
+            <div className="min-h-0 flex-1 overflow-auto">
+              <table className="w-full min-w-[1280px] table-fixed text-left text-sm">
+                <ForexTableColGroup />
                 <tbody className="divide-y divide-slate-100 text-slate-700">
                   {scanResults.map((result) => {
                     const system = result.systemDecision;
@@ -934,14 +1067,14 @@ export default function SignalDashboard() {
                         aria-expanded={expandedRow === rowKey}
                         className={`cursor-pointer transition hover:bg-slate-50/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${isSelected ? 'bg-amber-50/30' : ''}`}
                       >
-                        <td className="p-3 font-black text-slate-900">{result.symbol}</td>
-                        <td className="p-3 font-mono text-xs font-bold text-slate-400">{result.timeframe}</td>
-                        <td className="p-3 text-center">
-                          <span className={`inline-flex rounded-lg px-2.5 py-1 text-xs font-black border ${decisionClass(systemDir)}`}>
+                        <td className="px-2 py-1.5 font-black text-slate-900">{result.symbol}</td>
+                        <td className="px-2 py-1.5 font-mono text-xs font-bold text-slate-400">{result.timeframe}</td>
+                        <td className="px-2 py-1.5 text-center">
+                          <span className={`inline-flex rounded-md px-2 py-0.5 text-xs font-black border ${decisionClass(systemDir)}`}>
                             {systemDir.replace('_', ' ')}
                           </span>
                         </td>
-                        <td className="p-3 text-center font-mono font-extrabold text-sm">
+                        <td className="px-2 py-1.5 text-center font-mono text-sm font-extrabold">
                           {system?.confidence !== undefined ? (
                             <span className={
                               system.confidence >= 90 ? 'text-emerald-600 font-black' :
@@ -953,8 +1086,8 @@ export default function SignalDashboard() {
                             </span>
                           ) : 'n/a'}
                         </td>
-                        <td className="p-3 text-center">
-                          <div className="flex flex-col items-center gap-1.5">
+                        <td className="px-2 py-1.5 text-center">
+                          <div className="flex flex-col items-center gap-1 leading-tight">
                             {renderSignalQualityBadge(system?.signalQuality)}
                             {renderGradeBadge(system?.grade)}
                             {system?.strategyType && (
@@ -964,16 +1097,16 @@ export default function SignalDashboard() {
                               <span className="text-[10px] font-bold text-slate-400">DAT {system.datFramework.score}/3</span>
                             )}
                             {system?.sessionContext?.reason && (
-                              <span className="max-w-[150px] truncate text-[10px] font-semibold text-slate-400" title={system.sessionContext.reason}>
+                              <span className="max-w-[115px] truncate text-[10px] font-semibold text-slate-400" title={system.sessionContext.reason}>
                                 {system.sessionContext.reason}
                               </span>
                             )}
                           </div>
                         </td>
-                        <td className="p-3 font-mono font-extrabold text-slate-900">
-                          {system?.entryPrice ? price(system.entryPrice) : 'n/a'}
+                        <td className="px-2 py-1.5 font-mono font-extrabold text-slate-900" onClick={(e) => e.stopPropagation()}>
+                          <PriceWithCopy value={system?.entryPrice ?? null} label="Entry price" />
                         </td>
-                        <td className="p-3">
+                        <td className="px-2 py-1.5">
                           <div className="inline-flex flex-col gap-1" title={suggestedEntry.tip}>
                             <span className={`inline-flex w-fit rounded-lg border px-2 py-0.5 text-[10px] font-black ${suggestedEntry.directionClass}`}>
                               {suggestedEntry.directionLabel}
@@ -983,44 +1116,44 @@ export default function SignalDashboard() {
                             </span>
                           </div>
                         </td>
-                        <td className="p-3 font-mono font-bold text-red-600">
-                          {system?.stopLoss ? price(system.stopLoss) : 'n/a'}
+                        <td className="px-2 py-1.5 font-mono font-bold text-red-600" onClick={(e) => e.stopPropagation()}>
+                          <PriceWithCopy value={system?.stopLoss ?? null} label="Stop loss" />
                         </td>
-                        <td className="p-3 font-mono text-xs font-bold text-emerald-700">
-                          <div>TP1 {price(system?.takeProfit1)}</div>
-                          <div>TP2 {price(system?.takeProfit2)}</div>
-                          <div>TP3 {price(system?.takeProfit3)}</div>
+                        <td className="px-2 py-1.5 font-mono text-xs font-bold leading-tight text-emerald-700" onClick={(e) => e.stopPropagation()}>
+                          <div><PriceWithCopy value={system?.takeProfit1 ?? null} label="TP1" prefix="TP1" /></div>
+                          <div><PriceWithCopy value={system?.takeProfit2 ?? null} label="TP2" prefix="TP2" /></div>
+                          <div><PriceWithCopy value={system?.takeProfit3 ?? null} label="TP3" prefix="TP3" /></div>
                         </td>
-                        <td className="p-3 text-xs">
+                        <td className="px-2 py-1.5 text-xs leading-tight">
                           <div className="font-mono font-black text-slate-900">Lot {risk?.suggestedLotSize ?? 'n/a'}</div>
                           <div className="font-semibold text-slate-500">Multiplier {multiplier}</div>
                           <div className="font-semibold text-slate-500">Margin {money(margin)}</div>
                         </td>
-                        <td className="p-3 text-xs">
+                        <td className="px-2 py-1.5 text-xs leading-tight">
                           <div className="font-semibold text-slate-700">Risk {money(amountToRisk)}</div>
                           <div className="font-mono font-black text-red-600">SL Loss {signedLoss(slLoss)}</div>
                           <div className="font-semibold text-slate-500">Stop {risk?.stopPips ?? 'n/a'} pips</div>
                         </td>
-                        <td className="p-3 text-xs">
+                        <td className="px-2 py-1.5 text-xs leading-tight">
                           <div className="font-semibold text-emerald-700">TP1 {money(risk?.profitAtTp1)}</div>
                           <div className="font-semibold text-emerald-700">TP2 {money(risk?.profitAtTp2)}</div>
                           <div className="font-semibold text-emerald-700">TP3 {money(risk?.profitAtTp3)}</div>
                         </td>
-                        <td className="p-3 font-mono font-bold">
+                        <td className="px-2 py-1.5 font-mono font-bold">
                           {system && system.adrUsagePercent > 0 ? (
                             <span className={system.adrExhausted ? 'text-red-600 font-black' : 'text-slate-600'}>
                               {system.adrUsagePercent.toFixed(0)}%
                             </span>
                           ) : 'n/a'}
                         </td>
-                        <td className="p-3 text-center">
+                        <td className="px-2 py-1.5 text-center">
                           {system?.newsRisk?.block ? (
-                            <span className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2 py-1 text-[10px] font-black text-red-700" title={system.newsRisk.reason || ''}>
+                            <span className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50 px-1.5 py-0.5 text-[9px] font-black text-red-700" title={system.newsRisk.reason || ''}>
                               <AlertTriangle size={10} /> NEWS
                             </span>
                           ) : system?.newsRisk?.caution ? (
-                            <span className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] font-black text-amber-700" title={system.newsRisk.reason || ''}>
-                              <CalendarClock size={10} /> CAUTION
+                            <span className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[9px] font-black text-amber-700" title={system.newsRisk.reason || ''}>
+                              <CalendarClock size={10} /> CAUT
                             </span>
                           ) : (
                             <span className="text-slate-300 text-xs font-bold">—</span>
@@ -1029,7 +1162,7 @@ export default function SignalDashboard() {
                       </tr>
                       {expandedRow === rowKey && (
                         <tr>
-                          <td colSpan={14} className="p-3 pt-0">
+                          <td colSpan={14} className="px-2 pb-1.5 pt-0">
                             <ForexAdvisorDetails result={result} />
                           </td>
                         </tr>
@@ -1042,39 +1175,30 @@ export default function SignalDashboard() {
             </div>
             
             {scanResults.length === 0 && !isScanning && (
-              <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-semibold text-slate-500">
-                No Forex symbols scanned yet. Choose a timeframe and click "Scan Primary Symbols".
+              <div className="m-3 rounded-2xl border border-dashed border-slate-200 bg-white p-5 text-center text-sm font-semibold text-slate-500">
+                No Forex symbols scanned yet. Choose a timeframe or wait for the live stream.
               </div>
             )}
           </>
         ) : (
           <>
-            <div className="mb-4 flex items-center justify-between">
+            <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/70 px-3 py-2">
               <div className="flex items-center gap-3 text-slate-900">
-                <Timer className="text-amber-500" size={20} />
-                <h2 className="text-xl font-black">Fixed-Time Scan Results ({fttScanResults.length})</h2>
+                <Timer className="text-amber-500" size={18} />
+                <h2 className="text-base font-black">Fixed-Time Scan Results ({fttScanResults.length})</h2>
               </div>
-              <span className="text-xs font-bold text-slate-400">
-                Click any row to load its detailed indicator grid below
-              </span>
             </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] text-left text-sm">
-                <thead className="text-xs uppercase tracking-[0.18em] text-slate-500 border-b border-slate-100 pb-3">
-                  <tr>
-                    <th className="p-3">Symbol</th>
-                    <th className="p-3">Expiry</th>
-                    <th className="p-3">Trade Time</th>
-                    <th className="p-3 text-center">System Advisor</th>
-                    <th className="p-3 text-center">Score</th>
-                    <th className="p-3 text-center">FTT Grade</th>
-                    <th className="p-3 text-center">AI Advisor</th>
-                    <th className="p-3">Entry Price</th>
-                    <th className="p-3">Suggested Entry</th>
-                    <th className="p-3 text-right">Actions</th>
-                  </tr>
-                </thead>
+            <div className="shrink-0 overflow-x-auto border-b border-slate-200 bg-white">
+              <table className="w-full min-w-[860px] table-fixed text-left text-sm">
+                <FttTableColGroup />
+                <FttTableHead />
+              </table>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-auto">
+              <table className="w-full min-w-[860px] table-fixed text-left text-sm">
+                <FttTableColGroup />
                 <tbody className="divide-y divide-slate-100 text-slate-700">
                   {fttScanResults.map((result) => {
                     const system = result.systemPrediction;
@@ -1104,15 +1228,15 @@ export default function SignalDashboard() {
                         aria-expanded={expandedRow === rowKey}
                         className={`cursor-pointer transition hover:bg-slate-50/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 ${qualityTier === 'QUALITY_SIGNAL' ? 'bg-emerald-50/40 ring-1 ring-emerald-100' : ''} ${isSelected ? 'bg-amber-50/30' : ''}`}
                       >
-                        <td className="p-3 font-black text-slate-900">{result.symbol}</td>
-                        <td className="p-3 font-mono text-xs font-bold text-slate-400">{result.expiry}</td>
-                        <td className="p-3 font-semibold text-slate-700">{formatExpiryLabel(result.expiry)}</td>
-                        <td className="p-3 text-center">
-                          <span className={`inline-flex rounded-lg px-2.5 py-1 text-xs font-black border ${decisionClass(systemDir)}`}>
+                        <td className="px-2 py-1.5 font-black text-slate-900">{result.symbol}</td>
+                        <td className="px-2 py-1.5 font-mono text-xs font-bold text-slate-400">{result.expiry}</td>
+                        <td className="px-2 py-1.5 font-semibold text-slate-700">{formatExpiryLabel(result.expiry)}</td>
+                        <td className="px-2 py-1.5 text-center">
+                          <span className={`inline-flex rounded-md px-2 py-0.5 text-xs font-black border ${decisionClass(systemDir)}`}>
                             {systemDir}
                           </span>
                         </td>
-                        <td className="p-3 text-center font-mono font-extrabold text-sm">
+                        <td className="px-2 py-1.5 text-center font-mono text-sm font-extrabold">
                           {system?.confidence !== undefined ? (
                             <span className={
                               system.confidence >= 90 ? 'text-emerald-600 font-black' :
@@ -1124,37 +1248,37 @@ export default function SignalDashboard() {
                             </span>
                           ) : 'n/a'}
                         </td>
-                        <td className="p-3 text-center">
-                          <div className="flex flex-col items-center gap-1">
+                        <td className="px-2 py-1.5 text-center">
+                          <div className="flex flex-col items-center gap-0.5 leading-tight">
                             {renderFttStatusBadge(system)}
                             {system?.indicators?.qualityScore !== undefined && (
                               <span className="text-[10px] font-bold text-slate-400">Q {system.indicators.qualityScore}/100</span>
                             )}
                             {topWarning && (
-                              <span className="max-w-[150px] truncate text-[10px] font-semibold text-slate-400" title={String(topWarning)}>{String(topWarning)}</span>
+                              <span className="max-w-[120px] truncate text-[10px] font-semibold text-slate-400" title={String(topWarning)}>{String(topWarning)}</span>
                             )}
                           </div>
                         </td>
-                        <td className="p-3 text-center">
+                        <td className="px-2 py-1.5 text-center">
                           {ai ? (
-                            <span className={`inline-flex rounded-lg px-2.5 py-1 text-xs font-black border ${decisionClass(aiDir)}`}>
+                            <span className={`inline-flex rounded-md px-2 py-0.5 text-xs font-black border ${decisionClass(aiDir)}`}>
                               {aiDir}
                             </span>
                           ) : (
                             <span className="text-slate-300 font-bold text-xs italic">Not analyzed</span>
                           )}
                         </td>
-                        <td className="p-3 font-mono font-extrabold text-slate-900">
-                          {system?.entryPrice ? price(system.entryPrice) : 'n/a'}
+                        <td className="px-2 py-1.5 font-mono font-extrabold text-slate-900" onClick={(e) => e.stopPropagation()}>
+                          <PriceWithCopy value={system?.entryPrice ?? null} label="FTT entry price" />
                         </td>
-                        <td className="p-3 font-semibold">
+                        <td className="px-2 py-1.5 font-semibold">
                           <FttSuggestedEntryCell result={result} />
                         </td>
-                        <td className="p-3 text-right" onClick={(e) => e.stopPropagation()}>
+                        <td className="px-2 py-1.5 text-right" onClick={(e) => e.stopPropagation()}>
                           <button
                             onClick={() => handleFttAskAi(result.symbol)}
                             disabled={loadingAiMap[result.symbol]}
-                            className="inline-flex items-center gap-1 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-bold text-amber-700 hover:bg-amber-100 transition disabled:opacity-50"
+                            className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-xs font-bold text-amber-700 transition hover:bg-amber-100 disabled:opacity-50"
                           >
                             {loadingAiMap[result.symbol] ? (
                               <Loader2 size={12} className="animate-spin" />
@@ -1167,7 +1291,7 @@ export default function SignalDashboard() {
                       </tr>
                       {expandedRow === rowKey && (
                         <tr>
-                          <td colSpan={10} className="p-3 pt-0">
+                          <td colSpan={10} className="px-2 pb-1.5 pt-0">
                             <FttAdvisorDetails result={result} />
                           </td>
                         </tr>
@@ -1180,15 +1304,15 @@ export default function SignalDashboard() {
             </div>
             
             {fttScanResults.length === 0 && !isScanning && (
-              <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-semibold text-slate-500">
-                No Fixed-Time symbols scanned yet. Choose an expiry and click "Scan Primary Symbols".
+              <div className="m-3 rounded-2xl border border-dashed border-slate-200 bg-white p-5 text-center text-sm font-semibold text-slate-500">
+                No Fixed-Time symbols scanned yet. Choose an expiry or wait for the live stream.
               </div>
             )}
           </>
         )}
         
         {isScanning && (
-          <div className="flex flex-col items-center justify-center py-12 space-y-3">
+          <div className="flex flex-col items-center justify-center space-y-3 py-8">
             <Loader2 size={32} className="animate-spin text-amber-500" />
             <p className="text-sm font-bold text-slate-500">Running quantitative scan on all Exness assets...</p>
           </div>
@@ -1197,7 +1321,7 @@ export default function SignalDashboard() {
 
       {/* Selected Symbol Detail Header */}
       {selectedSymbol && (
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between pt-6 border-t border-slate-100">
+        <div className="flex flex-col gap-3 border-t border-slate-100 pt-3 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <p className="text-xs font-black uppercase tracking-[0.32em] text-slate-500">Details</p>
             <h2 className="mt-2 text-2xl font-black text-slate-900">{selectedSymbol} {selectedTimeframe} Indicators</h2>

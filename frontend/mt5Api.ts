@@ -7,6 +7,7 @@ import type {
   AiDecisionResponse,
   CalibrationResponse,
   SignalLogResponse,
+  ProjectionTrackRecord,
   ForexBacktestResponse,
   EmailAlertSettings,
   EmailAlertSettingsResponse,
@@ -987,6 +988,11 @@ export async function saveProjection(params: {
 
 export async function fetchSavedProjections(): Promise<{ ok: boolean; savedProjections: any[] }> {
   return fetchJson<{ ok: boolean; savedProjections: any[] }>('/api/projections/saved');
+}
+
+export async function fetchProjectionTrackRecord(days?: number): Promise<ProjectionTrackRecord> {
+  const qs = days ? `?days=${days}` : '';
+  return fetchJson<ProjectionTrackRecord>(`/api/projections/track-record${qs}`);
 }
 
 export async function updateSavedProjectionOutcome(id: string, outcome: 'WIN' | 'LOSS' | 'DRAW' | 'PENDING'): Promise<{ ok: boolean }> {

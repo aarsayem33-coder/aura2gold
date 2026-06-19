@@ -52,6 +52,25 @@ function timeframeSeconds(tf: string): number {
   return 0;
 }
 
+/** Build a synthetic live-forming bar for the current period when the feed only
+ * delivers closed bars (no intra-bar ticks). Flat at the last close until the next
+ * real bar arrives — so the current candle slot exists and the time axis advances,
+ * making the chart visibly "live" without inventing price movement. Returns null
+ * when real data already covers the current period (or the timeframe is unknown). */
+function formingBarFor(lastClosed: { time: number; close: number } | null, tfSec: number, nowMs = Date.now()) {
+  if (!lastClosed || tfSec <= 0 || !Number.isFinite(lastClosed.close)) return null;
+  const open = Math.floor(Math.floor(nowMs / 1000) / tfSec) * tfSec;
+  if (lastClosed.time >= open) return null; // a real bar already occupies the current period
+  return { time: open, open: lastClosed.close, high: lastClosed.close, low: lastClosed.close, close: lastClosed.close, volume: 0 };
+}
+
+/** Whole seconds remaining until the current timeframe bar closes (for the countdown). */
+function secsToNextBar(tfSec: number, nowMs = Date.now()) {
+  if (tfSec <= 0) return null;
+  const nowSec = Math.floor(nowMs / 1000);
+  return tfSec - (nowSec % tfSec);
+}
+
 /** Robust price precision: gold=2, JPY pairs=3, otherwise infer from magnitude. */
 function priceDigits(symbol: string, sample?: number | null) {
   const s = (symbol || '').toUpperCase();
@@ -169,6 +188,9 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const markersApiRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
   const lastLenRef = useRef(0);
+  // Latest CLOSED bar (time in seconds + close), used to synthesize the live-forming bar.
+  const lastClosedRef = useRef<{ time: number; close: number } | null>(null);
+  const countdownRef = useRef<HTMLDivElement | null>(null);
 
   const candlesRef = useRef<Mt5Candle[]>([]);
   candlesRef.current = candles;
@@ -336,7 +358,16 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     const data = [...byBar.values()].map((x) => x.candle).sort((a, b) => Number(a.time) - Number(b.time));
     if (data.length === 0) return;
 
-    series.setData(data);
+    // Record the latest closed bar so the 1-second live effect can keep a forming
+    // bar pinned to the current period (the feed only sends closed bars).
+    const lastBar = data[data.length - 1];
+    lastClosedRef.current = { time: Number(lastBar.time), close: Number(lastBar.close) };
+
+    // Render the closed bars plus a synthetic forming bar for the current period
+    // (only the candlestick series gets the forming bar; overlays/markers stay on
+    // closed data so EMAs/volume aren't skewed by the flat placeholder).
+    const forming = formingBarFor(lastClosedRef.current, tfSec);
+    series.setData(forming ? [...data, forming] : data);
 
     // Volume — create/remove on demand.
     if (showVolume) {
@@ -452,6 +483,42 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     }
   }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, levels]);
 
+  // ─── Effect D: live forming bar + countdown (1s) ────────────────────────
+  // The feed sends closed bars only, so without this the chart sits frozen between
+  // bar closes. Each second we keep a flat forming bar pinned to the current period
+  // (via series.update — cheap, no full re-render) and tick a "next bar in m:ss"
+  // countdown, so the chart is visibly live. No invented price movement; the bar
+  // updates for real the moment a new closed bar arrives (Effect C).
+  useEffect(() => {
+    const tfSec = timeframeSeconds(timeframe);
+    const tick = () => {
+      const el = countdownRef.current;
+      if (el) {
+        const secs = secsToNextBar(tfSec);
+        if (secs === null) {
+          el.textContent = '';
+        } else {
+          const m = Math.floor(secs / 60);
+          const s = secs % 60;
+          el.textContent = `● LIVE · next ${timeframe} in ${m}:${String(s).padStart(2, '0')}`;
+        }
+      }
+      const series = seriesRef.current;
+      if (!series) return;
+      const forming = formingBarFor(lastClosedRef.current, tfSec);
+      if (forming) {
+        try {
+          series.update(forming);
+        } catch {
+          /* chart may be mid-teardown */
+        }
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [symbol, timeframe]);
+
   // Keep the chart sized correctly when toggling fullscreen.
   useEffect(() => {
     const id = window.setTimeout(() => {
@@ -508,6 +575,12 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         <div
           ref={legendRef}
           className="pointer-events-none absolute left-3 top-3 z-10 rounded-lg border border-slate-100/50 bg-white/75 px-2.5 py-1.5 shadow-sm backdrop-blur-[3px]"
+        />
+
+        {/* Live countdown to next bar close */}
+        <div
+          ref={countdownRef}
+          className="pointer-events-none absolute bottom-12 left-3 z-10 rounded-md border border-emerald-200/60 bg-white/80 px-2 py-0.5 font-mono text-[10px] font-bold text-emerald-600 shadow-sm backdrop-blur-[3px]"
         />
 
         {/* Floating toolbar */}

@@ -1023,6 +1023,32 @@ export interface SignalLogResponse {
   count: number;
 }
 
+export interface ProjectionTrackBucket {
+  value: string;
+  total: number;
+  wins: number;
+  losses: number;
+  expired: number;
+  pending: number;
+  settled: number;
+  hitRate: number | null;
+  confidence: string;
+}
+
+export interface ProjectionTrackRecord {
+  ok: boolean;
+  days: number;
+  overall: {
+    total: number; wins: number; losses: number; expired: number; pending: number;
+    settled: number; hitRate: number | null; confidence: string;
+  };
+  byGrade: ProjectionTrackBucket[];
+  byTimeframe: ProjectionTrackBucket[];
+  byBias: ProjectionTrackBucket[];
+  byConfidence: ProjectionTrackBucket[];
+  note: string;
+}
+
 export interface ForexBacktestSample {
   id: string;
   symbol: string;
