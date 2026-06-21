@@ -18,7 +18,8 @@ import rateLimit from 'express-rate-limit';
 import { WebSocketServer, WebSocket } from 'ws';
 import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
-import { aggregateSignals, detectSupportResistance } from './signalEngine.js';
+import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
+import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive } from './liquidityEngine.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini } from './geminiEngine.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
 import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
@@ -692,6 +693,19 @@ async function initializeDatabase() {
       // before its decision commits off HOLD. Compact; heeds Trap #6.
       await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'lean', "VARCHAR(8) NULL");
       await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'lean_conviction', 'DECIMAL(6,1) NULL');
+      // Trade outcome tracking for EXECUTED forecasts — settles WIN/LOSS by replaying
+      // the entry/SL/TP ladder against real candles (same engine as the system signal
+      // log). The forecast "track record": did the setup we announced ready pay off?
+      // Compact; pruned with the rest of the row, so it never re-bloats the DB.
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'take_profit_2', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'take_profit_3', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_outcome', 'VARCHAR(16) NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_exit_price', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_pips', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_tp_hit_level', 'INT NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_mfe_pips', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_mae_pips', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_resolved_at', 'DATETIME(3) NULL');
 
       return pool;
     })().catch((error) => {
@@ -7075,6 +7089,8 @@ async function logSystemSignal(result, { emailed = false, emailReportId = null }
     htfBias: sd.htfBias || null,
     adrUsagePercent: sd.adrUsagePercent ?? null,
     signalQuality: sd.signalQuality || null,
+    drive: sd.drive || null,
+    premiumDiscount: sd.premiumDiscount || null,
   };
   try {
     await pool.execute(
@@ -7145,6 +7161,115 @@ async function processSystemSignalLog() {
   } catch (err) {
     console.error('[SignalLog] outcome resolver error:', err.message);
   }
+}
+
+// Open the trade-outcome ledger for a forecast that just became EXECUTED. Captures
+// the TP2/TP3 levels from the live systemDecision (the forecast row only stores TP1)
+// and flags it PENDING so processForecastTradeOutcomes will settle it later.
+async function initForecastTrade(pool, id, sd) {
+  if (!pool) return;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  try {
+    await pool.execute(
+      `UPDATE mt5_execution_forecasts
+          SET take_profit_2 = COALESCE(take_profit_2, ?),
+              take_profit_3 = COALESCE(take_profit_3, ?),
+              trade_outcome = COALESCE(trade_outcome, 'PENDING')
+        WHERE id = ?`,
+      [n(sd?.takeProfit2), n(sd?.takeProfit3), id],
+    );
+  } catch (err) {
+    console.error('[Forecast] initForecastTrade failed:', err.message);
+  }
+}
+
+// Settle WIN/LOSS for forecasts that became EXECUTED — replays the entry/SL/TP
+// ladder against real candles, exactly like processSystemSignalLog. This is the
+// forecast "track record": a setup we announced ready is only a win if the trade
+// actually reached target before stop. Conservative same-bar handling (AMBIGUOUS).
+async function processForecastTradeOutcomes() {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  const nowMs = Date.now();
+  try {
+    const [rows] = await pool.query(
+      "SELECT * FROM mt5_execution_forecasts WHERE status='EXECUTED' AND trade_outcome IN ('PENDING','TP1_WIN','TP2_WIN') ORDER BY actual_execution_time ASC LIMIT 100"
+    );
+    for (const row of rows) {
+      const entryMs = row.actual_execution_time ? new Date(row.actual_execution_time).getTime() : NaN;
+      if (!Number.isFinite(entryMs)) continue;
+      const ageHrs = (nowMs - entryMs) / (3600 * 1000);
+      if (ageHrs > 72) {
+        await pool.execute("UPDATE mt5_execution_forecasts SET trade_outcome='EXPIRED', trade_resolved_at=? WHERE id=?", [toMysqlDate(), row.id]);
+        continue;
+      }
+      const candles = getRecentCandles(row.symbol, row.timeframe, 1000);
+      if (!candles || candles.length < 2) continue;
+      const report = {
+        symbol: row.symbol, timeframe: row.timeframe,
+        signalTime: new Date(row.actual_execution_time).toISOString(),
+        direction: row.decision, entryPrice: row.entry_price, stopLoss: row.stop_loss,
+        takeProfit1: row.take_profit_1,
+        payload: { takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3 },
+        outcome: row.trade_outcome, exitPrice: row.trade_exit_price, resolvedAt: row.trade_resolved_at,
+      };
+      const replay = evaluateForexReplay(report, candles);
+      // Same convention as the signal-log resolver: replay 'EXPIRED'/'PENDING' = "no
+      // hit yet", stay PENDING. Real expiry is the ageHrs > 72 gate above.
+      if (!replay.valid || replay.outcome === 'PENDING' || replay.outcome === 'EXPIRED') continue;
+      if (replay.outcome === 'AMBIGUOUS') {
+        await pool.execute("UPDATE mt5_execution_forecasts SET trade_outcome='AMBIGUOUS', trade_resolved_at=? WHERE id=?", [toMysqlDate(replay.resolvedAt || new Date()), row.id]);
+        continue;
+      }
+      await pool.execute(
+        `UPDATE mt5_execution_forecasts
+            SET trade_outcome=?, trade_exit_price=?, trade_pips=?, trade_tp_hit_level=?, trade_mfe_pips=?, trade_mae_pips=?, trade_resolved_at=?
+          WHERE id=?`,
+        [replay.outcome || 'AMBIGUOUS', replay.exitPrice ?? null, replay.profitLossPips ?? null, replay.tpHitLevel ?? null, replay.mfePips ?? null, replay.maePips ?? null, toMysqlDate(replay.resolvedAt || new Date()), row.id]
+      );
+    }
+  } catch (err) {
+    console.error('[Forecast] Trade outcome resolver error:', err.message);
+  }
+}
+
+// Win/loss track-record summary for EXECUTED forecasts (overall + by ETA basis).
+function summarizeForecastTradeOutcomes(rows) {
+  const bucket = () => ({ total: 0, settled: 0, wins: 0, losses: 0, ambiguous: 0, expired: 0, pending: 0, netPips: 0, netR: 0, rCount: 0 });
+  const tally = (b, r) => {
+    b.total += 1;
+    const o = String(r.tradeOutcome || 'PENDING').toUpperCase();
+    if (o.endsWith('_WIN') || o === 'WIN') { b.wins += 1; b.settled += 1; }
+    else if (o === 'LOSS') { b.losses += 1; b.settled += 1; }
+    else if (o === 'AMBIGUOUS') b.ambiguous += 1;
+    else if (o === 'EXPIRED') b.expired += 1;
+    else b.pending += 1;
+    if (Number.isFinite(r.tradePips)) b.netPips += r.tradePips;
+    // R-multiple: realized pips ÷ initial risk (|entry-SL|). Think in R, not pips.
+    if (o.endsWith('_WIN') || o === 'WIN' || o === 'LOSS') {
+      const rm = rMultiple(r.symbol, r.entryPrice, r.stopLoss, r.tradePips);
+      if (rm !== null) { b.netR += rm; b.rCount += 1; }
+    }
+  };
+  const finalize = (b) => ({
+    ...b,
+    netPips: Math.round(b.netPips * 10) / 10,
+    netR: Math.round(b.netR * 100) / 100,
+    expectancyR: b.rCount ? Math.round((b.netR / b.rCount) * 100) / 100 : null,
+    winRate: (b.wins + b.losses) ? Math.round((b.wins / (b.wins + b.losses)) * 100) : 0,
+  });
+  const overall = bucket();
+  const byBasis = new Map();
+  for (const r of rows) {
+    tally(overall, r);
+    const basis = r.forecastBasis || 'UNKNOWN';
+    if (!byBasis.has(basis)) byBasis.set(basis, { basis, ...bucket() });
+    tally(byBasis.get(basis), r);
+  }
+  return {
+    overall: finalize(overall),
+    byBasis: [...byBasis.values()].map((b) => ({ basis: b.basis, ...finalize(b) })).sort((a, b) => b.total - a.total),
+  };
 }
 
 function normalizeSystemSignalRow(row) {
@@ -7475,6 +7600,20 @@ async function sendForexAlert(result) {
   const dat = sd.datFramework;
   const risk = sd.riskPlan;
   const pattern = dat?.trigger?.pattern || sd.candlePatterns?.find((p) => p.direction !== 'neutral')?.name || 'Structure trigger';
+  // Drive label line (advisory): 2nd drive = higher quality; 1st drive = fakeout risk.
+  const drive = sd.drive;
+  const driveActive = drive && drive.label && drive.label !== 'NONE';
+  const driveText = driveActive
+    ? (drive.label === 'SECOND_DRIVE'
+        ? `Drive: 2nd drive${drive.basis ? ` (${drive.basis === 'FAILED_FIRST' ? 'after shakeout' : 'after retest'})` : ''} ✓`
+        : `Drive: 1st drive — fakeout risk, wait for the second`)
+    : '';
+  // Premium/discount location line (advisory): buy discount / sell premium.
+  const pd = sd.premiumDiscount;
+  const pdText = pd
+    ? `Zone: ${pd.zone} ${pd.pct}%${pd.fit === 'GOOD' ? ' ✓ (well-located)' : pd.fit === 'POOR' ? ' ⚠ (against location — buy discount / sell premium)' : ''}`
+    : '';
+  const pdColor = !pd ? '#475569' : pd.fit === 'GOOD' ? '#047857' : pd.fit === 'POOR' ? '#b45309' : '#475569';
   const money = (value) => value === null || value === undefined ? 'n/a' : `$${Number(value).toFixed(2)}`;
   const quality = sd.signalQuality || setupLabel(sd.grade);
   const sentAt = new Date();
@@ -7493,6 +7632,8 @@ async function sendForexAlert(result) {
     `Entry ${px(sd.entryPrice, result.symbol)}  SL ${px(sd.stopLoss, result.symbol)}  TP1 ${px(sd.takeProfit1, result.symbol)}  TP2 ${px(sd.takeProfit2, result.symbol)}  TP3 ${px(sd.takeProfit3, result.symbol)}`,
     `RR ${sd.riskRewardRatio ?? 'n/a'} | Entry trigger ${sd.entryTrigger || 'IMMEDIATE'} | ${sd.timingTip || ''}`,
     dat ? `DAT: Direction ${dat.direction.pass ? 'PASS' : 'FAIL'} (${dat.direction.reason}) | Area ${dat.area.pass ? 'PASS' : 'FAIL'} | Trigger ${dat.trigger.pass ? 'PASS' : 'FAIL'} (${pattern})` : '',
+    driveText,
+    pdText,
     sd.sessionContext ? `Session: ${sd.sessionContext.reason}` : '',
     risk ? '' : '',
     risk ? 'POSITION PLAN' : '',
@@ -7528,6 +7669,8 @@ async function sendForexAlert(result) {
         <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP1 / TP2 / TP3</td><td style="color:#047857">${px(sd.takeProfit1, result.symbol)} / ${px(sd.takeProfit2, result.symbol)} / ${px(sd.takeProfit3, result.symbol)}</td></tr>
       </table>
       ${dat ? `<p style="font-size:12px;color:#334155"><b>DAT</b>: Direction ${dat.direction.pass ? 'PASS' : 'FAIL'} · Area ${dat.area.pass ? 'PASS' : 'FAIL'} · Trigger ${dat.trigger.pass ? 'PASS' : 'FAIL'} (${pattern})</p>` : ''}
+      ${driveActive ? `<p style="font-size:12px;color:${drive.label === 'SECOND_DRIVE' ? '#047857' : '#b45309'}"><b>${drive.label === 'SECOND_DRIVE' ? '2nd drive ✓' : '1st drive — wait'}</b> · ${drive.note}</p>` : ''}
+      ${pd ? `<p style="font-size:12px;color:${pdColor}"><b>Zone: ${pd.zone} ${pd.pct}%</b>${pd.fit === 'GOOD' ? ' · well-located ✓' : pd.fit === 'POOR' ? ' · against location (buy discount / sell premium)' : ''}</p>` : ''}
       ${sd.sessionContext ? `<p style="font-size:12px;color:#475569">Session: ${sd.sessionContext.reason}</p>` : ''}
       ${risk ? `<div style="margin:10px 0;padding:10px;border:1px solid #fde68a;background:#fffbeb;border-radius:10px"><p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#92400e;text-transform:uppercase">Position Plan</p><p style="font-size:13px;margin:2px 0">Risk <b>${risk.riskPercent}%</b> · Amount to risk / max loss <b>${money(risk.amountToRisk ?? risk.riskAmount ?? risk.maxLoss)}</b></p><p style="font-size:13px;margin:2px 0">Suggested lot <b>${risk.suggestedLotSize ?? 'n/a'}</b> · Approx margin/investment <b>${money(risk.marginRequired ?? risk.amountToInvestApprox)}</b> · Multiplier <b>${risk.multiplier || `${risk.leverage || 'n/a'}x`}</b></p><p style="font-size:13px;margin:2px 0">SL loss <b style="color:#b91c1c">-${money(risk.lossAtStop ?? risk.maxLoss)}</b> · Stop ${risk.stopPips ?? 'n/a'} pips</p><p style="font-size:13px;margin:6px 0 0;color:#047857">TP1 ${money(risk.profitAtTp1)} · TP2 ${money(risk.profitAtTp2)} · TP3 ${money(risk.profitAtTp3)}</p></div>` : ''}
       <p style="font-size:12px;color:#475569;margin:8px 0">${sd.timingTip || ''}</p>
@@ -7645,6 +7788,12 @@ async function sendFttAlert(prediction) {
   const riskWarnings = prediction.indicators?.riskWarnings || [];
   const patterns = prediction.indicators?.detectedPatterns || [];
   const volatilityState = prediction.indicators?.volatilityState || 'UNKNOWN';
+  // Premium/discount location (advisory): buy discount / sell premium.
+  const fttPd = prediction.indicators?.premiumDiscount || null;
+  const fttPdText = fttPd
+    ? `Zone: ${fttPd.zone} ${fttPd.pct}%${fttPd.fit === 'GOOD' ? ' ✓ (well-located)' : fttPd.fit === 'POOR' ? ' ⚠ (against location — buy discount / sell premium)' : ''}`
+    : '';
+  const fttPdColor = !fttPd ? '#334155' : fttPd.fit === 'GOOD' ? '#047857' : fttPd.fit === 'POOR' ? '#b45309' : '#334155';
   const text = [
     `AURA GOLD - FIXED TIME TRADE (${prediction.expiry})`,
     timingMeta.text,
@@ -7660,6 +7809,7 @@ async function sendFttAlert(prediction) {
     underlyingGrade ? `Underlying setup grade: ${underlyingGrade}` : '',
     patterns.length ? `Patterns: ${patterns.join(', ')}` : '',
     `Volatility: ${volatilityState}`,
+    fttPdText,
     qualityReasons.length ? `Quality reasons: ${qualityReasons.join('; ')}` : '',
     riskWarnings.length ? `Risk warnings: ${riskWarnings.join('; ')}` : '',
     tip ? `Timing: ${tip}` : '',
@@ -7677,6 +7827,7 @@ async function sendFttAlert(prediction) {
       ${underlyingGrade ? `<p style="margin:0 0 8px;font-size:12px;color:#64748b">Underlying system setup: ${underlyingGrade}</p>` : ''}
       ${patterns.length ? `<p style="font-size:12px;color:#334155"><b>Patterns</b>: ${patterns.join(', ')}</p>` : ''}
       <p style="font-size:12px;color:#334155"><b>Volatility</b>: ${volatilityState}</p>
+      ${fttPd ? `<p style="font-size:12px;color:${fttPdColor}"><b>Zone: ${fttPd.zone} ${fttPd.pct}%</b>${fttPd.fit === 'GOOD' ? ' · well-located ✓' : fttPd.fit === 'POOR' ? ' · against location (buy discount / sell premium)' : ''}</p>` : ''}
       ${qualityReasons.length ? `<p style="font-size:12px;color:#047857"><b>Why quality</b>: ${qualityReasons.join('; ')}</p>` : ''}
       ${riskWarnings.length ? `<p style="font-size:12px;color:#b45309"><b>Warnings</b>: ${riskWarnings.join('; ')}</p>` : ''}
       <p style="font-size:13px">Entry <b>${px(prediction.entryPrice, sym)}</b> · enter ${new Date(prediction.entryTime).toLocaleString()} · expires ${new Date(prediction.expiryTime).toLocaleString()} · source ${prediction.source || 'system'}</p>
@@ -8313,6 +8464,9 @@ async function reforecastActiveForecasts() {
         await persistExecutionForecast(fresh, transition);
         await sendForecastReadyEmail(pool, fresh.id, symbol, tf, sd);
         if (pool) await resolveForecastRow(pool, fresh.id, 'EXECUTED', nowMs, fresh.setupScore);
+        // Open the trade-outcome ledger for this execution: capture the full TP
+        // ladder so processForecastTradeOutcomes can later settle WIN/LOSS.
+        if (pool) await initForecastTrade(pool, fresh.id, sd);
         emitForecast(fresh, { ...transition, status: 'EXECUTED' });
         lastForecastByKey.delete(key);
       } else if (transition.status === 'EXPIRED') {
@@ -8795,6 +8949,15 @@ function normalizeForecastRow(row) {
     entryPrice: num(row.entry_price),
     stopLoss: num(row.stop_loss),
     takeProfit1: num(row.take_profit_1),
+    takeProfit2: num(row.take_profit_2),
+    takeProfit3: num(row.take_profit_3),
+    tradeOutcome: row.trade_outcome || null,
+    tradeExitPrice: num(row.trade_exit_price),
+    tradePips: num(row.trade_pips),
+    tradeTpHitLevel: row.trade_tp_hit_level === null || row.trade_tp_hit_level === undefined ? null : Number(row.trade_tp_hit_level),
+    tradeMfePips: num(row.trade_mfe_pips),
+    tradeMaePips: num(row.trade_mae_pips),
+    tradeResolvedAt: row.trade_resolved_at ? new Date(row.trade_resolved_at).toISOString() : null,
     actualExecutionTime: row.actual_execution_time ? new Date(row.actual_execution_time).toISOString() : null,
     forecastAccuracy: num(row.forecast_accuracy),
     timingAccuracy: num(row.timing_accuracy),
@@ -8994,6 +9157,345 @@ app.get('/api/reports/forecast-replay', async (req, res) => {
     const bars = Math.max(200, Math.min(Number(req.query.bars) || 1500, 5000));
     const candles = getRecentCandles(symbol, timeframe, bars);
     res.json(runForecastReplay({ symbol, timeframe, candles }));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/reports/forecast-outcomes — WIN/LOSS track record of EXECUTED forecasts,
+// settled by candle replay (TP/SL touch). The honest counterpart to the timing
+// calibration: a forecast that said "ready" only counts as a win if the trade it
+// implied actually reached target before stop.
+app.get('/api/reports/forecast-outcomes', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+    const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
+    const outcome = req.query.outcome ? String(req.query.outcome).toUpperCase() : null;
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 300, 1000));
+    let sql = "SELECT * FROM mt5_execution_forecasts WHERE status='EXECUTED' AND trade_outcome IS NOT NULL";
+    const params = [];
+    if (symbol) { sql += ' AND symbol = ?'; params.push(symbol); }
+    if (outcome) { sql += ' AND trade_outcome = ?'; params.push(outcome); }
+    if (days && Number(days) > 0) { sql += ' AND actual_execution_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)'; params.push(Number(days)); }
+    sql += ' ORDER BY actual_execution_time DESC LIMIT ?';
+    params.push(limit);
+    const [rows] = await pool.query(sql, params);
+    const trades = rows.map(normalizeForecastRow);
+    res.json({
+      trades,
+      summary: summarizeForecastTradeOutcomes(trades),
+      retentionDays: FORECAST_RETENTION_DAYS,
+      note: 'Settled from real candle replay (TP/SL touch). Conservative: if a bar hits both stop and target, it counts AMBIGUOUS, not a win. Track record only — past performance is not a guarantee. Resolved trades are pruned after the retention window.',
+      filters: { symbol, outcome, days, limit },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Day-trading discipline layer ────────────────────────────────────────────
+// Encodes four rules from the trading playbook as an ADVISORY layer on top of the
+// existing signals (no change to the live signal logic — heeds quality-not-quantity):
+//   1) Think in R-multiples (risk units), not pips/dollars.
+//   2) Daily risk budget — stop after the day's net R hits the limit ("two strikes").
+//   3) Over-extension guard — don't chase price stretched far from the EMA.
+//   4) Pre-session brief — one screen: bias, levels, extension, news, active forecast.
+const DAY_TRADING_DAILY_STOP_R = Math.max(1, Number(process.env.DAY_TRADING_DAILY_STOP_R || 2));
+const DAY_TRADING_BRIEF_TF = (process.env.DAY_TRADING_BRIEF_TF || 'M15').toUpperCase();
+const DAY_TRADING_EXTENSION_ATR = Math.max(0.5, Number(process.env.DAY_TRADING_EXTENSION_ATR || 2));
+
+// Risk in pips between entry and stop — the denominator for R-multiples.
+function riskPipsFor(symbol, entry, sl) {
+  const pip = pipSizeForSymbol(symbol);
+  if (!pip || !Number.isFinite(Number(entry)) || !Number.isFinite(Number(sl))) return null;
+  const r = Math.abs(Number(entry) - Number(sl)) / pip;
+  return r > 0 ? r : null;
+}
+// R-multiple of a realized move: profit pips ÷ initial risk pips. Honest null when
+// risk is unknown (can't fake an R without a real stop distance).
+function rMultiple(symbol, entry, sl, pips) {
+  const rp = riskPipsFor(symbol, entry, sl);
+  if (rp === null || !Number.isFinite(Number(pips))) return null;
+  return Math.round((Number(pips) / rp) * 100) / 100;
+}
+function startOfUtcDay(d = new Date()) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+}
+
+// Today's net R from the system signal log (settled WIN/LOSS only). Advisory: it
+// reflects the day's LOGGED signals, not your actual fills — but it's the honest
+// proxy for "how is the strategy doing today, and should I stop?".
+async function computeDailyRiskBudget(pool) {
+  const dailyStopR = DAY_TRADING_DAILY_STOP_R;
+  if (!pool) return { available: false, dailyStopR, note: 'Database unavailable.' };
+  try {
+    const [rows] = await pool.query(
+      `SELECT symbol, entry_price, stop_loss, profit_loss_pips, outcome
+         FROM mt5_system_signal_log
+        WHERE signal_time >= ? ORDER BY signal_time ASC`,
+      [toMysqlDate(startOfUtcDay())],
+    );
+    let settledR = 0, wins = 0, losses = 0, openCount = 0, rCount = 0;
+    for (const r of rows) {
+      const o = String(r.outcome || 'PENDING').toUpperCase();
+      const settled = o.endsWith('_WIN') || o === 'WIN' || o === 'LOSS';
+      if (!settled) { openCount += 1; continue; }
+      if (o === 'LOSS') losses += 1; else wins += 1;
+      const rm = rMultiple(r.symbol, r.entry_price, r.stop_loss, r.profit_loss_pips);
+      if (rm !== null) { settledR += rm; rCount += 1; }
+    }
+    settledR = Math.round(settledR * 100) / 100;
+    const limitHit = settledR <= -dailyStopR;
+    return {
+      available: true,
+      dateUtc: startOfUtcDay().toISOString().slice(0, 10),
+      settledR,
+      wins,
+      losses,
+      openCount,
+      rCount,
+      dailyStopR,
+      remainingR: Math.round((dailyStopR + Math.min(0, settledR)) * 100) / 100,
+      limitHit,
+      note: limitHit
+        ? `Daily stop hit (${settledR}R ≤ -${dailyStopR}R). The playbook says STOP for today — protect capital.`
+        : `Net ${settledR >= 0 ? '+' : ''}${settledR}R today across logged signals. Daily stop at -${dailyStopR}R.`,
+    };
+  } catch (e) {
+    return { available: false, dailyStopR, note: e.message };
+  }
+}
+
+// GET /api/day-trading/brief — the pre-session brief. Per curated symbol on one
+// timeframe: bias, regime, grade/score, EMA-extension (over-extension guard),
+// nearest S/R, ADR usage, and any active execution forecast — plus today's news
+// and the daily R budget. Read-only; runs aggregateSignals on fresh candles.
+app.get('/api/day-trading/brief', async (req, res) => {
+  try {
+    const tf = (req.query.timeframe ? String(req.query.timeframe) : DAY_TRADING_BRIEF_TF).toUpperCase();
+    const nowMs = Date.now();
+    const pool = await initializeDatabase();
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    const out = [];
+    const newsMap = new Map();
+    for (const symbol of symbols) {
+      try {
+        const candleList = getRecentCandles(symbol, tf, 200);
+        if (!candleList || candleList.length < 20) continue;
+        const { adr, dailyHighLow } = computeAdrDaily(symbol);
+        const summary = aggregateSignals({
+          symbol, timeframe: tf, candles: candleList,
+          indicators: getRecentIndicators(symbol, tf, 500),
+          marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
+          h4Candles: getRecentCandles(symbol, 'H4', 150), h1Candles: getRecentCandles(symbol, 'H1', 150),
+        });
+        const sd = summary.systemDecision;
+        const extAtr = sd?.features?.emaDistanceAtr ?? null;
+        const extended = extAtr !== null && Math.abs(extAtr) >= DAY_TRADING_EXTENSION_ATR;
+        const price = Number(sd?.latestCandle?.close ?? candleList[candleList.length - 1].close);
+        const sr = sd?.supportResistance || { support: [], resistance: [] };
+        const nearestSupport = (sr.support || []).map((s) => Number(s.level)).filter((v) => Number.isFinite(v) && v <= price).sort((a, b) => b - a)[0] ?? null;
+        const nearestResistance = (sr.resistance || []).map((s) => Number(s.level)).filter((v) => Number.isFinite(v) && v >= price).sort((a, b) => a - b)[0] ?? null;
+        const rr = sd?.riskPlan?.riskRewardRatio ?? sd?.riskRewardRatio ?? null;
+        const fc = lastForecastByKey.get(`${symbol}|${tf}`) || null;
+        out.push({
+          symbol, timeframe: tf,
+          decision: sd?.decision || 'HOLD',
+          grade: sd?.grade || null,
+          score: Number.isFinite(sd?.confidence) ? Math.round(sd.confidence) : null,
+          regime: sd?.regime || null,
+          htfBias: sd?.htfBias || null,
+          emaDistanceAtr: extAtr,
+          extended,
+          adrUsagePercent: sd?.adrUsagePercent ?? null,
+          riskRewardRatio: rr,
+          entryTiming: sd?.entryTimingInstruction || null,
+          nearestSupport, nearestResistance, price,
+          newsRisk: sd?.newsRisk?.block ? 'block' : sd?.newsRisk?.caution ? 'caution' : null,
+          forecast: fc && Number.isFinite(fc.expectedExecutionMs)
+            ? { eta: new Date(fc.expectedExecutionMs).toISOString(), basis: fc.forecastBasis, status: fc.status || null }
+            : null,
+        });
+        for (const e of (getUpcomingForSymbol(symbol, nowMs, 24) || [])) {
+          if (String(e.impact).toUpperCase() !== 'HIGH') continue;
+          const key = `${e.currency}|${e.title}|${e.timestampUtc}`;
+          if (!newsMap.has(key)) newsMap.set(key, { currency: e.currency, title: e.title, impact: e.impact, timeIso: e.timeIso || new Date(e.timestampUtc).toISOString(), timestampUtc: e.timestampUtc });
+        }
+      } catch { /* per-symbol resilience */ }
+    }
+    // Sort: actionable first (committed BUY/SELL, higher score), then the rest.
+    out.sort((a, b) => {
+      const av = (a.decision !== 'HOLD' ? 1000 : 0) + (a.score || 0);
+      const bv = (b.decision !== 'HOLD' ? 1000 : 0) + (b.score || 0);
+      return bv - av;
+    });
+    const news = [...newsMap.values()].sort((a, b) => a.timestampUtc - b.timestampUtc).slice(0, 12);
+    const dailyRisk = await computeDailyRiskBudget(pool);
+    res.json({
+      generatedAt: new Date(nowMs).toISOString(),
+      timeframe: tf,
+      extensionAtrThreshold: DAY_TRADING_EXTENSION_ATR,
+      symbols: out,
+      news,
+      dailyRisk,
+      note: 'Advisory pre-session brief. Extension = signed ATR distance from EMA; |value| ≥ threshold means price is stretched (don\'t chase). Daily R is from logged signals, not your fills. Not financial advice.',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ─── Day Trading Desk (market-structure read) ────────────────────────────────
+// Surfaces what the engine already computes, framed as the "Master Market
+// Structure" course teaches: trend phase, close-confirmed BOS, liquidity sweep
+// (wick-through vs close), demand/supply zone (order block) + imbalance (FVG),
+// HTF bias, the armed setup, extension guard, and the entry/SL/target plan.
+// Read-only; reuses the live detectors (no change to signal logic).
+function buildStructureDesk(symbol, tf) {
+  const candles = getRecentCandles(symbol, tf, 250);
+  if (!candles || candles.length < 30) return null;
+  const { adr, dailyHighLow } = computeAdrDaily(symbol);
+  let sd;
+  try {
+    sd = aggregateSignals({
+      symbol, timeframe: tf, candles,
+      indicators: getRecentIndicators(symbol, tf, 500),
+      marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
+      h4Candles: getRecentCandles(symbol, 'H4', 150), h1Candles: getRecentCandles(symbol, 'H1', 150),
+    }).systemDecision;
+  } catch { return null; }
+  const struct = detectMarketStructure(candles);
+  const sweep = detectLiquiditySweeps(candles);
+  const obs = detectOrderBlocks(candles);
+  const fvgs = detectFVGs(candles);
+  const price = Number(candles[candles.length - 1].close);
+  const tfTrend = getTimeframeTrend(candles);
+  const ranging = sd?.regime === 'ranging';
+  const phase = ranging ? 'CONSOLIDATION'
+    : tfTrend === 'BULLISH' ? 'UPTREND'
+    : tfTrend === 'BEARISH' ? 'DOWNTREND' : 'SIDEWAYS';
+
+  // Directional bias for zone selection: committed decision > HTF bias > TF trend.
+  const dec = String(sd?.decision || 'HOLD').toUpperCase();
+  const dir = dec.includes('BUY') ? 'BULLISH'
+    : dec.includes('SELL') ? 'BEARISH'
+    : sd?.htfBias === 'BULLISH' ? 'BULLISH'
+    : sd?.htfBias === 'BEARISH' ? 'BEARISH'
+    : tfTrend === 'BULLISH' ? 'BULLISH' : tfTrend === 'BEARISH' ? 'BEARISH' : null;
+
+  // Most recent order block in the trend direction = the demand/supply zone.
+  const wantOb = dir === 'BULLISH' ? 'BULLISH' : dir === 'BEARISH' ? 'BEARISH' : null;
+  const zoneOb = wantOb ? [...obs].reverse().find((o) => o.type === wantOb) : null;
+  let zone = null;
+  if (zoneOb) {
+    const low = Math.min(Number(zoneOb.top), Number(zoneOb.bottom));
+    const high = Math.max(Number(zoneOb.top), Number(zoneOb.bottom));
+    // Imbalance = an unfilled FVG of the same direction overlapping the zone.
+    const imbalance = fvgs.some((f) => f.type === wantOb && Number(f.bottom) <= high && Number(f.top) >= low);
+    zone = { kind: wantOb === 'BULLISH' ? 'DEMAND' : 'SUPPLY', low, high, imbalance };
+  }
+
+  const bos = struct.bosBullish ? { dir: 'bullish', level: struct.lastSwingHigh }
+    : struct.bosBearish ? { dir: 'bearish', level: struct.lastSwingLow } : null;
+  const sweepDir = sweep.sweepBullish ? 'bullish' : sweep.sweepBearish ? 'bearish' : null;
+
+  // Liquidity-pool targeting + breaker (the edge both podcast traders converge on).
+  const pools = detectLiquidityPools(candles);
+  const breaker = detectBreaker(candles);
+  const liquidityPlan = buildLiquidityPlan(breaker, pools);
+
+  // Drive label (advisory only — does NOT gate the signal): first drive (fakeout
+  // risk) vs second drive (after a failed first / retest = higher quality).
+  const drive = dir ? classifyDrive(candles, dir) : { label: 'NONE', basis: null, note: 'No directional bias' };
+
+  // Premium / discount: where price sits in the recent dealing range (50% = equilibrium).
+  // Buy discount, sell premium. Uses the last ~60 bars' high/low so price is always
+  // inside the range (pct stays 0–100), unlike raw last-swing levels.
+  let premiumDiscount = null;
+  const pdWindow = candles.slice(-60);
+  if (pdWindow.length >= 10) {
+    const rangeHigh = Math.max(...pdWindow.map((c) => Number(c.high)).filter(Number.isFinite));
+    const rangeLow = Math.min(...pdWindow.map((c) => Number(c.low)).filter(Number.isFinite));
+    if (Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) && rangeHigh > rangeLow) {
+      const pct = Math.max(0, Math.min(100, Math.round(((price - rangeLow) / (rangeHigh - rangeLow)) * 100)));
+      premiumDiscount = {
+        pct,
+        zone: pct > 55 ? 'PREMIUM' : pct < 45 ? 'DISCOUNT' : 'EQUILIBRIUM',
+        rangeHigh: Math.round(rangeHigh * 1e5) / 1e5,
+        rangeLow: Math.round(rangeLow * 1e5) / 1e5,
+        equilibrium: Math.round(((rangeHigh + rangeLow) / 2) * 1e5) / 1e5,
+      };
+    }
+  }
+
+  // Setup classification (course setups): pullback / breakout / shakeout.
+  let setup = null;
+  const trig = sd?.entryTrigger;
+  if (trig === 'LIMIT_PULLBACK') setup = 'Pullback to zone';
+  else if (trig === 'BREAKOUT_CONFIRMATION') setup = 'Breakout';
+  if ((dir === 'BULLISH' && sweep.sweepBullish) || (dir === 'BEARISH' && sweep.sweepBearish)) {
+    setup = `Shakeout (failed ${dir === 'BULLISH' ? 'breakdown' : 'breakout'})`;
+  }
+  const armed = Boolean(dec !== 'HOLD');
+
+  const extAtr = sd?.features?.emaDistanceAtr ?? null;
+  const extended = extAtr !== null && Math.abs(extAtr) >= DAY_TRADING_EXTENSION_ATR;
+
+  const entry = Number.isFinite(sd?.entryPrice) ? sd.entryPrice : null;
+  const sl = Number.isFinite(sd?.stopLoss) ? sd.stopLoss : null;
+  const tp = Number.isFinite(sd?.takeProfit1) ? sd.takeProfit1 : null;
+  const rr = sd?.riskPlan?.riskRewardRatio ?? sd?.riskRewardRatio ?? null;
+
+  return {
+    symbol, timeframe: tf, price,
+    phase, htfBias: sd?.htfBias || null, regime: sd?.regime || null,
+    decision: dec, grade: sd?.grade || null,
+    score: Number.isFinite(sd?.confidence) ? Math.round(sd.confidence) : null,
+    bos, sweep: sweepDir, zone,
+    setup, armed,
+    premiumDiscount,
+    emaDistanceAtr: extAtr, extended,
+    entryTiming: sd?.entryTimingInstruction || null,
+    plan: (entry !== null && sl !== null) ? { entry, sl, tp, rr } : null,
+    // Liquidity layer: resting pools, draw-on-liquidity targets, last sweep, breaker, and
+    // the liquidity-targeted plan (breaker entry/stop → opposing liquidity pool).
+    liquidity: {
+      targetAbove: pools.targetAbove, targetBelow: pools.targetBelow, recentSweep: pools.recentSweep,
+      buySide: pools.buySide, sellSide: pools.sellSide,
+    },
+    breaker,
+    liquidityPlan,
+    drive,
+    rejectionReasons: Array.isArray(sd?.rejectionReasons) ? sd.rejectionReasons.slice(0, 3) : [],
+  };
+}
+
+// GET /api/day-trading/desk?symbol=&timeframe= — full structure read for one symbol
+// plus a compact watchlist of all curated symbols on the same timeframe.
+app.get('/api/day-trading/desk', async (req, res) => {
+  try {
+    const tf = (req.query.timeframe ? String(req.query.timeframe) : 'M5').toUpperCase();
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    const want = req.query.symbol ? String(req.query.symbol).toUpperCase() : (symbols[0] || 'XAUUSDM');
+    const desks = [];
+    for (const s of symbols) {
+      const d = buildStructureDesk(s, tf);
+      if (d) desks.push(d);
+    }
+    // Ensure the requested symbol is present even if not in the curated set.
+    let primary = desks.find((d) => d.symbol === want) || null;
+    if (!primary) { primary = buildStructureDesk(want, tf); if (primary) desks.unshift(primary); }
+    res.json({
+      generatedAt: new Date().toISOString(),
+      timeframe: tf,
+      extensionAtrThreshold: DAY_TRADING_EXTENSION_ATR,
+      primarySymbol: primary ? primary.symbol : want,
+      desks,
+      note: 'Structure read per the Master Market Structure method. BOS is close-confirmed (not wicks); sweep = wick-through that closed back inside. Zones are order blocks; imbalance = unfilled FVG. Pro-trend only. Advisory — not financial advice.',
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -9521,6 +10023,11 @@ async function processAllRemindersAndSavedProjections() {
     await processSystemSignalLog();
   } catch (err) {
     console.error('[Scheduler] Error in processSystemSignalLog:', err.message);
+  }
+  try {
+    await processForecastTradeOutcomes();
+  } catch (err) {
+    console.error('[Scheduler] Error in processForecastTradeOutcomes:', err.message);
   }
   try {
     await pruneOldAccountSnapshots();

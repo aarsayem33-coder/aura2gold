@@ -690,6 +690,7 @@ export function generateFttPrediction({
       remainingSeconds,
       grade: aggregate.systemDecision?.grade,
       confluences: activeConfluences,
+      premiumDiscount: aggregate.systemDecision?.premiumDiscount || null,
       buyScore: aggregate.systemDecision?.buyScore,
       sellScore: aggregate.systemDecision?.sellScore,
       noiseFilterActive,

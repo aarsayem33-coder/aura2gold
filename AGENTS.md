@@ -142,6 +142,16 @@ drift** from the live scanner. Five phases, all shipped:
   **Until then the UI/email label it an "uncalibrated estimate" — never a guarantee** (see the
   Reality-check rule; same honesty stance as the projection track-record).
 
+- **Trade track record (WIN/LOSS)**: separate from the timing calibration above — once a forecast
+  becomes EXECUTED (READY), `initForecastTrade` captures the full TP ladder and
+  `processForecastTradeOutcomes()` (60s/30s reminder scheduler) **settles WIN/LOSS by replaying the
+  entry/SL/TP against real candles** via the same `evaluateForexReplay` used by the system signal log
+  (`trade_outcome` = TP1/2/3_WIN / LOSS / AMBIGUOUS / EXPIRED, plus `trade_pips` / `trade_mfe_pips` /
+  `trade_mae_pips`). Same-bar stop+target = **AMBIGUOUS** (not a win), 72h settle gate. Surfaced via
+  `GET /api/reports/forecast-outcomes` and the **Trade track record** panel on Reports → Forecasts
+  (win rate, W/L, net pips, by-basis + settled-trades table). Honest: a forecast that said "ready" is
+  only a win if the trade actually reached target before stop; settled rows are pruned with the row at
+  `FORECAST_RETENTION_DAYS`, so the track-record window is ~14d.
 - **News-aware (timing only, never a pre-release direction guess)**: when a high-impact event for the
   symbol's currency is within the **pre-window (15m)**, the forecast ETA anchors to the event time
   (`NEWS` basis) and the row is flagged `newsImminent` (blackout: generic reminders suppressed). After
@@ -153,15 +163,53 @@ drift** from the live scanner. Five phases, all shipped:
 
 Tables/endpoints: table `mt5_execution_forecasts` (compact, retention-pruned — heeds Trap #6 bloat).
 `GET /api/forecasts`, `POST /api/forecasts/:id/analyze`, `GET /api/reports/forecast-calibration`,
-`GET /api/reports/forecast-replay?symbol&timeframe&bars`. UI: "Upcoming Executions" table on the
+`GET /api/reports/forecast-replay?symbol&timeframe&bars`, `GET /api/reports/forecast-outcomes?days&symbol&outcome`.
+UI: "Upcoming Executions" table on the
 Future Predictions page + the **Reports → Forecasts** sub-route. Forecasts are **forex-only** (no FTT
 variant). Env: `FORECAST_ENABLED`, `FORECAST_SCAN_INTERVAL_MS` (1h), `FORECAST_RETENTION_DAYS` (14),
 `FORECAST_REFORECAST_WINDOW_MS` (20m), `FORECAST_EMAIL_MIN_SCORE` (75), `FORECAST_CALIBRATION_MIN_SAMPLE` (20),
 `NEWS_PRE_WINDOW_MIN` (15), `NEWS_POST_WINDOW_MIN` (10), `NEWS_REACTION_MIN_BODY` (0.5), `NEWS_REACTION_TF` (M5).
 
-> **Migration note:** Phase-5 columns (`original_execution_time`, `original_score`, `calibrated`) are
-> added on boot via `addColumnIfMissing`. If the DB is in the read-only/over-quota state (Trap #6),
-> the `ALTER`s are skipped — clear the quota, then restart so the columns get added.
+**Day-trading discipline layer (advisory, additive — does NOT change live signal logic):** encodes four
+playbook rules on top of existing signals. (1) **R-multiples** — `rMultiple()`/`riskPipsFor()` (risk =
+\|entry−SL\|); surfaced as expectancy/net R in the forecast track record. (2) **Daily risk budget** —
+`computeDailyRiskBudget()` sums today's settled R from `mt5_system_signal_log` (UTC day) vs
+`DAY_TRADING_DAILY_STOP_R` (default 2) → "stop for today" when hit. (3) **Over-extension guard** — reuses
+`systemDecision.features.emaDistanceAtr` (signed ATR distance from EMA); flagged when \|value\| ≥
+`DAY_TRADING_EXTENSION_ATR` (default 2) → "don't chase". (4) **Pre-session brief** — `GET /api/day-trading/brief`
+runs `aggregateSignals` per curated symbol on one TF (`DAY_TRADING_BRIEF_TF`, default M15): bias/regime/grade/
+score, extension flag, nearest S/R, ADR%, R:R, active forecast, plus today's high-impact news + daily R budget.
+UI: **Pre-Session Brief** page (`/day-trading`, `frontend/pages/DayTradingBrief.tsx`). Read-only; respects
+quality-not-quantity (never blocks/suppresses a signal — purely informational).
+
+**Day Trading Desk (market-structure read, `/day-trading-desk`):** `GET /api/day-trading/desk?symbol=&timeframe=`
+(`buildStructureDesk`) surfaces what the engine already computes, framed per the *Master Market Structure*
+course: trend phase, **close-confirmed BOS** (`detectMarketStructure`), **liquidity sweep** (wick-through +
+close back inside, `detectLiquiditySweeps`), **demand/supply zone** (order block) + **imbalance** (FVG),
+HTF bias, armed **setup** (pullback/breakout/shakeout), **extension** (`emaDistanceAtr`), and entry/SL/TP plan;
+plus a curated watchlist. Reuses the live detectors (now also exported from `signalEngine.js`) — **no change to
+signal logic**. UI: `frontend/pages/DayTradingDesk.tsx`.
+
+**Liquidity layer (`backend/liquidityEngine.js`, pure + unit-tested):** the edge both podcast traders (Marco
+"liquidity trap", Maine "ICT blueprint") converge on. `detectLiquidityPools` finds resting liquidity at swing
+highs (BSL) / lows (SSL), clusters equal highs/lows (×N stacked = stronger), flags **swept**, and exposes the
+nearest unswept **draw-on-liquidity target** above/below + the most recent sweep. `detectBreaker` finds the
+freshest bullish/bearish **breaker** (swing low swept → close back above prior swing high; mirror for bearish)
+→ entry zone + stop below the sweep. `buildLiquidityPlan` combines them: breaker entry/stop → opposing
+liquidity pool as target (+ honest RR). Each breaker carries a **displacement** confirmation
+(`detectDisplacement`): a strong-bodied in-direction FVG at the reclaim (≥0.8×ATR present, ≥1.3× strong) =
+"institutionally sponsored"; absent = weak break (flagged amber in UI). The Desk also shows **premium/discount**
+(price's position in the last ~60-bar dealing range, clamped 0–100; buy discount / sell premium). Surfaced on
+the Desk (`liquidity`, `breaker.displacement`, `liquidityPlan.displacement`, `premiumDiscount`). Tests:
+`backend/liquidityEngine.test.mjs` (18/18). Verified live on real candles. The system already implements this SMC course's method
+(BOS/sweep/supply-demand/imbalance); the literal 9EMA/20SMA/200SMA "Tutorial Mode" from `day_trading_plan.md`
+was deliberately NOT built (duplicate trend logic, no edge; gap-bias is a stock concept, irrelevant for 24/5 gold).
+
+> **Migration note:** Phase-5 columns (`original_execution_time`, `original_score`, `calibrated`) and the
+> trade-outcome columns (`take_profit_2/3`, `trade_outcome`, `trade_exit_price`, `trade_pips`,
+> `trade_tp_hit_level`, `trade_mfe_pips`, `trade_mae_pips`, `trade_resolved_at`) are added on boot via
+> `addColumnIfMissing`. If the DB is in the read-only/over-quota state (Trap #6), the `ALTER`s are
+> skipped — clear the quota, then restart so the columns get added.
 
 ---
 

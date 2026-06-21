@@ -50,6 +50,9 @@ import type {
   ForecastAnalysis,
   ForecastCalibrationResponse,
   ForecastReplayResponse,
+  ForecastOutcomeResponse,
+  DayTradingBriefResponse,
+  StructureDeskResponse,
 } from './types';
 import { playAlertSound, showBrowserNotification } from './utils/notifications';
 
@@ -351,6 +354,22 @@ export async function fetchForecastCalibration(days = 90): Promise<ForecastCalib
 
 export async function fetchForecastReplay(symbol: string, timeframe: string, bars = 1500): Promise<ForecastReplayResponse> {
   return fetchJson<ForecastReplayResponse>(`/api/reports/forecast-replay?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&bars=${bars}`);
+}
+
+export async function fetchForecastOutcomes(days = 30, symbol?: string): Promise<ForecastOutcomeResponse> {
+  const sym = symbol ? `&symbol=${encodeURIComponent(symbol)}` : '';
+  return fetchJson<ForecastOutcomeResponse>(`/api/reports/forecast-outcomes?days=${days}${sym}`);
+}
+
+export async function fetchDayTradingBrief(timeframe?: string): Promise<DayTradingBriefResponse> {
+  const tf = timeframe ? `?timeframe=${encodeURIComponent(timeframe)}` : '';
+  return fetchJson<DayTradingBriefResponse>(`/api/day-trading/brief${tf}`);
+}
+
+export async function fetchStructureDesk(symbol?: string, timeframe = 'M5'): Promise<StructureDeskResponse> {
+  const params = new URLSearchParams({ timeframe });
+  if (symbol) params.set('symbol', symbol);
+  return fetchJson<StructureDeskResponse>(`/api/day-trading/desk?${params.toString()}`);
 }
 
 export async function analyzeForecast(id: string): Promise<ForecastAnalysis> {

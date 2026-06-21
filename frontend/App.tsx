@@ -9,6 +9,8 @@ import EconomicCalendar from './pages/EconomicCalendar.tsx';
 import HighImpactNews from './pages/HighImpactNews.tsx';
 import TradeTheNews from './pages/TradeTheNews.tsx';
 import FuturePredictions from './pages/FuturePredictions.tsx';
+import DayTradingBrief from './pages/DayTradingBrief.tsx';
+import DayTradingDesk from './pages/DayTradingDesk.tsx';
 import Projections from './pages/Projections.tsx';
 import AIAnalysis from './pages/AIAnalysis.tsx';
 import TradeJournal from './pages/TradeJournal.tsx';
@@ -82,6 +84,8 @@ export default function App() {
           <Route path="projections" element={<Projections />} />
           <Route path="calendar" element={<EconomicCalendar />} />
           <Route path="news-high-impact" element={<HighImpactNews />} />
+          <Route path="day-trading" element={<DayTradingBrief />} />
+          <Route path="day-trading-desk" element={<DayTradingDesk />} />
           <Route path="trade-news" element={<TradeTheNews />} />
           <Route path="analysis" element={<AIAnalysis />} />
           <Route path="journal" element={<TradeJournal />} />

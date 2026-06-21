@@ -164,6 +164,7 @@ export interface AiDecision {
     netConviction?: number | null;
     regime?: string | null;
     htfBias?: string | null;
+    premiumDiscount?: { pct: number; zone: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM'; fit: 'GOOD' | 'POOR' | 'NEUTRAL'; rangeHigh: number; rangeLow: number; equilibrium: number } | null;
     rejectionReasons?: string[] | null;
     newsRisk?: {
       block: boolean;
@@ -445,6 +446,7 @@ export interface ScanResult {
     netConviction?: number | null;
     regime?: string | null;
     htfBias?: string | null;
+    premiumDiscount?: { pct: number; zone: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM'; fit: 'GOOD' | 'POOR' | 'NEUTRAL'; rangeHigh: number; rangeLow: number; equilibrium: number } | null;
     rejectionReasons?: string[] | null;
     newsRisk?: {
       block: boolean;
@@ -568,6 +570,8 @@ export interface FttHistoryResponse {
 export type ForecastStatus = 'FORECASTED' | 'DELAYED' | 'CANCELLED' | 'READY' | 'EXECUTED' | 'EXPIRED';
 export type ForecastBasis = 'IMMEDIATE' | 'NEXT_CANDLE' | 'NEWS' | 'PULLBACK' | 'SCORE_SLOPE' | 'SESSION' | 'UNKNOWN';
 
+export type TradeOutcome = 'PENDING' | 'TP1_WIN' | 'TP2_WIN' | 'TP3_WIN' | 'WIN' | 'LOSS' | 'AMBIGUOUS' | 'EXPIRED';
+
 export interface ExecutionForecast {
   id: string;
   symbol: string;
@@ -597,11 +601,21 @@ export interface ExecutionForecast {
   entryPrice: number | null;
   stopLoss: number | null;
   takeProfit1: number | null;
+  takeProfit2?: number | null;
+  takeProfit3?: number | null;
   actualExecutionTime?: string | null;
   forecastAccuracy?: number | null;
   timingAccuracy?: number | null;
   scoreAccuracy?: number | null;
   resolvedAt?: string | null;
+  // Trade outcome (win/loss) for EXECUTED forecasts — settled by candle replay.
+  tradeOutcome?: TradeOutcome | null;
+  tradeExitPrice?: number | null;
+  tradePips?: number | null;
+  tradeTpHitLevel?: number | null;
+  tradeMfePips?: number | null;
+  tradeMaePips?: number | null;
+  tradeResolvedAt?: string | null;
   newsImminent?: boolean;
   newsEvent?: string | null;       // e.g. "USD CPI"
   newsEventTime?: string | null;
@@ -645,6 +659,183 @@ export interface ForecastResponse {
   forecasts: ExecutionForecast[];
   calibrated: boolean;
   note: string;
+}
+
+export interface ForecastOutcomeBucket {
+  basis: string;
+  total: number;
+  settled: number;
+  wins: number;
+  losses: number;
+  ambiguous: number;
+  expired: number;
+  pending: number;
+  netPips: number;
+  netR: number;
+  expectancyR: number | null;
+  rCount: number;
+  winRate: number;
+}
+
+// ── Day-trading discipline layer (pre-session brief + R-budget) ──────────────
+export interface DayTradingDailyRisk {
+  available: boolean;
+  dateUtc?: string;
+  settledR?: number;
+  wins?: number;
+  losses?: number;
+  openCount?: number;
+  rCount?: number;
+  dailyStopR: number;
+  remainingR?: number;
+  limitHit?: boolean;
+  note: string;
+}
+
+export interface DayTradingBriefSymbol {
+  symbol: string;
+  timeframe: string;
+  decision: string;
+  grade: string | null;
+  score: number | null;
+  regime: string | null;
+  htfBias: string | null;
+  emaDistanceAtr: number | null;
+  extended: boolean;
+  adrUsagePercent: number | null;
+  riskRewardRatio: number | null;
+  entryTiming: string | null;
+  nearestSupport: number | null;
+  nearestResistance: number | null;
+  price: number | null;
+  newsRisk: 'block' | 'caution' | null;
+  forecast: { eta: string; basis: string; status: string | null } | null;
+}
+
+export interface DayTradingBriefNews {
+  currency: string;
+  title: string;
+  impact: string;
+  timeIso: string;
+  timestampUtc: number;
+}
+
+export interface LiquidityPool {
+  price: number;
+  type: 'BSL' | 'SSL';
+  touches: number;
+  equal: boolean;
+  swept: boolean;
+  sweptAtMs: number | null;
+  timeIso: string;
+  distance: number;
+}
+
+export interface Displacement {
+  present: boolean;
+  strong?: boolean;
+  atrMultiple: number;
+  gapLow?: number;
+  gapHigh?: number;
+}
+
+export interface BreakerBlock {
+  type: 'BULLISH' | 'BEARISH';
+  zoneTop: number;
+  zoneBottom: number;
+  entry: number;
+  stop: number;
+  sweepLevel: number;
+  structureLevel: number;
+  confirmedIso: string;
+  ageBars: number;
+  displacement: Displacement;
+}
+
+export interface LiquidityPlan {
+  direction: 'BUY' | 'SELL';
+  entry: number;
+  stop: number;
+  target: number;
+  targetType: 'BSL' | 'SSL';
+  targetEqual: boolean;
+  rr: number;
+  displacement: Displacement;
+}
+
+export interface PremiumDiscount {
+  pct: number;
+  zone: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM';
+  rangeHigh: number;
+  rangeLow: number;
+  equilibrium: number;
+}
+
+export interface StructureDesk {
+  symbol: string;
+  timeframe: string;
+  price: number;
+  phase: 'UPTREND' | 'DOWNTREND' | 'CONSOLIDATION' | 'SIDEWAYS';
+  htfBias: string | null;
+  regime: string | null;
+  decision: string;
+  grade: string | null;
+  score: number | null;
+  bos: { dir: 'bullish' | 'bearish'; level: number } | null;
+  sweep: 'bullish' | 'bearish' | null;
+  zone: { kind: 'DEMAND' | 'SUPPLY'; low: number; high: number; imbalance: boolean } | null;
+  setup: string | null;
+  armed: boolean;
+  premiumDiscount: PremiumDiscount | null;
+  emaDistanceAtr: number | null;
+  extended: boolean;
+  entryTiming: string | null;
+  plan: { entry: number; sl: number; tp: number | null; rr: number | null } | null;
+  liquidity: {
+    targetAbove: LiquidityPool | null;
+    targetBelow: LiquidityPool | null;
+    recentSweep: LiquidityPool | null;
+    buySide: LiquidityPool[];
+    sellSide: LiquidityPool[];
+  };
+  breaker: BreakerBlock | null;
+  liquidityPlan: LiquidityPlan | null;
+  drive: {
+    label: 'FIRST_DRIVE' | 'SECOND_DRIVE' | 'NONE';
+    basis: 'FAILED_FIRST' | 'RETEST' | null;
+    note: string;
+    edge?: number | null;
+    drives?: number;
+    isSecondDrive?: boolean;
+  } | null;
+  rejectionReasons: string[];
+}
+
+export interface StructureDeskResponse {
+  generatedAt: string;
+  timeframe: string;
+  extensionAtrThreshold: number;
+  primarySymbol: string;
+  desks: StructureDesk[];
+  note: string;
+}
+
+export interface DayTradingBriefResponse {
+  generatedAt: string;
+  timeframe: string;
+  extensionAtrThreshold: number;
+  symbols: DayTradingBriefSymbol[];
+  news: DayTradingBriefNews[];
+  dailyRisk: DayTradingDailyRisk;
+  note: string;
+}
+
+export interface ForecastOutcomeResponse {
+  trades: ExecutionForecast[];
+  summary: { overall: ForecastOutcomeBucket; byBasis: ForecastOutcomeBucket[] };
+  retentionDays: number;
+  note: string;
+  filters: { symbol: string | null; outcome: string | null; days: number; limit: number };
 }
 
 export interface ForecastPlan {

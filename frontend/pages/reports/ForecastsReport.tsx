@@ -1,12 +1,33 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Loader2, FlaskConical } from 'lucide-react';
-import { fetchForecastCalibration, fetchForecastReplay } from '../../mt5Api';
-import type { ForecastCalibrationResponse, ForecastReplayResponse } from '../../types';
+import { Loader2, FlaskConical, Trophy } from 'lucide-react';
+import { fetchForecastCalibration, fetchForecastReplay, fetchForecastOutcomes } from '../../mt5Api';
+import type { ForecastCalibrationResponse, ForecastReplayResponse, ForecastOutcomeResponse, TradeOutcome } from '../../types';
 import { ReportsHeader, ReportsTabs, ErrorBanner, DateCell } from './_shared';
 
 const BASIS_LABEL: Record<string, string> = {
-  IMMEDIATE: 'Ready now', NEXT_CANDLE: 'Next candle', PULLBACK: 'Pullback',
+  IMMEDIATE: 'Ready now', NEXT_CANDLE: 'Next candle', NEWS: 'News event', PULLBACK: 'Pullback',
   SCORE_SLOPE: 'Score rising', SESSION: 'Session open', UNKNOWN: 'No clear path', ALL: 'All bases',
+};
+
+function outcomeClass(o: TradeOutcome | null | undefined) {
+  const s = String(o || 'PENDING').toUpperCase();
+  if (s.endsWith('_WIN') || s === 'WIN') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  if (s === 'LOSS') return 'bg-rose-50 text-rose-700 border-rose-200';
+  if (s === 'AMBIGUOUS') return 'bg-amber-50 text-amber-700 border-amber-200';
+  if (s === 'EXPIRED') return 'bg-slate-100 text-slate-500 border-slate-200';
+  return 'bg-blue-50 text-blue-600 border-blue-200';
+}
+function outcomeLabel(o: TradeOutcome | null | undefined) {
+  const s = String(o || 'PENDING').toUpperCase();
+  if (s === 'TP1_WIN') return 'WIN · TP1';
+  if (s === 'TP2_WIN') return 'WIN · TP2';
+  if (s === 'TP3_WIN') return 'WIN · TP3';
+  return s;
+}
+const pipsCell = (v: number | null | undefined) => {
+  if (v === null || v === undefined) return <span className="text-slate-400">—</span>;
+  const cls = v > 0 ? 'text-emerald-600' : v < 0 ? 'text-rose-600' : 'text-slate-500';
+  return <span className={`font-mono font-bold ${cls}`}>{v > 0 ? '+' : ''}{v}</span>;
 };
 const confClass: Record<string, string> = {
   strong: 'bg-emerald-100 text-emerald-700', usable: 'bg-blue-100 text-blue-700',
@@ -26,6 +47,7 @@ export default function ForecastsReport() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<ForecastCalibrationResponse | null>(null);
+  const [outcomes, setOutcomes] = useState<ForecastOutcomeResponse | null>(null);
 
   const [replaySymbol, setReplaySymbol] = useState('XAUUSD');
   const [replayTf, setReplayTf] = useState('M15');
@@ -37,7 +59,12 @@ export default function ForecastsReport() {
     setLoading(true);
     setError(null);
     try {
-      setData(await fetchForecastCalibration(days));
+      const [cal, out] = await Promise.all([
+        fetchForecastCalibration(days),
+        fetchForecastOutcomes(days).catch(() => null),
+      ]);
+      setData(cal);
+      setOutcomes(out);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load forecast calibration');
     } finally {
@@ -142,6 +169,94 @@ export default function ForecastsReport() {
           </table>
         </div>
       </div>
+
+      {/* Trade track record — did EXECUTED forecasts actually win? */}
+      {(() => {
+        const tt = outcomes?.summary.overall;
+        return (
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+            <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3">
+              <Trophy size={16} className="text-amber-500" />
+              <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Trade track record</h3>
+              <span className="ml-2 text-[11px] font-semibold text-slate-400">EXECUTED forecasts, settled by candle replay (TP/SL touch)</span>
+            </div>
+            <div className="p-4 space-y-4">
+              <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 text-sm">
+                <div className="rounded-xl bg-slate-50 p-3"><div className="text-[11px] text-slate-400 font-bold uppercase">Settled</div><div className="text-lg font-black text-slate-900">{tt ? tt.settled : 0}<span className="text-xs font-bold text-slate-400"> / {tt ? tt.total : 0}</span></div></div>
+                <div className="rounded-xl bg-emerald-50 p-3"><div className="text-[11px] text-emerald-500 font-bold uppercase">Win rate</div><div className="text-lg font-black text-emerald-700">{tt && (tt.wins + tt.losses) ? `${tt.winRate}%` : '—'}</div></div>
+                <div className="rounded-xl bg-indigo-50 p-3"><div className="text-[11px] text-indigo-500 font-bold uppercase">Expectancy</div><div className={`text-lg font-black ${tt && tt.expectancyR !== null && tt.expectancyR > 0 ? 'text-emerald-700' : tt && tt.expectancyR !== null && tt.expectancyR < 0 ? 'text-rose-700' : 'text-indigo-700'}`}>{tt && tt.expectancyR !== null ? `${tt.expectancyR > 0 ? '+' : ''}${tt.expectancyR}R` : '—'}</div></div>
+                <div className="rounded-xl bg-emerald-50/60 p-3"><div className="text-[11px] text-emerald-500 font-bold uppercase">Wins</div><div className="text-lg font-black text-emerald-700">{tt ? tt.wins : 0}</div></div>
+                <div className="rounded-xl bg-rose-50 p-3"><div className="text-[11px] text-rose-500 font-bold uppercase">Losses</div><div className="text-lg font-black text-rose-700">{tt ? tt.losses : 0}</div></div>
+                <div className="rounded-xl bg-slate-50 p-3"><div className="text-[11px] text-slate-400 font-bold uppercase">Net pips · R</div><div className={`text-lg font-black ${tt && tt.netPips > 0 ? 'text-emerald-700' : tt && tt.netPips < 0 ? 'text-rose-700' : 'text-slate-900'}`}>{tt ? `${tt.netPips > 0 ? '+' : ''}${tt.netPips}` : '—'}<span className="text-xs font-bold text-slate-400"> · {tt ? `${tt.netR > 0 ? '+' : ''}${tt.netR}R` : '—'}</span></div></div>
+              </div>
+
+              {/* By-basis win rate */}
+              {outcomes?.summary.byBasis.length ? (
+                <div className="overflow-x-auto rounded-xl border border-slate-100">
+                  <table className="w-full min-w-[620px] text-left text-sm">
+                    <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+                      <tr>
+                        <th className="px-3 py-2">Basis</th>
+                        <th className="px-3 py-2 text-right">Settled</th>
+                        <th className="px-3 py-2 text-right">Win rate</th>
+                        <th className="px-3 py-2 text-right">W / L</th>
+                        <th className="px-3 py-2 text-right">Net pips</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-slate-700">
+                      {outcomes.summary.byBasis.map((b) => (
+                        <tr key={b.basis} className="hover:bg-slate-50/70">
+                          <td className="px-3 py-2 font-bold text-slate-800">{BASIS_LABEL[b.basis] || b.basis}</td>
+                          <td className="px-3 py-2 text-right font-mono">{b.settled}/{b.total}</td>
+                          <td className="px-3 py-2 text-right font-mono font-bold">{(b.wins + b.losses) ? `${b.winRate}%` : '—'}</td>
+                          <td className="px-3 py-2 text-right font-mono"><span className="text-emerald-600">{b.wins}</span> / <span className="text-rose-600">{b.losses}</span></td>
+                          <td className="px-3 py-2 text-right">{pipsCell(b.netPips)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+
+              {/* Settled trades */}
+              <div className="overflow-x-auto rounded-xl border border-slate-100">
+                <table className="w-full min-w-[860px] text-left text-sm">
+                  <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2">Symbol</th>
+                      <th className="px-3 py-2">Dir</th>
+                      <th className="px-3 py-2">Basis</th>
+                      <th className="px-3 py-2">Outcome</th>
+                      <th className="px-3 py-2 text-right">Pips</th>
+                      <th className="px-3 py-2 text-right">MFE / MAE</th>
+                      <th className="px-3 py-2">Entered</th>
+                      <th className="px-3 py-2">Settled</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-slate-700">
+                    {outcomes?.trades.length ? outcomes.trades.map((t) => (
+                      <tr key={`${t.id}-${t.tradeResolvedAt || t.actualExecutionTime}`} className="hover:bg-slate-50/70">
+                        <td className="px-3 py-2"><span className="font-black text-slate-900">{t.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{t.timeframe}</span></td>
+                        <td className="px-3 py-2 text-[12px] font-bold">{t.decision === 'BUY' ? <span className="text-emerald-600">BUY</span> : t.decision === 'SELL' ? <span className="text-rose-600">SELL</span> : <span className="text-slate-400">{t.decision || '—'}</span>}</td>
+                        <td className="px-3 py-2 text-[12px] font-semibold text-slate-500">{BASIS_LABEL[t.forecastBasis] || t.forecastBasis}</td>
+                        <td className="px-3 py-2"><span className={`rounded border px-1.5 py-0.5 text-[10px] font-black ${outcomeClass(t.tradeOutcome)}`}>{outcomeLabel(t.tradeOutcome)}</span></td>
+                        <td className="px-3 py-2 text-right">{pipsCell(t.tradePips)}</td>
+                        <td className="px-3 py-2 text-right font-mono text-[12px] text-slate-500">{t.tradeMfePips ?? '—'} / {t.tradeMaePips ?? '—'}</td>
+                        <td className="px-3 py-2 text-xs"><DateCell value={t.actualExecutionTime} /></td>
+                        <td className="px-3 py-2 text-xs"><DateCell value={t.tradeResolvedAt} /></td>
+                      </tr>
+                    )) : (
+                      <tr><td colSpan={8} className="px-3 py-8 text-center text-sm font-medium text-slate-400">No settled trades yet — outcomes populate as EXECUTED forecasts reach a TP or SL.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <p className="text-[11px] font-medium text-slate-400">{outcomes?.note || 'Settled from real candle replay (TP/SL touch). Track record only — not a guarantee.'}</p>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Backtest panel */}
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">

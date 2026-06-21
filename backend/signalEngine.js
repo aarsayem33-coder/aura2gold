@@ -1,5 +1,6 @@
 import { assessNewsRisk } from './economicCalendar.js';
 import { calculateADX } from './aiSignalsIndicators.js';
+import { detectSecondDrive } from './liquidityEngine.js';
 
 function normalizeIndicatorKey(name) {
   return String(name || '').trim().toUpperCase();
@@ -1274,8 +1275,54 @@ function aggregateSignals({
   const regimeAdjustedMinScore = isRanging ? MIN_SCORE + 15 : MIN_SCORE;
   if (isRanging) rejectionReasons.push(`Ranging regime (ADX ${adxValue.toFixed(1)} < 20)`);
 
-  const datTradePass = datDirectionPass && datAreaPass && datTriggerPass;
-  const relaxedDatTradePass = ALLOW_DAT_2_OF_3 && datTriggerPass && datScore >= 2;
+  // ─── Second-drive gate (Spec 1, flag-gated, default OFF) ───
+  // On BREAKOUT/SHAKEOUT triggers (BOS or liquidity sweep), require the move to be a
+  // SECOND drive (after a failed-first/shakeout or a retest), not the raw first break —
+  // Fabio's "never take the first drive". Clean continuation pullbacks are NOT gated.
+  // `drive` is computed unconditionally so the advisory badge always has data; the gate
+  // only *enforces* it when SECOND_DRIVE_GATE is on.
+  const SECOND_DRIVE_GATE = envBool('SECOND_DRIVE_GATE', false);
+  const driveDir = candidateDirection === 'BUY' ? 'BULLISH' : candidateDirection === 'SELL' ? 'BEARISH' : null;
+  const isBreakoutOrShakeout = driveDir === 'BULLISH'
+    ? Boolean(struct.bosBullish || sweep.sweepBullish)
+    : driveDir === 'BEARISH'
+      ? Boolean(struct.bosBearish || sweep.sweepBearish)
+      : false;
+  const drive = driveDir
+    ? detectSecondDrive(latestCandles, driveDir)
+    : { isSecondDrive: false, firstDriveIdx: null, basis: null, label: 'NONE', note: 'No directional bias', edge: null, drives: 0 };
+
+  let datTriggerPassGated = datTriggerPass;
+  if (SECOND_DRIVE_GATE && datTriggerPass && isBreakoutOrShakeout && driveDir && !drive.isSecondDrive) {
+    datTriggerPassGated = false;
+    rejectionReasons.push('First drive — waiting for second');
+  }
+
+  // ─── Premium / discount (advisory location) ───
+  // Where price sits in the last ~60-bar dealing range (0%=low, 100%=high). Buy discount,
+  // sell premium. `fit` is direction-aware: GOOD when the side matches the zone (buy in
+  // discount / sell in premium), POOR when it fights it. Surfaced on dashboard + alerts.
+  let premiumDiscount = null;
+  {
+    const r5 = (v) => Math.round(v * 1e5) / 1e5;
+    const pdWindow = latestCandles.slice(-60);
+    if (pdWindow.length >= 10) {
+      const rangeHigh = Math.max(...pdWindow.map((c) => Number(c.high)).filter(Number.isFinite));
+      const rangeLow = Math.min(...pdWindow.map((c) => Number(c.low)).filter(Number.isFinite));
+      const px = Number(latestCandle?.close);
+      if (Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) && rangeHigh > rangeLow && Number.isFinite(px)) {
+        const pct = Math.max(0, Math.min(100, Math.round(((px - rangeLow) / (rangeHigh - rangeLow)) * 100)));
+        const zone = pct > 55 ? 'PREMIUM' : pct < 45 ? 'DISCOUNT' : 'EQUILIBRIUM';
+        const fit = (candidateDirection === 'BUY' && zone === 'DISCOUNT') || (candidateDirection === 'SELL' && zone === 'PREMIUM') ? 'GOOD'
+          : (candidateDirection === 'BUY' && zone === 'PREMIUM') || (candidateDirection === 'SELL' && zone === 'DISCOUNT') ? 'POOR'
+          : 'NEUTRAL';
+        premiumDiscount = { pct, zone, fit, rangeHigh: r5(rangeHigh), rangeLow: r5(rangeLow), equilibrium: r5((rangeHigh + rangeLow) / 2) };
+      }
+    }
+  }
+
+  const datTradePass = datDirectionPass && datAreaPass && datTriggerPassGated;
+  const relaxedDatTradePass = ALLOW_DAT_2_OF_3 && datTriggerPassGated && datScore >= 2;
   const datQualifies = datTradePass || relaxedDatTradePass;
 
   const buyQualifies =
@@ -1652,6 +1699,8 @@ function aggregateSignals({
     regime: adxValue === null ? 'unknown' : (adxValue < 20 ? 'ranging' : (adxValue >= 25 ? 'trending' : 'developing')),
     htfBias,
     rejectionReasons,
+    drive,                              // advisory drive label (1st vs 2nd drive); gate enforced only when SECOND_DRIVE_GATE=on
+    premiumDiscount,                    // advisory location: { pct, zone, fit } — buy discount / sell premium
     fvgs: fvgs.slice(-5),
     orderBlocks: obs.slice(-5),
     confluences,
@@ -1709,6 +1758,8 @@ export {
   calculateEMA,
   detectFVGs,
   detectOrderBlocks,
+  detectMarketStructure,
+  detectLiquiditySweeps,
   detectSupportResistance,
   getTimeframeTrend,
   timeframeToMs,

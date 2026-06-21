@@ -724,6 +724,7 @@ function ForexTableHead() {
         <th className="px-2 py-2.5 text-left">TF</th>
         <th className="px-2 py-2.5 text-center">System Advisor</th>
         <th className="px-2 py-2.5 text-center">Score</th>
+        <th className="px-2 py-2.5 text-center">Zone</th>
         <th className="px-2 py-2.5 text-center">Setup</th>
         <th className="px-2 py-2.5 text-left">Entry Price</th>
         <th className="px-2 py-2.5 text-left">Suggested Entry</th>
@@ -1099,6 +1100,25 @@ export default function SignalDashboard() {
                           ) : 'n/a'}
                         </td>
                         <td className="px-2 py-1.5 text-center">
+                          {system?.premiumDiscount ? (
+                            <span
+                              title={
+                                system.premiumDiscount.fit === 'GOOD' ? 'Well-located: buying discount / selling premium'
+                                : system.premiumDiscount.fit === 'POOR' ? 'Against location: buy discount / sell premium'
+                                : `Price ${system.premiumDiscount.pct}% of range`
+                              }
+                              className={`inline-flex rounded-md px-1.5 py-0.5 text-[10px] font-black border ${
+                                system.premiumDiscount.zone === 'DISCOUNT' ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                : system.premiumDiscount.zone === 'PREMIUM' ? 'border-rose-200 bg-rose-50 text-rose-700'
+                                : 'border-slate-200 bg-slate-100 text-slate-500'
+                              }`}
+                            >
+                              {system.premiumDiscount.zone === 'EQUILIBRIUM' ? 'EQUIL' : system.premiumDiscount.zone} {system.premiumDiscount.pct}%
+                              {system.premiumDiscount.fit === 'GOOD' ? ' ✓' : system.premiumDiscount.fit === 'POOR' ? ' ⚠' : ''}
+                            </span>
+                          ) : <span className="text-slate-300 text-xs font-bold">—</span>}
+                        </td>
+                        <td className="px-2 py-1.5 text-center">
                           <div className="flex flex-col items-center gap-1 leading-tight">
                             {renderSignalQualityBadge(system?.signalQuality)}
                             {renderGradeBadge(system?.grade)}
@@ -1174,7 +1194,7 @@ export default function SignalDashboard() {
                       </tr>
                       {expandedRow === rowKey && (
                         <tr>
-                          <td colSpan={14} className="px-2 pb-1.5 pt-0">
+                          <td colSpan={15} className="px-2 pb-1.5 pt-0">
                             <ForexAdvisorDetails result={result} />
                           </td>
                         </tr>

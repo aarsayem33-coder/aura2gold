@@ -26,6 +26,8 @@ import {
   ClipboardList,
   FlaskConical,
   CalendarClock,
+  Sunrise,
+  LineChart,
   ChevronDown,
   X
 } from 'lucide-react';
@@ -276,6 +278,8 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/signals', icon: BarChart3, label: 'Signals' },
     { path: '/fixed-time', icon: Timer, label: 'Fixed-Time' },
     { path: '/future-predictions', icon: Brain, label: 'Future Predictions' },
+    { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
+    { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
     { path: '/projections', icon: Crosshair, label: 'Pullback Projections' },
     { path: '/calendar', icon: CalendarDays, label: 'Economic Calendar' },
     { path: '/news-high-impact', icon: Newspaper, label: 'High-Impact News' },
