@@ -23,7 +23,7 @@ MT5 Terminal (Exness)                Node.js backend                 React front
 └──────────────────┘              └──────────────────┘              └──────────────┘
                                           │
                                           ├─ signalEngine.js  (system signals, SMC scoring)
-                                          ├─ fttEngine.js     (fixed-time-trade predictions)
+                                          ├─ fttEngine.js     (fixed-time-trade predictions; see FTT fixes note below)
                                           ├─ executionForecastEngine.js (WHEN a setup becomes executable)
                                           └─ geminiEngine.js  (Vertex AI / Gemini analysis)
 ```
@@ -31,6 +31,29 @@ MT5 Terminal (Exness)                Node.js backend                 React front
 The architecture is **memory-first**: incoming candles go into an in-memory store and are pushed
 to the browser via SSE **instantly**; the MySQL write is fire-and-forget (`void persist().catch()`).
 Analysis reads from memory, never blocks on the DB.
+
+> **Outcome resolver — DO NOT expire wins (2026-06-21).** `processForexEmailReports` and
+> `processSystemSignalLog` keep PENDING + young (<72h) TP1/TP2 wins "open" for possible TP upgrade.
+> The age>72h branch must **only** expire rows whose outcome is still `PENDING` — never overwrite a
+> recorded `TP1_WIN`/`TP2_WIN` to `EXPIRED` (that erased real wins and understated win rate by ~10pts;
+> the emailed-only send calibration then suppressed good buckets). Wins ≥72h are excluded from the
+> resolver query so they finalize as wins. A one-off `backend/backfill_expired_wins.mjs` already
+> repaired historical corruption (relabel `EXPIRED AND profit_loss_pips>0` → win). Still-open audit
+> items (inflated "settled", emailed-only calibration survivorship, forecast hitRate gating, bucket
+> suppression, SL/TP outlier caps) are tracked in memory `calibration-outcome-bugs`.
+
+> **FTT fixes (2026-06-21, from a read-only audit).** Two real bugs fixed in `fttEngine.js`:
+> (1) **Directional confidence bias** — `qualityBonus` counted only bullish filters (`score>0/>=0.5`),
+> handicapping valid DOWN setups by up to ~10 confidence pts. Now **direction-aligned** (`score*dirSign`),
+> symmetric for UP/DOWN; UP is mathematically identical to before (longs undisturbed), only shorts change.
+> (2) **Timeframe/timing mismatch** — the server feeds candles at `mapExpiryToTimeframe(expiry)` (5m→M5,
+> 30m→M15, 1h→H1) but the engine computed candle-boundary timing against `tfConfig.entry` (e.g. M2),
+> producing wrong `remainingSeconds`/immediate-vs-wait **and** mis-gating the noise filter (×0.80 damp +
+> HOLD override). Fix: server now passes the actual `timeframe` into `generateFttPrediction`; the engine
+> uses it for `entryTf` and reports it in `timeframeMapping.entry`. Candle data feeding `aggregateSignals`
+> is **unchanged** (signal direction/confidence only shifts near candle boundaries where the old boundary
+> math was wrong). Verified live across 5m/30m/1h. **Not done (design choice, needs validation):** whether
+> to actually *feed* the engine's finer intended entry TFs (M2/M3) instead of the current coarser ones.
 
 ---
 

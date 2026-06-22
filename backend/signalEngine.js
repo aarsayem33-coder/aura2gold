@@ -1313,10 +1313,8 @@ function aggregateSignals({
       if (Number.isFinite(rangeHigh) && Number.isFinite(rangeLow) && rangeHigh > rangeLow && Number.isFinite(px)) {
         const pct = Math.max(0, Math.min(100, Math.round(((px - rangeLow) / (rangeHigh - rangeLow)) * 100)));
         const zone = pct > 55 ? 'PREMIUM' : pct < 45 ? 'DISCOUNT' : 'EQUILIBRIUM';
-        const fit = (candidateDirection === 'BUY' && zone === 'DISCOUNT') || (candidateDirection === 'SELL' && zone === 'PREMIUM') ? 'GOOD'
-          : (candidateDirection === 'BUY' && zone === 'PREMIUM') || (candidateDirection === 'SELL' && zone === 'DISCOUNT') ? 'POOR'
-          : 'NEUTRAL';
-        premiumDiscount = { pct, zone, fit, rangeHigh: r5(rangeHigh), rangeLow: r5(rangeLow), equilibrium: r5((rangeHigh + rangeLow) / 2) };
+        // fit is finalized later against the COMMITTED decision (HOLD → NEUTRAL).
+        premiumDiscount = { pct, zone, fit: 'NEUTRAL', rangeHigh: r5(rangeHigh), rangeLow: r5(rangeLow), equilibrium: r5((rangeHigh + rangeLow) / 2) };
       }
     }
   }
@@ -1646,6 +1644,17 @@ function aggregateSignals({
     } else if (score >= MIN_SCORE && triggerPassed && (realisticRR === null || realisticRR >= MIN_RR)) {
       signalQuality = 'B SIGNAL';
     }
+  }
+
+  // Finalize the premium/discount FIT against the COMMITTED decision, not the raw
+  // buyScore-vs-sellScore lean. On a HOLD / no-trade row the location is advisory
+  // only, so the trade-fit (✓/⚠) is suppressed (NEUTRAL) — the zone + % still show.
+  if (premiumDiscount) {
+    const committed = direction === 'HOLD' ? null : (direction.includes('BUY') ? 'BUY' : 'SELL');
+    premiumDiscount.fit = !committed ? 'NEUTRAL'
+      : (committed === 'BUY' && premiumDiscount.zone === 'DISCOUNT') || (committed === 'SELL' && premiumDiscount.zone === 'PREMIUM') ? 'GOOD'
+      : (committed === 'BUY' && premiumDiscount.zone === 'PREMIUM') || (committed === 'SELL' && premiumDiscount.zone === 'DISCOUNT') ? 'POOR'
+      : 'NEUTRAL';
   }
 
   const systemDecision = {

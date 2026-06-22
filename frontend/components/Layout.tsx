@@ -28,6 +28,7 @@ import {
   CalendarClock,
   Sunrise,
   LineChart,
+  Radar,
   ChevronDown,
   X
 } from 'lucide-react';
@@ -91,6 +92,8 @@ function money(value?: number | null) {
 }
 
 function alertTitle(alert: TopbarMarketAlert) {
+  if (alert.alertKind === 'CLOSE') return `⚠ CLOSE TRADE · ${alert.direction.replace('_', ' ')}`;
+  if (alert.alertKind === 'MANAGE') return `MANAGE TRADE · ${alert.direction.replace('_', ' ')}`;
   return alert.kind === 'FOREX'
     ? `${alert.grade || 'A'} FOREX ${alert.direction.replace('_', ' ')}`
     : `${alert.quality || alert.grade || 'A'} FIXED-TIME ${alert.direction}`;
@@ -161,16 +164,25 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
         <div className="absolute right-0 top-12 z-50 w-[360px] overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-900/15">
           <div className="flex items-start justify-between gap-3 border-b border-amber-100 bg-gradient-to-r from-amber-50 to-white p-4">
             <div>
-              <p className="text-[10px] font-black uppercase tracking-[0.22em] text-amber-600">Live quality signal</p>
-              <h3 className="mt-1 text-base font-black text-slate-950">{alertTitle(displayAlert)}</h3>
-              <p className="text-xs font-bold text-slate-500">{displayAlert.symbol} {displayAlert.timeframe || displayAlert.expiry || ''} · {displayAlert.confidence}/100 · {alertAgeLabel(displayAlert)}</p>
+              <p className={`text-[10px] font-black uppercase tracking-[0.22em] ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-600' : displayAlert.alertKind === 'MANAGE' ? 'text-amber-600' : 'text-amber-600'}`}>{displayAlert.alertKind ? 'Trade management alert' : 'Live quality signal'}</p>
+              <h3 className={`mt-1 text-base font-black ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-700' : 'text-slate-950'}`}>{alertTitle(displayAlert)}</h3>
+              <p className="text-xs font-bold text-slate-500">{displayAlert.symbol} {displayAlert.timeframe || displayAlert.expiry || ''} · {displayAlert.alertKind ? (displayAlert.currentR != null ? `${displayAlert.currentR}R` : '') : `${displayAlert.confidence}/100`} · {alertAgeLabel(displayAlert)}</p>
             </div>
             <button type="button" onClick={closePopup} className="rounded-full p-1 text-slate-400 hover:bg-white hover:text-slate-700">
               <X size={15} />
             </button>
           </div>
           <div className="space-y-3 p-4 text-xs">
-            {displayAlert.kind === 'FOREX' ? (
+            {displayAlert.alertKind ? (
+              <>
+                <div className="grid grid-cols-2 gap-2 font-mono text-slate-700">
+                  <div className="rounded-xl bg-slate-50 p-2"><span className="block text-[10px] font-bold uppercase text-slate-400">Now</span>{price(displayAlert.entryPrice, displayAlert.symbol)}</div>
+                  <div className={`rounded-xl p-2 ${(displayAlert.currentR ?? 0) >= 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}><span className="block text-[10px] font-bold uppercase opacity-70">Position</span>{displayAlert.currentPips != null ? `${displayAlert.currentPips} pips` : 'n/a'} {displayAlert.currentR != null ? `(${displayAlert.currentR}R)` : ''}</div>
+                </div>
+                {displayAlert.reason && <p className={`rounded-xl p-2 font-semibold ${displayAlert.alertKind === 'CLOSE' ? 'bg-rose-50 text-rose-800' : 'bg-amber-50 text-amber-800'}`}>{displayAlert.reason}</p>}
+                {displayAlert.action && <p className="rounded-xl bg-slate-900 p-2 font-bold text-white">→ {displayAlert.action}</p>}
+              </>
+            ) : displayAlert.kind === 'FOREX' ? (
               <>
                 <div className="grid grid-cols-2 gap-2 font-mono text-slate-700">
                   <div className="rounded-xl bg-slate-50 p-2"><span className="block text-[10px] font-bold uppercase text-slate-400">Entry</span>{price(displayAlert.entryPrice, displayAlert.symbol)}</div>
@@ -280,6 +292,7 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/future-predictions', icon: Brain, label: 'Future Predictions' },
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
     { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
+    { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },
     { path: '/projections', icon: Crosshair, label: 'Pullback Projections' },
     { path: '/calendar', icon: CalendarDays, label: 'Economic Calendar' },
     { path: '/news-high-impact', icon: Newspaper, label: 'High-Impact News' },

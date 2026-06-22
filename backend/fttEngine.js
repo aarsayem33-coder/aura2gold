@@ -474,6 +474,7 @@ export function generateFttPrediction({
   h4Candles = [],
   h1Candles = [],
   skipNews = false,
+  timeframe = null,   // actual TF of `candles` (from the server); used for entry-timing math
 }) {
   const expiryMs = parseExpiryMs(expiry);
   const category = expiryCategory(expiryMs);
@@ -553,9 +554,6 @@ export function generateFttPrediction({
       ? validFilters.reduce((sum, f) => sum + f.score, 0) / validFilters.length
       : 0;
 
-  const positiveFilterCount = momentumFilters.filter((f) => f.score > 0).length;
-  const strongFilterCount = momentumFilters.filter((f) => f.score >= 0.5).length;
-
   // Blend: Institutional score + short-term momentum filters
   const trendScore = aggregate.tradableCompositeScore ?? aggregate.compositeScore ?? 0;
   const blendedScore = trendWeight * trendScore + momentumWeight * momentumScore;
@@ -575,12 +573,23 @@ export function generateFttPrediction({
     (direction === 'DOWN' && trendScore < 0 && momentumScore < 0)
       ? 8
       : 0;
-  const qualityBonus = Math.min(10, (positiveFilterCount * 2) + (strongFilterCount * 2));
+  // Quality bonus rewards momentum filters that AGREE WITH THE TRADE DIRECTION —
+  // symmetric for UP and DOWN. Previously counted only positive (bullish) filters,
+  // which handicapped valid DOWN setups by up to ~10 confidence points. For UP this
+  // is mathematically identical to the old logic (score>0 / >=0.5); only shorts change.
+  const dirSign = direction === 'UP' ? 1 : direction === 'DOWN' ? -1 : 0;
+  const alignedFilterCount = dirSign ? momentumFilters.filter((f) => f.score * dirSign > 0).length : 0;
+  const strongAlignedFilterCount = dirSign ? momentumFilters.filter((f) => f.score * dirSign >= 0.5).length : 0;
+  const qualityBonus = Math.min(10, (alignedFilterCount * 2) + (strongAlignedFilterCount * 2));
 
   let finalConfidence = Math.min(95, baseConfidence + trendEdgeBonus + momentumEdgeBonus + agreementBonus + qualityBonus);
 
-  // 4a. Calculate timing instruction and noise-reduction check
-  const entryTf = tfConfig.entry;
+  // 4a. Calculate timing instruction and noise-reduction check.
+  // Use the ACTUAL timeframe of the candles we were given (passed by the server) so
+  // the candle-boundary math matches the bars in hand. Previously this used
+  // tfConfig.entry (e.g. M2) against candles that were actually M5 → wrong remaining
+  // time / immediate-vs-wait. Falls back to the engine's intended entry TF if unset.
+  const entryTf = timeframe || tfConfig.entry;
   
   function timeframeToMs(tframe) {
     const t = String(tframe || 'M5').trim().toUpperCase();
@@ -694,7 +703,7 @@ export function generateFttPrediction({
       buyScore: aggregate.systemDecision?.buyScore,
       sellScore: aggregate.systemDecision?.sellScore,
       noiseFilterActive,
-      timeframeMapping: tfConfig,
+      timeframeMapping: { ...tfConfig, entry: entryTf },   // entry reflects the TF actually used
       qualityTier: quality.qualityTier,
       qualityScore: quality.qualityScore,
       qualityReasons: quality.qualityReasons,

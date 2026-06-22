@@ -557,6 +557,53 @@ export interface TopbarMarketAlert {
   expiryTime?: string | null;
   sessionReason?: string | null;
   createdAt: string;
+  // Trade-management alerts (Signal Tracker) — distinct from new-entry signals so
+  // the popup never renders a "close/manage" alert as a fresh trade to enter.
+  alertKind?: 'MANAGE' | 'CLOSE';
+  reason?: string | null;
+  action?: string | null;
+  currentR?: number | null;
+  currentPips?: number | null;
+}
+
+export type SignalTrackerStatus = 'OPEN' | 'TP1_HIT' | 'TP2_HIT' | 'TP3_HIT' | 'STOPPED' | 'DANGER' | 'CLOSE_NOW' | 'EXPIRED';
+
+export interface SignalTrackerItem {
+  id: string;
+  source: 'system' | 'email';
+  symbol: string;
+  timeframe: string;
+  direction: string;
+  signalTime: string;
+  grade: string | null;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  takeProfit3: number | null;
+  currentPrice: number | null;
+  currentPips: number | null;
+  currentR: number | null;
+  mfeR: number | null;
+  maeR: number | null;
+  distToSlPips: number | null;
+  tpHit: number;
+  slHit: boolean;
+  status: SignalTrackerStatus;
+  riskState: 'HEALTHY' | 'CAUTION' | 'DANGER' | 'CLOSE_NOW' | 'UNKNOWN';
+  severity: number;
+  warningReason: string;
+  suggestedAction: string;
+  alertType: string | null;
+  realPosition: { ticket: string; profit: number | null; volume: number | null; openPrice: number | null; currentPrice: number | null } | null;
+  unrealizedProfit: number | null;
+}
+
+export interface SignalTrackerResponse {
+  items: SignalTrackerItem[];
+  generatedAt: string;
+  config: { windowHours: number };
+  note: string;
 }
 
 export interface FttHistoryResponse {
@@ -632,6 +679,7 @@ export interface ForecastCalibrationBucket {
   hitRate: number | null;
   avgTimingAccuracy: number | null;
   avgScoreAccuracy: number | null;
+  combinedConfidence: number | null;   // hitRate × timingAccuracy — the honest reliability
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
 
@@ -1280,10 +1328,35 @@ export interface CalibrationGroupStat {
   winRate: number;
 }
 
+export interface WouldSuppressItem {
+  type: string;
+  symbol: string;
+  timeframe: string | null;
+  expiry: string | null;
+  reason: string | null;
+  bucket: string | null;
+  winRate: number | null;
+  settled: number | null;
+  expectancy: number | null;
+  at: string;
+}
+export interface WouldSuppressResponse {
+  ok: boolean;
+  mode: { forex: string; ftt: string };
+  summary: { type: string; symbol: string; count: number }[];
+  recent: WouldSuppressItem[];
+  note: string;
+}
+
 export interface CalibrationResponse {
   ok: boolean;
   type: 'forex' | 'fixed';
-  total: number;
+  total: number;                 // all records in the window
+  records?: number;
+  winLossSettled?: number;       // honest scored evidence (wins + losses)
+  settled?: number;              // win/loss/draw/breakeven (excludes EXPIRED/AMBIGUOUS)
+  expired?: number;
+  ambiguous?: number;
   overall: TradeReportSummary & {
     settled: number;
     breakeven: number;

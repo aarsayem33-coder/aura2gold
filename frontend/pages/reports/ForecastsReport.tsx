@@ -144,6 +144,7 @@ export default function ForecastsReport() {
                 <th className="px-4 py-2 text-right">Samples</th>
                 <th className="px-4 py-2 text-right">Hit rate</th>
                 <th className="px-4 py-2 text-right">Timing acc.</th>
+                <th className="px-4 py-2 text-right">Reliability</th>
                 <th className="px-4 py-2 text-right">Score acc.</th>
                 <th className="px-4 py-2 text-right">Calibrated?</th>
               </tr>
@@ -155,6 +156,7 @@ export default function ForecastsReport() {
                   <td className="px-4 py-2 text-right font-mono">{b.samples}</td>
                   <td className="px-4 py-2 text-right font-mono font-bold">{num(b.hitRate, '%')}</td>
                   <td className="px-4 py-2 text-right font-mono">{num(b.avgTimingAccuracy, '%')}</td>
+                  <td className="px-4 py-2 text-right font-mono font-bold" title="hit rate × timing accuracy — low means the basis rarely executes reliably">{num(b.combinedConfidence, '%')}</td>
                   <td className="px-4 py-2 text-right font-mono">{num(b.avgScoreAccuracy, '%')}</td>
                   <td className="px-4 py-2 text-right">
                     <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${b.samples >= minSample ? 'bg-emerald-100 text-emerald-700' : confClass[b.confidence] || ''}`}>
@@ -163,7 +165,7 @@ export default function ForecastsReport() {
                   </td>
                 </tr>
               )) : (
-                <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">No resolved forecasts yet — accuracy populates as forecasts execute or expire.</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-sm font-medium text-slate-400">No resolved forecasts yet — accuracy populates as forecasts execute or expire.</td></tr>
               )}
             </tbody>
           </table>

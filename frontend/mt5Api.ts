@@ -6,6 +6,7 @@ import type {
   AiDecision,
   AiDecisionResponse,
   CalibrationResponse,
+  WouldSuppressResponse,
   SignalLogResponse,
   ProjectionTrackRecord,
   ForexBacktestResponse,
@@ -53,6 +54,7 @@ import type {
   ForecastOutcomeResponse,
   DayTradingBriefResponse,
   StructureDeskResponse,
+  SignalTrackerResponse,
 } from './types';
 import { playAlertSound, showBrowserNotification } from './utils/notifications';
 
@@ -370,6 +372,16 @@ export async function fetchStructureDesk(symbol?: string, timeframe = 'M5'): Pro
   const params = new URLSearchParams({ timeframe });
   if (symbol) params.set('symbol', symbol);
   return fetchJson<StructureDeskResponse>(`/api/day-trading/desk?${params.toString()}`);
+}
+
+export async function fetchSignalTracker(): Promise<SignalTrackerResponse> {
+  return fetchJson<SignalTrackerResponse>('/api/signal-tracker');
+}
+
+export async function markSignalTrackerDone(id: string): Promise<{ ok: boolean; id: string }> {
+  const response = await fetch(`/api/signal-tracker/${encodeURIComponent(id)}/done`, { method: 'POST' });
+  if (!response.ok) throw new Error(`Failed to mark done (${response.status})`);
+  return response.json();
 }
 
 export async function analyzeForecast(id: string): Promise<ForecastAnalysis> {
@@ -742,6 +754,35 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
       }
     });
 
+    source.addEventListener('signal_tracker_alert', (event) => {
+      try {
+        const a = JSON.parse((event as MessageEvent).data);
+        const close = (a.severity ?? 0) >= 3;
+        const alert = {
+          id: `tracker:${a.id}:${a.alertType}:${a.at}`,
+          kind: 'FOREX' as const,
+          alertKind: (close ? 'CLOSE' : 'MANAGE') as 'CLOSE' | 'MANAGE',
+          symbol: a.symbol,
+          timeframe: a.timeframe ?? null,
+          direction: String(a.direction || ''),
+          confidence: 0,
+          entryPrice: a.currentPrice ?? null,
+          currentR: a.currentR ?? null,
+          currentPips: a.currentPips ?? null,
+          reason: a.warningReason ?? null,
+          action: a.suggestedAction ?? null,
+          createdAt: a.at || new Date().toISOString(),
+        };
+        addTopbarAlert(alert, true);
+        showBrowserNotification(`${close ? 'CLOSE' : 'MANAGE'} ${a.symbol} ${alert.direction}`, {
+          body: `${a.warningReason || ''} — ${a.suggestedAction || ''}`,
+          tag: alert.id,
+        });
+      } catch {
+        /* ignore malformed tracker alert */
+      }
+    });
+
     source.addEventListener('account', (event) => {
       try {
         setAccount(JSON.parse((event as MessageEvent).data) as Mt5AccountSnapshot);
@@ -915,6 +956,10 @@ export async function fetchCalibrationReport(type: 'forex' | 'fixed', options?: 
   if (options?.limit) params.set('limit', String(options.limit));
   const qs = params.toString();
   return fetchJson<CalibrationResponse>(`/api/reports/calibration/${type}${qs ? `?${qs}` : ''}`);
+}
+
+export async function fetchWouldSuppress(): Promise<WouldSuppressResponse> {
+  return fetchJson<WouldSuppressResponse>('/api/reports/would-suppress');
 }
 
 export async function fetchForexBacktestReport(options?: {

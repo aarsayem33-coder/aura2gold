@@ -20,6 +20,7 @@ import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive } from './liquidityEngine.js';
+import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini } from './geminiEngine.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
 import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
@@ -706,6 +707,15 @@ async function initializeDatabase() {
       await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_mfe_pips', 'DOUBLE NULL');
       await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_mae_pips', 'DOUBLE NULL');
       await addColumnIfMissing(pool, 'mt5_execution_forecasts', 'trade_resolved_at', 'DATETIME(3) NULL');
+
+      // Signal Tracker "Done" dismissals — user marked the trade closed, so it drops
+      // off the tracker and stops alerting. Tiny (one row per dismissed trade), pruned.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_signal_tracker_dismissed (
+          id VARCHAR(160) PRIMARY KEY,
+          dismissed_at DATETIME(3) NOT NULL
+        )
+      `);
 
       return pool;
     })().catch((error) => {
@@ -4491,7 +4501,12 @@ app.get('/api/reports/calibration/:type', async (req, res) => {
     res.json({
       ok: true,
       type,
-      total: calibration.settled,
+      total: calibration.records,                  // all records (was the inflated "settled")
+      records: calibration.records,
+      winLossSettled: calibration.winLossSettled,  // the honest scored count (use this for headlines)
+      settled: calibration.settled,                // win/loss/draw/breakeven (excludes EXPIRED/AMBIGUOUS)
+      expired: calibration.expired,
+      ambiguous: calibration.ambiguous,
       pending: calibration.pending,
       overall: calibration.overall,
       leaderboards: calibration.leaderboards,
@@ -4853,6 +4868,7 @@ app.post('/api/ftt/predict', async (req, res) => {
     const systemPrediction = generateFttPrediction({
       symbol,
       expiry,
+      timeframe: inputs.timeframe,
       candles: inputs.candles,
       indicators: inputs.indicators,
       marketLevels: inputs.marketLevels,
@@ -4999,6 +5015,7 @@ app.post('/api/ftt/scan', async (req, res) => {
       const pred = generateFttPrediction({
         symbol,
         expiry,
+        timeframe: inputs.timeframe,
         candles: inputs.candles,
         indicators: inputs.indicators,
         marketLevels: inputs.marketLevels,
@@ -5676,6 +5693,47 @@ function recordSkippedAlert({ type, symbol, timeframe, expiry, reason, ageMs, ma
   });
 }
 
+// Shadow-mode tracking: when the calibration gate is in 'observe', it would suppress
+// some alerts but sends them anyway. We record those "would-suppress" events so they
+// can be watched (per-bucket) BEFORE flipping the gate to 'enforce'. In-memory ring
+// buffer (no DB bloat); also surfaced in delivery logs for the existing UI.
+const recentWouldSuppress = [];
+const wouldSuppressCounts = new Map(); // `${type}|${symbol}` -> count
+function recordWouldSuppress({ type, symbol, timeframe = null, expiry = null, reason = null, calibration = null }) {
+  const entry = {
+    type, symbol, timeframe, expiry, reason,
+    bucket: calibration?.bucket ?? null,
+    winRate: calibration?.winRate ?? null,
+    settled: calibration?.settled ?? null,
+    expectancy: calibration?.expectancy ?? null,
+    at: new Date().toISOString(),
+  };
+  recentWouldSuppress.unshift(entry);
+  if (recentWouldSuppress.length > 200) recentWouldSuppress.length = 200;
+  const key = `${type}|${symbol}`;
+  wouldSuppressCounts.set(key, (wouldSuppressCounts.get(key) || 0) + 1);
+  addDeliveryLog({
+    channel: 'Email', recipient: SIGNAL_ALERT_EMAIL_TO || null, signalId: null,
+    status: 'Would-suppress (shadow)',
+    error: `${type} ${symbol}${timeframe ? ` ${timeframe}` : ''}${expiry ? ` ${expiry}` : ''}: ${reason}`,
+  });
+}
+
+// GET /api/reports/would-suppress — what the calibration gate WOULD block under
+// 'enforce' (nothing is actually blocked while in observe/shadow). Watch before enforcing.
+app.get('/api/reports/would-suppress', (req, res) => {
+  const summary = [...wouldSuppressCounts.entries()]
+    .map(([k, count]) => { const [type, symbol] = k.split('|'); return { type, symbol, count }; })
+    .sort((a, b) => b.count - a.count);
+  res.json({
+    ok: true,
+    mode: { forex: resolveCalibrationPolicy('forex').mode, ftt: resolveCalibrationPolicy('ftt').mode },
+    summary,
+    recent: recentWouldSuppress.slice(0, 100),
+    note: 'Signals the calibration gate WOULD suppress under enforce mode. In observe/shadow nothing is blocked — these were still sent. Watch this (and the per-bucket calibration) before flipping to enforce. Counts reset on backend restart.',
+  });
+});
+
 function shouldSkipStaleForexAlert(result) {
   const maxAgeMs = forexMaxEmailAgeMs(result?.timeframe);
   if (!maxAgeMs) return null;
@@ -5800,7 +5858,11 @@ function buildCalibrationReport(items, signalType) {
     overall: { ...stats.overall, confidence: sampleConfidence(stats.overall.settled) },
     leaderboards: leaderboard,
     dimensions,
-    settled: settledItems.length,
+    records: items.length,                               // every signal in the window
+    winLossSettled: stats.overall.wins + stats.overall.losses, // the real scored evidence
+    settled: stats.overall.settled,                     // win/loss/draw/breakeven — NOT expired/ambiguous
+    expired: stats.overall.expired,
+    ambiguous: stats.overall.ambiguous,
     pending,
   };
 }
@@ -5858,8 +5920,41 @@ function calibrationMatchScore(report, candidate, signalType) {
   return score;
 }
 
+// Adapt a system-signal-log row into the report shape calibrationMatchScore +
+// buildGroupedStats expect (maps top-level fields into the payload slots the
+// matcher reads). Lets forex calibration learn from the FULL A/A+ set.
+function systemLogRowToCalibReport(row) {
+  return {
+    signalType: 'forex',
+    symbol: row.symbol,
+    timeframe: row.timeframe,
+    grade: row.grade,
+    outcome: row.outcome,
+    confidence: row.confidence,
+    profitLossPips: row.profitLossPips,
+    signalTime: row.signalTime,
+    payload: {
+      strategyType: row.strategyType,
+      strategyTags: Array.isArray(row.payload?.strategyTags) ? row.payload.strategyTags : (row.strategyType ? [row.strategyType] : []),
+      candlePatterns: (row.pattern && row.pattern !== 'none') ? [row.pattern] : [],
+      sessionContext: { reason: row.session },
+      volatilityState: row.regime,
+      signalQuality: row.signalQuality,
+    },
+  };
+}
+
 async function getCalibrationSnapshot(signalType, candidate, { days = 365, limit = 500 } = {}) {
-  const reports = await querySignalEmailReports(signalType, { days, limit });
+  // Forex: learn from the FULL system signal log (emailed + filtered A/A+ setups) to
+  // avoid survivorship bias from calibrating only on previously-emailed signals.
+  // Fixed-time: no full-set log exists, so keep emailed reports.
+  let reports;
+  if (signalType === 'forex') {
+    const { rows } = await querySystemSignalLog({ days, limit: 1000 });
+    reports = rows.map(systemLogRowToCalibReport);
+  } else {
+    reports = await querySignalEmailReports(signalType, { days, limit });
+  }
   const settled = reports.filter((report) => !['PENDING'].includes(String(report.outcome || '').toUpperCase()));
   const groups = [
     { name: 'exact', filter: (report) => calibrationMatchScore(report, candidate, signalType) >= 15 },
@@ -6800,13 +6895,14 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   highImpactNews: true,
   aiTracked: false,
   forecast: true,
+  signalTracker: true,
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
   postNewsForexMinGrade: 'A_NEWS_SETUP',
   postNewsFixedMinTier: 'QUALITY_SIGNAL',
 };
-const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast'];
+const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast', 'signalTracker'];
 const EMAIL_SELECT_SETTING_VALUES = {
   forexMinGrade: ['B_SETUP', 'A_SETUP', 'A_PLUS_SETUP'],
   forexMinQuality: ['B_SIGNAL', 'A_SIGNAL', 'A_PLUS_SIGNAL'],
@@ -6984,8 +7080,12 @@ async function processForexEmailReports() {
   if (!pool) return;
   const nowMs = Date.now();
   try {
+    // Keep PENDING trades open for resolution; keep TP1/TP2 wins open ONLY while
+    // they're young enough to still progress to a higher TP (<72h). A win older
+    // than 72h is final and must NOT be re-touched (it used to get overwritten to
+    // EXPIRED here, which erased real wins from win-rate scoring).
     const [rows] = await pool.query(
-      "SELECT * FROM mt5_signal_email_reports WHERE signal_type = 'forex' AND outcome IN ('PENDING','TP1_WIN','TP2_WIN') ORDER BY signal_time ASC LIMIT 50"
+      "SELECT * FROM mt5_signal_email_reports WHERE signal_type = 'forex' AND (outcome = 'PENDING' OR (outcome IN ('TP1_WIN','TP2_WIN') AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 72 HOUR))) ORDER BY signal_time ASC LIMIT 50"
     );
     for (const row of rows) {
       const report = normalizeSignalEmailReportRow(row);
@@ -6994,10 +7094,14 @@ async function processForexEmailReports() {
 
       const ageHrs = (nowMs - signalMs) / (3600 * 1000);
       if (ageHrs > 72) {
-        await pool.execute(
-          "UPDATE mt5_signal_email_reports SET outcome = 'EXPIRED', resolved_at = ? WHERE id = ?",
-          [toMysqlDate(), report.id]
-        );
+        // ONLY a still-PENDING trade expires. A TP1/TP2 win is excluded above, but
+        // guard defensively so a win is never relabeled EXPIRED.
+        if (String(report.outcome || '').toUpperCase() === 'PENDING') {
+          await pool.execute(
+            "UPDATE mt5_signal_email_reports SET outcome = 'EXPIRED', resolved_at = ? WHERE id = ?",
+            [toMysqlDate(), report.id]
+          );
+        }
         continue;
       }
 
@@ -7054,6 +7158,259 @@ async function querySignalEmailReports(signalType, { symbol = null, days = null,
   params.push(Math.min(Math.max(Number(limit) || 200, 1), 500));
   const [rows] = await pool.query(sql, params);
   return rows.map(normalizeSignalEmailReportRow).filter(Boolean);
+}
+
+// ── Signal Tracker — live health of given signals (system + emailed) ──────────
+// Combines active rows from the system signal log + emailed forex reports into one
+// live view: where each trade stands (pips/R/MFE/MAE), and an advisory health state
+// that warns to MANAGE or CLOSE before the stop is hit. Real broker P/L is overlaid
+// when an open MT5 position matches the signal. See backend/signalHealthEngine.js.
+const SIGNAL_TRACKER_WINDOW_HOURS = Math.max(1, Number(process.env.SIGNAL_TRACKER_WINDOW_HOURS || 72));
+const SIGNAL_TRACKER_COOLDOWN_MS = Math.max(60000, Number(process.env.SIGNAL_TRACKER_COOLDOWN_MS || 12 * 60 * 1000));
+const signalTrackerAlertState = new Map(); // `${id}|${alertType}` -> { at, severity }
+
+async function fetchOpenMt5Trades(pool) {
+  const map = new Map();
+  try {
+    const [rows] = await pool.query(
+      "SELECT symbol, type, volume, open_price, current_price, profit, ticket FROM mt5_trades WHERE close_time IS NULL OR UPPER(status)='OPEN' ORDER BY received_at DESC LIMIT 300",
+    );
+    for (const r of rows) {
+      const sym = String(r.symbol || '').toUpperCase();
+      if (!map.has(sym)) map.set(sym, []);
+      map.get(sym).push(r);
+    }
+  } catch { /* table may be empty */ }
+  return map;
+}
+function tradeDirMatches(tradeType, direction) {
+  const t = String(tradeType || '').toUpperCase();
+  const wantBuy = /BUY/.test(String(direction || '').toUpperCase());
+  const isBuy = /BUY/.test(t) || t === '0' || t === 'POSITION_TYPE_BUY';
+  const isSell = /SELL/.test(t) || t === '1' || t === 'POSITION_TYPE_SELL';
+  return wantBuy ? isBuy : isSell;
+}
+
+async function buildSignalTrackerView() {
+  const pool = await initializeDatabase();
+  if (!pool) return { items: [], generatedAt: new Date().toISOString(), config: { windowHours: SIGNAL_TRACKER_WINDOW_HOURS } };
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const winH = SIGNAL_TRACKER_WINDOW_HOURS;
+  const merged = new Map();
+  // Collapse to ONE active trade per symbol|timeframe|direction — consecutive
+  // same-direction signals are the same ongoing position, anchored to the most
+  // recent entry. Queries are signal_time DESC, so the first row per key wins.
+  const keyOf = (sym, tf, dir) => `${sym}|${tf}|${dir}`;
+
+  try {
+    const [sysRows] = await pool.query(
+      "SELECT * FROM mt5_system_signal_log WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) ORDER BY signal_time DESC LIMIT 200",
+      [winH],
+    );
+    for (const r of sysRows) {
+      const sym = String(r.symbol).toUpperCase(), tf = String(r.timeframe).toUpperCase(), dir = String(r.direction).toUpperCase();
+      const ms = new Date(r.signal_time).getTime();
+      if (!Number.isFinite(ms)) continue;
+      if (merged.has(keyOf(sym, tf, dir))) continue;  // keep the most recent
+      merged.set(keyOf(sym, tf, dir), {
+        id: r.id, source: r.emailed ? 'email' : 'system', symbol: sym, timeframe: tf, direction: dir,
+        signalTime: new Date(r.signal_time).toISOString(), signalMs: ms, grade: r.grade || null, outcome: r.outcome,
+        entryPrice: num(r.entry_price), stopLoss: num(r.stop_loss),
+        takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
+      });
+    }
+  } catch (e) { console.error('[SignalTracker] system log query failed:', e.message); }
+
+  try {
+    const [emRows] = await pool.query(
+      "SELECT * FROM mt5_signal_email_reports WHERE signal_type='forex' AND outcome IN ('PENDING','TP1_WIN','TP2_WIN') AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) ORDER BY signal_time DESC LIMIT 100",
+      [winH],
+    );
+    for (const r of emRows) {
+      const sym = String(r.symbol).toUpperCase(), tf = String(r.timeframe || '').toUpperCase(), dir = String(r.direction).toUpperCase();
+      const ms = new Date(r.signal_time).getTime();
+      if (!Number.isFinite(ms)) continue;
+      const k = keyOf(sym, tf, dir);
+      if (merged.has(k)) continue;  // already represented by the (richer / more recent) system-log row
+      let pl = null; try { pl = r.payload_json ? JSON.parse(r.payload_json) : null; } catch { pl = null; }
+      merged.set(k, {
+        id: r.id, source: 'email', symbol: sym, timeframe: tf, direction: dir,
+        signalTime: new Date(r.signal_time).toISOString(), signalMs: ms, grade: r.grade || null, outcome: r.outcome,
+        entryPrice: num(r.entry_price), stopLoss: num(r.stop_loss),
+        takeProfit1: num(r.take_profit_1), takeProfit2: num(pl?.takeProfit2 ?? pl?.take_profit_2), takeProfit3: num(pl?.takeProfit3 ?? pl?.take_profit_3),
+      });
+    }
+  } catch (e) { console.error('[SignalTracker] email reports query failed:', e.message); }
+
+  const openTrades = await fetchOpenMt5Trades(pool);
+  const dismissed = new Set();
+  try {
+    const [drows] = await pool.query(
+      'SELECT id FROM mt5_signal_tracker_dismissed WHERE dismissed_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)', [winH],
+    );
+    for (const r of drows) dismissed.add(r.id);
+  } catch { /* table may not exist yet */ }
+
+  const ctxCache = new Map();
+  const items = [];
+  for (const sig of merged.values()) {
+    if (dismissed.has(sig.id)) continue;  // user marked this trade Done — hide + no alerts
+    try {
+      const candles = getRecentCandles(sig.symbol, sig.timeframe, 1000);
+      if (!candles || candles.length < 5) continue;
+      const pip = pipSizeForSymbol(sig.symbol);
+      const snap = computeSignalSnapshot({ ...sig, candles, pip, signalMs: sig.signalMs, horizonHours: winH });
+      // Skip terminal trades: stop already hit (closed loss) or final target reached.
+      // These are done — the outcome resolver will settle them; don't show/alert as active.
+      if (snap.valid && (snap.slHit || snap.tpHit >= 3)) continue;
+
+      const ck = `${sig.symbol}|${sig.timeframe}`;
+      let ctx = ctxCache.get(ck);
+      if (!ctx) {
+        let sd = null, breaker = null;
+        try {
+          const cl = getRecentCandles(sig.symbol, sig.timeframe, 250);
+          if (cl && cl.length >= 20) {
+            const { adr, dailyHighLow } = computeAdrDaily(sig.symbol);
+            sd = aggregateSignals({
+              symbol: sig.symbol, timeframe: sig.timeframe, candles: cl,
+              indicators: getRecentIndicators(sig.symbol, sig.timeframe, 500),
+              marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
+              h4Candles: getRecentCandles(sig.symbol, 'H4', 150), h1Candles: getRecentCandles(sig.symbol, 'H1', 150),
+            }).systemDecision;
+            breaker = detectBreaker(cl);
+          }
+        } catch { /* per-symbol resilience */ }
+        ctx = { sd, breaker };
+        ctxCache.set(ck, ctx);
+      }
+
+      const health = evaluateSignalHealth({ snapshot: snap, direction: sig.direction, freshDecision: ctx.sd, breaker: ctx.breaker, newsRisk: ctx.sd?.newsRisk || null });
+
+      const cand = (openTrades.get(sig.symbol) || []).find((t) => tradeDirMatches(t.type, sig.direction));
+      const real = cand ? { ticket: String(cand.ticket), profit: num(cand.profit), volume: num(cand.volume), openPrice: num(cand.open_price), currentPrice: num(cand.current_price) } : null;
+
+      items.push({
+        id: sig.id, source: sig.source, symbol: sig.symbol, timeframe: sig.timeframe, direction: sig.direction,
+        signalTime: sig.signalTime, grade: sig.grade,
+        entryPrice: sig.entryPrice, stopLoss: sig.stopLoss,
+        takeProfit1: sig.takeProfit1, takeProfit2: sig.takeProfit2, takeProfit3: sig.takeProfit3,
+        currentPrice: snap.currentPrice, currentPips: snap.currentPips, currentR: snap.currentR,
+        mfeR: snap.mfeR, maeR: snap.maeR, distToSlPips: snap.distToSlPips,
+        tpHit: snap.tpHit, slHit: snap.slHit,
+        status: health.status, riskState: health.riskState, severity: health.severity,
+        warningReason: health.warningReason, suggestedAction: health.suggestedAction, alertType: health.alertType,
+        realPosition: real, unrealizedProfit: real ? real.profit : null,
+      });
+    } catch (e) { /* per-signal resilience */ }
+  }
+  items.sort((a, b) => (b.severity - a.severity) || (Math.abs(b.currentR || 0) - Math.abs(a.currentR || 0)));
+  return { items, generatedAt: new Date().toISOString(), config: { windowHours: winH }, note: 'Advisory live health of given signals — early warning, not a guarantee. P/L is real only for matched open MT5 positions; otherwise estimated from signal levels.' };
+}
+
+// GET /api/signal-tracker — live health of all active signals.
+app.get('/api/signal-tracker', async (req, res) => {
+  try { res.json(await buildSignalTrackerView()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// GET /api/signal-tracker/:id — one signal's live health.
+app.get('/api/signal-tracker/:id', async (req, res) => {
+  try {
+    const view = await buildSignalTrackerView();
+    const item = view.items.find((i) => i.id === String(req.params.id));
+    if (!item) return res.status(404).json({ error: 'Signal not found or no longer active.' });
+    res.json({ item, generatedAt: view.generatedAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/signal-tracker/:id/done — user closed the trade: drop it from the tracker
+// and stop all alerts (popup + email) for it. Durable (survives restart), pruned by window.
+app.post('/api/signal-tracker/:id/done', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  const id = String(req.params.id);
+  try {
+    await pool.execute(
+      'INSERT INTO mt5_signal_tracker_dismissed (id, dismissed_at) VALUES (?, ?) ON DUPLICATE KEY UPDATE dismissed_at = VALUES(dismissed_at)',
+      [id, toMysqlDate()],
+    );
+    // Clear any pending alert dedupe state so it never re-fires for this signal.
+    for (const key of signalTrackerAlertState.keys()) {
+      if (key.startsWith(`${id}|`)) signalTrackerAlertState.delete(key);
+    }
+    // Best-effort prune of old dismissals (keep the table tiny).
+    pool.execute('DELETE FROM mt5_signal_tracker_dismissed WHERE dismissed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)', [SIGNAL_TRACKER_WINDOW_HOURS * 2]).catch(() => {});
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+async function sendSignalTrackerEmail(item) {
+  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('signalTracker')) return;
+  const sym = item.symbol;
+  const close = item.severity >= 3;
+  const tag = close ? 'CLOSE TRADE' : 'MANAGE TRADE';
+  const rTxt = item.currentR != null ? `${item.currentR}R` : '';
+  const subject = `[${tag}] ${sym} ${item.timeframe} ${item.direction} ${rTxt} — ${item.warningReason}`.slice(0, 180);
+  const text = [
+    `AURA GOLD — SIGNAL TRACKER (${tag})`,
+    `${sym} ${item.timeframe} ${item.direction}  (${item.source} signal)`,
+    `Entry ${px(item.entryPrice, sym)}  SL ${px(item.stopLoss, sym)}  TP1 ${px(item.takeProfit1, sym)}`,
+    `Now ${px(item.currentPrice, sym)}  |  ${item.currentPips != null ? item.currentPips + ' pips' : ''} ${rTxt ? '(' + rTxt + ')' : ''}`,
+    item.unrealizedProfit != null ? `Live position P/L: ${item.unrealizedProfit}` : '',
+    `Why: ${item.warningReason}`,
+    `Action: ${item.suggestedAction}`,
+    'Advisory early warning — not a guarantee, not financial advice.',
+  ].filter(Boolean).join('\n');
+  const color = close ? '#b91c1c' : '#b45309';
+  const html = `<div style="font-family:Arial,sans-serif;max-width:640px">
+    <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.12em;color:${color};text-transform:uppercase">Signal Tracker · ${tag}</p>
+    <h2 style="margin:0 0 4px;color:${color}">${item.direction} ${sym} <span style="font-size:13px;color:#64748b">${item.timeframe} · ${item.source}</span></h2>
+    <p style="font-size:13px;color:#0f172a;margin:2px 0"><b>${item.warningReason}</b></p>
+    <table style="font-size:13px;border-collapse:collapse">
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Entry / SL / TP1</td><td>${px(item.entryPrice, sym)} / ${px(item.stopLoss, sym)} / ${px(item.takeProfit1, sym)}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Now</td><td><b>${px(item.currentPrice, sym)}</b>  ${item.currentPips != null ? item.currentPips + ' pips' : ''} ${rTxt ? '(' + rTxt + ')' : ''}</td></tr>
+      ${item.unrealizedProfit != null ? `<tr><td style="padding:2px 10px 2px 0;color:#64748b">Live P/L</td><td><b>${item.unrealizedProfit}</b></td></tr>` : ''}
+    </table>
+    <p style="font-size:13px;color:#0f172a;margin:8px 0 0">Action: <b>${item.suggestedAction}</b></p>
+    <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory early warning — not a guarantee, not financial advice. — Aura Gold Signal Tracker</p></div>`;
+  try {
+    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `tracker:${item.id}:${item.alertType}` });
+    console.log(`[SignalTracker] Emailed ${tag} ${item.direction} ${sym} (${item.warningReason})`);
+  } catch (e) { console.error('[SignalTracker] email failed:', e.message); }
+}
+
+// Monitor loop: emit SSE popup + email when a tracked signal needs managing/closing.
+// Deduped per (signal, alertType): re-alerts only on escalation or after the cooldown.
+async function processSignalTracker() {
+  let view;
+  try { view = await buildSignalTrackerView(); } catch { return; }
+  const now = Date.now();
+  for (const item of view.items) {
+    const actionable = item.severity >= 2 || item.alertType === 'tp_hit';
+    if (!actionable || !item.alertType) continue;
+    const key = `${item.id}|${item.alertType}`;
+    const prev = signalTrackerAlertState.get(key);
+    const escalate = !prev || item.severity > prev.severity || (now - prev.at) >= SIGNAL_TRACKER_COOLDOWN_MS;
+    if (!escalate) continue;
+    signalTrackerAlertState.set(key, { at: now, severity: item.severity });
+    sendStreamEvent('signal_tracker_alert', {
+      id: item.id, symbol: item.symbol, timeframe: item.timeframe, direction: item.direction,
+      status: item.status, riskState: item.riskState, severity: item.severity,
+      currentR: item.currentR, currentPips: item.currentPips, currentPrice: item.currentPrice,
+      warningReason: item.warningReason, suggestedAction: item.suggestedAction, alertType: item.alertType,
+      unrealizedProfit: item.unrealizedProfit, at: new Date(now).toISOString(),
+    });
+    // Email only for trades the user likely actually took: an emailed signal or a
+    // matched real MT5 position. System-only signals still pop in-app, but don't
+    // email (avoids "close" emails for signals that were never acted on).
+    const worthEmailing = item.source === 'email' || item.realPosition;
+    if (worthEmailing && (item.severity >= 3 || item.alertType === 'tp_hit')) {
+      try { await sendSignalTrackerEmail(item); } catch { /* logged inside */ }
+    }
+  }
+  for (const [k, v] of signalTrackerAlertState) {
+    if (now - v.at > 6 * 3600 * 1000) signalTrackerAlertState.delete(k);
+  }
 }
 
 // ── System Signal Log (Phase: executable-signal record) ──────────────────────
@@ -7122,15 +7479,21 @@ async function processSystemSignalLog() {
   if (!pool) return;
   const nowMs = Date.now();
   try {
+    // Same rule as the email-report resolver: PENDING stays open; a TP1/TP2 win is
+    // only re-checked while <72h (could still hit a higher TP). Wins ≥72h are final
+    // and excluded — they must never be overwritten to EXPIRED.
     const [rows] = await pool.query(
-      "SELECT * FROM mt5_system_signal_log WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') ORDER BY signal_time ASC LIMIT 100"
+      "SELECT * FROM mt5_system_signal_log WHERE (outcome = 'PENDING' OR (outcome IN ('TP1_WIN','TP2_WIN') AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 72 HOUR))) ORDER BY signal_time ASC LIMIT 100"
     );
     for (const row of rows) {
       const signalMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
       if (!Number.isFinite(signalMs)) continue;
       const ageHrs = (nowMs - signalMs) / (3600 * 1000);
       if (ageHrs > 72) {
-        await pool.execute("UPDATE mt5_system_signal_log SET outcome = 'EXPIRED', resolved_at = ? WHERE id = ?", [toMysqlDate(), row.id]);
+        // Only a still-PENDING trade expires; never relabel a recorded win.
+        if (String(row.outcome || '').toUpperCase() === 'PENDING') {
+          await pool.execute("UPDATE mt5_system_signal_log SET outcome = 'EXPIRED', resolved_at = ? WHERE id = ?", [toMysqlDate(), row.id]);
+        }
         continue;
       }
       const candles = getRecentCandles(row.symbol, row.timeframe, 1000);
@@ -7524,9 +7887,16 @@ function deriveSlTpSuggestions(winnerMaeR, loserMfeR, allMfeR, minSample) {
   return { ready: true, suggestions: out };
 }
 
+// Cap per-trade excursion R before percentiles/suggestions. A tiny stop distance or
+// post-close drift over the 72h horizon can yield absurd MFE-R (e.g. 147R) that
+// blows out the p75/p90 and produces unrealistic target guidance. Clamp to a sane
+// max so one outlier can't distort the suggestion. Configurable via SLTP_MAX_R.
+const SLTP_MAX_R = Math.max(2, Number(process.env.SLTP_MAX_R || 10));
+
 async function runSlTpCalibration({ days = 90, symbol = null, minSample = 8 } = {}) {
   const { rows } = await querySystemSignalLog({ days, symbol, limit: 1000 });
   const bySymbol = {};
+  const capR = (v) => (v === null ? null : Math.min(v, SLTP_MAX_R));
   for (const r of rows) {
     const entry = Number(r.entryPrice);
     const sl = Number(r.stopLoss);
@@ -7534,11 +7904,14 @@ async function runSlTpCalibration({ days = 90, symbol = null, minSample = 8 } = 
     const pip = pipSizeForSymbol(r.symbol);
     const stopPips = Math.abs(entry - sl) / pip;
     if (!(stopPips > 0)) continue;
-    const mfeR = Number.isFinite(r.mfePips) ? r.mfePips / stopPips : null;
-    const maeR = Number.isFinite(r.maePips) ? Math.abs(r.maePips) / stopPips : null;
-    const g = (bySymbol[r.symbol] ||= { rows: 0, stopPipsSum: 0, winnersMaeR: [], losersMfeR: [], allMfeR: [] });
+    const mfeRraw = Number.isFinite(r.mfePips) ? r.mfePips / stopPips : null;
+    const maeRraw = Number.isFinite(r.maePips) ? Math.abs(r.maePips) / stopPips : null;
+    const mfeR = capR(mfeRraw);
+    const maeR = capR(maeRraw);
+    const g = (bySymbol[r.symbol] ||= { rows: 0, stopPipsSum: 0, capped: 0, winnersMaeR: [], losersMfeR: [], allMfeR: [] });
     g.rows += 1;
     g.stopPipsSum += stopPips;
+    if ((mfeRraw !== null && mfeRraw > SLTP_MAX_R) || (maeRraw !== null && maeRraw > SLTP_MAX_R)) g.capped += 1;
     if (mfeR !== null) g.allMfeR.push(mfeR);
     if (isWinOutcome(r.outcome) && maeR !== null) g.winnersMaeR.push(maeR);
     else if (isLossOutcome(r.outcome) && mfeR !== null) g.losersMfeR.push(mfeR);
@@ -7554,6 +7927,8 @@ async function runSlTpCalibration({ days = 90, symbol = null, minSample = 8 } = 
       sampleRows: g.rows,
       settled,
       confidence: sampleConfidence(settled),
+      cappedOutliers: g.capped,         // trades whose excursion R was clamped to capR
+      capR: SLTP_MAX_R,
       avgStopPips: g.rows ? Math.round((g.stopPipsSum / g.rows) * 10) / 10 : null,
       winnerMaeR: { n: wMae.length, p50: percentileAsc(wMae, 50), p75: percentileAsc(wMae, 75), p90: percentileAsc(wMae, 90) },
       loserMfeR: { n: lMfe.length, p50: percentileAsc(lMfe, 50), p75: percentileAsc(lMfe, 75), p90: percentileAsc(lMfe, 90) },
@@ -7565,9 +7940,10 @@ async function runSlTpCalibration({ days = 90, symbol = null, minSample = 8 } = 
   return {
     params: { days, symbol, minSample },
     perSymbol,
+    capR: SLTP_MAX_R,
     note: totalSettled < 30
-      ? 'Thin sample — suggestions are directional until more signals settle. MFE/MAE on EXPIRED rows still counts toward reach; win/loss splits need settled outcomes.'
-      : 'Suggestions are advisory and must be validated on the replay/OOS harness before changing live SL/TP.',
+      ? `Thin sample — suggestions are directional until more signals settle. Excursion R is capped at ${SLTP_MAX_R}R so outliers (tiny stops / 72h drift) don't distort percentiles.`
+      : `Suggestions are advisory and must be validated on the replay/OOS harness before changing live SL/TP. Excursion R is capped at ${SLTP_MAX_R}R; see cappedOutliers per symbol.`,
   };
 }
 
@@ -7591,6 +7967,7 @@ async function sendForexAlert(result) {
   }
   if (calGate.action === 'shadow') {
     console.warn(`[Calibration][OBSERVE] Would suppress FOREX ${result.symbol} ${result.timeframe}: ${calGate.reason} (set forex calibration mode to 'enforce' to act)`);
+    recordWouldSuppress({ type: 'FOREX', symbol: result.symbol, timeframe: result.timeframe, reason: calGate.reason, calibration });
   }
   const calConfidence = blendCalibratedConfidence(sd.confidence, calibration);
   result.calibratedConfidence = calConfidence;
@@ -7766,6 +8143,7 @@ async function sendFttAlert(prediction) {
   }
   if (calGate.action === 'shadow') {
     console.warn(`[Calibration][OBSERVE] Would suppress FTT ${prediction.symbol} ${prediction.expiry}: ${calGate.reason} (set ftt calibration mode to 'enforce' to act)`);
+    recordWouldSuppress({ type: 'FTT', symbol: prediction.symbol, expiry: prediction.expiry, reason: calGate.reason, calibration });
   }
   const calConfidence = blendCalibratedConfidence(prediction.confidence, calibration);
   prediction.calibratedConfidence = calConfidence;
@@ -8106,7 +8484,7 @@ async function runScanCycle() {
           const bar = latest.time;
           const sourceReceivedAt = latest.receivedAt || latest.raw?.receivedAt || null;
           const pred = generateFttPrediction({
-            symbol, expiry, candles: inputs.candles, indicators: inputs.indicators,
+            symbol, expiry, timeframe: inputs.timeframe, candles: inputs.candles, indicators: inputs.indicators,
             marketLevels: inputs.marketLevels, accountSnapshot: inputs.accountSnapshot,
             adr: inputs.adr, dailyHighLow: inputs.dailyHighLow,
             h4Candles: getRecentCandles(symbol, 'H4', 150), h1Candles: getRecentCandles(symbol, 'H1', 150),
@@ -8800,8 +9178,13 @@ async function resolveForecastRow(pool, id, outcome, nowMs, realizedScore) {
 function applyForecastCalibration(fc) {
   if (!fc) return fc;
   const cal = forecastCalibrationByBasis.get(fc.forecastBasis);
-  if (cal && cal.samples >= FORECAST_CALIBRATION_MIN_SAMPLE && Number.isFinite(cal.avgTiming)) {
-    fc.forecastConfidence = cal.avgTiming;
+  if (cal && cal.samples >= FORECAST_CALIBRATION_MIN_SAMPLE && Number.isFinite(cal.avgTiming) && Number.isFinite(cal.hitRate)) {
+    // Combined measured confidence = hitRate × timingAccuracy. A timing forecast is
+    // only trustworthy if the setup BOTH becomes executable (hitRate) AND the ETA was
+    // accurate (avgTiming). Timing accuracy ALONE is misleading for a basis that
+    // rarely executes — e.g. SESSION at 0% hit rate would otherwise show ~50%
+    // "confidence" despite never actually executing; hitRate×timing collapses it to ~0.
+    fc.forecastConfidence = Math.round((cal.hitRate / 100) * cal.avgTiming);
     fc.calibrated = true;
   }
   return fc;
@@ -8824,17 +9207,24 @@ function summarizeForecastCalibration(rows) {
       if (r.score_accuracy !== null && r.score_accuracy !== undefined) { acc.scoreSum += Number(r.score_accuracy); acc.scoreN += 1; }
     }
   }
-  const finalize = (b) => ({
-    basis: b.basis,
-    samples: b.samples,
-    executed: b.executed,
-    expired: b.expired,
-    cancelled: b.cancelled,
-    hitRate: b.samples ? Math.round((b.executed / b.samples) * 1000) / 10 : null,
-    avgTimingAccuracy: b.timingN ? Math.round((b.timingSum / b.timingN) * 10) / 10 : null,
-    avgScoreAccuracy: b.scoreN ? Math.round((b.scoreSum / b.scoreN) * 10) / 10 : null,
-    confidence: sampleConfidence(b.samples),
-  });
+  const finalize = (b) => {
+    const hitRate = b.samples ? Math.round((b.executed / b.samples) * 1000) / 10 : null;
+    const avgTimingAccuracy = b.timingN ? Math.round((b.timingSum / b.timingN) * 10) / 10 : null;
+    return {
+      basis: b.basis,
+      samples: b.samples,
+      executed: b.executed,
+      expired: b.expired,
+      cancelled: b.cancelled,
+      hitRate,
+      avgTimingAccuracy,
+      avgScoreAccuracy: b.scoreN ? Math.round((b.scoreSum / b.scoreN) * 10) / 10 : null,
+      // Combined "is this timing forecast actually reliable?" = hitRate × timingAccuracy.
+      // Low when a basis rarely executes (even if its timing-on-execution looks ok).
+      combinedConfidence: (hitRate !== null && avgTimingAccuracy !== null) ? Math.round((hitRate / 100) * avgTimingAccuracy) : null,
+      confidence: sampleConfidence(b.samples),
+    };
+  };
   return {
     overall: finalize({ ...overall, basis: 'ALL' }),
     byBasis: [...byBasis.values()].map(finalize).sort((a, b) => b.samples - a.samples),
@@ -10028,6 +10418,11 @@ async function processAllRemindersAndSavedProjections() {
     await processForecastTradeOutcomes();
   } catch (err) {
     console.error('[Scheduler] Error in processForecastTradeOutcomes:', err.message);
+  }
+  try {
+    await processSignalTracker();
+  } catch (err) {
+    console.error('[Scheduler] Error in processSignalTracker:', err.message);
   }
   try {
     await pruneOldAccountSnapshots();

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Timer, TrendingUp } from 'lucide-react';
-import { fetchCalibrationReport } from '../../mt5Api';
-import type { CalibrationGroupStat, CalibrationResponse } from '../../types';
+import { fetchCalibrationReport, fetchWouldSuppress } from '../../mt5Api';
+import type { CalibrationGroupStat, CalibrationResponse, WouldSuppressResponse } from '../../types';
 import { ReportsHeader, ReportsTabs, ErrorBanner } from './_shared';
 
 const FOREX_KEYS = ['grade', 'symbol', 'timeframe', 'strategyType', 'signalQuality', 'session', 'volatilityState', 'pattern'];
@@ -61,13 +61,18 @@ export default function CalibrationReport() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [calibration, setCalibration] = useState<CalibrationResponse | null>(null);
+  const [wouldSuppress, setWouldSuppress] = useState<WouldSuppressResponse | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const cal = await fetchCalibrationReport(market, { days, limit: 500 });
+      const [cal, ws] = await Promise.all([
+        fetchCalibrationReport(market, { days, limit: 500 }),
+        fetchWouldSuppress().catch(() => null),
+      ]);
       setCalibration(cal);
+      setWouldSuppress(ws);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load calibration');
     } finally {
@@ -99,10 +104,55 @@ export default function CalibrationReport() {
             <Timer size={16} /> Fixed-Time
           </button>
         </div>
-        {calibration && <div className="text-sm font-bold text-slate-500">{calibration.total} settled samples</div>}
+        {calibration && <div className="text-sm font-bold text-slate-500">{calibration.winLossSettled ?? calibration.overall?.settled ?? 0} scored · {calibration.total} signals{calibration.expired ? ` · ${calibration.expired} expired` : ''}</div>}
       </div>
 
       <ErrorBanner error={error} />
+
+      {/* Would-suppress (shadow) — the calibration gate runs in observe mode: it flags
+          what it WOULD block under enforce, but nothing is actually dropped yet. */}
+      {wouldSuppress && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 shadow-card">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+            <h4 className="text-sm font-black uppercase tracking-wider text-amber-700">Would-suppress (shadow)</h4>
+            <div className="flex items-center gap-2 text-[11px] font-bold">
+              <span className={`rounded px-1.5 py-0.5 ${wouldSuppress.mode.forex === 'enforce' ? 'bg-rose-100 text-rose-700' : wouldSuppress.mode.forex === 'observe' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>forex: {wouldSuppress.mode.forex}</span>
+              <span className={`rounded px-1.5 py-0.5 ${wouldSuppress.mode.ftt === 'enforce' ? 'bg-rose-100 text-rose-700' : wouldSuppress.mode.ftt === 'observe' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>fixed: {wouldSuppress.mode.ftt}</span>
+            </div>
+          </div>
+          {wouldSuppress.summary.length ? (
+            <>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {wouldSuppress.summary.slice(0, 12).map((s) => (
+                  <span key={`${s.type}-${s.symbol}`} className="rounded-lg border border-amber-200 bg-white px-2.5 py-1 text-[12px] font-bold text-amber-800">{s.symbol} <span className="text-amber-500">×{s.count}</span></span>
+                ))}
+              </div>
+              <div className="overflow-x-auto rounded-xl border border-amber-100 bg-white">
+                <table className="w-full min-w-[640px] text-left text-sm">
+                  <thead className="border-b border-amber-100 text-[10px] uppercase tracking-[0.15em] text-amber-600">
+                    <tr><th className="px-3 py-2">Signal</th><th className="px-3 py-2">Bucket</th><th className="px-3 py-2 text-right">Win%</th><th className="px-3 py-2 text-right">Settled</th><th className="px-3 py-2">Why</th><th className="px-3 py-2">When</th></tr>
+                  </thead>
+                  <tbody className="divide-y divide-amber-50 text-slate-700">
+                    {wouldSuppress.recent.slice(0, 12).map((r, i) => (
+                      <tr key={`${r.symbol}-${r.at}-${i}`}>
+                        <td className="px-3 py-1.5 font-bold text-slate-800">{r.type} {r.symbol} <span className="text-[10px] text-slate-400">{r.timeframe || r.expiry || ''}</span></td>
+                        <td className="px-3 py-1.5 text-[12px] text-slate-500">{r.bucket || '—'}</td>
+                        <td className="px-3 py-1.5 text-right font-mono">{r.winRate ?? '—'}%</td>
+                        <td className="px-3 py-1.5 text-right font-mono">{r.settled ?? '—'}</td>
+                        <td className="px-3 py-1.5 text-[11px] text-slate-500">{r.reason}</td>
+                        <td className="px-3 py-1.5 text-[11px] text-slate-400">{new Date(r.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <p className="text-[12px] font-medium text-amber-700/80">Nothing flagged yet. As alerts fire, any that the gate would block under <b>enforce</b> appear here — none are dropped while in observe.</p>
+          )}
+          <p className="mt-2 text-[11px] font-medium text-slate-400">{wouldSuppress.note}</p>
+        </div>
+      )}
 
       {calibration && (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
