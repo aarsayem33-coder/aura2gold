@@ -5,6 +5,7 @@ import type { SignalLogBucket, SignalLogResponse, SystemSignalLogRow } from '../
 import {
   DateCell, ReportsHeader, ReportsTabs, ErrorBanner,
   price, outcomeBadge, outcomeIcon, gradeBadgeClass,
+  rangeToParams, type RangeKey,
 } from './_shared';
 
 function BucketCard({ title, bucket, accent, hint }: { title: string; bucket: SignalLogBucket; accent: string; hint: string }) {
@@ -26,7 +27,7 @@ function BucketCard({ title, bucket, accent, hint }: { title: string; bucket: Si
 }
 
 export default function SignalLog() {
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<RangeKey>('d30');
   const [query, setQuery] = useState('');
   const [gradeFilter, setGradeFilter] = useState<'all' | 'A Setup' | 'A+ Setup'>('all');
   const [emailedFilter, setEmailedFilter] = useState<'all' | 'emailed' | 'filtered'>('all');
@@ -39,7 +40,7 @@ export default function SignalLog() {
     setError(null);
     try {
       const res = await fetchSignalLog({
-        days,
+        ...rangeToParams(range),
         grade: gradeFilter === 'all' ? undefined : gradeFilter,
         emailed: emailedFilter === 'all' ? undefined : emailedFilter === 'emailed',
         limit: 500,
@@ -50,7 +51,7 @@ export default function SignalLog() {
     } finally {
       setLoading(false);
     }
-  }, [days, gradeFilter, emailedFilter]);
+  }, [range, gradeFilter, emailedFilter]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -77,7 +78,7 @@ export default function SignalLog() {
       <ReportsHeader
         title="System Signal Log"
         subtitle="Every executable A/A+ forex setup the system produced — emailed or filtered — with auto-resolved outcomes"
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
 

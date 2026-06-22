@@ -21,6 +21,7 @@ import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive } from './liquidityEngine.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
+import { listStrategies, evaluateStrategy, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini } from './geminiEngine.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
 import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
@@ -716,6 +717,52 @@ async function initializeDatabase() {
           dismissed_at DATETIME(3) NOT NULL
         )
       `);
+
+      // Strategy Lab — isolated single-strategy signals (NOT the main system). One row
+      // per strategy|symbol|timeframe|bar. Each signal is scored two ways: forex (TP/SL
+      // replay) and fixed-time (direction at next-candle expiry). Compact + pruned.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_strategy_signals (
+          id VARCHAR(200) PRIMARY KEY,
+          strategy VARCHAR(48) NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          bar_time DATETIME(3) NOT NULL,
+          signal_time DATETIME(3) NOT NULL,
+          direction VARCHAR(16) NOT NULL,
+          score DECIMAL(5,1) NULL,
+          grade VARCHAR(8) NULL,
+          entry_price DOUBLE NULL,
+          stop_loss DOUBLE NULL,
+          take_profit_1 DOUBLE NULL,
+          take_profit_2 DOUBLE NULL,
+          take_profit_3 DOUBLE NULL,
+          risk_reward DOUBLE NULL,
+          reason VARCHAR(255) NULL,
+          outcome VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+          exit_price DOUBLE NULL,
+          profit_loss_pips DOUBLE NULL,
+          tp_hit_level INT NULL,
+          mfe_pips DOUBLE NULL,
+          mae_pips DOUBLE NULL,
+          ft_outcome VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+          ft_exit_price DOUBLE NULL,
+          ft_pips DOUBLE NULL,
+          resolved_at DATETIME(3) NULL,
+          created_at DATETIME(3) NOT NULL,
+          KEY idx_strat_outcome (strategy, outcome),
+          KEY idx_strat_ft (strategy, ft_outcome),
+          KEY idx_strat_signal_time (signal_time),
+          KEY idx_strat_sym_tf (strategy, symbol, timeframe)
+        )
+      `);
+      // score/grade may be absent if the table was created before scoring was added.
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'score', 'DECIMAL(5,1) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'grade', 'VARCHAR(8) NULL');
+      // Channel tracking (display only — never affects scoring/outcomes): was this signal
+      // surfaced as a live popup and/or sent by email when it was first logged.
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'popup_sent', 'TINYINT NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'email_sent', 'TINYINT NULL');
 
       return pool;
     })().catch((error) => {
@@ -4355,9 +4402,11 @@ app.get('/api/reports/forex', async (req, res) => {
   try {
     const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
     const days = req.query.days ? Number(req.query.days) : null;
+    const preset = req.query.preset ? String(req.query.preset) : null;
     const outcome = req.query.outcome ? String(req.query.outcome).toUpperCase() : null;
     const limit = req.query.limit ? Number(req.query.limit) : 200;
-    const reports = await querySignalEmailReports('forex', { symbol, days, outcome, limit });
+    const win = preset ? reportDateWindow({ preset }) : null;
+    const reports = await querySignalEmailReports('forex', { symbol, days: win ? null : days, from: win ? win.from : null, to: win ? win.to : null, outcome, limit });
     const stats = buildGroupedStats(
       reports,
       ['symbol', 'timeframe', 'direction', 'grade', 'confidenceBucket'],
@@ -4387,6 +4436,7 @@ app.get('/api/reports/forex', async (req, res) => {
       },
       groups: stats.groups,
       filters: { symbol, days, outcome, limit },
+      window: win ? { label: win.label, from: win.fromIso, to: win.toIso, preset: win.preset } : null,
       status: getMt5Status(),
     });
   } catch (error) {
@@ -4402,12 +4452,14 @@ app.get('/api/reports/signal-log', async (req, res) => {
   try {
     const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
     const days = req.query.days ? Number(req.query.days) : 30;
+    const preset = req.query.preset ? String(req.query.preset) : null;
     const grade = req.query.grade ? String(req.query.grade) : null;
     const outcome = req.query.outcome ? String(req.query.outcome).toUpperCase() : null;
     const limit = req.query.limit ? Number(req.query.limit) : 300;
     const emailed = req.query.emailed === 'true' ? true : req.query.emailed === 'false' ? false : null;
-    const { rows, summary } = await querySystemSignalLog({ symbol, days, grade, outcome, limit, emailed });
-    res.json({ ok: true, rows, summary, count: rows.length });
+    const win = preset ? reportDateWindow({ preset }) : null;
+    const { rows, summary } = await querySystemSignalLog({ symbol, days: win ? null : days, from: win ? win.from : null, to: win ? win.to : null, grade, outcome, limit, emailed });
+    res.json({ ok: true, rows, summary, count: rows.length, window: win ? { label: win.label, from: win.fromIso, to: win.toIso, preset: win.preset } : null });
   } catch (error) {
     console.error('[Reports] signal-log failed:', error.message);
     res.status(500).json({ error: error.message });
@@ -4448,9 +4500,11 @@ app.get('/api/reports/fixed', async (req, res) => {
   try {
     const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
     const days = req.query.days ? Number(req.query.days) : null;
+    const preset = req.query.preset ? String(req.query.preset) : null;
     const outcome = req.query.outcome ? String(req.query.outcome).toUpperCase() : null;
     const limit = req.query.limit ? Number(req.query.limit) : 200;
-    const reports = await querySignalEmailReports('fixed', { symbol, days, outcome, limit });
+    const win = preset ? reportDateWindow({ preset }) : null;
+    const reports = await querySignalEmailReports('fixed', { symbol, days: win ? null : days, from: win ? win.from : null, to: win ? win.to : null, outcome, limit });
     const stats = buildGroupedStats(
       reports,
       ['symbol', 'expiry', 'direction', 'grade', 'candleEntryTf'],
@@ -4479,6 +4533,7 @@ app.get('/api/reports/fixed', async (req, res) => {
       },
       groups: stats.groups,
       filters: { symbol, days, outcome, limit },
+      window: win ? { label: win.label, from: win.fromIso, to: win.toIso, preset: win.preset } : null,
       status: getMt5Status(),
     });
   } catch (error) {
@@ -5616,6 +5671,7 @@ function digitsFor(symbol) {
   return /XAU|GOLD|XAG/.test(s) ? 2 : /JPY/.test(s) ? 3 : 5;
 }
 function px(v, symbol) { return (v === null || v === undefined) ? 'n/a' : Number(v).toFixed(digitsFor(symbol)); }
+function px2(v) { return (v === null || v === undefined || !Number.isFinite(Number(v))) ? 'n/a' : `$${Number(v).toFixed(2)}`; }
 
 function setupLabel(grade) {
   const text = String(grade || '').trim();
@@ -6200,6 +6256,11 @@ function evaluateForexReplay(report, candles, { horizonHours = 72 } = {}) {
   if (!Number.isFinite(entry) || !Number.isFinite(sl) || !Number.isFinite(tp1)) {
     return { outcome: 'PENDING', valid: false };
   }
+  // A take-profit only counts if it is finite, positive, and on the correct side of
+  // entry. Number(null) coerces to 0, and Number.isFinite(0) is true — without this
+  // guard a missing TP2/TP3 (single-target strategies) would register as an
+  // instantly-hit target for BUYs (high >= 0 is always true) and produce a bogus win.
+  const validTp = (tp) => Number.isFinite(tp) && tp > 0 && (isBuy ? tp > entry : tp < entry);
 
   const horizonMs = Math.max(1, Number(horizonHours) || 72) * 3600 * 1000;
   const laterCandles = candles
@@ -6232,9 +6293,9 @@ function evaluateForexReplay(report, candles, { horizonHours = 72 } = {}) {
     mfePips = Math.max(mfePips, Math.round(favorable * 10) / 10);
     maePips = Math.min(maePips, Math.round(adverse * 10) / 10);
 
-    const hitTp1 = isBuy ? high >= tp1 : low <= tp1;
-    const hitTp2 = Number.isFinite(tp2) ? (isBuy ? high >= tp2 : low <= tp2) : false;
-    const hitTp3 = Number.isFinite(tp3) ? (isBuy ? high >= tp3 : low <= tp3) : false;
+    const hitTp1 = validTp(tp1) ? (isBuy ? high >= tp1 : low <= tp1) : false;
+    const hitTp2 = validTp(tp2) ? (isBuy ? high >= tp2 : low <= tp2) : false;
+    const hitTp3 = validTp(tp3) ? (isBuy ? high >= tp3 : low <= tp3) : false;
     const hitAnyTarget = hitTp3 || hitTp2 || hitTp1;
     const hitLevel = hitTp3 ? 3 : hitTp2 ? 2 : hitTp1 ? 1 : 0;
     const hitSl = isBuy ? low <= sl : high >= sl;
@@ -6896,13 +6957,24 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   aiTracked: false,
   forecast: true,
   signalTracker: true,
+  strategyLab: false,
+  strategyLabFixedTime: false,
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
   postNewsForexMinGrade: 'A_NEWS_SETUP',
   postNewsFixedMinTier: 'QUALITY_SIGNAL',
+  // Strategy Lab email rules (frontend-controlled): which score / grade / strategies email.
+  // Forex (TP/SL) framing.
+  strategyLabMinScore: 75,
+  strategyLabMinGrade: 'ANY',      // ANY | B | A | A+
+  strategyLabStrategies: {},       // { [strategyId]: boolean } — empty = all enabled
+  // Fixed-time (direction at next-candle expiry) framing — independent rules.
+  strategyLabFttMinScore: 75,
+  strategyLabFttMinGrade: 'ANY',   // ANY | B | A | A+
+  strategyLabFttStrategies: {},    // { [strategyId]: boolean } — empty = all enabled
 };
-const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast', 'signalTracker'];
+const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast', 'signalTracker', 'strategyLab', 'strategyLabFixedTime'];
 const EMAIL_SELECT_SETTING_VALUES = {
   forexMinGrade: ['B_SETUP', 'A_SETUP', 'A_PLUS_SETUP'],
   forexMinQuality: ['B_SIGNAL', 'A_SIGNAL', 'A_PLUS_SIGNAL'],
@@ -6938,6 +7010,34 @@ function saveEmailAlertSettings(nextSettings) {
     const value = String(nextSettings[key] || '').toUpperCase();
     if (allowedValues.includes(value)) sanitized[key] = value;
   }
+  // Strategy Lab email rules.
+  if (Object.prototype.hasOwnProperty.call(nextSettings || {}, 'strategyLabMinScore')) {
+    const v = Number(nextSettings.strategyLabMinScore);
+    if (Number.isFinite(v)) sanitized.strategyLabMinScore = Math.max(40, Math.min(95, Math.round(v)));
+  }
+  if (Object.prototype.hasOwnProperty.call(nextSettings || {}, 'strategyLabMinGrade')) {
+    const g = String(nextSettings.strategyLabMinGrade || 'ANY').toUpperCase();
+    if (['ANY', 'B', 'A', 'A+'].includes(g)) sanitized.strategyLabMinGrade = g;
+  }
+  if (nextSettings && nextSettings.strategyLabStrategies && typeof nextSettings.strategyLabStrategies === 'object') {
+    const map = {};
+    for (const [k, v] of Object.entries(nextSettings.strategyLabStrategies)) map[String(k)] = Boolean(v);
+    sanitized.strategyLabStrategies = map;
+  }
+  // Strategy Lab fixed-time email rules (independent of the forex rules above).
+  if (Object.prototype.hasOwnProperty.call(nextSettings || {}, 'strategyLabFttMinScore')) {
+    const v = Number(nextSettings.strategyLabFttMinScore);
+    if (Number.isFinite(v)) sanitized.strategyLabFttMinScore = Math.max(40, Math.min(95, Math.round(v)));
+  }
+  if (Object.prototype.hasOwnProperty.call(nextSettings || {}, 'strategyLabFttMinGrade')) {
+    const g = String(nextSettings.strategyLabFttMinGrade || 'ANY').toUpperCase();
+    if (['ANY', 'B', 'A', 'A+'].includes(g)) sanitized.strategyLabFttMinGrade = g;
+  }
+  if (nextSettings && nextSettings.strategyLabFttStrategies && typeof nextSettings.strategyLabFttStrategies === 'object') {
+    const map = {};
+    for (const [k, v] of Object.entries(nextSettings.strategyLabFttStrategies)) map[String(k)] = Boolean(v);
+    sanitized.strategyLabFttStrategies = map;
+  }
   emailAlertSettingsCache = sanitized;
   fs.mkdirSync(path.dirname(EMAIL_ALERT_SETTINGS_FILE), { recursive: true });
   fs.writeFileSync(EMAIL_ALERT_SETTINGS_FILE, JSON.stringify(sanitized, null, 2), 'utf8');
@@ -6947,6 +7047,34 @@ function saveEmailAlertSettings(nextSettings) {
 function isEmailSystemEnabled(key) {
   const settings = loadEmailAlertSettings();
   return settings[key] !== false;
+}
+
+// Strategy Lab EMAIL rule (frontend-controlled): master toggle + min score + min grade
+// + per-strategy enable. Popups are NOT gated by this — only emails.
+const STRATEGY_GRADE_RANK = { C: 0, B: 1, A: 2, 'A+': 3 };
+function strategyLabEmailAllowed(strategy, score, grade) {
+  const s = loadEmailAlertSettings();
+  if (s.strategyLab === false) return false;
+  if ((Number(score) || 0) < Number(s.strategyLabMinScore ?? 75)) return false;
+  const minG = String(s.strategyLabMinGrade || 'ANY').toUpperCase();
+  if (minG !== 'ANY' && (STRATEGY_GRADE_RANK[String(grade || '').toUpperCase()] ?? 0) < (STRATEGY_GRADE_RANK[minG] ?? 0)) return false;
+  const map = s.strategyLabStrategies || {};
+  if (Object.keys(map).length && map[strategy] !== true) return false;  // explicit per-strategy selection
+  return true;
+}
+
+// Strategy Lab FIXED-TIME EMAIL rule (frontend-controlled): master toggle + min score
+// + min grade + per-strategy enable. Independent of the forex rule above so the user can
+// receive one framing without the other. Popups are NOT gated by this — only emails.
+function strategyLabFttEmailAllowed(strategy, score, grade) {
+  const s = loadEmailAlertSettings();
+  if (s.strategyLabFixedTime === false || s.strategyLabFixedTime === undefined) return false;
+  if ((Number(score) || 0) < Number(s.strategyLabFttMinScore ?? 75)) return false;
+  const minG = String(s.strategyLabFttMinGrade || 'ANY').toUpperCase();
+  if (minG !== 'ANY' && (STRATEGY_GRADE_RANK[String(grade || '').toUpperCase()] ?? 0) < (STRATEGY_GRADE_RANK[minG] ?? 0)) return false;
+  const map = s.strategyLabFttStrategies || {};
+  if (Object.keys(map).length && map[strategy] !== true) return false;  // explicit per-strategy selection
+  return true;
 }
 
 async function persistEmailedPostNewsForexReport(sig, referenceId) {
@@ -7137,7 +7265,31 @@ async function processForexEmailReports() {
   }
 }
 
-async function querySignalEmailReports(signalType, { symbol = null, days = null, outcome = null, limit = 200 } = {}) {
+// Generic report date window (shared by the /reports endpoints). Either a rolling
+// day-window (days=N) or a Bangladesh-time (UTC+6) calendar preset: today / yesterday /
+// last7. Returns MySQL UTC datetime strings ready for signal_time range filtering.
+function reportDateWindow({ days = null, preset = null } = {}) {
+  const BD = 6 * 3600 * 1000;
+  const nowMs = Date.now();
+  let fromMs;
+  let toMs = nowMs;
+  let label;
+  const p = preset ? String(preset).toLowerCase() : null;
+  if (p === 'today' || p === 'yesterday' || p === 'last7') {
+    const bdNow = new Date(nowMs + BD);
+    const mid = Date.UTC(bdNow.getUTCFullYear(), bdNow.getUTCMonth(), bdNow.getUTCDate()) - BD; // BD 00:00 in real UTC
+    if (p === 'today') { fromMs = mid; label = 'Today (BD)'; }
+    else if (p === 'yesterday') { fromMs = mid - 86400000; toMs = mid; label = 'Yesterday (BD)'; }
+    else { fromMs = mid - 6 * 86400000; label = 'Last 7 days (BD)'; }
+  } else {
+    const d = Math.max(1, Math.min(Number(days) || 30, 365));
+    fromMs = nowMs - d * 86400000;
+    label = `Last ${d} days`;
+  }
+  return { fromMs, toMs, from: toMysqlDate(new Date(fromMs)), to: toMysqlDate(new Date(toMs)), fromIso: new Date(fromMs).toISOString(), toIso: new Date(toMs).toISOString(), preset: p, label };
+}
+
+async function querySignalEmailReports(signalType, { symbol = null, days = null, from = null, to = null, outcome = null, limit = 200 } = {}) {
   const pool = await initializeDatabase();
   if (!pool) return [];
   let sql = 'SELECT * FROM mt5_signal_email_reports WHERE signal_type = ?';
@@ -7150,7 +7302,10 @@ async function querySignalEmailReports(signalType, { symbol = null, days = null,
     sql += ' AND outcome = ?';
     params.push(String(outcome).toUpperCase());
   }
-  if (days && Number(days) > 0) {
+  if (from && to) {
+    sql += ' AND signal_time >= ? AND signal_time < ?';
+    params.push(from, to);
+  } else if (days && Number(days) > 0) {
     sql += ' AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)';
     params.push(Number(days));
   }
@@ -7694,7 +7849,7 @@ function summarizeSignalLog(rows) {
   return { all: finalize(all), emailed: finalize(emailed), filtered: finalize(filtered) };
 }
 
-async function querySystemSignalLog({ days = 30, symbol = null, grade = null, emailed = null, outcome = null, limit = 300 } = {}) {
+async function querySystemSignalLog({ days = 30, from = null, to = null, symbol = null, grade = null, emailed = null, outcome = null, limit = 300 } = {}) {
   const pool = await initializeDatabase();
   if (!pool) return { rows: [], summary: summarizeSignalLog([]) };
   let sql = 'SELECT * FROM mt5_system_signal_log WHERE 1=1';
@@ -7703,7 +7858,8 @@ async function querySystemSignalLog({ days = 30, symbol = null, grade = null, em
   if (grade) { sql += ' AND grade = ?'; params.push(grade); }
   if (emailed === true || emailed === false) { sql += ' AND emailed = ?'; params.push(emailed ? 1 : 0); }
   if (outcome) { sql += ' AND outcome = ?'; params.push(String(outcome).toUpperCase()); }
-  if (days && Number(days) > 0) { sql += ' AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)'; params.push(Number(days)); }
+  if (from && to) { sql += ' AND signal_time >= ? AND signal_time < ?'; params.push(from, to); }
+  else if (days && Number(days) > 0) { sql += ' AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)'; params.push(Number(days)); }
   sql += ' ORDER BY signal_time DESC LIMIT ?';
   params.push(Math.min(Math.max(Number(limit) || 300, 1), 1000));
   const [rows] = await pool.query(sql, params);
@@ -9892,6 +10048,774 @@ app.get('/api/day-trading/desk', async (req, res) => {
 });
 
 
+// ─── Strategy Lab — isolated single-strategy signals (forex + fixed-time, all TFs) ──
+// Completely separate from aggregateSignals. Runs each registered strategy over every
+// curated symbol × every available timeframe, logs signals, and scores each TWO ways:
+// forex (TP/SL replay) + fixed-time (direction at next-candle expiry). Honest per-
+// strategy / per-timeframe win rates so we can see which actually works.
+const STRATEGY_LAB_TIMEFRAMES = (process.env.STRATEGY_LAB_TIMEFRAMES || 'M1,M5,M15,M30,H1,H4,D1')
+  .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+const STRATEGY_LAB_SCAN_MS = Math.max(60000, Number(process.env.STRATEGY_LAB_SCAN_MS || 5 * 60 * 1000));
+const STRATEGY_LAB_RETENTION_DAYS = Math.max(7, Number(process.env.STRATEGY_LAB_RETENTION_DAYS || 45));
+const STRATEGY_LAB_FT_EXPIRY_BARS = Math.max(1, Number(process.env.STRATEGY_LAB_FT_EXPIRY_BARS || 1));
+const STRATEGY_LAB_ALERT_MIN_SCORE = Math.max(50, Number(process.env.STRATEGY_LAB_ALERT_MIN_SCORE || 75));
+let strategyLabScanRunning = false;
+
+// Trading session for a Strategy Lab signal, in Bangladesh time (BDT = UTC+6). Pure
+// function of the timestamp — no DB column needed; works for historical rows too. Hour
+// ranges are chosen for gold/forex liquidity. The London–NY overlap (19:00–22:00 BD) is
+// when XAU moves most. NOTE: fixed offset, ignores DST in London/NY (advisory label only).
+const STRATEGY_LAB_SESSION_META = {
+  SYDNEY:  { label: 'Sydney',            bdRange: '04:00–07:00 BD' },
+  TOKYO:   { label: 'Tokyo (Asian)',     bdRange: '07:00–13:00 BD' },
+  LONDON:  { label: 'London',            bdRange: '13:00–19:00 BD' },
+  OVERLAP: { label: 'London–NY overlap', bdRange: '19:00–22:00 BD' },
+  NEWYORK: { label: 'New York',          bdRange: '22:00–02:00 BD' },
+  OFF:     { label: 'Off-hours (quiet)', bdRange: '02:00–04:00 BD' },
+  UNKNOWN: { label: 'Unknown',           bdRange: '' },
+};
+function strategyLabSessionKey(bdHour) {
+  if (bdHour >= 4 && bdHour < 7) return 'SYDNEY';
+  if (bdHour >= 7 && bdHour < 13) return 'TOKYO';
+  if (bdHour >= 13 && bdHour < 19) return 'LONDON';
+  if (bdHour >= 19 && bdHour < 22) return 'OVERLAP';
+  if (bdHour >= 2 && bdHour < 4) return 'OFF';
+  return 'NEWYORK'; // 22, 23, 0, 1
+}
+function strategyLabSession(value) {
+  const ms = Date.parse(value || '');
+  if (!Number.isFinite(ms)) return { key: 'UNKNOWN', ...STRATEGY_LAB_SESSION_META.UNKNOWN, bdHour: null, bdTime: null };
+  const d = new Date(ms);
+  const bdHour = (d.getUTCHours() + 6) % 24;
+  const bdMin = d.getUTCMinutes();
+  const key = strategyLabSessionKey(bdHour);
+  return {
+    key, ...STRATEGY_LAB_SESSION_META[key], bdHour,
+    bdTime: `${String(bdHour).padStart(2, '0')}:${String(bdMin).padStart(2, '0')} BD`,
+  };
+}
+
+// Position sizing for a strategy signal. Lots are risk-based: a fixed % of equity divided
+// by the stop distance in pips — so the suggested volume scales naturally WITH the
+// timeframe (a higher-TF signal has a wider stop → fewer lots; a scalp TF → more lots).
+// Equity comes from the live MT5 snapshot, else FOREX_SIGNAL_DEFAULT_EQUITY.
+function strategyLabSizing(symbol, entry, stop, targets = {}) {
+  const e = Number(entry), s = Number(stop);
+  if (!Number.isFinite(e) || !Number.isFinite(s) || e === s) return null;
+  const pipSize = forexSizingPipSize(symbol);
+  const pipValue = forexSizingPipValuePerLot(symbol);
+  const equity = finitePositive(mt5State.accountSnapshot?.equity)
+    ?? finitePositive(mt5State.accountSnapshot?.balance)
+    ?? Math.max(1, Number(process.env.FOREX_SIGNAL_DEFAULT_EQUITY || 1000));
+  const riskPercent = Math.min(3, Math.max(0.1, Number(process.env.STRATEGY_LAB_RISK_PERCENT || process.env.FOREX_SIGNAL_RISK_PERCENT || 1)));
+  const stopPips = Math.round((Math.abs(e - s) / pipSize) * 10) / 10;
+  if (!(stopPips > 0)) return null;
+  const riskAmount = Math.round(equity * (riskPercent / 100) * 100) / 100;
+  const lots = Math.max(0.01, Math.round((riskAmount / (stopPips * pipValue)) * 100) / 100);
+  const profitAt = (tp) => {
+    const t = Number(tp);
+    if (!Number.isFinite(t)) return null;
+    return Math.round((Math.abs(t - e) / pipSize) * pipValue * lots * 100) / 100;
+  };
+  return {
+    equity, riskPercent, riskAmount, stopPips, pipValuePerLot: pipValue, suggestedLots: lots,
+    lossAtStop: Math.round(stopPips * pipValue * lots * 100) / 100,
+    profitAtTp1: profitAt(targets.tp1), profitAtTp2: profitAt(targets.tp2), profitAtTp3: profitAt(targets.tp3),
+  };
+}
+
+// Entry-timing / tradability for a logged signal. These are limit-style entries, so a
+// fresh signal is only actionable for a short window after it forms. Deterministic, from
+// the candles since the signal bar:
+//   WAIT      — price hasn't reached the entry yet, still inside the validity window.
+//   TRADABLE  — price has tagged the entry (and not the stop) → take it now.
+//   EXPIRED   — entry never filled in time, or the stop was touched first → gone; the
+//               scanner will surface the next best setup on its next pass.
+//   SETTLED   — outcome already resolved (WIN/LOSS) → it has played out.
+const STRATEGY_LAB_ENTRY_VALID_BARS = Math.max(1, Number(process.env.STRATEGY_LAB_ENTRY_VALID_BARS || 4));
+function strategyLabTiming(row) {
+  const sigMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+  const tfMin = timeframeMinutes(row.timeframe);
+  const expectByMs = Number.isFinite(sigMs) ? sigMs + STRATEGY_LAB_ENTRY_VALID_BARS * tfMin * 60000 : NaN;
+  const expectEntryBy = Number.isFinite(expectByMs) ? new Date(expectByMs).toISOString() : null;
+  const hhmm = Number.isFinite(expectByMs)
+    ? new Date(expectByMs).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC'
+    : '';
+  const outcome = String(row.outcome || 'PENDING').toUpperCase();
+  if (['LOSS', 'TP1_WIN', 'TP2_WIN', 'TP3_WIN', 'WIN', 'AMBIGUOUS'].includes(outcome)) {
+    return { status: 'SETTLED', expectEntryBy, message: `Played out — ${outcome.replace('_', ' ')}` };
+  }
+  if (outcome === 'EXPIRED') {
+    return { status: 'EXPIRED', expectEntryBy, message: 'Expired & gone — best setup returns after the next scan' };
+  }
+  // PENDING — decide from price action since the signal bar.
+  const entry = Number(row.entry_price), stop = Number(row.stop_loss);
+  const buy = /BUY/.test(String(row.direction).toUpperCase());
+  const candles = getRecentCandles(row.symbol, row.timeframe, 300);
+  let touchedEntry = false, hitStop = false;
+  if (candles && candles.length && Number.isFinite(sigMs)) {
+    for (const c of candles) {
+      const t = Date.parse(c.time || '');
+      if (!Number.isFinite(t) || t <= sigMs) continue;
+      const hi = Number(c.high), lo = Number(c.low);
+      if (Number.isFinite(hi) && Number.isFinite(lo)) {
+        if (Number.isFinite(entry) && lo <= entry && entry <= hi) touchedEntry = true;
+        if (Number.isFinite(stop) && (buy ? lo <= stop : hi >= stop)) hitStop = true;
+      }
+    }
+  }
+  if (hitStop) return { status: 'EXPIRED', expectEntryBy, message: 'Invalidated (stop touched before entry) — returns after next scan' };
+  if (touchedEntry) return { status: 'TRADABLE', expectEntryBy, message: 'Entry reached — tradable now' };
+  if (Number.isFinite(expectByMs) && Date.now() <= expectByMs) {
+    return { status: 'WAIT', expectEntryBy, message: `Wait for limit @ entry — valid until ${hhmm}` };
+  }
+  return { status: 'EXPIRED', expectEntryBy, message: 'Entry not reached in time — expired & gone; returns after next scan' };
+}
+
+// LIVE tradability for a current-bar signal, judged against the latest price. These are
+// limit entries at a level, so the actionable call is: has price reached the entry yet
+// (take it now), is it still away (wait for the pullback/approach), or has the stop
+// already been breached (skip — the scanner will surface the next setup).
+function strategyLabLiveTiming(symbol, direction, price, entry, stop) {
+  const buy = /BUY/.test(String(direction).toUpperCase());
+  const p = Number(price), e = Number(entry), s = Number(stop);
+  if (![p, e, s].every(Number.isFinite)) return { status: 'WAIT', message: 'Awaiting price' };
+  if (buy ? p <= s : p >= s) return { status: 'EXPIRED', message: 'Stop already hit — skip; next scan brings the best setup' };
+  if (buy ? p <= e : p >= e) return { status: 'TRADABLE', message: 'Price at entry — tradable now' };
+  const pip = pipSizeForSymbol(symbol) || 0.0001;
+  const distPips = Math.round((Math.abs(p - e) / pip) * 10) / 10;
+  return { status: 'WAIT', message: `Wait — ${distPips} pips ${buy ? 'pullback' : 'rally'} to entry ${px(e, symbol)}` };
+}
+
+// High-score Strategy Lab signal → live popup (SSE) + optional email. Gated by score
+// so the every-timeframe scan doesn't flood; signals are already deduped per breaker.
+async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, popup = true, email = false }) {  const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+  const lots = sizing?.suggestedLots ?? null;
+  const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
+  const at = new Date().toISOString();
+  if (popup) {
+    sendStreamEvent('strategy_signal', {
+      id, strategy, strategyName, symbol, timeframe, direction: sig.decision,
+      score: sig.score ?? null, grade: sig.grade ?? null,
+      entry: sig.entry ?? null, stopLoss: sig.stopLoss ?? null,
+      takeProfit1: sig.takeProfit1 ?? null, takeProfit2: sig.takeProfit2 ?? null, takeProfit3: sig.takeProfit3 ?? null,
+      lots, stopPips: sizing?.stopPips ?? null,
+      riskReward: sig.riskRewardRatio ?? null, reason: sig.reason || null, at,
+    });
+  }
+  if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
+  const subject = `[STRATEGY ${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
+  const lotLine = lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a';
+  const text = [
+    `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})`,
+    `${sig.decision} ${symbol} ${timeframe} | score ${Math.round(sig.score)}/100 (${sig.grade}) | RR 1:${sig.riskRewardRatio ?? 'n/a'}`,
+    `Entry ${px(sig.entry, symbol)}   SL ${px(sig.stopLoss, symbol)}`,
+    `TP1 ${px(sig.takeProfit1, symbol)} (1R)   TP2 ${px(sig.takeProfit2, symbol)} (2R)   TP3 ${px(sig.takeProfit3, symbol)} (target)`,
+    lotLine,
+    `Why: ${sig.reason || ''}`,
+    'Isolated strategy-lab signal (not the main system). Advisory — not financial advice.',
+  ].join('\n');
+  const dirColor = /BUY/.test(sig.decision) ? '#047857' : '#b91c1c';
+  const html = `<div style="font-family:Arial,sans-serif;max-width:640px">
+    <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#7c3aed;text-transform:uppercase">Strategy Lab · ${strategyName}</p>
+    <h2 style="margin:0 0 4px;color:${dirColor}">${sig.decision} ${symbol} <span style="font-size:13px;color:#64748b">${timeframe} · score ${Math.round(sig.score)} (${sig.grade})</span></h2>
+    <table style="font-size:13px;border-collapse:collapse">
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Entry</td><td><b>${px(sig.entry, symbol)}</b></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Stop loss</td><td style="color:#b91c1c">${px(sig.stopLoss, symbol)} <span style="color:#94a3b8">(${sizing?.stopPips ?? '?'} pips)</span></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP1 (1R)</td><td style="color:#047857">${px(sig.takeProfit1, symbol)}${sizing?.profitAtTp1 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp1)}</span>` : ''}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP2 (2R)</td><td style="color:#047857">${px(sig.takeProfit2, symbol)}${sizing?.profitAtTp2 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp2)}</span>` : ''}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP3 (target)</td><td style="color:#047857">${px(sig.takeProfit3, symbol)}${sizing?.profitAtTp3 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp3)}</span>` : ''}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Volume</td><td><b>${lots !== null ? `${lots} lots` : 'n/a'}</b>${lots !== null ? ` <span style="color:#94a3b8">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})</span>` : ''}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">R:R</td><td>1:${sig.riskRewardRatio ?? 'n/a'}</td></tr>
+    </table>
+    <p style="font-size:12px;color:#475569;margin:6px 0 0">${sig.reason || ''}</p>
+    <p style="font-size:11px;color:#94a3b8;margin-top:8px">Volume sized at ${sizing?.riskPercent ?? '?'}% risk on ${px2(sizing?.equity || 0)} equity, scaled to the ${timeframe} stop. Isolated strategy-lab signal — not the main system. Advisory only. — Aura Gold Strategy Lab</p></div>`;
+  try {
+    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `stratlab:${id}` });
+    console.log(`[StrategyLab] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (${strategyName}, score ${Math.round(sig.score)})`);
+  } catch (e) { console.error('[StrategyLab] email failed:', e.message); }
+}
+
+// Fixed-time expiry framing for a strategy signal. The strategy's fixed-time outcome
+// (resolveStrategyFixedTime) is judged at the close STRATEGY_LAB_FT_EXPIRY_BARS candles
+// after the signal bar. For a signal that just formed on the last closed bar, that expiry
+// is the close of the current forming bar (+ any extra expiry bars). Returns the expiry
+// timestamp + seconds remaining so the UI/email can frame it as a fixed-time trade.
+function strategyLabFttExpiry(timeframe) {
+  const tfMin = timeframeMinutes(timeframe);
+  if (!(tfMin > 0)) return null;
+  const tfMs = tfMin * 60000;
+  const now = Date.now();
+  const nextBoundary = Math.ceil(now / tfMs) * tfMs;                 // current forming bar closes here
+  const expiryMs = nextBoundary + (STRATEGY_LAB_FT_EXPIRY_BARS - 1) * tfMs;
+  return {
+    expiryIso: new Date(expiryMs).toISOString(),
+    secondsToExpiry: Math.max(0, Math.round((expiryMs - now) / 1000)),
+    expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS,
+    durationLabel: STRATEGY_LAB_FT_EXPIRY_BARS === 1 ? `next ${timeframe} close` : `${STRATEGY_LAB_FT_EXPIRY_BARS} × ${timeframe}`,
+  };
+}
+
+// Fixed-time framing of a Strategy Lab signal → dedicated live popup (SSE event
+// strategy_ftt_signal) + optional fixed-time email. UP = BUY, DOWN = SELL; the call is
+// simply "will price be higher/lower than the reference at the next-candle expiry?" — the
+// same direction the strategy's fixed-time win rate is measured on. Isolated lab, never
+// the main FTT engine.
+async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, refClose = null, popup = true, email = false }) {
+  const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
+  const ftDir = /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN';
+  const expiry = strategyLabFttExpiry(timeframe);
+  const reference = Number.isFinite(Number(refClose)) ? Number(refClose) : (sig.entry ?? null);
+  const at = new Date().toISOString();
+  if (popup) {
+    sendStreamEvent('strategy_ftt_signal', {
+      id, strategy, strategyName, symbol, timeframe, direction: ftDir,
+      score: sig.score ?? null, grade: sig.grade ?? null,
+      reference, expiryIso: expiry?.expiryIso ?? null, secondsToExpiry: expiry?.secondsToExpiry ?? null,
+      durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null, at,
+    });
+  }
+  if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
+  const expiryUtc = expiry?.expiryIso
+    ? new Date(expiry.expiryIso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC'
+    : 'next candle';
+  const subject = `[FIXED-TIME ${sig.grade || ''}] ${strategyName}: ${ftDir} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
+  const text = [
+    `AURA GOLD — STRATEGY LAB FIXED-TIME SIGNAL (${strategyName})`,
+    `Predict ${ftDir} on ${symbol} ${timeframe} | score ${Math.round(sig.score)}/100 (${sig.grade})`,
+    `Reference price ${reference != null ? px(reference, symbol) : 'market'}`,
+    `Expiry: ${expiry?.durationLabel || 'next candle'} — closes ~${expiryUtc}`,
+    `Call: price ${ftDir === 'UP' ? 'HIGHER' : 'LOWER'} than the reference at expiry.`,
+    `Why: ${sig.reason || ''}`,
+    'Isolated strategy-lab fixed-time signal (not the main system / not the FTT engine). Advisory — not financial advice.',
+  ].join('\n');
+  const dirColor = ftDir === 'UP' ? '#047857' : '#b91c1c';
+  const html = `<div style="font-family:Arial,sans-serif;max-width:640px">
+    <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#7c3aed;text-transform:uppercase">Strategy Lab · Fixed-Time · ${strategyName}</p>
+    <h2 style="margin:0 0 4px;color:${dirColor}">${ftDir} ${symbol} <span style="font-size:13px;color:#64748b">${timeframe} · score ${Math.round(sig.score)} (${sig.grade})</span></h2>
+    <table style="font-size:13px;border-collapse:collapse">
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Direction</td><td style="color:${dirColor}"><b>${ftDir}</b> — price ${ftDir === 'UP' ? 'higher' : 'lower'} at expiry</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Reference</td><td><b>${reference != null ? px(reference, symbol) : 'market'}</b></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Expiry</td><td>${expiry?.durationLabel || 'next candle'} <span style="color:#94a3b8">(closes ~${expiryUtc})</span></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Score</td><td>${Math.round(sig.score)}/100 (${sig.grade})</td></tr>
+    </table>
+    <p style="font-size:12px;color:#475569;margin:6px 0 0">${sig.reason || ''}</p>
+    <p style="font-size:11px;color:#94a3b8;margin-top:8px">Fixed-time call (direction at next-candle expiry). Isolated strategy-lab signal — not the main system or FTT engine. Advisory only. — Aura Gold Strategy Lab</p></div>`;
+  try {
+    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `stratlabftt:${id}` });
+    console.log(`[StrategyLab] Emailed FIXED-TIME ${sig.grade} ${ftDir} ${symbol} ${timeframe} (${strategyName}, score ${Math.round(sig.score)})`);
+  } catch (e) { console.error('[StrategyLab] FTT email failed:', e.message); }
+}
+
+function buildStrategyContext(symbol, tf) {
+  const candles = getRecentCandles(symbol, tf, 400);
+  if (!candles || candles.length < 60) return null;
+  return {
+    symbol, timeframe: tf, candles, pip: pipSizeForSymbol(symbol),
+    h4Trend: getTimeframeTrend(getRecentCandles(symbol, 'H4', 150)),
+    h1Trend: getTimeframeTrend(getRecentCandles(symbol, 'H1', 150)),
+  };
+}
+
+async function runStrategyLabScan() {
+  if (strategyLabScanRunning) return;
+  strategyLabScanRunning = true;
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    if (!symbols.length) return;
+    const now = new Date();
+    let logged = 0;
+    for (const stratId of Object.keys(STRATEGY_LAB_REGISTRY)) {
+      for (const symbol of symbols) {
+        for (const tf of STRATEGY_LAB_TIMEFRAMES) {
+          const ctx = buildStrategyContext(symbol, tf);
+          if (!ctx) continue;
+          const sig = evaluateStrategy(stratId, ctx);
+          if (!sig || !sig.decision || sig.decision === 'HOLD') continue;
+          const barMs = Date.parse(sig.barIso || ctx.candles[ctx.candles.length - 1].time);
+          if (!Number.isFinite(barMs)) continue;
+          const id = `${stratId}:${symbol}:${tf}:${barMs}`;
+          try {
+            const [res] = await pool.execute(
+              `INSERT INTO mt5_strategy_signals
+                 (id, strategy, symbol, timeframe, bar_time, signal_time, direction, score, grade,
+                  entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
+                  risk_reward, reason, outcome, ft_outcome, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?)
+               ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade))`,
+              [id, stratId, symbol, tf, toMysqlDate(new Date(barMs)), toMysqlDate(now), sig.decision, sig.score ?? null, sig.grade ?? null,
+               sig.entry ?? null, sig.stopLoss ?? null, sig.takeProfit1 ?? null, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
+               sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), toMysqlDate(now)],
+            );
+            if (res.affectedRows === 1) {
+              logged += 1;
+              // New signal: live popup (broad score gate) + email (frontend-controlled
+              // per-strategy / min-score / min-grade rules) — evaluated independently.
+              const wantPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
+              const wantEmail = strategyLabEmailAllowed(stratId, sig.score, sig.grade);
+              if (wantPopup || wantEmail) {
+                await emitStrategyLabSignal({ id, strategy: stratId, symbol, timeframe: tf, sig, popup: wantPopup, email: wantEmail });
+              }
+              // Same signal, fixed-time framing (dedicated channel): independent popup +
+              // email gates so the user can receive the fixed-time call on its own terms.
+              const wantFttPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
+              const wantFttEmail = strategyLabFttEmailAllowed(stratId, sig.score, sig.grade);
+              if (wantFttPopup || wantFttEmail) {
+                const refClose = Number(ctx.candles[ctx.candles.length - 1].close);
+                await emitStrategyLabFttSignal({ id, strategy: stratId, symbol, timeframe: tf, sig, refClose, popup: wantFttPopup, email: wantFttEmail });
+              }
+              // Channel tracking (display only): record whether this signal was surfaced
+              // as a popup and/or emailed (forex or fixed-time), so the report/recent view
+              // can show how each signal was tracked. Never affects scoring/outcomes.
+              try {
+                await pool.execute(
+                  'UPDATE mt5_strategy_signals SET popup_sent=?, email_sent=? WHERE id=?',
+                  [(wantPopup || wantFttPopup) ? 1 : 0, (wantEmail || wantFttEmail) ? 1 : 0, id],
+                );
+              } catch { /* tracking is best-effort */ }
+            }
+          } catch { /* per-signal resilience */ }
+        }
+      }
+    }
+    if (logged) console.log(`[StrategyLab] Logged ${logged} new signals across ${symbols.length} symbols.`);
+  } catch (e) {
+    console.error('[StrategyLab] Scan error:', e.message);
+  } finally {
+    strategyLabScanRunning = false;
+  }
+}
+
+// Fixed-time outcome: was the close STRATEGY_LAB_FT_EXPIRY_BARS candles after the
+// signal bar in the predicted direction? (entry reference = signal-bar close).
+function resolveStrategyFixedTime(row, candles) {
+  const barMs = row.bar_time ? new Date(row.bar_time).getTime() : NaN;
+  if (!Number.isFinite(barMs) || !candles.length) return null;
+  let sigIdx = -1;
+  for (let i = 0; i < candles.length; i++) { if (Date.parse(candles[i].time) <= barMs) sigIdx = i; else break; }
+  if (sigIdx < 0) return null;
+  const expiryIdx = sigIdx + STRATEGY_LAB_FT_EXPIRY_BARS;
+  if (expiryIdx >= candles.length) return null; // expiry bar not in the store yet
+  // Only settle once the expiry candle has actually CLOSED — never on a still-forming bar.
+  // getRecentCandles keeps the current forming bar as the last element, so settling as soon
+  // as expiryIdx exists would resolve against an incomplete candle (premature/wrong outcome
+  // AND no live window). Wait until the expiry candle's close-time has passed.
+  const expiryOpenMs = Date.parse(candles[expiryIdx].time);
+  const tfMs = timeframeMinutes(row.timeframe) * 60000;
+  if (Number.isFinite(expiryOpenMs) && tfMs > 0 && Date.now() < expiryOpenMs + tfMs) return null; // expiry candle still forming
+  const ftEntry = Number(candles[sigIdx].close);
+  const expiryClose = Number(candles[expiryIdx].close);
+  if (!Number.isFinite(ftEntry) || !Number.isFinite(expiryClose)) return null;
+  const pip = pipSizeForSymbol(row.symbol);
+  const buy = /BUY/.test(String(row.direction).toUpperCase());
+  const diff = buy ? expiryClose - ftEntry : ftEntry - expiryClose;
+  return { outcome: diff > 0 ? 'WIN' : diff < 0 ? 'LOSS' : 'DRAW', exitPrice: expiryClose, pips: Math.round((diff / pip) * 10) / 10 };
+}
+
+async function processStrategyLabOutcomes() {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  const nowMs = Date.now();
+  try {
+    // Repair pass (idempotent): re-open any impossible win so it re-resolves with the
+    // corrected replay. A win can never have negative pips, and a TP level can't be hit
+    // if that target was never defined (the old Number(null)->0 bug faked TP3 wins for
+    // BUYs at exit price 0). Recomputed rows won't match, so this self-heals once.
+    await pool.execute(
+      `UPDATE mt5_strategy_signals
+          SET outcome='PENDING', exit_price=NULL, profit_loss_pips=NULL, tp_hit_level=NULL,
+              mfe_pips=NULL, mae_pips=NULL, resolved_at=NULL
+        WHERE outcome IN ('TP1_WIN','TP2_WIN','TP3_WIN','WIN')
+          AND ( profit_loss_pips < 0
+                OR (tp_hit_level >= 2 AND take_profit_2 IS NULL)
+                OR (tp_hit_level >= 3 AND take_profit_3 IS NULL) )`,
+    );
+    // Purge degenerate signals: a stop tighter than 3 pips is sub-spread noise (logged
+    // before the engine's stopTooTight guard) — untradeable and skews the metrics. Pip
+    // size is symbol-derived (JPY/gold = 0.01, else 0.0001). Idempotent; self-heals once.
+    await pool.execute(
+      `DELETE FROM mt5_strategy_signals
+        WHERE entry_price IS NOT NULL AND stop_loss IS NOT NULL
+          AND ABS(entry_price - stop_loss) < 3 * (CASE
+                WHEN symbol LIKE '%JPY%' OR symbol LIKE '%XAU%' OR symbol LIKE '%GOLD%' THEN 0.01
+                ELSE 0.0001 END)
+        LIMIT 5000`,
+    );
+    const [rows] = await pool.query(
+      "SELECT * FROM mt5_strategy_signals WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') OR ft_outcome = 'PENDING' ORDER BY signal_time ASC LIMIT 300",
+    );
+    for (const row of rows) {
+      const signalMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+      if (!Number.isFinite(signalMs)) continue;
+      const ageHrs = (nowMs - signalMs) / (3600 * 1000);
+      const candles = getRecentCandles(row.symbol, row.timeframe, 1000);
+
+      // Forex outcome (TP/SL). Only PENDING expires past 72h — never overwrite a win.
+      if (['PENDING', 'TP1_WIN', 'TP2_WIN'].includes(String(row.outcome).toUpperCase())) {
+        if (ageHrs > 72 && String(row.outcome).toUpperCase() === 'PENDING') {
+          await pool.execute("UPDATE mt5_strategy_signals SET outcome='EXPIRED', resolved_at=? WHERE id=?", [toMysqlDate(), row.id]);
+        } else if (candles && candles.length >= 2) {
+          const report = {
+            symbol: row.symbol, timeframe: row.timeframe, signalTime: new Date(row.signal_time).toISOString(),
+            direction: row.direction, entryPrice: row.entry_price, stopLoss: row.stop_loss, takeProfit1: row.take_profit_1,
+            payload: { takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3 },
+            outcome: row.outcome, exitPrice: row.exit_price, resolvedAt: row.resolved_at,
+          };
+          const replay = evaluateForexReplay(report, candles);
+          if (replay.valid && !['PENDING', 'EXPIRED'].includes(replay.outcome)) {
+            if (replay.outcome === 'AMBIGUOUS') {
+              await pool.execute("UPDATE mt5_strategy_signals SET outcome='AMBIGUOUS', resolved_at=? WHERE id=?", [toMysqlDate(replay.resolvedAt || new Date()), row.id]);
+            } else {
+              await pool.execute(
+                "UPDATE mt5_strategy_signals SET outcome=?, exit_price=?, profit_loss_pips=?, tp_hit_level=?, mfe_pips=?, mae_pips=?, resolved_at=? WHERE id=?",
+                [replay.outcome, replay.exitPrice ?? null, replay.profitLossPips ?? null, replay.tpHitLevel ?? null, replay.mfePips ?? null, replay.maePips ?? null, toMysqlDate(replay.resolvedAt || new Date()), row.id],
+              );
+            }
+          }
+        }
+      }
+
+      // Fixed-time outcome (direction at expiry).
+      if (String(row.ft_outcome).toUpperCase() === 'PENDING') {
+        const ft = candles && candles.length ? resolveStrategyFixedTime(row, candles) : null;
+        if (ft) {
+          await pool.execute("UPDATE mt5_strategy_signals SET ft_outcome=?, ft_exit_price=?, ft_pips=? WHERE id=?", [ft.outcome, ft.exitPrice, ft.pips, row.id]);
+        } else if (ageHrs > 72) {
+          await pool.execute("UPDATE mt5_strategy_signals SET ft_outcome='EXPIRED' WHERE id=?", [row.id]);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[StrategyLab] outcome resolver error:', e.message);
+  }
+}
+
+async function pruneStrategyLabSignals() {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  try {
+    await pool.query(
+      "DELETE FROM mt5_strategy_signals WHERE outcome <> 'PENDING' AND ft_outcome <> 'PENDING' AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT 5000",
+      [STRATEGY_LAB_RETENTION_DAYS],
+    );
+  } catch (e) { console.error('[StrategyLab] prune failed:', e.message); }
+}
+
+// Aggregate per-strategy (and per-timeframe) performance — forex + fixed-time win rates.
+function strategyLabAccumulate(b, row) {
+  const fo = String(row.outcome || 'PENDING').toUpperCase();
+  if (fo.endsWith('_WIN') || fo === 'WIN') { b.fxWins += 1; }
+  else if (fo === 'LOSS') { b.fxLosses += 1; }
+  else if (fo === 'EXPIRED') b.fxExpired += 1; else if (fo === 'PENDING') b.fxPending += 1;
+  if (Number.isFinite(row.profit_loss_pips)) { b.fxNetPips += Number(row.profit_loss_pips); b.fxPipsN += 1; }
+  if (fo.endsWith('_WIN') || fo === 'WIN' || fo === 'LOSS') {
+    const rm = rMultiple(row.symbol, row.entry_price, row.stop_loss, row.profit_loss_pips);
+    if (rm !== null) { b.fxNetR += rm; b.fxRN += 1; }
+  }
+  const fto = String(row.ft_outcome || 'PENDING').toUpperCase();
+  if (fto === 'WIN') b.ftWins += 1; else if (fto === 'LOSS') b.ftLosses += 1;
+  else if (fto === 'DRAW') b.ftDraws += 1; else if (fto === 'PENDING') b.ftPending += 1;
+}
+function strategyLabBucket() {
+  return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0 };
+}
+function strategyLabFinalize(b) {
+  const fxScored = b.fxWins + b.fxLosses;
+  const ftScored = b.ftWins + b.ftLosses;
+  return {
+    total: b.total,
+    forex: {
+      wins: b.fxWins, losses: b.fxLosses, expired: b.fxExpired, pending: b.fxPending,
+      winLossSettled: fxScored,
+      winRate: fxScored ? Math.round((b.fxWins / fxScored) * 1000) / 10 : null,
+      expectancyPips: b.fxPipsN ? Math.round((b.fxNetPips / b.fxPipsN) * 10) / 10 : null,
+      expectancyR: b.fxRN ? Math.round((b.fxNetR / b.fxRN) * 100) / 100 : null,
+      confidence: sampleConfidence(fxScored),
+    },
+    fixedTime: {
+      wins: b.ftWins, losses: b.ftLosses, draws: b.ftDraws, pending: b.ftPending,
+      winLossSettled: ftScored,
+      winRate: ftScored ? Math.round((b.ftWins / ftScored) * 1000) / 10 : null,
+      confidence: sampleConfidence(ftScored),
+    },
+  };
+}
+
+// Report date window for the Strategy Lab reports. Supports rolling day-windows
+// (days=N) and calendar presets in Bangladesh time (UTC+6): today / yesterday / last7,
+// so "Today"/"Yesterday" align to BD calendar days (matching the BD session labels).
+function strategyLabReportWindow({ days = 90, preset = null } = {}) {
+  const BD = 6 * 3600 * 1000;
+  const nowMs = Date.now();
+  let fromMs;
+  let toMs = nowMs;
+  let label;
+  const p = preset ? String(preset).toLowerCase() : null;
+  if (p === 'today' || p === 'yesterday' || p === 'last7') {
+    const bdNow = new Date(nowMs + BD);
+    const bdMidnightUtc = Date.UTC(bdNow.getUTCFullYear(), bdNow.getUTCMonth(), bdNow.getUTCDate()) - BD; // BD 00:00 expressed in real UTC
+    if (p === 'today') { fromMs = bdMidnightUtc; label = 'Today (BD)'; }
+    else if (p === 'yesterday') { fromMs = bdMidnightUtc - 86400000; toMs = bdMidnightUtc; label = 'Yesterday (BD)'; }
+    else { fromMs = bdMidnightUtc - 6 * 86400000; label = 'Last 7 days (BD)'; } // today + previous 6 BD days
+  } else {
+    const d = Math.max(1, Math.min(Number(days) || 90, 365));
+    fromMs = nowMs - d * 86400000;
+    label = `Last ${d} days`;
+  }
+  return { fromMs, toMs, preset: p, days, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), label };
+}
+
+async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
+  const pool = await initializeDatabase();
+  const win = strategyLabReportWindow({ days, preset });
+  const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
+  if (!pool) return out;
+  const [rows] = await pool.query(
+    "SELECT strategy, symbol, timeframe, direction, entry_price, stop_loss, outcome, profit_loss_pips, ft_outcome, signal_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
+    [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
+  );
+  const byStrat = new Map();
+  // Cross-cutting aggregates (across ALL strategies) — answer "which timeframe / which
+  // symbol actually works", independent of strategy.
+  const globalTf = new Map();
+  const globalSymbol = new Map();
+  const globalSession = new Map();
+  // strategy×symbol×timeframe combos — the most granular ranking ("best edge anywhere").
+  const comboMap = new Map();
+  for (const r of rows) {
+    if (!byStrat.has(r.strategy)) byStrat.set(r.strategy, { overall: strategyLabBucket(), byTf: new Map(), bySymbol: new Map(), bySession: new Map() });
+    const s = byStrat.get(r.strategy);
+    s.overall.total += 1; strategyLabAccumulate(s.overall, r);
+    if (!s.byTf.has(r.timeframe)) s.byTf.set(r.timeframe, strategyLabBucket());
+    const tb = s.byTf.get(r.timeframe); tb.total += 1; strategyLabAccumulate(tb, r);
+    if (!s.bySymbol.has(r.symbol)) s.bySymbol.set(r.symbol, strategyLabBucket());
+    const sb = s.bySymbol.get(r.symbol); sb.total += 1; strategyLabAccumulate(sb, r);
+
+    // Trading session (Bangladesh time) — pure function of signal_time.
+    const sess = strategyLabSession(r.signal_time);
+    if (!s.bySession.has(sess.key)) s.bySession.set(sess.key, { meta: sess, b: strategyLabBucket() });
+    const ses = s.bySession.get(sess.key); ses.b.total += 1; strategyLabAccumulate(ses.b, r);
+
+    if (!globalTf.has(r.timeframe)) globalTf.set(r.timeframe, strategyLabBucket());
+    const gt = globalTf.get(r.timeframe); gt.total += 1; strategyLabAccumulate(gt, r);
+    if (!globalSymbol.has(r.symbol)) globalSymbol.set(r.symbol, strategyLabBucket());
+    const gs = globalSymbol.get(r.symbol); gs.total += 1; strategyLabAccumulate(gs, r);
+    if (!globalSession.has(sess.key)) globalSession.set(sess.key, { meta: sess, b: strategyLabBucket() });
+    const gss = globalSession.get(sess.key); gss.b.total += 1; strategyLabAccumulate(gss.b, r);
+
+    const ckey = `${r.strategy}|${r.symbol}|${r.timeframe}`;
+    if (!comboMap.has(ckey)) comboMap.set(ckey, { strategy: r.strategy, symbol: r.symbol, timeframe: r.timeframe, b: strategyLabBucket() });
+    const cb = comboMap.get(ckey); cb.b.total += 1; strategyLabAccumulate(cb.b, r);
+  }
+  const meta = Object.fromEntries(listStrategies().map((m) => [m.id, m]));
+  // Rank by win rate, but only once a bucket has enough settled samples to trust — thin
+  // samples sink to the bottom (never crown a winner on 2 trades). Tie-break by sample size.
+  const minSample = out.minSampleToRank;
+  const rankByWin = (a, b) => {
+    const aOk = (a.forex.winLossSettled ?? 0) >= minSample, bOk = (b.forex.winLossSettled ?? 0) >= minSample;
+    if (aOk !== bOk) return aOk ? -1 : 1;
+    return ((b.forex.winRate ?? -1) - (a.forex.winRate ?? -1)) || ((b.forex.winLossSettled ?? 0) - (a.forex.winLossSettled ?? 0));
+  };
+  out.strategies = [...byStrat.entries()].map(([id, s]) => ({
+    id, name: meta[id]?.name || id, source: meta[id]?.source || null,
+    ...strategyLabFinalize(s.overall),
+    byTimeframe: [...s.byTf.entries()].map(([tf, b]) => ({ timeframe: tf, ...strategyLabFinalize(b) }))
+      .sort(rankByWin),
+    bySymbol: [...s.bySymbol.entries()].map(([symbol, b]) => ({ symbol, ...strategyLabFinalize(b) }))
+      .sort(rankByWin),
+    bySession: [...s.bySession.values()].map(({ meta: m, b }) => ({ session: m.key, sessionLabel: m.label, bdRange: m.bdRange, ...strategyLabFinalize(b) }))
+      .sort(rankByWin),
+  })).sort(rankByWin);
+  out.timeframeRanking = [...globalTf.entries()].map(([timeframe, b]) => ({ timeframe, ...strategyLabFinalize(b) })).sort(rankByWin);
+  out.symbolRanking = [...globalSymbol.entries()].map(([symbol, b]) => ({ symbol, ...strategyLabFinalize(b) })).sort(rankByWin);
+  out.sessionRanking = [...globalSession.values()].map(({ meta: m, b }) => ({ session: m.key, sessionLabel: m.label, bdRange: m.bdRange, ...strategyLabFinalize(b) })).sort(rankByWin);
+  out.combos = [...comboMap.values()]
+    .map((c) => ({ strategy: c.strategy, strategyName: meta[c.strategy]?.name || c.strategy, symbol: c.symbol, timeframe: c.timeframe, ...strategyLabFinalize(c.b) }))
+    .filter((c) => (c.forex.winLossSettled ?? 0) > 0 || (c.fixedTime.winLossSettled ?? 0) > 0)
+    .sort(rankByWin)
+    .slice(0, 60);
+  return out;
+}
+
+// GET /api/strategy-lab/strategies — registry metadata.
+app.get('/api/strategy-lab/strategies', (req, res) => {
+  res.json({ ok: true, strategies: listStrategies(), timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
+});
+
+// GET /api/strategy-lab/live?strategy=&timeframe= — LIVE command per curated symbol on
+// one timeframe (like the fixed-time scan): ENTRY (with plan) or HOLD / NO-DATA.
+app.get('/api/strategy-lab/live', (req, res) => {
+  try {
+    const strategy = req.query.strategy ? String(req.query.strategy) : Object.keys(STRATEGY_LAB_REGISTRY)[0];
+    if (!STRATEGY_LAB_REGISTRY[strategy]) return res.status(404).json({ error: 'Unknown strategy.' });
+    const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'M15').toUpperCase();
+    // "ALL" → scan every lab timeframe and return one row per symbol×timeframe.
+    const tfs = tfParam === 'ALL' ? STRATEGY_LAB_TIMEFRAMES : [tfParam];
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    const rows = [];
+    for (const symbol of symbols) {
+      for (const tf of tfs) {
+        const ctx = buildStrategyContext(symbol, tf);
+        if (!ctx) { rows.push({ symbol, timeframe: tf, command: 'NO_DATA' }); continue; }
+        const price = Number(ctx.candles[ctx.candles.length - 1].close);
+        const sig = evaluateStrategy(strategy, ctx);
+        if (sig && sig.decision && sig.decision !== 'HOLD') {
+          const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+          rows.push({
+            symbol, timeframe: tf, command: 'ENTRY', direction: sig.decision,
+            score: sig.score ?? null, grade: sig.grade ?? null, price,
+            entry: sig.entry ?? null, stopLoss: sig.stopLoss ?? null,
+            takeProfit1: sig.takeProfit1 ?? null, takeProfit2: sig.takeProfit2 ?? null, takeProfit3: sig.takeProfit3 ?? null,
+            riskReward: sig.riskRewardRatio ?? null, reason: sig.reason || null,
+            lots: sizing?.suggestedLots ?? null, stopPips: sizing?.stopPips ?? null,
+            lossAtStop: sizing?.lossAtStop ?? null, riskPercent: sizing?.riskPercent ?? null,
+            timing: strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss),
+          });
+        } else {
+          rows.push({ symbol, timeframe: tf, command: 'HOLD', price });
+        }
+      }
+    }
+    // ENTRY first (by score), then HOLD/NO-DATA.
+    rows.sort((a, b) => {
+      const rank = (r) => (r.command === 'ENTRY' ? 2 : r.command === 'HOLD' ? 1 : 0);
+      return (rank(b) - rank(a)) || ((b.score || 0) - (a.score || 0));
+    });
+    res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, rows, generatedAt: new Date().toISOString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/strategy-lab/live-ftt?strategy=&timeframe= — LIVE fixed-time framing of the
+// same strategy signals: UP/DOWN call with a next-candle expiry (instead of the forex
+// TP/SL plan). One row per curated symbol×timeframe: CALL (UP/DOWN) or HOLD / NO-DATA.
+app.get('/api/strategy-lab/live-ftt', (req, res) => {
+  try {
+    const strategy = req.query.strategy ? String(req.query.strategy) : Object.keys(STRATEGY_LAB_REGISTRY)[0];
+    if (!STRATEGY_LAB_REGISTRY[strategy]) return res.status(404).json({ error: 'Unknown strategy.' });
+    const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'M15').toUpperCase();
+    const tfs = tfParam === 'ALL' ? STRATEGY_LAB_TIMEFRAMES : [tfParam];
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    const rows = [];
+    for (const symbol of symbols) {
+      for (const tf of tfs) {
+        const ctx = buildStrategyContext(symbol, tf);
+        if (!ctx) { rows.push({ symbol, timeframe: tf, command: 'NO_DATA' }); continue; }
+        const price = Number(ctx.candles[ctx.candles.length - 1].close);
+        const sig = evaluateStrategy(strategy, ctx);
+        if (sig && sig.decision && sig.decision !== 'HOLD') {
+          const expiry = strategyLabFttExpiry(tf);
+          rows.push({
+            symbol, timeframe: tf, command: 'CALL',
+            direction: /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN',
+            score: sig.score ?? null, grade: sig.grade ?? null,
+            reference: Number.isFinite(price) ? price : null,
+            expiryIso: expiry?.expiryIso ?? null, secondsToExpiry: expiry?.secondsToExpiry ?? null,
+            durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null,
+          });
+        } else {
+          rows.push({ symbol, timeframe: tf, command: 'HOLD', reference: Number.isFinite(price) ? price : null });
+        }
+      }
+    }
+    // CALL first (by score), then HOLD/NO-DATA.
+    rows.sort((a, b) => {
+      const rank = (r) => (r.command === 'CALL' ? 2 : r.command === 'HOLD' ? 1 : 0);
+      return (rank(b) - rank(a)) || ((b.score || 0) - (a.score || 0));
+    });
+    res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, rows, generatedAt: new Date().toISOString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Live fixed-time position for a still-PENDING call (display only — never affects the
+// recorded outcome). Compares the current price to the call's reference (the signal-bar
+// close, same reference resolveStrategyFixedTime settles against) and reports whether the
+// call is currently winning/losing + the live pips. Returns null once the call has settled.
+function strategyLabFtLivePosition(row) {
+  if (String(row.ft_outcome || '').toUpperCase() !== 'PENDING') return null;
+  const candles = getRecentCandles(row.symbol, row.timeframe, 400);
+  if (!candles || !candles.length) return null;
+  const barMs = row.bar_time ? new Date(row.bar_time).getTime() : NaN;
+  let sigIdx = -1;
+  for (let i = 0; i < candles.length; i++) { if (Date.parse(candles[i].time) <= barMs) sigIdx = i; else break; }
+  const ref = sigIdx >= 0 ? Number(candles[sigIdx].close) : Number(row.entry_price);
+  const current = Number(candles[candles.length - 1].close);
+  if (!Number.isFinite(ref) || !Number.isFinite(current)) return null;
+  const pip = pipSizeForSymbol(row.symbol) || 0.0001;
+  const up = /BUY/.test(String(row.direction).toUpperCase());
+  const pips = Math.round(((up ? current - ref : ref - current) / pip) * 10) / 10;
+  return {
+    currentPrice: current, reference: ref, pips,
+    status: pips > 0 ? 'WINNING' : pips < 0 ? 'LOSING' : 'FLAT',
+  };
+}
+
+// GET /api/strategy-lab/signals?strategy=&timeframe=&limit= — recent logged signals.
+app.get('/api/strategy-lab/signals', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const strategy = req.query.strategy ? String(req.query.strategy) : null;
+    const timeframe = req.query.timeframe ? String(req.query.timeframe).toUpperCase() : null;
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 200, 500));
+    let sql = 'SELECT * FROM mt5_strategy_signals WHERE 1=1';
+    const params = [];
+    if (strategy) { sql += ' AND strategy = ?'; params.push(strategy); }
+    if (timeframe) { sql += ' AND timeframe = ?'; params.push(timeframe); }
+    sql += ' ORDER BY signal_time DESC LIMIT ?'; params.push(limit);
+    const [rows] = await pool.query(sql, params);
+    const num = (v) => (v === null || v === undefined ? null : Number(v));
+    res.json({
+      ok: true,
+      signals: rows.map((r) => {
+        const sizing = strategyLabSizing(r.symbol, r.entry_price, r.stop_loss, { tp1: r.take_profit_1, tp2: r.take_profit_2, tp3: r.take_profit_3 });
+        return {
+          id: r.id, strategy: r.strategy, symbol: r.symbol, timeframe: r.timeframe,
+          signalTime: r.signal_time ? new Date(r.signal_time).toISOString() : null,
+          direction: r.direction, score: num(r.score), grade: r.grade || null,
+          entryPrice: num(r.entry_price), stopLoss: num(r.stop_loss),
+          takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
+          riskReward: num(r.risk_reward), reason: r.reason,
+          lots: sizing?.suggestedLots ?? null, stopPips: sizing?.stopPips ?? null, lossAtStop: sizing?.lossAtStop ?? null,
+          timing: strategyLabTiming(r),
+          outcome: r.outcome, profitLossPips: num(r.profit_loss_pips), tpHitLevel: r.tp_hit_level === null ? null : Number(r.tp_hit_level),
+          ftOutcome: r.ft_outcome, ftPips: num(r.ft_pips),
+          live: strategyLabFtLivePosition(r),
+          popupSent: r.popup_sent === null || r.popup_sent === undefined ? null : !!r.popup_sent,
+          emailSent: r.email_sent === null || r.email_sent === undefined ? null : !!r.email_sent,
+          resolvedAt: r.resolved_at ? new Date(r.resolved_at).toISOString() : null,
+        };
+      }),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/strategy-lab/performance?days=  |  ?preset=today|yesterday|last7
+// per-strategy forex + fixed-time win rates over the chosen window.
+app.get('/api/strategy-lab/performance', async (req, res) => {
+  try {
+    const days = req.query.days ? Number(req.query.days) : 90;
+    const preset = req.query.preset ? String(req.query.preset) : null;
+    const perf = await buildStrategyLabPerformance({ days, preset });
+    res.json({
+      ok: true, ...perf,
+      note: 'Each strategy is isolated (never blended with the live system). Scored two ways: forex (TP/SL) and fixed-time (direction at next-candle expiry). A strategy/timeframe is only trustworthy once its sample confidence is usable — don\'t crown a winner on a thin sample.',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function startStrategyLabScanner() {
+  const timer = setInterval(() => void runStrategyLabScan(), STRATEGY_LAB_SCAN_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  setTimeout(() => void runStrategyLabScan(), 25000);
+  const prune = setInterval(() => void pruneStrategyLabSignals(), 6 * 60 * 60 * 1000);
+  if (typeof prune.unref === 'function') prune.unref();
+  console.log(`[StrategyLab] Scanner started — ${Object.keys(STRATEGY_LAB_REGISTRY).length} strategies × ${STRATEGY_LAB_TIMEFRAMES.join(',')} every ${Math.round(STRATEGY_LAB_SCAN_MS / 60000)}m.`);
+}
+startStrategyLabScanner();
+
+
 let reminderSchedulerRunning = false;
 
 async function processProjectionReminders() {
@@ -10425,6 +11349,11 @@ async function processAllRemindersAndSavedProjections() {
     console.error('[Scheduler] Error in processSignalTracker:', err.message);
   }
   try {
+    await processStrategyLabOutcomes();
+  } catch (err) {
+    console.error('[Scheduler] Error in processStrategyLabOutcomes:', err.message);
+  }
+  try {
     await pruneOldAccountSnapshots();
   } catch (err) {
     console.error('[Scheduler] Error in pruneOldAccountSnapshots:', err.message);
@@ -10658,3 +11587,6 @@ server.on('upgrade', async (request, socket, head) => {
     socket.destroy();
   }
 });
+
+// TEMP restart trigger (2026-06-23): bumped to pick up STRATEGY_LAB_SCAN_MS=60000 for a
+// faster live-call demo. Safe to remove together with the env line when reverting.

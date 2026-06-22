@@ -6,6 +6,7 @@ import { formatBdDateTime } from '../../utils/time';
 import {
   DateCell, ReportsHeader, ReportsTabs, SummaryCards, ErrorBanner,
   price, delayLabel, delayBadgeClass, outcomeBadge, outcomeIcon,
+  rangeToParams, type RangeKey,
 } from './_shared';
 
 function getCalibrationPayload(payload: SignalEmailReport['payload']) {
@@ -15,7 +16,7 @@ function getCalibrationPayload(payload: SignalEmailReport['payload']) {
 }
 
 export default function FixedOutcomes() {
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<RangeKey>('d30');
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -26,7 +27,7 @@ export default function FixedOutcomes() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetchFixedEmailReports({ days, limit: 300 });
+      const res = await fetchFixedEmailReports({ ...rangeToParams(range), limit: 300 });
       setReports(res.reports);
       setSummary(res.summary);
     } catch (err) {
@@ -34,7 +35,7 @@ export default function FixedOutcomes() {
     } finally {
       setLoading(false);
     }
-  }, [days]);
+  }, [range]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -49,7 +50,7 @@ export default function FixedOutcomes() {
       <ReportsHeader
         title="Fixed-Time Outcomes"
         subtitle="Tracked outcomes for fixed-time trade alerts sent by email"
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
       {summary && <SummaryCards summary={summary} market="fixed" />}

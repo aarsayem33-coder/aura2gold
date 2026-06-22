@@ -1,9 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { Smartphone, Mail, MessageSquare, Send, CheckCircle2, XCircle, Bell, Volume2 } from 'lucide-react';
-import { fetchEmailAlertSettings, saveEmailAlertSettings, useMt5Stream } from '../mt5Api';
+import { fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, useMt5Stream } from '../mt5Api';
 import { formatBdDateTime } from '../utils/time';
 import { playAlertSound, requestNotificationPermission, showBrowserNotification } from '../utils/notifications';
-import type { EmailAlertSettings } from '../types';
+import type { EmailAlertSettings, StrategyMeta } from '../types';
+
+const STRATEGY_LAB_POPUP_GATE = 75; // display only — matches backend STRATEGY_LAB_ALERT_MIN_SCORE default
 
 const defaultEmailAlertSettings: EmailAlertSettings = {
   forexScanner: false,
@@ -14,6 +16,14 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   aiTracked: false,
   forecast: true,
   signalTracker: true,
+  strategyLab: false,
+  strategyLabMinScore: 75,
+  strategyLabMinGrade: 'ANY',
+  strategyLabStrategies: {},
+  strategyLabFixedTime: false,
+  strategyLabFttMinScore: 75,
+  strategyLabFttMinGrade: 'ANY',
+  strategyLabFttStrategies: {},
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
@@ -21,7 +31,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   postNewsFixedMinTier: 'QUALITY_SIGNAL',
 };
 
-type EmailRouteKey = 'forexScanner' | 'fixedTime' | 'postNewsForex' | 'postNewsFixed' | 'highImpactNews' | 'aiTracked' | 'forecast' | 'signalTracker';
+type EmailRouteKey = 'forexScanner' | 'fixedTime' | 'postNewsForex' | 'postNewsFixed' | 'highImpactNews' | 'aiTracked' | 'forecast' | 'signalTracker' | 'strategyLab' | 'strategyLabFixedTime';
 type EmailSelectKey = 'forexMinGrade' | 'forexMinQuality' | 'fixedTimeMinTier' | 'postNewsForexMinGrade' | 'postNewsFixedMinTier';
 
 const emailSignalOptions: Array<{ key: EmailRouteKey; title: string; description: string; note: string }> = [
@@ -33,6 +43,8 @@ const emailSignalOptions: Array<{ key: EmailRouteKey; title: string; description
   { key: 'aiTracked', title: 'AI Tracked Projection Emails', description: 'Emails when tracked AI entry projections trigger.', note: 'Tracked entries only' },
   { key: 'forecast', title: 'Execution Forecast Emails', description: 'When a favorable setup is forecast to become executable: created + ~10m, ~5m, and at the predicted time.', note: 'Timing forecast · score ≥ 60 · times in BDT' },
   { key: 'signalTracker', title: 'Signal Tracker — Close / Manage Alerts', description: 'Live trade management: emails to CLOSE NOW on danger (near stop, opposite signal, news, counter-breaker) or MANAGE on TP hit / profit give-back.', note: 'Active trades only · advisory early warning' },
+  { key: 'strategyLab', title: 'Strategy Lab — High-Score Signals', description: 'Emails for isolated single-strategy signals (ICT breaker, etc.) that score ≥ 75. Popups fire regardless; this just adds email.', note: 'Score ≥ 75 only · isolated lab, not the main system' },
+  { key: 'strategyLabFixedTime', title: 'Strategy Lab — Fixed-Time Calls', description: 'Fixed-time (UP/DOWN at next-candle expiry) emails for the same isolated strategy signals. Separate from the Forex strategy-lab emails above.', note: 'Direction call · isolated lab, not the main FTT engine' },
 ];
 
 const forexGradeOptions = [
@@ -69,6 +81,7 @@ export default function NotificationSettings() {
   const [emailSettingsStatus, setEmailSettingsStatus] = useState<string | null>(null);
   const [savingEmailSettings, setSavingEmailSettings] = useState(false);
   const [emailSettingsMeta, setEmailSettingsMeta] = useState<{ emailTo?: string | null; newsEmailTo?: string | null; smtpConfigured?: boolean }>({});
+  const [labStrategies, setLabStrategies] = useState<StrategyMeta[]>([]);
 
   const [browserNotifications, setBrowserNotifications] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -104,6 +117,12 @@ export default function NotificationSettings() {
       .catch((error) => {
         if (!cancelled) setEmailSettingsStatus(error instanceof Error ? error.message : 'Failed to load email routing settings');
       });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchStrategies().then((r) => { if (!cancelled) setLabStrategies(r.strategies || []); }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
@@ -156,6 +175,44 @@ export default function NotificationSettings() {
 
   const handleEmailSettingSelect = (key: EmailSelectKey, value: string) => {
     setEmailSettings((current) => ({ ...current, [key]: value as EmailAlertSettings[EmailSelectKey] }));
+    setEmailSettingsStatus(null);
+  };
+
+  const handleLabMinScore = (value: number) => {
+    setEmailSettings((current) => ({ ...current, strategyLabMinScore: Math.max(40, Math.min(95, Math.round(value))) }));
+    setEmailSettingsStatus(null);
+  };
+  const handleLabMinGrade = (value: string) => {
+    setEmailSettings((current) => ({ ...current, strategyLabMinGrade: value as EmailAlertSettings['strategyLabMinGrade'] }));
+    setEmailSettingsStatus(null);
+  };
+  const handleLabStrategyToggle = (id: string) => {
+    setEmailSettings((current) => {
+      const map = { ...(current.strategyLabStrategies || {}) };
+      // Empty map = "all enabled"; on first toggle, seed the full set so the choice is explicit.
+      if (Object.keys(map).length === 0) for (const s of labStrategies) map[s.id] = true;
+      map[id] = !(map[id] ?? true);
+      return { ...current, strategyLabStrategies: map };
+    });
+    setEmailSettingsStatus(null);
+  };
+
+  // Fixed-time strategy-lab email rule handlers (independent of the forex rules above).
+  const handleLabFttMinScore = (value: number) => {
+    setEmailSettings((current) => ({ ...current, strategyLabFttMinScore: Math.max(40, Math.min(95, Math.round(value))) }));
+    setEmailSettingsStatus(null);
+  };
+  const handleLabFttMinGrade = (value: string) => {
+    setEmailSettings((current) => ({ ...current, strategyLabFttMinGrade: value as EmailAlertSettings['strategyLabFttMinGrade'] }));
+    setEmailSettingsStatus(null);
+  };
+  const handleLabFttStrategyToggle = (id: string) => {
+    setEmailSettings((current) => {
+      const map = { ...(current.strategyLabFttStrategies || {}) };
+      if (Object.keys(map).length === 0) for (const s of labStrategies) map[s.id] = true;
+      map[id] = !(map[id] ?? true);
+      return { ...current, strategyLabFttStrategies: map };
+    });
     setEmailSettingsStatus(null);
   };
 
@@ -441,6 +498,136 @@ export default function NotificationSettings() {
               </button>
             </div>
             {emailSettingsStatus && <p className="mt-3 text-xs font-bold text-slate-500">{emailSettingsStatus}</p>}
+          </div>
+
+          {/* Strategy Lab email rules — which strategies / score / grade send email */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
+            <div className="mb-5 border-b border-slate-100 pb-3">
+              <h3 className="text-lg font-bold text-slate-900">Strategy Lab Email Rules</h3>
+              <p className="mt-1 text-xs font-semibold text-slate-500">Choose which strategies email, the minimum score, and the minimum grade. Popups still fire for every score ≥ {STRATEGY_LAB_POPUP_GATE}; these rules only filter <b>emails</b>.</p>
+            </div>
+
+            <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div>
+                <h4 className="text-sm font-bold text-slate-800">Strategy Lab emails</h4>
+                <p className="mt-0.5 text-xs font-medium text-slate-500">Master switch — turn on to email high-score strategy signals.</p>
+              </div>
+              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                <input type="checkbox" checked={emailSettings.strategyLab} onChange={() => handleEmailSettingToggle('strategyLab')} className="sr-only peer" />
+                <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
+              </label>
+            </div>
+
+            <div className={`mt-4 grid gap-4 sm:grid-cols-2 ${emailSettings.strategyLab ? '' : 'opacity-50 pointer-events-none'}`}>
+              <div>
+                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum score: <span className="text-gold-600">{emailSettings.strategyLabMinScore}</span></label>
+                <input type="range" min={40} max={95} step={1} value={emailSettings.strategyLabMinScore} onChange={(e) => handleLabMinScore(Number(e.target.value))} className="mt-3 w-full accent-gold-500" />
+                <div className="flex justify-between text-[10px] font-bold text-slate-400"><span>40</span><span>95</span></div>
+              </div>
+              <div>
+                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum grade</label>
+                <select value={emailSettings.strategyLabMinGrade} onChange={(e) => handleLabMinGrade(e.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500">
+                  <option value="ANY">Any grade</option>
+                  <option value="B">B and above</option>
+                  <option value="A">A and above</option>
+                  <option value="A+">A+ only</option>
+                </select>
+              </div>
+            </div>
+
+            <div className={`mt-4 ${emailSettings.strategyLab ? '' : 'opacity-50 pointer-events-none'}`}>
+              <p className="text-xs font-black uppercase tracking-wider text-slate-500 mb-2">Strategies that email</p>
+              <div className="space-y-2">
+                {labStrategies.map((s) => {
+                  const map = emailSettings.strategyLabStrategies || {};
+                  const enabled = Object.keys(map).length === 0 ? true : (map[s.id] ?? true);
+                  return (
+                    <div key={s.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div>
+                        <h5 className="text-sm font-bold text-slate-800">{s.name}</h5>
+                        {s.source && <p className="text-[10px] font-semibold text-slate-400">{s.source}</p>}
+                      </div>
+                      <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                        <input type="checkbox" checked={enabled} onChange={() => handleLabStrategyToggle(s.id)} className="sr-only peer" />
+                        <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
+                      </label>
+                    </div>
+                  );
+                })}
+                {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end">
+              <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
+                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Strategy Lab Rules'}
+              </button>
+            </div>
+          </div>
+
+          {/* Strategy Lab FIXED-TIME email rules — independent UP/DOWN call emails */}
+          <div className="bg-white rounded-2xl border border-violet-200 p-6 sm:p-8 shadow-card">
+            <div className="mb-5 border-b border-slate-100 pb-3">
+              <h3 className="text-lg font-bold text-slate-900">Strategy Lab — Fixed-Time Email Rules</h3>
+              <p className="mt-1 text-xs font-semibold text-slate-500">Independent rules for the <b>fixed-time (UP/DOWN at next-candle expiry)</b> framing of strategy-lab signals. Choose which strategies email, the minimum score, and the minimum grade. Separate from the Forex strategy-lab emails above.</p>
+            </div>
+
+            <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div>
+                <h4 className="text-sm font-bold text-slate-800">Strategy Lab fixed-time emails</h4>
+                <p className="mt-0.5 text-xs font-medium text-slate-500">Master switch — turn on to email high-score fixed-time calls.</p>
+              </div>
+              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                <input type="checkbox" checked={emailSettings.strategyLabFixedTime} onChange={() => handleEmailSettingToggle('strategyLabFixedTime')} className="sr-only peer" />
+                <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
+              </label>
+            </div>
+
+            <div className={`mt-4 grid gap-4 sm:grid-cols-2 ${emailSettings.strategyLabFixedTime ? '' : 'opacity-50 pointer-events-none'}`}>
+              <div>
+                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum score: <span className="text-gold-600">{emailSettings.strategyLabFttMinScore}</span></label>
+                <input type="range" min={40} max={95} step={1} value={emailSettings.strategyLabFttMinScore} onChange={(e) => handleLabFttMinScore(Number(e.target.value))} className="mt-3 w-full accent-gold-500" />
+                <div className="flex justify-between text-[10px] font-bold text-slate-400"><span>40</span><span>95</span></div>
+              </div>
+              <div>
+                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum grade</label>
+                <select value={emailSettings.strategyLabFttMinGrade} onChange={(e) => handleLabFttMinGrade(e.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500">
+                  <option value="ANY">Any grade</option>
+                  <option value="B">B and above</option>
+                  <option value="A">A and above</option>
+                  <option value="A+">A+ only</option>
+                </select>
+              </div>
+            </div>
+
+            <div className={`mt-4 ${emailSettings.strategyLabFixedTime ? '' : 'opacity-50 pointer-events-none'}`}>
+              <p className="text-xs font-black uppercase tracking-wider text-slate-500 mb-2">Strategies that email fixed-time calls</p>
+              <div className="space-y-2">
+                {labStrategies.map((s) => {
+                  const map = emailSettings.strategyLabFttStrategies || {};
+                  const enabled = Object.keys(map).length === 0 ? true : (map[s.id] ?? true);
+                  return (
+                    <div key={s.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div>
+                        <h5 className="text-sm font-bold text-slate-800">{s.name}</h5>
+                        {s.source && <p className="text-[10px] font-semibold text-slate-400">{s.source}</p>}
+                      </div>
+                      <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                        <input type="checkbox" checked={enabled} onChange={() => handleLabFttStrategyToggle(s.id)} className="sr-only peer" />
+                        <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
+                      </label>
+                    </div>
+                  );
+                })}
+                {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end">
+              <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
+                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Fixed-Time Rules'}
+              </button>
+            </div>
           </div>
         </div>
 

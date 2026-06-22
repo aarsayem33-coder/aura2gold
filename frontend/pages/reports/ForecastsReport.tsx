@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Loader2, FlaskConical, Trophy } from 'lucide-react';
 import { fetchForecastCalibration, fetchForecastReplay, fetchForecastOutcomes } from '../../mt5Api';
 import type { ForecastCalibrationResponse, ForecastReplayResponse, ForecastOutcomeResponse, TradeOutcome } from '../../types';
-import { ReportsHeader, ReportsTabs, ErrorBanner, DateCell } from './_shared';
+import { ReportsHeader, ReportsTabs, ErrorBanner, DateCell, rangeToParams, type RangeKey } from './_shared';
 
 const BASIS_LABEL: Record<string, string> = {
   IMMEDIATE: 'Ready now', NEXT_CANDLE: 'Next candle', NEWS: 'News event', PULLBACK: 'Pullback',
@@ -43,7 +43,7 @@ const num = (v: number | null | undefined, suffix = '') => (v === null || v === 
 const REPLAY_TFS = ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
 
 export default function ForecastsReport() {
-  const [days, setDays] = useState(90);
+  const [range, setRange] = useState<RangeKey>('d90');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<ForecastCalibrationResponse | null>(null);
@@ -59,9 +59,10 @@ export default function ForecastsReport() {
     setLoading(true);
     setError(null);
     try {
+      const d = rangeToParams(range).days;
       const [cal, out] = await Promise.all([
-        fetchForecastCalibration(days),
-        fetchForecastOutcomes(days).catch(() => null),
+        fetchForecastCalibration(d),
+        fetchForecastOutcomes(d).catch(() => null),
       ]);
       setData(cal);
       setOutcomes(out);
@@ -70,7 +71,7 @@ export default function ForecastsReport() {
     } finally {
       setLoading(false);
     }
-  }, [days]);
+  }, [range]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -95,7 +96,7 @@ export default function ForecastsReport() {
       <ReportsHeader
         title="Execution Forecasts"
         subtitle="Measured accuracy of execution-timing forecasts — the honest payoff: confidence flips from estimate to measured."
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
       <ErrorBanner error={error} />

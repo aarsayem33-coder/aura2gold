@@ -25,8 +25,17 @@ MT5 Terminal (Exness)                Node.js backend                 React front
                                           ├─ signalEngine.js  (system signals, SMC scoring)
                                           ├─ fttEngine.js     (fixed-time-trade predictions; see FTT fixes note below)
                                           ├─ executionForecastEngine.js (WHEN a setup becomes executable)
-                                          └─ geminiEngine.js  (Vertex AI / Gemini analysis)
+                                          ├─ geminiEngine.js  (Vertex AI / Gemini analysis)
+                                          ├─ liquidityEngine.js (breakers, liquidity pools, displacement)
+                                          └─ strategyLab.js   (ISOLATED single-strategy lab — NOT the main system)
 ```
+
+> **Strategy Lab (`/strategy-lab`, `backend/strategyLab.js`) is deliberately ISOLATED** from `aggregateSignals`/
+> `fttEngine` — pluggable single-strategy modules (one per tutorial; ICT Breaker seeded, reuses `liquidityEngine`),
+> each logged to `mt5_strategy_signals` and scored **two ways** (forex TP/SL + fixed-time next-candle) across
+> **every timeframe**, so per-strategy/per-timeframe win rates show which actually works (ranking gated on sample
+> confidence — no crowning thin samples). Add a strategy = one entry in the `STRATEGIES` registry. Never blend it
+> into live signals. Endpoints `/api/strategy-lab/{strategies,signals,performance}`. See memory `strategy-lab`.
 
 The architecture is **memory-first**: incoming candles go into an in-memory store and are pushed
 to the browser via SSE **instantly**; the MySQL write is fire-and-forget (`void persist().catch()`).

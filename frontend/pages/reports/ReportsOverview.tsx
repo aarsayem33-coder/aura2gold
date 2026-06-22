@@ -3,10 +3,10 @@ import { Link } from 'react-router-dom';
 import { ArrowRight, ClipboardList, Timer, TrendingUp } from 'lucide-react';
 import { fetchForexEmailReports, fetchFixedEmailReports, fetchSignalLog } from '../../mt5Api';
 import type { SignalLogResponse, TradeReportSummary } from '../../types';
-import { ReportsHeader, ReportsTabs, SummaryCards, ErrorBanner } from './_shared';
+import { ReportsHeader, ReportsTabs, SummaryCards, ErrorBanner, rangeToParams, type RangeKey } from './_shared';
 
 export default function ReportsOverview() {
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<RangeKey>('d30');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [forex, setForex] = useState<TradeReportSummary | null>(null);
@@ -17,10 +17,11 @@ export default function ReportsOverview() {
     setLoading(true);
     setError(null);
     try {
+      const p = rangeToParams(range);
       const [f, x, log] = await Promise.all([
-        fetchForexEmailReports({ days, limit: 1 }),
-        fetchFixedEmailReports({ days, limit: 1 }),
-        fetchSignalLog({ days, limit: 1 }),
+        fetchForexEmailReports({ ...p, limit: 1 }),
+        fetchFixedEmailReports({ ...p, limit: 1 }),
+        fetchSignalLog({ ...p, limit: 1 }),
       ]);
       setForex(f.summary);
       setFixed(x.summary);
@@ -30,7 +31,7 @@ export default function ReportsOverview() {
     } finally {
       setLoading(false);
     }
-  }, [days]);
+  }, [range]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -39,7 +40,7 @@ export default function ReportsOverview() {
       <ReportsHeader
         title="Reports Overview"
         subtitle="Headline performance across emailed alerts and all executable system signals"
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
       <ErrorBanner error={error} />

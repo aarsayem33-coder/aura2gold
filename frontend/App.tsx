@@ -12,6 +12,8 @@ import FuturePredictions from './pages/FuturePredictions.tsx';
 import DayTradingBrief from './pages/DayTradingBrief.tsx';
 import DayTradingDesk from './pages/DayTradingDesk.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
+import StrategyLab from './pages/StrategyLab.tsx';
+import StrategyLabReports from './pages/StrategyLabReports.tsx';
 import Projections from './pages/Projections.tsx';
 import AIAnalysis from './pages/AIAnalysis.tsx';
 import TradeJournal from './pages/TradeJournal.tsx';
@@ -88,6 +90,8 @@ export default function App() {
           <Route path="day-trading" element={<DayTradingBrief />} />
           <Route path="day-trading-desk" element={<DayTradingDesk />} />
           <Route path="signal-tracker" element={<SignalTracker />} />
+          <Route path="strategy-lab" element={<StrategyLab />} />
+          <Route path="strategy-lab/reports" element={<StrategyLabReports />} />
           <Route path="trade-news" element={<TradeTheNews />} />
           <Route path="analysis" element={<AIAnalysis />} />
           <Route path="journal" element={<TradeJournal />} />

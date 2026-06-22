@@ -55,6 +55,11 @@ import type {
   DayTradingBriefResponse,
   StructureDeskResponse,
   SignalTrackerResponse,
+  StrategyMeta,
+  StrategySignal,
+  StrategyPerformanceResponse,
+  StrategyLiveResponse,
+  StrategyFttLiveResponse,
 } from './types';
 import { playAlertSound, showBrowserNotification } from './utils/notifications';
 
@@ -376,6 +381,32 @@ export async function fetchStructureDesk(symbol?: string, timeframe = 'M5'): Pro
 
 export async function fetchSignalTracker(): Promise<SignalTrackerResponse> {
   return fetchJson<SignalTrackerResponse>('/api/signal-tracker');
+}
+
+export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; timeframes: string[]; ftExpiryBars: number }> {
+  return fetchJson('/api/strategy-lab/strategies');
+}
+export async function fetchStrategySignals(strategy?: string, timeframe?: string): Promise<{ ok: boolean; signals: StrategySignal[] }> {
+  const p = new URLSearchParams();
+  if (strategy) p.set('strategy', strategy);
+  if (timeframe) p.set('timeframe', timeframe);
+  const qs = p.toString();
+  return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
+}
+export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string } = {}): Promise<StrategyPerformanceResponse> {
+  const opts = typeof params === 'number' ? { days: params } : params;
+  const q = new URLSearchParams();
+  if (opts.preset) q.set('preset', opts.preset);
+  else q.set('days', String(opts.days ?? 90));
+  return fetchJson<StrategyPerformanceResponse>(`/api/strategy-lab/performance?${q.toString()}`);
+}
+export async function fetchStrategyLive(strategy: string, timeframe = 'M15'): Promise<StrategyLiveResponse> {
+  const p = new URLSearchParams({ strategy, timeframe });
+  return fetchJson<StrategyLiveResponse>(`/api/strategy-lab/live?${p.toString()}`);
+}
+export async function fetchStrategyLiveFtt(strategy: string, timeframe = 'M15'): Promise<StrategyFttLiveResponse> {
+  const p = new URLSearchParams({ strategy, timeframe });
+  return fetchJson<StrategyFttLiveResponse>(`/api/strategy-lab/live-ftt?${p.toString()}`);
 }
 
 export async function markSignalTrackerDone(id: string): Promise<{ ok: boolean; id: string }> {
@@ -783,6 +814,65 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
       }
     });
 
+    source.addEventListener('strategy_signal', (event) => {
+      try {
+        const s = JSON.parse((event as MessageEvent).data);
+        const alert = {
+          id: `strat:${s.id}`,
+          kind: 'FOREX' as const,
+          strategySource: s.strategyName || s.strategy || 'Strategy',
+          symbol: s.symbol,
+          timeframe: s.timeframe ?? null,
+          direction: String(s.direction || ''),
+          grade: s.grade ?? null,
+          confidence: Number(s.score) || 0,
+          entryPrice: s.entry ?? null,
+          stopLoss: s.stopLoss ?? null,
+          takeProfit1: s.takeProfit1 ?? null,
+          takeProfit2: s.takeProfit2 ?? null,
+          takeProfit3: s.takeProfit3 ?? null,
+          lotSize: s.lots ?? null,
+          sessionReason: s.reason ?? null,
+          createdAt: s.at || new Date().toISOString(),
+        };
+        addTopbarAlert(alert, true);
+        showBrowserNotification(`${s.grade || ''} ${s.strategyName || 'Strategy'}: ${s.symbol} ${s.timeframe} ${alert.direction}`, {
+          body: `Score ${Math.round(Number(s.score) || 0)} · ${s.lots != null ? `${s.lots} lots · ` : ''}Entry ${s.entry ?? 'market'} · SL ${s.stopLoss ?? 'n/a'} · TP1 ${s.takeProfit1 ?? 'n/a'} / TP2 ${s.takeProfit2 ?? 'n/a'} / TP3 ${s.takeProfit3 ?? 'n/a'}`,
+          tag: alert.id,
+        });
+      } catch {
+        /* ignore malformed strategy signal */
+      }
+    });
+
+    source.addEventListener('strategy_ftt_signal', (event) => {
+      try {
+        const s = JSON.parse((event as MessageEvent).data);
+        const dir = String(s.direction || '');
+        const alert = {
+          id: `stratftt:${s.id}`,
+          kind: 'FIXED_TIME' as const,
+          strategySource: s.strategyName || s.strategy || 'Strategy',
+          symbol: s.symbol,
+          timeframe: s.timeframe ?? null,
+          expiry: s.durationLabel ?? null,
+          expiryTime: s.expiryIso ?? null,
+          direction: dir,
+          grade: s.grade ?? null,
+          confidence: Number(s.score) || 0,
+          sessionReason: s.reason ?? null,
+          createdAt: s.at || new Date().toISOString(),
+        };
+        addTopbarAlert(alert, true);
+        showBrowserNotification(`${s.grade || ''} ${s.strategyName || 'Strategy'} FIXED-TIME: ${s.symbol} ${s.timeframe} ${dir}`, {
+          body: `Score ${Math.round(Number(s.score) || 0)} · predict ${dir === 'UP' ? 'HIGHER' : 'LOWER'} · expiry ${s.durationLabel || 'next candle'}${s.reference != null ? ` · ref ${s.reference}` : ''}`,
+          tag: alert.id,
+        });
+      } catch {
+        /* ignore malformed strategy ftt signal */
+      }
+    });
+
     source.addEventListener('account', (event) => {
       try {
         setAccount(JSON.parse((event as MessageEvent).data) as Mt5AccountSnapshot);
@@ -904,7 +994,8 @@ export async function fetchForexEmailReports(options?: {
 }): Promise<SignalEmailReportsResponse> {
   const params = new URLSearchParams();
   if (options?.symbol) params.set('symbol', options.symbol);
-  if (options?.days) params.set('days', String(options.days));
+  if ((options as { preset?: string })?.preset) params.set('preset', (options as { preset?: string }).preset as string);
+  else if (options?.days) params.set('days', String(options.days));
   if (options?.outcome) params.set('outcome', options.outcome);
   if (options?.limit) params.set('limit', String(options.limit));
   const qs = params.toString();
@@ -919,7 +1010,8 @@ export async function fetchFixedEmailReports(options?: {
 }): Promise<SignalEmailReportsResponse> {
   const params = new URLSearchParams();
   if (options?.symbol) params.set('symbol', options.symbol);
-  if (options?.days) params.set('days', String(options.days));
+  if ((options as { preset?: string })?.preset) params.set('preset', (options as { preset?: string }).preset as string);
+  else if (options?.days) params.set('days', String(options.days));
   if (options?.outcome) params.set('outcome', options.outcome);
   if (options?.limit) params.set('limit', String(options.limit));
   const qs = params.toString();
@@ -936,7 +1028,8 @@ export async function fetchSignalLog(options?: {
 }): Promise<SignalLogResponse> {
   const params = new URLSearchParams();
   if (options?.symbol) params.set('symbol', options.symbol);
-  if (options?.days) params.set('days', String(options.days));
+  if ((options as { preset?: string })?.preset) params.set('preset', (options as { preset?: string }).preset as string);
+  else if (options?.days) params.set('days', String(options.days));
   if (options?.grade) params.set('grade', options.grade);
   if (options?.outcome) params.set('outcome', options.outcome);
   if (options?.emailed !== undefined) params.set('emailed', String(options.emailed));

@@ -114,23 +114,47 @@ export function ReportsTabs() {
   );
 }
 
-// ── shared page header with day-range filter + refresh ──
+// ── shared date-range presets (BD-time calendar for today/yesterday/last7) ──
+export type RangeKey = 'today' | 'yesterday' | 'last7' | 'd30' | 'd90' | 'd365';
+export const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
+  { key: 'today', label: 'Today' },
+  { key: 'yesterday', label: 'Yesterday' },
+  { key: 'last7', label: 'Last 7 days' },
+  { key: 'd30', label: 'Last 30 days' },
+  { key: 'd90', label: 'Last 90 days' },
+  { key: 'd365', label: 'Last year' },
+];
+// today/yesterday/last7 carry a `preset` (exact BD calendar window on supporting
+// endpoints) plus a `days` fallback for endpoints that only accept a rolling window.
+export function rangeToParams(r: RangeKey): { preset?: string; days: number } {
+  switch (r) {
+    case 'today': return { preset: 'today', days: 1 };
+    case 'yesterday': return { preset: 'yesterday', days: 2 };
+    case 'last7': return { preset: 'last7', days: 7 };
+    case 'd30': return { days: 30 };
+    case 'd90': return { days: 90 };
+    case 'd365': return { days: 365 };
+    default: return { days: 30 };
+  }
+}
+
+// ── shared page header with date-range preset filter + refresh ──
 export function ReportsHeader({
   title,
   subtitle,
-  days,
-  setDays,
+  range,
+  setRange,
   onRefresh,
   loading,
-  showDays = true,
+  showRange = true,
 }: {
   title: string;
   subtitle: string;
-  days?: number;
-  setDays?: (n: number) => void;
+  range?: RangeKey;
+  setRange?: (r: RangeKey) => void;
   onRefresh: () => void;
   loading: boolean;
-  showDays?: boolean;
+  showRange?: boolean;
 }) {
   return (
     <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
@@ -139,16 +163,13 @@ export function ReportsHeader({
         <p className="text-slate-500 text-sm mt-1 font-medium">{subtitle}</p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        {showDays && setDays && (
+        {showRange && setRange && (
           <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+            value={range}
+            onChange={(e) => setRange(e.target.value as RangeKey)}
             className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 shadow-sm"
           >
-            <option value={7}>Last 7 days</option>
-            <option value={30}>Last 30 days</option>
-            <option value={90}>Last 90 days</option>
-            <option value={365}>Last year</option>
+            {RANGE_OPTIONS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
           </select>
         )}
         <button

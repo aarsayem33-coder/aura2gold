@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { fetchForexBacktestReport } from '../../mt5Api';
 import type { ForexBacktestResponse } from '../../types';
-import { ReportsHeader, ReportsTabs, ErrorBanner } from './_shared';
+import { ReportsHeader, ReportsTabs, ErrorBanner, rangeToParams, type RangeKey } from './_shared';
 
 function BacktestCard({ backtest }: { backtest: ForexBacktestResponse }) {
   const s = backtest.summary;
@@ -45,7 +45,7 @@ function BacktestCard({ backtest }: { backtest: ForexBacktestResponse }) {
 }
 
 export default function BacktestReport() {
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<RangeKey>('d30');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [backtest, setBacktest] = useState<ForexBacktestResponse | null>(null);
@@ -54,14 +54,14 @@ export default function BacktestReport() {
     setLoading(true);
     setError(null);
     try {
-      const back = await fetchForexBacktestReport({ days, limit: 100 });
+      const back = await fetchForexBacktestReport({ days: rangeToParams(range).days, limit: 100 });
       setBacktest(back);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load backtest');
     } finally {
       setLoading(false);
     }
-  }, [days]);
+  }, [range]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -70,7 +70,7 @@ export default function BacktestReport() {
       <ReportsHeader
         title="Backtest"
         subtitle="Historical replay of emailed forex signals (report-based)"
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
       <ErrorBanner error={error} />

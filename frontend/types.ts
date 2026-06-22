@@ -381,11 +381,22 @@ export interface EmailAlertSettings {
   highImpactNews: boolean;
   aiTracked: boolean;
   forecast: boolean;
+  signalTracker: boolean;
+  strategyLab: boolean;
+  strategyLabFixedTime: boolean;
   forexMinGrade: 'B_SETUP' | 'A_SETUP' | 'A_PLUS_SETUP';
   forexMinQuality: 'B_SIGNAL' | 'A_SIGNAL' | 'A_PLUS_SIGNAL';
   fixedTimeMinTier: 'QUALITY_SIGNAL' | 'TRADE_SIGNAL';
   postNewsForexMinGrade: 'B_NEWS_SETUP' | 'A_NEWS_SETUP' | 'A_PLUS_NEWS_SETUP';
   postNewsFixedMinTier: 'QUALITY_SIGNAL' | 'TRADE_SIGNAL';
+  // Strategy Lab email rules — forex (TP/SL) framing.
+  strategyLabMinScore: number;
+  strategyLabMinGrade: 'ANY' | 'B' | 'A' | 'A+';
+  strategyLabStrategies: Record<string, boolean>;
+  // Strategy Lab email rules — fixed-time (direction at next-candle expiry) framing.
+  strategyLabFttMinScore: number;
+  strategyLabFttMinGrade: 'ANY' | 'B' | 'A' | 'A+';
+  strategyLabFttStrategies: Record<string, boolean>;
 }
 
 export interface EmailAlertSettingsResponse {
@@ -564,6 +575,133 @@ export interface TopbarMarketAlert {
   action?: string | null;
   currentR?: number | null;
   currentPips?: number | null;
+  // Strategy Lab signals — distinct source label so they read as a separate engine.
+  strategySource?: string | null;
+}
+
+// ── Strategy Lab (isolated single-strategy signals) ─────────────────────────
+export interface StrategyMeta {
+  id: string;
+  name: string;
+  source: string | null;
+  description: string;
+  timeframes: string[];
+}
+export interface StrategyTiming {
+  status: 'WAIT' | 'TRADABLE' | 'EXPIRED' | 'SETTLED';
+  expectEntryBy: string | null;
+  message: string;
+}
+export interface StrategySignal {
+  id: string;
+  strategy: string;
+  symbol: string;
+  timeframe: string;
+  signalTime: string | null;
+  direction: string;
+  score: number | null;
+  grade: string | null;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  takeProfit3: number | null;
+  riskReward: number | null;
+  reason: string | null;
+  lots: number | null;
+  stopPips: number | null;
+  lossAtStop: number | null;
+  timing: StrategyTiming;
+  outcome: string;
+  profitLossPips: number | null;
+  tpHitLevel: number | null;
+  ftOutcome: string;
+  ftPips: number | null;
+  live?: { currentPrice: number; reference: number; pips: number; status: 'WINNING' | 'LOSING' | 'FLAT' } | null;
+  popupSent?: boolean | null;
+  emailSent?: boolean | null;
+  resolvedAt: string | null;
+}
+export interface StrategyForexBucket {
+  wins: number; losses: number; expired: number; pending: number;
+  winLossSettled: number; winRate: number | null;
+  expectancyPips: number | null; expectancyR: number | null;
+  confidence: 'weak' | 'early' | 'usable' | 'strong';
+}
+export interface StrategyFtBucket {
+  wins: number; losses: number; draws: number; pending: number;
+  winLossSettled: number; winRate: number | null;
+  confidence: 'weak' | 'early' | 'usable' | 'strong';
+}
+export interface StrategyTfRow {
+  timeframe: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+}
+export interface StrategySymbolRow {
+  symbol: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+}
+export interface StrategySessionRow {
+  session: string; sessionLabel: string; bdRange: string;
+  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+}
+export interface StrategyComboRow {
+  strategy: string; strategyName: string; symbol: string; timeframe: string;
+  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+}
+export interface StrategyPerf {
+  id: string; name: string; source: string | null; total: number;
+  forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  byTimeframe: StrategyTfRow[];
+  bySymbol: StrategySymbolRow[];
+  bySession: StrategySessionRow[];
+}
+export interface StrategyPerformanceResponse {
+  ok: boolean; strategies: StrategyPerf[];
+  timeframeRanking: StrategyTfRow[];
+  symbolRanking: StrategySymbolRow[];
+  sessionRanking: StrategySessionRow[];
+  combos: StrategyComboRow[];
+  window?: { from: string; to: string; label: string; preset: string | null; days: number };
+  minSampleToRank: number; generatedAt: string; note: string;
+}
+export interface StrategyLiveRow {
+  symbol: string;
+  timeframe: string;
+  command: 'ENTRY' | 'HOLD' | 'NO_DATA';
+  direction?: string;
+  score?: number | null;
+  grade?: string | null;
+  price?: number | null;
+  entry?: number | null;
+  stopLoss?: number | null;
+  takeProfit1?: number | null;
+  takeProfit2?: number | null;
+  takeProfit3?: number | null;
+  riskReward?: number | null;
+  reason?: string | null;
+  lots?: number | null;
+  stopPips?: number | null;
+  lossAtStop?: number | null;
+  riskPercent?: number | null;
+  timing?: StrategyTiming;
+}
+export interface StrategyLiveResponse {
+  ok: boolean; strategy: string; strategyName: string; timeframe: string; rows: StrategyLiveRow[]; generatedAt: string;
+}
+export interface StrategyFttLiveRow {
+  symbol: string;
+  timeframe: string;
+  command: 'CALL' | 'HOLD' | 'NO_DATA';
+  direction?: 'UP' | 'DOWN';
+  score?: number | null;
+  grade?: string | null;
+  reference?: number | null;
+  expiryIso?: string | null;
+  secondsToExpiry?: number | null;
+  durationLabel?: string | null;
+  reason?: string | null;
+}
+export interface StrategyFttLiveResponse {
+  ok: boolean; strategy: string; strategyName: string; timeframe: string; expiryBars: number; rows: StrategyFttLiveRow[]; generatedAt: string;
 }
 
 export type SignalTrackerStatus = 'OPEN' | 'TP1_HIT' | 'TP2_HIT' | 'TP3_HIT' | 'STOPPED' | 'DANGER' | 'CLOSE_NOW' | 'EXPIRED';

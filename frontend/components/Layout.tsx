@@ -94,6 +94,7 @@ function money(value?: number | null) {
 function alertTitle(alert: TopbarMarketAlert) {
   if (alert.alertKind === 'CLOSE') return `⚠ CLOSE TRADE · ${alert.direction.replace('_', ' ')}`;
   if (alert.alertKind === 'MANAGE') return `MANAGE TRADE · ${alert.direction.replace('_', ' ')}`;
+  if (alert.strategySource) return `${alert.grade || ''} ${alert.strategySource} · ${alert.direction.replace('_', ' ')}`.trim();
   return alert.kind === 'FOREX'
     ? `${alert.grade || 'A'} FOREX ${alert.direction.replace('_', ' ')}`
     : `${alert.quality || alert.grade || 'A'} FIXED-TIME ${alert.direction}`;
@@ -164,7 +165,7 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
         <div className="absolute right-0 top-12 z-50 w-[360px] overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-900/15">
           <div className="flex items-start justify-between gap-3 border-b border-amber-100 bg-gradient-to-r from-amber-50 to-white p-4">
             <div>
-              <p className={`text-[10px] font-black uppercase tracking-[0.22em] ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-600' : displayAlert.alertKind === 'MANAGE' ? 'text-amber-600' : 'text-amber-600'}`}>{displayAlert.alertKind ? 'Trade management alert' : 'Live quality signal'}</p>
+              <p className={`text-[10px] font-black uppercase tracking-[0.22em] ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-600' : displayAlert.strategySource ? 'text-violet-600' : 'text-amber-600'}`}>{displayAlert.alertKind ? 'Trade management alert' : displayAlert.strategySource ? `Strategy Lab · ${displayAlert.strategySource}` : 'Live quality signal'}</p>
               <h3 className={`mt-1 text-base font-black ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-700' : 'text-slate-950'}`}>{alertTitle(displayAlert)}</h3>
               <p className="text-xs font-bold text-slate-500">{displayAlert.symbol} {displayAlert.timeframe || displayAlert.expiry || ''} · {displayAlert.alertKind ? (displayAlert.currentR != null ? `${displayAlert.currentR}R` : '') : `${displayAlert.confidence}/100`} · {alertAgeLabel(displayAlert)}</p>
             </div>
@@ -293,6 +294,13 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
     { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
     { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },
+    {
+      path: '/strategy-lab', icon: FlaskConical, label: 'Strategy Lab',
+      children: [
+        { path: '/strategy-lab', icon: Radar, label: 'Signals', end: true },
+        { path: '/strategy-lab/reports', icon: BarChart3, label: 'Reports' },
+      ],
+    },
     { path: '/projections', icon: Crosshair, label: 'Pullback Projections' },
     { path: '/calendar', icon: CalendarDays, label: 'Economic Calendar' },
     { path: '/news-high-impact', icon: Newspaper, label: 'High-Impact News' },

@@ -5,6 +5,7 @@ import type { SignalEmailReport, TradeReportSummary } from '../../types';
 import {
   DateCell, ReportsHeader, ReportsTabs, SummaryCards, ErrorBanner,
   price, delayLabel, delayBadgeClass, outcomeBadge, outcomeIcon, signalQualityBadge,
+  rangeToParams, type RangeKey,
 } from './_shared';
 
 function getCalibrationPayload(payload: SignalEmailReport['payload']) {
@@ -14,7 +15,7 @@ function getCalibrationPayload(payload: SignalEmailReport['payload']) {
 }
 
 export default function ForexOutcomes() {
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<RangeKey>('d30');
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,7 +26,7 @@ export default function ForexOutcomes() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetchForexEmailReports({ days, limit: 300 });
+      const res = await fetchForexEmailReports({ ...rangeToParams(range), limit: 300 });
       setReports(res.reports);
       setSummary(res.summary);
     } catch (err) {
@@ -33,7 +34,7 @@ export default function ForexOutcomes() {
     } finally {
       setLoading(false);
     }
-  }, [days]);
+  }, [range]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -48,7 +49,7 @@ export default function ForexOutcomes() {
       <ReportsHeader
         title="Forex Outcomes"
         subtitle="Tracked outcomes for forex trade alerts sent by email"
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
       {summary && <SummaryCards summary={summary} market="forex" />}

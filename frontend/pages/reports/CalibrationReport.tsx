@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Timer, TrendingUp } from 'lucide-react';
 import { fetchCalibrationReport, fetchWouldSuppress } from '../../mt5Api';
 import type { CalibrationGroupStat, CalibrationResponse, WouldSuppressResponse } from '../../types';
-import { ReportsHeader, ReportsTabs, ErrorBanner } from './_shared';
+import { ReportsHeader, ReportsTabs, ErrorBanner, rangeToParams, type RangeKey } from './_shared';
 
 const FOREX_KEYS = ['grade', 'symbol', 'timeframe', 'strategyType', 'signalQuality', 'session', 'volatilityState', 'pattern'];
 const FIXED_KEYS = ['grade', 'symbol', 'expiry', 'strategyType', 'qualityTier', 'session', 'volatilityState', 'ichimokuState', 'pattern'];
@@ -57,7 +57,7 @@ function LeaderboardCard({ title, rows }: { title: string; rows: CalibrationGrou
 
 export default function CalibrationReport() {
   const [market, setMarket] = useState<'forex' | 'fixed'>('forex');
-  const [days, setDays] = useState(90);
+  const [range, setRange] = useState<RangeKey>('d90');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [calibration, setCalibration] = useState<CalibrationResponse | null>(null);
@@ -68,7 +68,7 @@ export default function CalibrationReport() {
     setError(null);
     try {
       const [cal, ws] = await Promise.all([
-        fetchCalibrationReport(market, { days, limit: 500 }),
+        fetchCalibrationReport(market, { days: rangeToParams(range).days, limit: 500 }),
         fetchWouldSuppress().catch(() => null),
       ]);
       setCalibration(cal);
@@ -78,7 +78,7 @@ export default function CalibrationReport() {
     } finally {
       setLoading(false);
     }
-  }, [market, days]);
+  }, [market, range]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -89,7 +89,7 @@ export default function CalibrationReport() {
       <ReportsHeader
         title="Calibration"
         subtitle="Historical win rate and expectancy by category — each dimension in its own table"
-        days={days} setDays={setDays} onRefresh={() => void load()} loading={loading}
+        range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
 

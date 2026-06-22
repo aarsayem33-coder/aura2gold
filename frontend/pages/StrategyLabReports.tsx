@@ -1,0 +1,512 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals } from '../mt5Api';
+import type {
+  StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyFtBucket,
+  StrategyTfRow, StrategySymbolRow, StrategySessionRow, StrategyComboRow, StrategySignal,
+} from '../types';
+
+const REFRESH_MS = 60000;
+type Metric = 'forex' | 'ftt';
+type RangeKey = 'today' | 'yesterday' | 'last7' | 'd30' | 'd60' | 'd90' | 'd180';
+const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
+  { key: 'today', label: 'Today' },
+  { key: 'yesterday', label: 'Yesterday' },
+  { key: 'last7', label: 'Last 7 days' },
+  { key: 'd30', label: '30 days' },
+  { key: 'd60', label: '60 days' },
+  { key: 'd90', label: '90 days' },
+  { key: 'd180', label: '180 days' },
+];
+function rangeToParams(r: RangeKey): { days?: number; preset?: string } {
+  return (r === 'today' || r === 'yesterday' || r === 'last7') ? { preset: r } : { days: Number(r.slice(1)) };
+}
+
+const confClass: Record<string, string> = {
+  strong: 'bg-emerald-100 text-emerald-700', usable: 'bg-blue-100 text-blue-700',
+  early: 'bg-amber-100 text-amber-700', weak: 'bg-slate-100 text-slate-500',
+};
+
+type AnyBucketRow = { forex: StrategyForexBucket; fixedTime: StrategyFtBucket };
+const pick = (row: AnyBucketRow, m: Metric): StrategyForexBucket | StrategyFtBucket => (m === 'ftt' ? row.fixedTime : row.forex);
+
+function rankByMetric<T extends AnyBucketRow>(rows: T[], m: Metric, minSample: number): T[] {
+  return [...rows].sort((a, b) => {
+    const ba = pick(a, m), bb = pick(b, m);
+    const aOk = (ba.winLossSettled ?? 0) >= minSample, bOk = (bb.winLossSettled ?? 0) >= minSample;
+    if (aOk !== bOk) return aOk ? -1 : 1;
+    return ((bb.winRate ?? -1) - (ba.winRate ?? -1)) || ((bb.winLossSettled ?? 0) - (ba.winLossSettled ?? 0));
+  });
+}
+
+const wrColor = (wr: number | null) => (wr === null ? 'text-slate-400' : wr >= 60 ? 'text-emerald-600' : wr >= 50 ? 'text-blue-600' : 'text-rose-600');
+const barColor = (wr: number | null) => (wr === null ? 'bg-slate-200' : wr >= 60 ? 'bg-emerald-500' : wr >= 50 ? 'bg-blue-500' : 'bg-rose-500');
+
+// Win-rate cell with a tiny progress bar + confidence chip.
+function WinCell({ b, minSample, bar = true }: { b: StrategyForexBucket | StrategyFtBucket; minSample: number; bar?: boolean }) {
+  const settled = b.winLossSettled ?? 0;
+  const trusted = settled >= minSample;
+  return (
+    <div className="min-w-[92px]">
+      <div className="flex items-baseline justify-end gap-1">
+        <span className={`text-base font-black ${wrColor(b.winRate)}`}>{b.winRate === null ? '—' : `${b.winRate}%`}</span>
+      </div>
+      {bar && (
+        <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+          <div className={`h-full rounded-full ${barColor(b.winRate)}`} style={{ width: `${b.winRate === null ? 0 : Math.max(2, Math.min(100, b.winRate))}%` }} />
+        </div>
+      )}
+      <div className={`mt-1 inline-block rounded px-1.5 py-0.5 text-[9px] font-black uppercase ${trusted ? confClass.strong : confClass[b.confidence] || ''}`}>
+        {trusted ? `${b.wins}W/${b.losses}L · ${settled} scored` : `${b.confidence} (${settled})`}
+      </div>
+    </div>
+  );
+}
+
+// A compact "top pick" summary card.
+function PickCard({ icon, label, title, subtitle, b, minSample }: {
+  icon: React.ReactNode; label: string; title: string; subtitle?: string | null;
+  b: (StrategyForexBucket | StrategyFtBucket) | null; minSample: number;
+}) {
+  const wr = b?.winRate ?? null;
+  const settled = b?.winLossSettled ?? 0;
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
+      <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-wider text-slate-400">{icon} {label}</div>
+      <div className="mt-2 flex items-end justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-black text-slate-900" title={title}>{title || '—'}</p>
+          {subtitle && <p className="truncate text-[11px] font-semibold text-slate-400">{subtitle}</p>}
+        </div>
+        <div className={`shrink-0 text-2xl font-black ${wrColor(wr)}`}>{wr === null ? '—' : `${wr}%`}</div>
+      </div>
+      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+        <div className={`h-full rounded-full ${barColor(wr)}`} style={{ width: `${wr === null ? 0 : Math.max(2, Math.min(100, wr))}%` }} />
+      </div>
+      <p className="mt-1.5 text-[10px] font-bold uppercase text-slate-400">{settled >= minSample ? `${settled} scored · trusted` : `${settled} scored · ${b?.confidence || 'no'} sample`}</p>
+    </div>
+  );
+}
+
+const expLabel = (b: StrategyForexBucket) =>
+  b.expectancyPips === null ? '—'
+    : `${b.expectancyPips > 0 ? '+' : ''}${b.expectancyPips}p${b.expectancyR !== null ? ` · ${b.expectancyR > 0 ? '+' : ''}${b.expectancyR}R` : ''}`;
+
+function outcomeChip(o: string) {
+  const s = (o || '').toUpperCase();
+  if (s.endsWith('_WIN') || s === 'WIN') return 'bg-emerald-50 text-emerald-700';
+  if (s === 'LOSS') return 'bg-rose-50 text-rose-700';
+  if (s === 'PENDING') return 'bg-blue-50 text-blue-600';
+  if (s === 'DRAW' || s === 'AMBIGUOUS') return 'bg-amber-50 text-amber-700';
+  return 'bg-slate-100 text-slate-400';
+}
+
+// System / email tracking chips for a signal.
+function SourceChips({ popupSent, emailSent }: { popupSent?: boolean | null; emailSent?: boolean | null }) {
+  if (popupSent == null && emailSent == null) return <span className="text-[10px] text-slate-300">—</span>;
+  return (
+    <div className="flex items-center gap-1">
+      <span className={`inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[9px] font-black ${popupSent ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-400'}`} title={popupSent ? 'Tracked by system (live popup)' : 'No popup'}><Radio size={9} /> SYS</span>
+      <span className={`inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[9px] font-black ${emailSent ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-400'}`} title={emailSent ? 'Sent by email' : 'Not emailed'}><Mail size={9} /> MAIL</span>
+    </div>
+  );
+}
+
+// Fixed-time live/settled cell: pulsing green/red LIVE pill while pending, else WIN/LOSS/DRAW.
+function FtResultCell({ s }: { s: StrategySignal }) {
+  if (s.live) {
+    const st = s.live.status;
+    const pillCls = st === 'WINNING' ? 'bg-emerald-100 text-emerald-700' : st === 'LOSING' ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-500';
+    const dotCls = st === 'WINNING' ? 'bg-emerald-500' : st === 'LOSING' ? 'bg-rose-500' : 'bg-slate-400';
+    return (
+      <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-black ${pillCls}`}>
+        <span className={`h-1.5 w-1.5 rounded-full ${dotCls} animate-pulse`} /> LIVE {s.live.pips > 0 ? '+' : ''}{s.live.pips}p
+      </span>
+    );
+  }
+  return (
+    <span>
+      <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span>
+      {s.ftPips !== null && <span className={`ml-1 font-mono text-[11px] font-bold ${s.ftPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>{s.ftPips > 0 ? '+' : ''}{s.ftPips}p</span>}
+    </span>
+  );
+}
+
+export default function StrategyLabReports() {
+  const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
+  const [selected, setSelected] = useState('');
+  const [perf, setPerf] = useState<StrategyPerformanceResponse | null>(null);
+  const [signals, setSignals] = useState<StrategySignal[]>([]);
+  const [range, setRange] = useState<RangeKey>('last7');
+  const [metric, setMetric] = useState<Metric>('forex');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchStrategies().then((m) => { setStrategies(m.strategies); setSelected((c) => c || m.strategies[0]?.id || ''); }).catch(() => {});
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setPerf(await fetchStrategyPerformance(rangeToParams(range))); setError(null); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Failed to load performance'); }
+    finally { setLoading(false); }
+  }, [range]);
+
+  useEffect(() => {
+    void load();
+    const t = setInterval(() => void load(), REFRESH_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const loadSignals = useCallback(async () => {
+    if (!selected) return;
+    try { const r = await fetchStrategySignals(selected); setSignals(r.signals); } catch { /* log is best-effort */ }
+  }, [selected]);
+
+  useEffect(() => {
+    void loadSignals();
+    const t = setInterval(() => void loadSignals(), REFRESH_MS);
+    return () => clearInterval(t);
+  }, [loadSignals]);
+
+  const minSample = perf?.minSampleToRank ?? 20;
+  const activePerf = useMemo(() => perf?.strategies.find((s) => s.id === selected) || null, [perf, selected]);
+
+  // Client-side re-rank by the chosen metric (forex / fixed-time).
+  const rankedStrategies = useMemo(() => rankByMetric(perf?.strategies || [], metric, minSample), [perf, metric, minSample]);
+  const rankedTf = useMemo(() => rankByMetric(perf?.timeframeRanking || [], metric, minSample), [perf, metric, minSample]);
+  const rankedSymbols = useMemo(() => rankByMetric(perf?.symbolRanking || [], metric, minSample), [perf, metric, minSample]);
+  const rankedSessions = useMemo(() => rankByMetric(perf?.sessionRanking || [], metric, minSample), [perf, metric, minSample]);
+  const rankedCombos = useMemo(() => rankByMetric(perf?.combos || [], metric, minSample), [perf, metric, minSample]);
+  const tfBySel = useMemo(() => rankByMetric(activePerf?.byTimeframe || [], metric, minSample), [activePerf, metric, minSample]);
+  const symBySel = useMemo(() => rankByMetric(activePerf?.bySymbol || [], metric, minSample), [activePerf, metric, minSample]);
+  const sessBySel = useMemo(() => rankByMetric(activePerf?.bySession || [], metric, minSample), [activePerf, metric, minSample]);
+
+  // Signal log filtered to the selected date window (matches the performance window).
+  const logSignals = useMemo(() => {
+    const w = perf?.window;
+    if (!w) return signals;
+    const from = Date.parse(w.from), to = Date.parse(w.to);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) return signals;
+    return signals.filter((s) => { const t = s.signalTime ? Date.parse(s.signalTime) : NaN; return Number.isFinite(t) && t >= from && t < to; });
+  }, [signals, perf]);
+
+  function bestOf<T extends AnyBucketRow>(rows: T[]): T | null {
+    if (!rows.length) return null;
+    const trusted = rows.find((r) => (pick(r, metric).winLossSettled ?? 0) >= minSample);
+    return trusted || rows[0];
+  }
+  const bestStrategy = bestOf(rankedStrategies);
+  const bestTf = bestOf(rankedTf);
+  const bestSymbol = bestOf(rankedSymbols);
+  const bestSession = bestOf(rankedSessions) as StrategySessionRow | null;
+
+  const totalSignals = (perf?.strategies || []).reduce((a, s) => a + (s.total || 0), 0);
+
+  const MetricToggle = (
+    <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-0.5">
+      <button type="button" onClick={() => setMetric('forex')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${metric === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Forex</button>
+      <button type="button" onClick={() => setMetric('ftt')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${metric === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Fixed-Time</button>
+    </div>
+  );
+
+  return (
+    <div className="space-y-5 p-1">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="rounded-xl bg-amber-100 p-2"><Trophy className="text-amber-600" size={22} /></div>
+          <div>
+            <h1 className="text-xl font-black text-slate-900">Strategy Lab — Reports</h1>
+            <p className="text-xs font-medium text-slate-400">What actually works — ranked by win rate across strategies, timeframes, symbols & combos. Measured forex (TP/SL) + fixed-time.</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {MetricToggle}
+          <select value={range} onChange={(e) => setRange(e.target.value as RangeKey)} className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-semibold">
+            {RANGE_OPTIONS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+          </select>
+          <Link to="/strategy-lab" className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-bold text-slate-600 hover:bg-slate-50">Signals</Link>
+          <button type="button" onClick={() => { void load(); void loadSignals(); }} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-bold text-white hover:bg-slate-700 disabled:opacity-50">
+            {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</div>}
+
+      {/* TOP PICKS — best in each dimension, by the chosen metric */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <PickCard icon={<Award size={12} />} label={`Best strategy · ${metric === 'ftt' ? 'fixed-time' : 'forex'}`} title={bestStrategy?.name || '—'} subtitle={`${bestStrategy?.total ?? 0} signals`} b={bestStrategy ? pick(bestStrategy, metric) : null} minSample={minSample} />
+        <PickCard icon={<Clock size={12} />} label="Best timeframe" title={bestTf?.timeframe || '—'} subtitle={`${bestTf?.total ?? 0} signals (all strategies)`} b={bestTf ? pick(bestTf, metric) : null} minSample={minSample} />
+        <PickCard icon={<Coins size={12} />} label="Best symbol" title={bestSymbol?.symbol || '—'} subtitle={`${bestSymbol?.total ?? 0} signals (all strategies)`} b={bestSymbol ? pick(bestSymbol, metric) : null} minSample={minSample} />
+        <PickCard icon={<Globe size={12} />} label="Best session (BD time)" title={bestSession?.sessionLabel || '—'} subtitle={bestSession?.bdRange || 'all strategies'} b={bestSession ? pick(bestSession, metric) : null} minSample={minSample} />
+      </div>
+
+      {/* STRATEGY LEADERBOARD */}
+      <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+        <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
+          <Trophy size={16} className="text-amber-500" />
+          <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Strategy leaderboard · {perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label}</h3>
+          <span className="ml-1 text-[11px] font-semibold text-slate-400">ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate · trusted once ≥ {minSample} scored · {totalSignals} signals total</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[820px] text-left text-sm">
+            <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+              <tr>
+                <th className="px-4 py-2 w-10">#</th>
+                <th className="px-4 py-2">Strategy</th>
+                <th className="px-4 py-2 text-right">Forex win%</th>
+                <th className="px-4 py-2 text-right">Expectancy</th>
+                <th className="px-4 py-2 text-right">Fixed-time win%</th>
+                <th className="px-4 py-2 text-right">Signals</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-700">
+              {rankedStrategies.length ? rankedStrategies.map((s, i) => (
+                <tr key={s.id} className={`hover:bg-slate-50/70 cursor-pointer ${s.id === selected ? 'bg-violet-50/50' : ''}`} onClick={() => setSelected(s.id)}>
+                  <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
+                  <td className="px-4 py-2"><span className="font-bold text-slate-800">{s.name}</span>{s.source && <span className="block text-[10px] font-semibold text-slate-400 max-w-[260px] truncate" title={s.source}>{s.source}</span>}</td>
+                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.forex} minSample={minSample} /></div></td>
+                  <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(s.forex)}</td>
+                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.fixedTime} minSample={minSample} /></div></td>
+                  <td className="px-4 py-2 text-right font-mono font-bold">{s.total}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* TIMEFRAME + SYMBOL + SESSION global rankings (across all strategies) */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+        <RankTable
+          title="Timeframe ranking" sub="all strategies" icon={<Clock size={16} className="text-blue-500" />}
+          colLabel="TF" rows={rankedTf} keyOf={(r) => (r as StrategyTfRow).timeframe} render={(r) => (r as StrategyTfRow).timeframe} metric={metric} minSample={minSample}
+        />
+        <RankTable
+          title="Symbol ranking" sub="all strategies" icon={<Coins size={16} className="text-amber-500" />}
+          colLabel="Symbol" rows={rankedSymbols} keyOf={(r) => (r as StrategySymbolRow).symbol} render={(r) => (r as StrategySymbolRow).symbol} metric={metric} minSample={minSample}
+        />
+        <RankTable
+          title="Session ranking" sub="Bangladesh time" icon={<Globe size={16} className="text-violet-500" />}
+          colLabel="Session" rows={rankedSessions} keyOf={(r) => (r as StrategySessionRow).session}
+          render={(r) => {
+            const s = r as StrategySessionRow;
+            return (<><span className="font-black text-slate-800">{s.sessionLabel}</span><span className="block text-[10px] font-semibold text-slate-400">{s.bdRange}</span></>);
+          }}
+          metric={metric} minSample={minSample}
+        />
+      </div>
+
+      {/* BEST COMBOS — strategy × symbol × timeframe */}
+      <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+        <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
+          <Target size={16} className="text-violet-500" />
+          <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Best combos · strategy × symbol × timeframe</h3>
+          <span className="ml-1 text-[11px] font-semibold text-slate-400">the sharpest edges, ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[860px] text-left text-sm">
+            <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+              <tr>
+                <th className="px-4 py-2 w-10">#</th>
+                <th className="px-4 py-2">Strategy</th>
+                <th className="px-4 py-2">Symbol</th>
+                <th className="px-4 py-2">TF</th>
+                <th className="px-4 py-2 text-right">Forex win%</th>
+                <th className="px-4 py-2 text-right">Exp</th>
+                <th className="px-4 py-2 text-right">Fixed-time win%</th>
+                <th className="px-4 py-2 text-right">Signals</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-700">
+              {rankedCombos.length ? rankedCombos.slice(0, 25).map((c, i) => (
+                <tr key={`${c.strategy}-${c.symbol}-${c.timeframe}`} className="hover:bg-slate-50/70">
+                  <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
+                  <td className="px-4 py-2 font-bold text-slate-700">{c.strategyName}</td>
+                  <td className="px-4 py-2 font-black text-slate-900">{c.symbol}</td>
+                  <td className="px-4 py-2 font-bold text-slate-500">{c.timeframe}</td>
+                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.forex} minSample={minSample} bar={false} /></div></td>
+                  <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(c.forex)}</td>
+                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.fixedTime} minSample={minSample} bar={false} /></div></td>
+                  <td className="px-4 py-2 text-right font-mono font-bold">{c.total}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan={8} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No combos settled yet.'}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* SELECTED STRATEGY DEEP-DIVE: by timeframe + by symbol */}
+      <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Layers size={16} className="text-slate-500" />
+            <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Deep dive · {activePerf?.name || selected}</h3>
+          </div>
+          <select value={selected} onChange={(e) => setSelected(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+            {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div className="grid grid-cols-1 gap-0 lg:grid-cols-3 lg:divide-x lg:divide-slate-100">
+          <BreakdownTable title="By timeframe" colLabel="TF" rows={tfBySel} keyOf={(r) => (r as StrategyTfRow).timeframe} render={(r) => (r as StrategyTfRow).timeframe} minSample={minSample} loading={loading} />
+          <BreakdownTable title="By symbol" colLabel="Symbol" rows={symBySel} keyOf={(r) => (r as StrategySymbolRow).symbol} render={(r) => (r as StrategySymbolRow).symbol} minSample={minSample} loading={loading} />
+          <BreakdownTable title="By session (BD time)" colLabel="Session" rows={sessBySel} keyOf={(r) => (r as StrategySessionRow).session}
+            render={(r) => { const s = r as StrategySessionRow; return (<><span className="font-bold">{s.sessionLabel}</span><span className="block text-[10px] font-semibold text-slate-400">{s.bdRange}</span></>); }}
+            minSample={minSample} loading={loading} />
+        </div>
+      </div>
+
+      {/* PER-SIGNAL TRACKED LOG — every signal (system + email), forex + fixed-time, live */}
+      <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <ScrollText size={16} className="text-slate-500" />
+            <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Signal log · {activePerf?.name || selected}</h3>
+            <span className="ml-1 text-[11px] font-semibold text-slate-400">every call tracked by system &amp; email · live position · {logSignals.length} in {perf?.window?.label || 'window'}</span>
+          </div>
+          <select value={selected} onChange={(e) => setSelected(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+            {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[860px] text-left text-sm">
+            <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+              <tr>
+                <th className="px-3 py-2">Dir</th>
+                <th className="px-3 py-2">Symbol</th>
+                <th className="px-3 py-2 text-right">Score</th>
+                <th className="px-3 py-2">Forex result</th>
+                <th className="px-3 py-2 text-right">Pips</th>
+                <th className="px-3 py-2">Fixed-time (live/result)</th>
+                <th className="px-3 py-2">Track</th>
+                <th className="px-3 py-2">Signal made</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-700">
+              {logSignals.length ? logSignals.slice(0, 80).map((s) => {
+                const up = /BUY/.test(s.direction);
+                const liveTint = s.live ? (s.live.status === 'WINNING' ? 'bg-emerald-50/40' : s.live.status === 'LOSING' ? 'bg-rose-50/40' : '') : '';
+                return (
+                  <tr key={s.id} className={`hover:bg-slate-50/70 ${liveTint}`}>
+                    <td className="px-3 py-2">
+                      {up
+                        ? <span className="inline-flex items-center gap-1 rounded-md bg-emerald-600/10 px-1.5 py-0.5 text-[11px] font-black text-emerald-700"><TrendingUp size={12} /> BUY</span>
+                        : <span className="inline-flex items-center gap-1 rounded-md bg-rose-600/10 px-1.5 py-0.5 text-[11px] font-black text-rose-700"><TrendingDown size={12} /> SELL</span>}
+                    </td>
+                    <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
+                    <td className="px-3 py-2 text-right">{s.score === null ? <span className="text-slate-300">—</span> : <span className="font-black text-slate-700">{Math.round(s.score)}{s.grade ? ` ${s.grade}` : ''}</span>}</td>
+                    <td className="px-3 py-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
+                    <td className="px-3 py-2 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
+                    <td className="px-3 py-2"><FtResultCell s={s} /></td>
+                    <td className="px-3 py-2"><SourceChips popupSent={s.popupSent} emailSent={s.emailSent} /></td>
+                    <td className="px-3 py-2 text-[11px] text-slate-400 whitespace-nowrap">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan={8} className="px-3 py-8 text-center text-sm font-medium text-slate-400">No signals logged yet for this strategy.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="border-t border-slate-100 px-4 py-2 text-[11px] font-medium text-slate-400">
+          Every signal is logged (system) regardless of score; <span className="font-bold">SYS</span> = surfaced as a popup, <span className="font-bold">MAIL</span> = emailed · <span className="font-bold text-emerald-600">LIVE</span> shows the fixed-time call&apos;s current position (green winning / red losing) · multiple calls on the same candle are all kept.
+        </div>
+      </div>
+
+      {perf?.note && <p className="text-[11px] font-medium text-slate-400 px-1">{perf.note}</p>}
+    </div>
+  );
+}
+
+// Global rank table (timeframe / symbol / session) — both win rates + signals, ranked.
+function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, minSample }: {
+  title: string; sub: string; icon: React.ReactNode; colLabel: string;
+  rows: (StrategyTfRow | StrategySymbolRow | StrategySessionRow)[];
+  keyOf: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => string;
+  render: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => React.ReactNode;
+  metric: Metric; minSample: number;
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+      <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3">
+        {icon}
+        <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">{title}</h3>
+        <span className="ml-1 text-[11px] font-semibold text-slate-400">{sub} · by {metric === 'ftt' ? 'fixed-time' : 'forex'} win%</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-sm">
+          <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+            <tr>
+              <th className="px-4 py-2 w-8">#</th>
+              <th className="px-4 py-2">{colLabel}</th>
+              <th className="px-4 py-2 text-right">Forex</th>
+              <th className="px-4 py-2 text-right">Fixed-time</th>
+              <th className="px-4 py-2 text-right">Signals</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100 text-slate-700">
+            {rows.length ? rows.map((r, i) => (
+              <tr key={keyOf(r)} className="hover:bg-slate-50/70">
+                <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
+                <td className="px-4 py-2 font-black text-slate-800">{render(r)}</td>
+                <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2 text-right font-mono font-bold">{r.total}</td>
+              </tr>
+            )) : (
+              <tr><td colSpan={5} className="px-4 py-8 text-center text-sm font-medium text-slate-400">No data yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Per-strategy breakdown table (timeframe / symbol / session) with expectancy.
+function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loading }: {
+  title: string; colLabel: string; rows: (StrategyTfRow | StrategySymbolRow | StrategySessionRow)[];
+  keyOf: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => string;
+  render: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => React.ReactNode;
+  minSample: number; loading: boolean;
+}) {
+  return (
+    <div>
+      <div className="px-4 py-2.5 text-[11px] font-black uppercase tracking-wider text-slate-400">{title}</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-sm">
+          <thead className="border-y border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+            <tr>
+              <th className="px-4 py-2">{colLabel}</th>
+              <th className="px-4 py-2 text-right">Forex win%</th>
+              <th className="px-4 py-2 text-right">Exp</th>
+              <th className="px-4 py-2 text-right">Fixed-time</th>
+              <th className="px-4 py-2 text-right">Signals</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100 text-slate-700">
+            {rows.length ? rows.map((r) => (
+              <tr key={keyOf(r)} className="hover:bg-slate-50/70">
+                <td className="px-4 py-2 font-bold">{render(r)}</td>
+                <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(r.forex)}</td>
+                <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2 text-right font-mono font-bold">{r.total}</td>
+              </tr>
+            )) : (
+              <tr><td colSpan={5} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No settled signals for this strategy yet.'}</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
