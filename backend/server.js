@@ -1946,9 +1946,50 @@ function indexCandleSeriesBatch(list) {
   }
 }
 
+// Real-time Strategy Lab notification trigger. When a NEW closed candle appears for a
+// curated symbol/timeframe, debounce a notify-only pass so a fresh setup is sent within
+// seconds (DB logging stays on the periodic scanner). De-dup is the lifecycle's job.
+const strategyNotifyPendingPairs = new Set();
+const strategyNotifyLastBar = new Map(); // seriesKey -> last seen bar time ms
+let strategyNotifyDebounce = null;
+let strategyNotifyCuratedCache = { at: 0, set: new Set() };
+function strategyNotifyCuratedSet() {
+  const now = Date.now();
+  if (now - strategyNotifyCuratedCache.at > 60000) {
+    try { strategyNotifyCuratedCache = { at: now, set: new Set(getCuratedSymbols(getMt5Status().symbols)) }; }
+    catch { /* keep last cache */ }
+  }
+  return strategyNotifyCuratedCache.set;
+}
+function noteCandleForNotify(candle) {
+  if (!candle || !candle.symbol || !candle.timeframe) return;
+  const tf = String(candle.timeframe).toUpperCase();
+  if (!STRATEGY_LAB_TIMEFRAMES.includes(tf)) return;
+  if (!strategyNotifyCuratedSet().has(candle.symbol)) return;
+  const t = Date.parse(candle.time);
+  if (!Number.isFinite(t)) return;
+  const k = seriesKey(candle.symbol, tf);
+  const prev = strategyNotifyLastBar.get(k);
+  if (prev !== undefined && t > prev) {
+    // A bar newer than we'd seen → the prior candle just closed → check this series now.
+    strategyNotifyPendingPairs.add(`${candle.symbol}|${tf}`);
+    if (!strategyNotifyDebounce) {
+      strategyNotifyDebounce = setTimeout(() => {
+        strategyNotifyDebounce = null;
+        const pairs = [...strategyNotifyPendingPairs];
+        strategyNotifyPendingPairs.clear();
+        if (pairs.length) void runStrategyNotifyPass(pairs);
+      }, 2500);
+      if (typeof strategyNotifyDebounce.unref === 'function') strategyNotifyDebounce.unref();
+    }
+  }
+  if (prev === undefined || t > prev) strategyNotifyLastBar.set(k, t);
+}
+
 function addCandle(candle) {
   upsertRecord(candles, candle, (item) => item.id, MAX_CANDLES);
   indexCandleSeries(candle);
+  noteCandleForNotify(candle);
   void persistCandle(candle).catch((error) => {
     console.error('[MySQL] Failed to persist candle:', error.message);
   });
@@ -1980,6 +2021,7 @@ function addCandlesBatch(candlesList) {
 
   // Keep the per-series analysis store populated (independent per-series cap).
   indexCandleSeriesBatch(candlesList);
+  for (let i = 0; i < candlesList.length; i++) noteCandleForNotify(candlesList[i]);
 
   void persistCandlesBatch(candlesList).catch((error) => {
     console.error('[MySQL] Failed to persist candles batch:', error.message);
@@ -10172,6 +10214,16 @@ function strategyLabTiming(row) {
   return { status: 'EXPIRED', expectEntryBy, message: 'Entry not reached in time — expired & gone; returns after next scan' };
 }
 
+// Honesty gate for FIXED-TIME: a next-candle call is only valid if it was surfaced while
+// its expiry candle was still open — i.e. at `atMs` we have not passed bar_time + 2×tf
+// (setup bar closes at +1×tf, the expiry candle closes at +2×tf). Setups surfaced later
+// (strategy looked back N bars) were never tradable as a next-candle bet. Used to skip
+// stale fixed-time outcomes/notifications. Does NOT affect the forex (TP/SL) side.
+function strategyFtActionable(barMs, timeframe, atMs = Date.now()) {
+  const tfMs = timeframeMinutes(timeframe) * 60000;
+  return Number.isFinite(barMs) && tfMs > 0 && atMs < barMs + 2 * tfMs;
+}
+
 // LIVE tradability for a current-bar signal, judged against the latest price. These are
 // limit entries at a level, so the actionable call is: has price reached the entry yet
 // (take it now), is it still away (wait for the pullback/approach), or has the stop
@@ -10187,9 +10239,47 @@ function strategyLabLiveTiming(symbol, direction, price, entry, stop) {
   return { status: 'WAIT', message: `Wait — ${distPips} pips ${buy ? 'pullback' : 'rally'} to entry ${px(e, symbol)}` };
 }
 
+// Short advisory for a forex strategy signal: enter now / wait for the pullback / skip,
+// judged from the latest price vs the limit entry + a conviction note from the score.
+// Advisory only — not financial advice.
+function strategyForexAdvisory(symbol, timeframe, sig) {
+  let price = NaN;
+  try { const c = getRecentCandles(symbol, timeframe, 2); if (c && c.length) price = Number(c[c.length - 1].close); } catch { /* ignore */ }
+  const t = strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss);
+  const conv = (sig.score ?? 0) >= 85 ? ' High-conviction setup.' : (sig.score ?? 0) < 70 ? ' Lower-conviction — be selective.' : '';
+  if (t.status === 'TRADABLE') return `ENTER NOW — price is at the entry. Set SL ${px(sig.stopLoss, symbol)} and scale out at TP1/TP2/TP3.${conv}`;
+  if (t.status === 'EXPIRED') return 'SKIP — price already reached the stop side; this setup is gone. Wait for the next one.';
+  return `WAIT for a pullback — ${t.message.replace(/^Wait — /, '')}. If price runs away without tagging the entry, skip it and wait for the next setup.${conv}`;
+}
+
 // High-score Strategy Lab signal → live popup (SSE) + optional email. Gated by score
 // so the every-timeframe scan doesn't flood; signals are already deduped per breaker.
-async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, popup = true, email = false }) {  const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+// `kind` (NEW / IMPROVED / RE-ENTRY / CONFIRMED) is set by the notification lifecycle so
+// the same setup isn't spammed — it only re-sends on genuine improvement or at candle close.
+const STRATEGY_NOTIFY_KIND_LABEL = { NEW: '', IMPROVED: 'UPDATE · ', 'RE-ENTRY': 'RE-ENTRY · ', CONFIRMED: 'CONFIRMED · ' };
+
+// Bangladesh-time (UTC+6) wall-clock stamp, e.g. "Jun 23, 12:10 PM BD".
+function bdtStamp(ms) {
+  if (!Number.isFinite(ms)) return 'n/a';
+  return new Date(ms + 6 * 3600 * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' BD';
+}
+// Timing transparency for a strategy signal across the whole pipeline:
+//   candle formed (bar_time) → signal made (detected) → email sent (dispatched),
+// with the two delays (candle→signal = how late the strategy surfaced it; signal→email
+// = dispatch latency). All times in Bangladesh time (UTC+6).
+function strategySignalTiming(sig, timeframe, madeMs = Date.now(), sentMs = Date.now()) {
+  const barMs = Date.parse(sig.barIso || '');
+  const tfMin = timeframeMinutes(timeframe) || 0;
+  const c2sMin = Number.isFinite(barMs) ? Math.max(0, Math.round((madeMs - barMs) / 60000)) : null;
+  const c2sBars = (c2sMin != null && tfMin > 0) ? Math.round((c2sMin / tfMin) * 10) / 10 : null;
+  const s2eSec = Number.isFinite(madeMs) && Number.isFinite(sentMs) ? Math.max(0, Math.round((sentMs - madeMs) / 1000)) : null;
+  return {
+    formed: bdtStamp(barMs), made: bdtStamp(madeMs), sent: bdtStamp(sentMs), barMs,
+    candleToSignal: c2sMin == null ? 'n/a' : `${c2sMin} min${c2sBars != null ? ` (~${c2sBars} ${timeframe} candle${c2sBars === 1 ? '' : 's'})` : ''}`,
+    signalToEmail: s2eSec == null ? 'n/a' : (s2eSec < 60 ? `${s2eSec}s` : `${Math.round(s2eSec / 60)} min`),
+  };
+}
+async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, popup = true, email = false, kind = 'NEW', madeMs = Date.now() }) {  const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
   const lots = sizing?.suggestedLots ?? null;
   const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
   const at = new Date().toISOString();
@@ -10200,18 +10290,24 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
       entry: sig.entry ?? null, stopLoss: sig.stopLoss ?? null,
       takeProfit1: sig.takeProfit1 ?? null, takeProfit2: sig.takeProfit2 ?? null, takeProfit3: sig.takeProfit3 ?? null,
       lots, stopPips: sizing?.stopPips ?? null,
-      riskReward: sig.riskRewardRatio ?? null, reason: sig.reason || null, at,
+      riskReward: sig.riskRewardRatio ?? null, reason: sig.reason || null, kind, at,
     });
   }
   if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
-  const subject = `[STRATEGY ${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
+  const timing = strategySignalTiming(sig, timeframe, madeMs, Date.now());
+  const advisory = strategyForexAdvisory(symbol, timeframe, sig);
+  const subject = `[STRATEGY ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
   const lotLine = lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a';
   const text = [
-    `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})`,
+    `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})${kind !== 'NEW' ? ` — ${kind}` : ''}`,
     `${sig.decision} ${symbol} ${timeframe} | score ${Math.round(sig.score)}/100 (${sig.grade}) | RR 1:${sig.riskRewardRatio ?? 'n/a'}`,
+    `>> ACTION: ${advisory}`,
     `Entry ${px(sig.entry, symbol)}   SL ${px(sig.stopLoss, symbol)}`,
     `TP1 ${px(sig.takeProfit1, symbol)} (1R)   TP2 ${px(sig.takeProfit2, symbol)} (2R)   TP3 ${px(sig.takeProfit3, symbol)} (target)`,
     lotLine,
+    `Candle formed: ${timing.formed} (${timeframe})`,
+    `Signal made:   ${timing.made}   [candle→signal ${timing.candleToSignal}]`,
+    `Email sent:    ${timing.sent}   [signal→email ${timing.signalToEmail}]`,
     `Why: ${sig.reason || ''}`,
     'Isolated strategy-lab signal (not the main system). Advisory — not financial advice.',
   ].join('\n');
@@ -10219,6 +10315,7 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
   const html = `<div style="font-family:Arial,sans-serif;max-width:640px">
     <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#7c3aed;text-transform:uppercase">Strategy Lab · ${strategyName}</p>
     <h2 style="margin:0 0 4px;color:${dirColor}">${sig.decision} ${symbol} <span style="font-size:13px;color:#64748b">${timeframe} · score ${Math.round(sig.score)} (${sig.grade})</span></h2>
+    <p style="margin:6px 0;padding:8px 10px;background:#f1f5f9;border-left:3px solid ${dirColor};border-radius:4px;font-size:13px;font-weight:600;color:#0f172a">▶ ${advisory}</p>
     <table style="font-size:13px;border-collapse:collapse">
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Entry</td><td><b>${px(sig.entry, symbol)}</b></td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Stop loss</td><td style="color:#b91c1c">${px(sig.stopLoss, symbol)} <span style="color:#94a3b8">(${sizing?.stopPips ?? '?'} pips)</span></td></tr>
@@ -10227,6 +10324,9 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP3 (target)</td><td style="color:#047857">${px(sig.takeProfit3, symbol)}${sizing?.profitAtTp3 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp3)}</span>` : ''}</td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Volume</td><td><b>${lots !== null ? `${lots} lots` : 'n/a'}</b>${lots !== null ? ` <span style="color:#94a3b8">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})</span>` : ''}</td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">R:R</td><td>1:${sig.riskRewardRatio ?? 'n/a'}</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Candle formed</td><td><b>${timing.formed}</b> <span style="color:#94a3b8">(${timeframe})</span></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Signal made</td><td>${timing.made} <span style="color:#94a3b8">· candle→signal ${timing.candleToSignal}</span></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Email sent</td><td>${timing.sent} <span style="color:#94a3b8">· signal→email ${timing.signalToEmail}</span></td></tr>
     </table>
     <p style="font-size:12px;color:#475569;margin:6px 0 0">${sig.reason || ''}</p>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Volume sized at ${sizing?.riskPercent ?? '?'}% risk on ${px2(sizing?.equity || 0)} equity, scaled to the ${timeframe} stop. Isolated strategy-lab signal — not the main system. Advisory only. — Aura Gold Strategy Lab</p></div>`;
@@ -10261,7 +10361,7 @@ function strategyLabFttExpiry(timeframe) {
 // simply "will price be higher/lower than the reference at the next-candle expiry?" — the
 // same direction the strategy's fixed-time win rate is measured on. Isolated lab, never
 // the main FTT engine.
-async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, refClose = null, popup = true, email = false }) {
+async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, refClose = null, popup = true, email = false, kind = 'NEW', madeMs = Date.now() }) {
   const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
   const ftDir = /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN';
   const expiry = strategyLabFttExpiry(timeframe);
@@ -10272,20 +10372,29 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
       id, strategy, strategyName, symbol, timeframe, direction: ftDir,
       score: sig.score ?? null, grade: sig.grade ?? null,
       reference, expiryIso: expiry?.expiryIso ?? null, secondsToExpiry: expiry?.secondsToExpiry ?? null,
-      durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null, at,
+      durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null, kind, at,
     });
   }
   if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
   const expiryUtc = expiry?.expiryIso
     ? new Date(expiry.expiryIso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC'
     : 'next candle';
-  const subject = `[FIXED-TIME ${sig.grade || ''}] ${strategyName}: ${ftDir} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
+  const subject = `[FIXED-TIME ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${ftDir} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
+  const timing = strategySignalTiming(sig, timeframe, madeMs, Date.now());
+  const ftSecs = expiry?.secondsToExpiry ?? null;
+  const ftAdvisory = (ftSecs != null && ftSecs < 30)
+    ? `Expires in ~${ftSecs}s — too late to enter safely; skip and wait for the next call.`
+    : `TAKE THE ${ftDir} NOW — enter before the candle closes (~${expiryUtc}). One-shot bet to expiry, no SL/TP to manage.`;
   const text = [
     `AURA GOLD — STRATEGY LAB FIXED-TIME SIGNAL (${strategyName})`,
     `Predict ${ftDir} on ${symbol} ${timeframe} | score ${Math.round(sig.score)}/100 (${sig.grade})`,
+    `>> ACTION: ${ftAdvisory}`,
     `Reference price ${reference != null ? px(reference, symbol) : 'market'}`,
     `Expiry: ${expiry?.durationLabel || 'next candle'} — closes ~${expiryUtc}`,
     `Call: price ${ftDir === 'UP' ? 'HIGHER' : 'LOWER'} than the reference at expiry.`,
+    `Candle formed: ${timing.formed} (${timeframe})`,
+    `Signal made:   ${timing.made}   [candle→signal ${timing.candleToSignal}]`,
+    `Email sent:    ${timing.sent}   [signal→email ${timing.signalToEmail}]`,
     `Why: ${sig.reason || ''}`,
     'Isolated strategy-lab fixed-time signal (not the main system / not the FTT engine). Advisory — not financial advice.',
   ].join('\n');
@@ -10293,11 +10402,15 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
   const html = `<div style="font-family:Arial,sans-serif;max-width:640px">
     <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#7c3aed;text-transform:uppercase">Strategy Lab · Fixed-Time · ${strategyName}</p>
     <h2 style="margin:0 0 4px;color:${dirColor}">${ftDir} ${symbol} <span style="font-size:13px;color:#64748b">${timeframe} · score ${Math.round(sig.score)} (${sig.grade})</span></h2>
+    <p style="margin:6px 0;padding:8px 10px;background:#f1f5f9;border-left:3px solid ${dirColor};border-radius:4px;font-size:13px;font-weight:600;color:#0f172a">▶ ${ftAdvisory}</p>
     <table style="font-size:13px;border-collapse:collapse">
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Direction</td><td style="color:${dirColor}"><b>${ftDir}</b> — price ${ftDir === 'UP' ? 'higher' : 'lower'} at expiry</td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Reference</td><td><b>${reference != null ? px(reference, symbol) : 'market'}</b></td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Expiry</td><td>${expiry?.durationLabel || 'next candle'} <span style="color:#94a3b8">(closes ~${expiryUtc})</span></td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Score</td><td>${Math.round(sig.score)}/100 (${sig.grade})</td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Candle formed</td><td><b>${timing.formed}</b> <span style="color:#94a3b8">(${timeframe})</span></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Signal made</td><td>${timing.made} <span style="color:#94a3b8">· candle→signal ${timing.candleToSignal}</span></td></tr>
+      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Email sent</td><td>${timing.sent} <span style="color:#94a3b8">· signal→email ${timing.signalToEmail}</span></td></tr>
     </table>
     <p style="font-size:12px;color:#475569;margin:6px 0 0">${sig.reason || ''}</p>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Fixed-time call (direction at next-candle expiry). Isolated strategy-lab signal — not the main system or FTT engine. Advisory only. — Aura Gold Strategy Lab</p></div>`;
@@ -10315,6 +10428,168 @@ function buildStrategyContext(symbol, tf) {
     h4Trend: getTimeframeTrend(getRecentCandles(symbol, 'H4', 150)),
     h1Trend: getTimeframeTrend(getRecentCandles(symbol, 'H1', 150)),
   };
+}
+
+// ── Notification lifecycle (de-spam) ─────────────────────────────────────────
+// DB logging to mt5_strategy_signals stays per-candle (win-rate stats untouched). This
+// layer ONLY governs popups/emails so the same setup isn't re-sent every candle:
+//   NEW       — first appearance of a setup → send immediately.
+//   IMPROVED  — same setup, but score +N / grade up / RR +M vs the best already sent.
+//   CONFIRMED — once, when the candle the NEW fired on closes (still-valid setup) →
+//               "tradable at the score it had when it formed".
+//   RE-ENTRY  — the setup disappeared for ≥1 bar then re-qualified → a fresh send.
+// Continuation (same setup persisting candle-after-candle, no improvement) is suppressed.
+const strategyNotifyState = new Map(); // key: strategy|symbol|tf|direction
+const STRATEGY_NOTIFY_PRUNE_MS = 24 * 3600 * 1000;
+const STRATEGY_NOTIFY_IMPROVE_SCORE = Math.max(1, Number(process.env.STRATEGY_LAB_IMPROVE_SCORE || 3));
+const STRATEGY_NOTIFY_IMPROVE_RR = Math.max(0.05, Number(process.env.STRATEGY_LAB_IMPROVE_RR || 0.2));
+
+function strategyNotifyKey(strategy, symbol, tf, direction) {
+  return `${strategy}|${symbol}|${tf}|${String(direction).toUpperCase()}`;
+}
+
+// Genuine improvement over the best already notified for this setup? (score / grade / RR;
+// RR captures a better entry/position since it's derived from entry vs stop/target.)
+function strategySignalImproved(sig, best) {
+  if ((Number(sig.score) || 0) >= (Number(best.score) || 0) + STRATEGY_NOTIFY_IMPROVE_SCORE) return 'score';
+  if ((STRATEGY_GRADE_RANK[String(sig.grade || '').toUpperCase()] ?? 0) > (STRATEGY_GRADE_RANK[String(best.grade || '').toUpperCase()] ?? 0)) return 'grade';
+  if ((Number(sig.riskRewardRatio) || 0) >= (Number(best.rr) || 0) + STRATEGY_NOTIFY_IMPROVE_RR) return 'rr';
+  return null;
+}
+
+// Decide what (if anything) to notify for a freshly-evaluated signal; updates state.
+function strategyNotifyDecide(strategy, symbol, tf, sig) {
+  const key = strategyNotifyKey(strategy, symbol, tf, sig.decision);
+  const tfMs = Math.max(1, timeframeMinutes(tf)) * 60000;
+  const barMs = Date.parse(sig.barIso || '') || Date.now();
+  const now = Date.now();
+  const st = strategyNotifyState.get(key);
+  let kind = null;
+  if (!st) kind = 'NEW';
+  else if (barMs > st.lastBarMs + 1.5 * tfMs) kind = 'RE-ENTRY';   // vanished ≥1 bar then back
+  else kind = strategySignalImproved(sig, st.best) ? 'IMPROVED' : null;
+
+  if (kind === 'NEW' || kind === 'RE-ENTRY') {
+    strategyNotifyState.set(key, {
+      createdBarMs: barMs, createdBarCloseMs: barMs + tfMs, lastBarMs: barMs,
+      firstScore: sig.score ?? null, firstGrade: sig.grade ?? null,
+      best: { score: sig.score ?? 0, grade: sig.grade ?? null, rr: sig.riskRewardRatio ?? 0 },
+      confirmedSent: false, episode: (st?.episode || 0) + 1, updatedAt: now,
+      strategy, symbol, tf, direction: sig.decision,
+    });
+  } else if (st) {
+    st.lastBarMs = Math.max(st.lastBarMs, barMs);
+    if (kind === 'IMPROVED') {
+      const gUp = (STRATEGY_GRADE_RANK[String(sig.grade || '').toUpperCase()] ?? 0) > (STRATEGY_GRADE_RANK[String(st.best.grade || '').toUpperCase()] ?? 0);
+      st.best = {
+        score: Math.max(st.best.score, sig.score ?? 0),
+        grade: gUp ? sig.grade : st.best.grade,
+        rr: Math.max(st.best.rr, sig.riskRewardRatio ?? 0),
+      };
+    }
+    st.updatedAt = now;
+  }
+  return kind;
+}
+
+// Send the popup/email for a decided signal (respecting the existing score/email gates).
+async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date.now()) {
+  const kind = strategyNotifyDecide(strategy, symbol, tf, sig);
+  if (!kind) return { popupSent: false, emailSent: false, kind: null };
+  const wantPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
+  const wantEmail = strategyLabEmailAllowed(strategy, sig.score, sig.grade);
+  const wantFttEmail = strategyLabFttEmailAllowed(strategy, sig.score, sig.grade);
+  const barMs = Date.parse(sig.barIso || '') || Date.now();
+  const id = `${strategy}:${symbol}:${tf}:${barMs}`;
+  if (wantPopup || wantEmail) {
+    await emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: wantPopup, email: wantEmail, kind, madeMs });
+  }
+  // Fixed-time notification only when the call is still tradable (expiry candle open) —
+  // never alert a next-candle bet whose candle has already closed (stale-on-arrival).
+  if (strategyFtActionable(barMs, tf) && (wantPopup || wantFttEmail)) {
+    const refClose = ctx ? Number(ctx.candles[ctx.candles.length - 1].close) : null;
+    await emitStrategyLabFttSignal({ id, strategy, symbol, timeframe: tf, sig, refClose, popup: wantPopup, email: wantFttEmail, kind, madeMs });
+  }
+  return { popupSent: wantPopup, emailSent: wantEmail || wantFttEmail, kind };
+}
+
+// Candle-close confirmation pass: for any active setup whose creation candle has closed
+// and that hasn't been confirmed, re-evaluate; if it still qualifies in the same
+// direction, send ONE "CONFIRMED — tradable at the formed score" follow-up. Also prunes.
+async function processStrategyNotifyConfirms() {
+  const now = Date.now();
+  for (const [key, st] of strategyNotifyState) {
+    if (now - st.updatedAt > STRATEGY_NOTIFY_PRUNE_MS) { strategyNotifyState.delete(key); continue; }
+    if (st.confirmedSent || now < st.createdBarCloseMs) continue;
+    st.confirmedSent = true; // mark once so we never nag
+    try {
+      const ctx = buildStrategyContext(st.symbol, st.tf);
+      if (!ctx) continue;
+      const sig = evaluateStrategy(st.strategy, ctx);
+      if (!sig || sig.decision !== st.direction) continue; // didn't hold at the close
+      const wantPopup = (st.firstScore ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
+      const wantEmail = strategyLabEmailAllowed(st.strategy, st.firstScore, st.firstGrade);
+      const wantFttEmail = strategyLabFttEmailAllowed(st.strategy, st.firstScore, st.firstGrade);
+      if (!wantPopup && !wantEmail && !wantFttEmail) continue;
+      const confirmSig = { ...sig, score: st.firstScore ?? sig.score, grade: st.firstGrade ?? sig.grade };
+      const id = `${st.strategy}:${st.symbol}:${st.tf}:${st.createdBarMs}`;
+      if (wantPopup || wantEmail) await emitStrategyLabSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, popup: wantPopup, email: wantEmail, kind: 'CONFIRMED' });
+      if (strategyFtActionable(st.createdBarMs, st.tf) && (wantPopup || wantFttEmail)) { const refClose = Number(ctx.candles[ctx.candles.length - 1].close); await emitStrategyLabFttSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, refClose, popup: wantPopup, email: wantFttEmail, kind: 'CONFIRMED' }); }
+    } catch { /* confirm is best-effort */ }
+  }
+}
+
+// Notify-only pass (NO DB logging) for given symbol|tf pairs — driven by the real-time
+// candle-close trigger so a fresh setup is sent within seconds, not at the next scan tick.
+async function runStrategyNotifyPass(pairs) {
+  const pool = await initializeDatabase();
+  for (const pair of pairs) {
+    const [symbol, tf] = pair.split('|');
+    for (const stratId of Object.keys(STRATEGY_LAB_REGISTRY)) {
+      try {
+        const ctx = buildStrategyContext(symbol, tf);
+        if (!ctx) continue;
+        const sig = evaluateStrategy(stratId, ctx);
+        if (!sig || !sig.decision || sig.decision === 'HOLD') continue;
+        // Detection = logging: persist on this path too so a setup caught only by the
+        // real-time trigger (between scan ticks) is still tracked/reported.
+        if (pool) {
+          const barMs = Date.parse(sig.barIso || ctx.candles[ctx.candles.length - 1].time);
+          if (Number.isFinite(barMs)) {
+            try {
+              const { id } = await persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs);
+              const sent = await maybeNotifyStrategy(stratId, symbol, tf, sig, ctx);
+              if (sent.popupSent || sent.emailSent) {
+                try { await pool.execute('UPDATE mt5_strategy_signals SET popup_sent=?, email_sent=? WHERE id=?', [sent.popupSent ? 1 : 0, sent.emailSent ? 1 : 0, id]); } catch { /* best-effort */ }
+              }
+              continue;
+            } catch { /* fall through to notify-only */ }
+          }
+        }
+        await maybeNotifyStrategy(stratId, symbol, tf, sig, ctx);
+      } catch { /* per-pair resilience */ }
+    }
+  }
+  await processStrategyNotifyConfirms();
+}
+
+// Persist one strategy signal row (logging). Shared by the periodic scan and the
+// real-time notify pass so detection = logging on EVERY path — nothing detected escapes
+// the report. Idempotent: ON DUPLICATE keeps the first score/grade for that bar.
+async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, nowDate = new Date()) {
+  const id = `${stratId}:${symbol}:${tf}:${barMs}`;
+  const [res] = await pool.execute(
+    `INSERT INTO mt5_strategy_signals
+       (id, strategy, symbol, timeframe, bar_time, signal_time, direction, score, grade,
+        entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
+        risk_reward, reason, outcome, ft_outcome, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?)
+     ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade))`,
+    [id, stratId, symbol, tf, toMysqlDate(new Date(barMs)), toMysqlDate(nowDate), sig.decision, sig.score ?? null, sig.grade ?? null,
+     sig.entry ?? null, sig.stopLoss ?? null, sig.takeProfit1 ?? null, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
+     sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), toMysqlDate(nowDate)],
+  );
+  return { id, affectedRows: res.affectedRows };
 }
 
 async function runStrategyLabScan() {
@@ -10336,43 +10611,19 @@ async function runStrategyLabScan() {
           if (!sig || !sig.decision || sig.decision === 'HOLD') continue;
           const barMs = Date.parse(sig.barIso || ctx.candles[ctx.candles.length - 1].time);
           if (!Number.isFinite(barMs)) continue;
-          const id = `${stratId}:${symbol}:${tf}:${barMs}`;
           try {
-            const [res] = await pool.execute(
-              `INSERT INTO mt5_strategy_signals
-                 (id, strategy, symbol, timeframe, bar_time, signal_time, direction, score, grade,
-                  entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
-                  risk_reward, reason, outcome, ft_outcome, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?)
-               ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade))`,
-              [id, stratId, symbol, tf, toMysqlDate(new Date(barMs)), toMysqlDate(now), sig.decision, sig.score ?? null, sig.grade ?? null,
-               sig.entry ?? null, sig.stopLoss ?? null, sig.takeProfit1 ?? null, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
-               sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), toMysqlDate(now)],
-            );
-            if (res.affectedRows === 1) {
-              logged += 1;
-              // New signal: live popup (broad score gate) + email (frontend-controlled
-              // per-strategy / min-score / min-grade rules) — evaluated independently.
-              const wantPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
-              const wantEmail = strategyLabEmailAllowed(stratId, sig.score, sig.grade);
-              if (wantPopup || wantEmail) {
-                await emitStrategyLabSignal({ id, strategy: stratId, symbol, timeframe: tf, sig, popup: wantPopup, email: wantEmail });
-              }
-              // Same signal, fixed-time framing (dedicated channel): independent popup +
-              // email gates so the user can receive the fixed-time call on its own terms.
-              const wantFttPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
-              const wantFttEmail = strategyLabFttEmailAllowed(stratId, sig.score, sig.grade);
-              if (wantFttPopup || wantFttEmail) {
-                const refClose = Number(ctx.candles[ctx.candles.length - 1].close);
-                await emitStrategyLabFttSignal({ id, strategy: stratId, symbol, timeframe: tf, sig, refClose, popup: wantFttPopup, email: wantFttEmail });
-              }
-              // Channel tracking (display only): record whether this signal was surfaced
-              // as a popup and/or emailed (forex or fixed-time), so the report/recent view
-              // can show how each signal was tracked. Never affects scoring/outcomes.
+            const { id, affectedRows } = await persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, now);
+            if (affectedRows === 1) logged += 1;
+            // Notifications run every pass (not only on a new DB row) so improvements
+            // during a forming candle are caught; the lifecycle de-dups continuation
+            // spam, so the same setup is sent once (NEW) then only on real improvement,
+            // a re-entry, or the candle-close confirmation.
+            const sent = await maybeNotifyStrategy(stratId, symbol, tf, sig, ctx, now.getTime());
+            if (sent.popupSent || sent.emailSent) {
               try {
                 await pool.execute(
                   'UPDATE mt5_strategy_signals SET popup_sent=?, email_sent=? WHERE id=?',
-                  [(wantPopup || wantFttPopup) ? 1 : 0, (wantEmail || wantFttEmail) ? 1 : 0, id],
+                  [sent.popupSent ? 1 : 0, sent.emailSent ? 1 : 0, id],
                 );
               } catch { /* tracking is best-effort */ }
             }
@@ -10380,6 +10631,7 @@ async function runStrategyLabScan() {
         }
       }
     }
+    await processStrategyNotifyConfirms();
     if (logged) console.log(`[StrategyLab] Logged ${logged} new signals across ${symbols.length} symbols.`);
   } catch (e) {
     console.error('[StrategyLab] Scan error:', e.message);
@@ -10477,7 +10729,10 @@ async function processStrategyLabOutcomes() {
         }
       }
 
-      // Fixed-time outcome (direction at expiry).
+      // Fixed-time outcome (direction at expiry). Resolved for EVERY signal so the recent
+      // view always shows a real WIN/LOSS/DRAW. "Tradable vs late" is a separate flag
+      // (ftActionable) computed from timestamps — late-surfaced calls still show their
+      // result, they're just excluded from the tradable win-rate.
       if (String(row.ft_outcome).toUpperCase() === 'PENDING') {
         const ft = candles && candles.length ? resolveStrategyFixedTime(row, candles) : null;
         if (ft) {
@@ -10515,8 +10770,14 @@ function strategyLabAccumulate(b, row) {
     if (rm !== null) { b.fxNetR += rm; b.fxRN += 1; }
   }
   const fto = String(row.ft_outcome || 'PENDING').toUpperCase();
-  if (fto === 'WIN') b.ftWins += 1; else if (fto === 'LOSS') b.ftLosses += 1;
-  else if (fto === 'DRAW') b.ftDraws += 1; else if (fto === 'PENDING') b.ftPending += 1;
+  // Fixed-time win-rate counts only TRADABLE calls (surfaced before their expiry candle
+  // closed). Late-surfaced calls still have a real outcome (shown in the recent view) but
+  // were never tradable, so they're excluded from the win-rate. PENDING counts regardless.
+  const bt = row.bar_time ? new Date(row.bar_time).getTime() : NaN;
+  const st = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+  const ftAct = (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, row.timeframe, st) : true;
+  if (fto === 'PENDING') b.ftPending += 1;
+  else if (ftAct) { if (fto === 'WIN') b.ftWins += 1; else if (fto === 'LOSS') b.ftLosses += 1; else if (fto === 'DRAW') b.ftDraws += 1; }
 }
 function strategyLabBucket() {
   return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0 };
@@ -10573,7 +10834,7 @@ async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
   const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
-    "SELECT strategy, symbol, timeframe, direction, entry_price, stop_loss, outcome, profit_loss_pips, ft_outcome, signal_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
+    "SELECT strategy, symbol, timeframe, direction, entry_price, stop_loss, outcome, profit_loss_pips, ft_outcome, signal_time, bar_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
     [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
   );
   const byStrat = new Map();
@@ -10781,6 +11042,7 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
           timing: strategyLabTiming(r),
           outcome: r.outcome, profitLossPips: num(r.profit_loss_pips), tpHitLevel: r.tp_hit_level === null ? null : Number(r.tp_hit_level),
           ftOutcome: r.ft_outcome, ftPips: num(r.ft_pips),
+          ftActionable: (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; return (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, r.timeframe, st) : null; })(),
           live: strategyLabFtLivePosition(r),
           popupSent: r.popup_sent === null || r.popup_sent === undefined ? null : !!r.popup_sent,
           emailSent: r.email_sent === null || r.email_sent === undefined ? null : !!r.email_sent,

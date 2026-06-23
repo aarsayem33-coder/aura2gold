@@ -617,6 +617,7 @@ export interface StrategySignal {
   tpHitLevel: number | null;
   ftOutcome: string;
   ftPips: number | null;
+  ftActionable?: boolean | null;
   live?: { currentPrice: number; reference: number; pips: number; status: 'WINNING' | 'LOSING' | 'FLAT' } | null;
   popupSent?: boolean | null;
   emailSent?: boolean | null;

@@ -129,6 +129,7 @@ function FtResultCell({ s }: { s: StrategySignal }) {
     <span>
       <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span>
       {s.ftPips !== null && <span className={`ml-1 font-mono text-[11px] font-bold ${s.ftPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>{s.ftPips > 0 ? '+' : ''}{s.ftPips}p</span>}
+      {s.ftActionable === false && <span className="ml-1 rounded px-1 py-0.5 text-[9px] font-black bg-amber-50 text-amber-600" title="Surfaced after its expiry candle had closed — real result, but not tradable as a fixed-time call (excluded from the tradable win-rate).">LATE</span>}
     </span>
   );
 }

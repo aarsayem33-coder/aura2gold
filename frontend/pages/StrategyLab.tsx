@@ -115,6 +115,7 @@ function FtResultCell({ s }: { s: StrategySignal }) {
     <div className="min-w-[110px]">
       <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span>
       {s.ftPips !== null && <span className={`ml-1.5 font-mono text-[11px] font-bold ${s.ftPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>{s.ftPips > 0 ? '+' : ''}{s.ftPips}p</span>}
+      {s.ftActionable === false && <span className="ml-1.5 rounded px-1 py-0.5 text-[9px] font-black bg-amber-50 text-amber-600" title="Surfaced after its expiry candle had closed — result is real but it wasn't tradable as a fixed-time call, so it's excluded from the tradable win-rate.">LATE</span>}
     </div>
   );
 }
@@ -125,6 +126,7 @@ export default function StrategyLab() {
   const [selected, setSelected] = useState('');
   const [liveTf, setLiveTf] = useState('M15');
   const [histTf, setHistTf] = useState('');
+  const [histStrategy, setHistStrategy] = useState(''); // '' = all strategies (recent tables)
   const [tab, setTab] = useState<Tab>('forex');
   const [live, setLive] = useState<StrategyLiveResponse | null>(null);
   const [ftLive, setFtLive] = useState<StrategyFttLiveResponse | null>(null);
@@ -140,24 +142,23 @@ export default function StrategyLab() {
     }).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load strategies'));
   }, []);
 
+  const stratName = useCallback((id: string) => strategies.find((s) => s.id === id)?.name || id, [strategies]);
+
   const loadData = useCallback(async () => {
     if (!selected) return;
     setLoading(true);
-    try {
-      const [livePromise, sg] = await Promise.all([
-        tab === 'ftt' ? fetchStrategyLiveFtt(selected, liveTf) : fetchStrategyLive(selected, liveTf),
-        fetchStrategySignals(selected, histTf || undefined),
-      ]);
-      if (tab === 'ftt') setFtLive(livePromise as StrategyFttLiveResponse);
-      else setLive(livePromise as StrategyLiveResponse);
-      setSignals(sg.signals);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load strategy signals');
-    } finally {
-      setLoading(false);
-    }
-  }, [selected, liveTf, histTf, tab]);
+    // Live grid (per selected strategy) and the recent-signals table (ALL strategies) load
+    // independently — a hiccup in the live scan never blanks the recent history, and the
+    // recent table shows every logged signal regardless of which strategy is selected.
+    const livePromise = (tab === 'ftt' ? fetchStrategyLiveFtt(selected, liveTf) : fetchStrategyLive(selected, liveTf))
+      .then((lv) => { if (tab === 'ftt') setFtLive(lv as StrategyFttLiveResponse); else setLive(lv as StrategyLiveResponse); })
+      .catch(() => { /* live grid best-effort */ });
+    const sigPromise = fetchStrategySignals(histStrategy || undefined, histTf || undefined)
+      .then((sg) => { setSignals(sg.signals); setError(null); })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load strategy signals'));
+    await Promise.allSettled([livePromise, sigPromise]);
+    setLoading(false);
+  }, [selected, liveTf, histTf, histStrategy, tab]);
 
   useEffect(() => {
     void loadData();
@@ -269,16 +270,23 @@ export default function StrategyLab() {
           {/* RECENT SIGNALS (history with outcomes) */}
           <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
-              <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Recent signals & outcomes</h3>
-              <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                <option value="">All TFs</option>
-                {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-              </select>
+              <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Recent signals & outcomes <span className="text-[11px] font-bold text-slate-400">· all strategies</span></h3>
+              <div className="flex items-center gap-2">
+                <select value={histStrategy} onChange={(e) => setHistStrategy(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  <option value="">All strategies</option>
+                  {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+                <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  <option value="">All TFs</option>
+                  {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left text-sm">
+              <table className="w-full min-w-[1000px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
+                    <th className="px-3 py-2">Strategy</th>
                     <th className="px-3 py-2">Symbol</th><th className="px-3 py-2">Dir</th>
                     <th className="px-3 py-2 text-right">Score</th><th className="px-3 py-2 text-right">Lots</th>
                     <th className="px-3 py-2 text-right">Entry / SL / TP1·2·3</th><th className="px-3 py-2 text-right">RR</th>
@@ -290,6 +298,7 @@ export default function StrategyLab() {
                 <tbody className="divide-y divide-slate-100 text-slate-700">
                   {signals.length ? signals.map((s) => (
                     <tr key={s.id} className="hover:bg-slate-50/70">
+                      <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{stratName(s.strategy)}</td>
                       <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
                       <td className="px-3 py-2">{/BUY/.test(s.direction) ? <span className="text-emerald-600 font-bold text-[12px]">BUY</span> : <span className="text-rose-600 font-bold text-[12px]">SELL</span>}</td>
                       <td className="px-3 py-2 text-right">{scoreBadge(s.score, s.grade)}</td>
@@ -303,7 +312,7 @@ export default function StrategyLab() {
                       <td className="px-3 py-2"><TimingCell timing={s.timing} /></td>
                     </tr>
                   )) : (
-                    <tr><td colSpan={11} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No signals logged yet for this strategy.'}</td></tr>
+                    <tr><td colSpan={12} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No signals logged yet for this strategy.'}</td></tr>
                   )}
                 </tbody>
               </table>
@@ -368,6 +377,10 @@ export default function StrategyLab() {
                   <span className="inline-flex items-center gap-1 rounded-md bg-rose-50 px-2 py-0.5 text-[10px] font-black text-rose-700"><span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse" /> {ftStats.liveLoss} live loss</span>
                   <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-500">{ftStats.win}W / {ftStats.loss}L settled</span>
                 </div>
+                <select value={histStrategy} onChange={(e) => setHistStrategy(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  <option value="">All strategies</option>
+                  {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
                 <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
                   <option value="">All TFs</option>
                   {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
@@ -375,9 +388,10 @@ export default function StrategyLab() {
               </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[760px] text-left text-sm">
+              <table className="w-full min-w-[820px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
+                    <th className="px-3 py-2">Strategy</th>
                     <th className="px-3 py-2">Call</th>
                     <th className="px-3 py-2">Symbol</th>
                     <th className="px-3 py-2 text-right">Score</th>
@@ -392,6 +406,7 @@ export default function StrategyLab() {
                     const liveTint = s.live ? (s.live.status === 'WINNING' ? 'bg-emerald-50/40' : s.live.status === 'LOSING' ? 'bg-rose-50/40' : '') : '';
                     return (
                       <tr key={s.id} className={`hover:bg-slate-50/70 ${liveTint}`}>
+                        <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{stratName(s.strategy)}</td>
                         <td className="px-3 py-2">
                           {up
                             ? <span className="inline-flex items-center gap-1 rounded-md bg-emerald-600/10 px-1.5 py-0.5 text-[11px] font-black text-emerald-700"><TrendingUp size={12} /> UP</span>
@@ -405,7 +420,7 @@ export default function StrategyLab() {
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={6} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No fixed-time calls logged yet for this strategy.'}</td></tr>
+                    <tr><td colSpan={7} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No fixed-time calls logged yet for this strategy.'}</td></tr>
                   )}
                 </tbody>
               </table>
