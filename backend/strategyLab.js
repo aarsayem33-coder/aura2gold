@@ -10,7 +10,7 @@
 //              takeProfit3?, riskRewardRatio, reason, barIso, meta }
 // Pure: no I/O. New strategies = add one entry to STRATEGIES.
 
-import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14 } from './liquidityEngine.js';
+import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive } from './liquidityEngine.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
 const n = (v) => Number(v);
@@ -740,6 +740,788 @@ function stageAnalysis(ctx) {
   return sellPullback() || sellBreakout();
 }
 
+// ── Candlestick pattern library ──────────────────────────────────────────────
+// Pure detector. Returns the strongest BULLISH and BEARISH pattern found on the last
+// 1–3 closed candles (weight = reliability), plus a neutral-doji flag. A neutral doji
+// is NEVER directional on its own — it only marks indecision. Directional dojis
+// (dragonfly = bullish, gravestone = bearish) count, but weakly.
+function candleParts(c) {
+  const o = n(c.open), cl = n(c.close), hi = n(c.high), lo = n(c.low);
+  const range = hi - lo, body = Math.abs(cl - o);
+  return { o, cl, hi, lo, range, body, upper: hi - Math.max(o, cl), lower: Math.min(o, cl) - lo, bull: cl > o, bear: cl < o };
+}
+export function detectCandlePatterns(candles) {
+  const i = candles.length - 1;
+  if (i < 2) return { bull: null, bear: null, doji: false };
+  const c0 = candleParts(candles[i]), c1 = candleParts(candles[i - 1]), c2 = candleParts(candles[i - 2]);
+  if (!(c0.range > 0)) return { bull: null, bear: null, doji: false };
+  const bulls = [], bears = [];
+  const doji = c0.body <= c0.range * 0.1;
+
+  // Single-candle
+  if (doji && c0.lower >= c0.range * 0.6 && c0.upper <= c0.range * 0.15) bulls.push({ name: 'dragonfly doji', weight: 4 });
+  if (doji && c0.upper >= c0.range * 0.6 && c0.lower <= c0.range * 0.15) bears.push({ name: 'gravestone doji', weight: 4 });
+  if (c0.body > 0 && c0.lower >= c0.body * 2 && c0.upper <= c0.body * 0.8) bulls.push({ name: 'hammer / bullish pin', weight: 6 });
+  if (c0.body > 0 && c0.upper >= c0.body * 2 && c0.lower <= c0.body * 0.8) bears.push({ name: 'shooting star / bearish pin', weight: 6 });
+  if (c0.bull && c0.body >= c0.range * 0.8) bulls.push({ name: 'strong bullish candle', weight: 5 });
+  if (c0.bear && c0.body >= c0.range * 0.8) bears.push({ name: 'strong bearish candle', weight: 5 });
+
+  // Two-candle (current vs previous)
+  if (c0.bull && c1.bear && c0.cl >= c1.o && c0.o <= c1.cl && c0.body > c1.body) bulls.push({ name: 'bullish engulfing', weight: 8 });
+  if (c0.bear && c1.bull && c0.cl <= c1.o && c0.o >= c1.cl && c0.body > c1.body) bears.push({ name: 'bearish engulfing', weight: 8 });
+  const mid1 = (c1.o + c1.cl) / 2;
+  if (c0.bull && c1.bear && c0.o <= c1.lo && c0.cl > mid1 && c0.cl < c1.o) bulls.push({ name: 'piercing line', weight: 6 });
+  if (c0.bear && c1.bull && c0.o >= c1.hi && c0.cl < mid1 && c0.cl > c1.o) bears.push({ name: 'dark cloud cover', weight: 6 });
+  const tol = c0.range * 0.1;
+  if (c0.bull && c1.bear && Math.abs(c0.lo - c1.lo) <= tol) bulls.push({ name: 'tweezer bottom', weight: 5 });
+  if (c0.bear && c1.bull && Math.abs(c0.hi - c1.hi) <= tol) bears.push({ name: 'tweezer top', weight: 5 });
+
+  // Three-candle stars
+  const c1Small = c1.body <= c1.range * 0.4;
+  if (c2.bear && c2.body >= c2.range * 0.5 && c1Small && c0.bull && c0.cl >= (c2.o + c2.cl) / 2) bulls.push({ name: 'morning star', weight: 9 });
+  if (c2.bull && c2.body >= c2.range * 0.5 && c1Small && c0.bear && c0.cl <= (c2.o + c2.cl) / 2) bears.push({ name: 'evening star', weight: 9 });
+
+  const best = (arr) => (arr.length ? arr.reduce((a, b) => (b.weight > a.weight ? b : a)) : null);
+  return { bull: best(bulls), bear: best(bears), doji };
+}
+
+// ── Strategy 6: Swing Structure Candles ──────────────────────────────────────
+// Reads the swing skeleton (HH/HL = uptrend, LH/LL = downtrend), ranks its strength by the
+// number of confirming swings (2 = weak/early, 3 = preferred, 4+ = strongest with an
+// over-extension guard), then fires a DIRECTION on a candlestick trigger:
+//   • Continuation — in an uptrend, a bullish trigger at a pullback to the latest higher
+//     low → BUY (mirror: bearish trigger at the latest lower high in a downtrend → SELL).
+//   • Reversal — a strong bearish trigger rejecting a fresh higher high → SELL (mirror:
+//     strong bullish trigger at a fresh lower low → BUY); countertrend, needs a strong pattern.
+// 2-swing structures fire only on a strong pattern (engulfing/star). A volatility-contraction
+// read (tight base / inside bar before the trigger) adds a quality bonus and tucks the stop to
+// the base. Every setup is then confirmed top-down against the next LOWER timeframe (ltfVerdict):
+// CONTRADICT → skip, CONFIRM → small score bump, NEUTRAL/MISSING → allowed only if the main score is strong.
+// Stop beyond the swing (+ATR buffer), TP1/TP2 = 1R/2R, TP3 = opposing swing / measured move. Min 1.8R. Pure.
+function risingTail(arr) {
+  if (!arr.length) return 0;
+  let k = 1;
+  for (let i = arr.length - 1; i > 0; i--) { if (arr[i].price > arr[i - 1].price) k++; else break; }
+  return k;
+}
+function fallingTail(arr) {
+  if (!arr.length) return 0;
+  let k = 1;
+  for (let i = arr.length - 1; i > 0; i--) { if (arr[i].price < arr[i - 1].price) k++; else break; }
+  return k;
+}
+function avgLeg(arr, count) {
+  if (arr.length < 2) return 0;
+  const tail = arr.slice(-Math.max(2, count));
+  let s = 0, k = 0;
+  for (let i = 1; i < tail.length; i++) { s += Math.abs(tail[i].price - tail[i - 1].price); k++; }
+  return k ? s / k : 0;
+}
+// Volatility contraction before the trigger — the "really tight, narrow base" the swing
+// pros wait for (contraction precedes expansion; works on any instrument, unlike stock
+// gap/volume cues). Measures the price SPAN of the bars JUST BEFORE the trigger candle
+// (excludes the trigger itself, which is usually a wide breakout/rejection bar) vs ATR,
+// and flags an inside bar tightening into the trigger. Pure; returns the base extremes so
+// the caller can tuck the stop to the base (tighter stop → better RR, same target).
+function baseContraction(candles, atr, { contractionWindow = 5, contractionAtr = 1.5 } = {}) {
+  const len = candles.length;
+  if (len < contractionWindow + 2 || !(atr > 0)) return { contracted: false, ratio: null, insideBar: false, baseLow: null, baseHigh: null };
+  const win = candles.slice(len - 1 - contractionWindow, len - 1); // bars before the trigger
+  let hi = -Infinity, lo = Infinity;
+  for (const k of win) { hi = Math.max(hi, n(k.high)); lo = Math.min(lo, n(k.low)); }
+  const span = hi - lo;
+  const ratio = span > 0 ? span / atr : Infinity;
+  const tight = span > 0 && ratio <= contractionAtr;
+  const a = candles[len - 2], b = candles[len - 3];           // bar before trigger inside its prior?
+  const insideBar = !!(a && b && n(a.high) <= n(b.high) && n(a.low) >= n(b.low));
+  return { contracted: tight || insideBar, ratio: Number.isFinite(ratio) ? Math.round(ratio * 100) / 100 : null, insideBar, baseLow: lo, baseHigh: hi };
+}
+
+// Flat-base / equal-highs (equal-lows) breakout with a CONFIRMED CLOSE beyond the level.
+// The swing pros' "the strongest charts break a horizontal level and don't retest", fused
+// with the candle-pattern rule that a break is only real once a candle CLOSES beyond the
+// level (a wick-through that closes back inside is a trap) and the breakout bar isn't a
+// big-momentum climax candle (those trap FOMO entries). Reuses detectLiquidityPools for the
+// equal-level shelf (touches ≥ 2) and targets the next draw on liquidity. Returns a breakout
+// descriptor { decision, stop, target, pat, level, strength } or null. Pure.
+function flatBaseBreakout(candles, atr, pools, h4Trend, config) {
+  const { breakoutBufferAtr = 0.05, breakoutMaxChaseAtr = 1.0, breakoutClimaxAtr = 2.2, breakoutBaseLookback = 20 } = config;
+  const len = candles.length;
+  if (!pools || len < breakoutBaseLookback + 2 || !(atr > 0)) return null;
+  const c = candles[len - 1], prev = candles[len - 2];
+  const close = n(c.close), open = n(c.open), hi = n(c.high), lo = n(c.low);
+  if (hi - lo > breakoutClimaxAtr * atr) return null;          // anti-climax: skip the big-momentum trap candle
+  const win = candles.slice(len - 1 - breakoutBaseLookback, len - 1);
+  let baseHigh = -Infinity, baseLow = Infinity;
+  for (const k of win) { baseHigh = Math.max(baseHigh, n(k.high)); baseLow = Math.min(baseLow, n(k.low)); }
+  const prevClose = n(prev.close);
+
+  // BUY: confirmed close above an equal-high shelf (flat top) we were consolidating under.
+  if (close > open && h4Trend !== 'BEARISH') {
+    const pool = (pools.buySide || []).filter((p) => p.equal && p.price < close && p.price <= baseHigh + 0.1 * atr)
+      .sort((a, b) => b.price - a.price)[0];                    // highest equal-high below the close = the broken resistance
+    if (pool) {
+      const beyond = close - pool.price;
+      if (beyond >= breakoutBufferAtr * atr && beyond <= breakoutMaxChaseAtr * atr && prevClose <= pool.price + 0.1 * atr) {
+        const stop = Math.min(baseLow, lo) - 0.3 * atr;
+        const target = (pools.targetAbove && pools.targetAbove.price > close) ? pools.targetAbove.price : null;
+        return { decision: 'BUY', stop, target, level: pool.price, pat: { name: 'confirmed-close breakout (equal highs)', weight: 7 } };
+      }
+    }
+  }
+  // SELL: mirror — confirmed close below an equal-low shelf (flat bottom).
+  if (close < open && h4Trend !== 'BULLISH') {
+    const pool = (pools.sellSide || []).filter((p) => p.equal && p.price > close && p.price >= baseLow - 0.1 * atr)
+      .sort((a, b) => a.price - b.price)[0];                    // lowest equal-low above the close = the broken support
+    if (pool) {
+      const beyond = pool.price - close;
+      if (beyond >= breakoutBufferAtr * atr && beyond <= breakoutMaxChaseAtr * atr && prevClose >= pool.price - 0.1 * atr) {
+        const stop = Math.max(baseHigh, hi) + 0.3 * atr;
+        const target = (pools.targetBelow && pools.targetBelow.price < close) ? pools.targetBelow.price : null;
+        return { decision: 'SELL', stop, target, level: pool.price, pat: { name: 'confirmed-close breakdown (equal lows)', weight: 7 } };
+      }
+    }
+  }
+  return null;
+}
+
+// Lower-timeframe confirmation for the swing setup. Reuses the SAME swing + candle
+// detectors on the next-lower TF (e.g. M5 for an M15 setup) and grades whether the
+// lower TF's micro-structure/trigger AGREES with the proposed direction:
+//   CONFIRM    — lower TF is forming structure in-direction (rising lows for BUY /
+//                falling highs for SELL) OR shows an in-direction candle trigger.
+//   CONTRADICT — lower TF shows a strong opposite trigger or a fresh opposite break.
+//   NEUTRAL    — neither; lower TF is undecided.
+//   MISSING    — no/insufficient lower-TF data (caller decides strict vs lenient).
+// Pure. Only reads candles up to the latest closed bar, so no lookahead vs the main TF.
+function ltfVerdict(decision, ltfCandles) {
+  if (!Array.isArray(ltfCandles) || ltfCandles.length < 30) return 'MISSING';
+  const { highs, lows } = fractalSwings(ltfCandles);
+  if (highs.length < 2 || lows.length < 2) return 'NEUTRAL';
+  const pat = detectCandlePatterns(ltfCandles);
+  const up = Math.min(risingTail(highs), risingTail(lows));     // forming HH+HL
+  const down = Math.min(fallingTail(highs), fallingTail(lows));  // forming LH+LL
+  const lastLow = lows[lows.length - 1].price;
+  const prevLow = lows[lows.length - 2].price;
+  const lastHigh = highs[highs.length - 1].price;
+  const prevHigh = highs[highs.length - 2].price;
+  if (decision === 'BUY') {
+    const strongBear = pat.bear && pat.bear.weight >= 6;
+    const freshLowerLow = lastLow < prevLow && down >= 2;
+    if (strongBear || freshLowerLow) return 'CONTRADICT';
+    const risingStructure = up >= 2 || lastLow > prevLow;
+    if (risingStructure || (pat.bull && pat.bull.weight >= 5)) return 'CONFIRM';
+    return 'NEUTRAL';
+  }
+  // SELL (mirror)
+  const strongBull = pat.bull && pat.bull.weight >= 6;
+  const freshHigherHigh = lastHigh > prevHigh && up >= 2;
+  if (strongBull || freshHigherHigh) return 'CONTRADICT';
+  const fallingStructure = down >= 2 || lastHigh < prevHigh;
+  if (fallingStructure || (pat.bear && pat.bear.weight >= 5)) return 'CONFIRM';
+  return 'NEUTRAL';
+}
+
+function swingStructureCandles(ctx) {
+  const { candles, h4Trend = null, config = {}, pip = 0.0001, ltfCandles = null, ltfTimeframe = null } = ctx;
+  const minRR = config.minRR ?? 1.8;
+  const minSwings = Math.max(2, config.minSwings ?? 2);
+  const nearAtr = config.nearAtr ?? 1.5;        // entry must be within this many ATR of the swing pivot (no chasing)
+  const overextAtr = config.overextAtr ?? 3.0;  // 4+ swing over-extension guard
+  const tpR = config.tpR ?? 2.5;
+  if (!Array.isArray(candles) || candles.length < 60) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const { highs, lows } = fractalSwings(candles);
+  if (highs.length < 2 || lows.length < 2) return null;
+
+  const lastIdx = candles.length - 1;
+  const c = candles[lastIdx];
+  const price = n(c.close);
+  const patterns = detectCandlePatterns(candles);
+  const contraction = baseContraction(candles, atr, config); // tight base before the trigger?
+  const pools = (config.breakoutEnabled ?? true) ? detectLiquidityPools(candles) : null; // equal-high/low shelves
+
+  const upStrength = Math.min(risingTail(highs), risingTail(lows));     // confirming HH+HL swings
+  const downStrength = Math.min(fallingTail(highs), fallingTail(lows)); // confirming LH+LL swings
+  const latestHigh = highs[highs.length - 1];
+  const latestLow = lows[lows.length - 1];
+
+  // Shared builder: enforce sane/min stop & RR, compute the ladder, score & grade.
+  const build = (decision, entry, stop, finalTarget, strength, pat, kind, locScore) => {
+    let risk = decision === 'BUY' ? entry - stop : stop - entry;
+    if (!(risk > 0) || risk / atr > 8) return null;
+    if (stopTooTight(risk, atr, pip, config)) return null;
+    // Tight base → tuck the stop to the base extreme if that's tighter, still tradable, and
+    // keeps RR (same target). Mirrors the pro "stop at low of day" on a narrow breakout.
+    if (contraction.contracted && (config.contractionTightenStop ?? true)) {
+      const tightStop = decision === 'BUY' ? contraction.baseLow - 0.1 * atr : contraction.baseHigh + 0.1 * atr;
+      const tightRisk = decision === 'BUY' ? entry - tightStop : tightStop - entry;
+      if (tightRisk > 0 && tightRisk < risk && !stopTooTight(tightRisk, atr, pip, config)
+        && Math.abs(finalTarget - entry) / tightRisk >= minRR) {
+        stop = tightStop; risk = tightRisk;
+      }
+    }
+    const rr = Math.abs(finalTarget - entry) / risk;
+    if (!(rr >= minRR)) return null;
+    // ── Lower-timeframe confirmation gate (top-down: main-TF setup → LTF timing) ──
+    const ltfReq = config.ltfRequired ?? true;
+    const verdict = ltfVerdict(decision, ltfCandles);
+    if (verdict === 'CONTRADICT') return null;              // LTF disagrees → skip
+    if (verdict === 'MISSING' && ltfReq) return null;       // strict: no LTF data → skip
+    const ladder = tpLadder(decision, entry, risk, finalTarget);
+    let score = 52;
+    score += strength >= 4 ? 14 : strength === 3 ? 10 : 4;             // swing-strength ranking
+    score += Math.min(14, Math.round((pat?.weight ?? 0) * 1.5));       // pattern reliability
+    score += locScore;                                                 // location (near the pivot)
+    const leg = decision === 'BUY' ? avgLeg(lows, strength + 1) : avgLeg(highs, strength + 1);
+    score += Math.min(6, Math.round(leg / atr));                       // bigger swing legs = stronger
+    if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 6;
+    if (kind.startsWith('reversal')) score -= 4;                       // countertrend discount
+    if (verdict === 'CONFIRM') score += (config.ltfConfirmBonus ?? 6); // LTF agrees → modest bump
+    if (contraction.contracted) score += (config.contractionBonus ?? 6) + (contraction.insideBar ? 2 : 0); // coiled base → expansion edge
+    score = Math.max(40, Math.min(95, score));
+    // NEUTRAL (or MISSING when not strict): allow only if the main setup is strong on its own.
+    if ((verdict === 'NEUTRAL' || verdict === 'MISSING') && score < (config.ltfNeutralFloor ?? 70)) return null;
+    const setup = kind === 'breakout'
+      ? `Breakout: confirmed close ${decision === 'BUY' ? 'above equal-highs' : 'below equal-lows'} flat base`
+      : kind === 'continuation'
+        ? `Continuation: ${strength}-swing ${decision === 'BUY' ? 'uptrend' : 'downtrend'} structure, ${decision === 'BUY' ? 'higher-low pullback' : 'lower-high pullback'}`
+        : `Reversal: ${strength}-swing ${decision === 'BUY' ? 'downtrend' : 'uptrend'} structure, ${decision === 'BUY' ? 'lower-low rejection' : 'higher-high rejection'}`;
+    return {
+      decision, score,
+      grade: score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C',
+      entry: r5(entry), stopLoss: r5(stop), ...ladder,
+      riskRewardRatio: Math.round(rr * 100) / 100,
+      reason: `${setup} + ${pat?.name}${contraction.contracted ? ` · tight base${contraction.insideBar ? ' (inside bar)' : ''}` : ''} · ${ltfTimeframe || 'LTF'} ${verdict.toLowerCase()}`,
+      barIso: c.time,
+      meta: { v: 2, kind, strength, pattern: pat?.name, patternWeight: pat?.weight, upStrength, downStrength, latestHigh: r5(latestHigh.price), latestLow: r5(latestLow.price), h4Trend, ltf: { timeframe: ltfTimeframe, verdict }, contraction: { contracted: contraction.contracted, ratio: contraction.ratio, insideBar: contraction.insideBar } },
+    };
+  };
+
+  // ── UPTREND structure (HH + HL) ──
+  if (upStrength >= minSwings && upStrength >= downStrength) {
+    // Continuation BUY: pullback near the latest higher low + bullish trigger.
+    if (h4Trend !== 'BEARISH') {
+      const pat = patterns.bull;
+      const nearHL = price >= latestLow.price && (price - latestLow.price) <= nearAtr * atr;
+      const strongOnly = upStrength < 3;                              // 2-swing needs a strong pattern
+      const overext = upStrength >= 4 && (price - latestLow.price) > overextAtr * atr;
+      if (nearHL && pat && (!strongOnly || pat.weight >= 8) && !overext) {
+        const stop = latestLow.price - 0.3 * atr;
+        const target = Math.max(latestHigh.price, price + (price - stop) * tpR);
+        const locScore = Math.max(0, 6 - Math.round(((price - latestLow.price) / atr) * 4));
+        const sig = build('BUY', price, stop, target, upStrength, pat, 'continuation', locScore);
+        if (sig) return sig;
+      }
+    }
+    // Reversal SELL: strong bearish trigger rejecting a fresh higher high.
+    const patB = patterns.bear;
+    const nearHH = n(c.high) >= latestHigh.price || Math.abs(latestHigh.price - price) <= nearAtr * atr;
+    if (nearHH && patB && patB.weight >= 6) {
+      const stop = Math.max(n(c.high), latestHigh.price) + 0.3 * atr;
+      const target = Math.min(latestLow.price, price - (stop - price) * minRR);
+      const locScore = Math.max(0, 6 - Math.round((Math.abs(latestHigh.price - price) / atr) * 4));
+      const sig = build('SELL', price, stop, target, upStrength, patB, 'reversal-sell', locScore);
+      if (sig) return sig;
+    }
+  }
+
+  // ── DOWNTREND structure (LH + LL) ──
+  if (downStrength >= minSwings && downStrength >= upStrength) {
+    // Continuation SELL: pullback near the latest lower high + bearish trigger.
+    if (h4Trend !== 'BULLISH') {
+      const pat = patterns.bear;
+      const nearLH = price <= latestHigh.price && (latestHigh.price - price) <= nearAtr * atr;
+      const strongOnly = downStrength < 3;
+      const overext = downStrength >= 4 && (latestHigh.price - price) > overextAtr * atr;
+      if (nearLH && pat && (!strongOnly || pat.weight >= 8) && !overext) {
+        const stop = latestHigh.price + 0.3 * atr;
+        const target = Math.min(latestLow.price, price - (stop - price) * tpR);
+        const locScore = Math.max(0, 6 - Math.round(((latestHigh.price - price) / atr) * 4));
+        const sig = build('SELL', price, stop, target, downStrength, pat, 'continuation', locScore);
+        if (sig) return sig;
+      }
+    }
+    // Reversal BUY: strong bullish trigger at a fresh lower low.
+    const patBull = patterns.bull;
+    const nearLL = n(c.low) <= latestLow.price || Math.abs(price - latestLow.price) <= nearAtr * atr;
+    if (nearLL && patBull && patBull.weight >= 6) {
+      const stop = Math.min(n(c.low), latestLow.price) - 0.3 * atr;
+      const target = Math.max(latestHigh.price, price + (price - stop) * minRR);
+      const locScore = Math.max(0, 6 - Math.round((Math.abs(price - latestLow.price) / atr) * 4));
+      const sig = build('BUY', price, stop, target, downStrength, patBull, 'reversal-buy', locScore);
+      if (sig) return sig;
+    }
+  }
+
+  // ── FLAT-BASE / EQUAL-HIGHS(LOWS) BREAKOUT (confirmed close beyond the level) ──
+  // Fallback after the swing-pullback / reversal setups: catches the consolidation breakout
+  // they miss (price coils under a horizontal shelf, then CLOSES through it). The confirmed-
+  // close + anti-climax rules live in flatBaseBreakout; HTF bias is enforced there too.
+  if (pools) {
+    const bo = flatBaseBreakout(candles, atr, pools, h4Trend, config);
+    if (bo) {
+      const risk0 = bo.decision === 'BUY' ? price - bo.stop : bo.stop - price;
+      if (risk0 > 0) {
+        let finalTarget = bo.decision === 'BUY' ? price + risk0 * tpR : price - risk0 * tpR;
+        if (Number.isFinite(bo.target)) finalTarget = bo.decision === 'BUY' ? Math.max(finalTarget, bo.target) : Math.min(finalTarget, bo.target);
+        const strength = Math.max(2, bo.decision === 'BUY' ? upStrength : downStrength);
+        const sig = build(bo.decision, price, bo.stop, finalTarget, strength, bo.pat, 'breakout', 4);
+        if (sig) return sig;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SMC ENGINES — Smart Money Concepts (course distillation). SMC reduces to three
+// concepts: market structure, liquidity, and the fair value gap. None of the
+// engines above use the FVG (the course's most-emphasised concept), so these add
+// it plus the two frameworks built on it: the Market Makers Model (external↔
+// internal) and Candle Continuity. Pure, self-contained, deduped vs the above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Most recent CONFIRMED sweep + reclaim ("no sweep, no trade"): a fractal swing a
+// later bar pierced, then a bar CLOSED back inside. dir 'BULLISH' = a low was swept
+// (look BUY), 'BEARISH' = a high (look SELL). extreme = the wick beyond the level.
+function smcRecentSweep(candles, { lookback = 50 } = {}) {
+  const { highs, lows } = fractalSwings(candles);
+  const last = candles.length - 1;
+  let best = null;
+  const scan = (points, side) => {
+    for (const p of points) {
+      for (let j = p.i + 1; j < candles.length; j++) {
+        const pierced = side === 'low' ? n(candles[j].low) < p.price : n(candles[j].high) > p.price;
+        if (!pierced) continue;
+        for (let k = j; k < candles.length; k++) {
+          const reclaimed = side === 'low' ? n(candles[k].close) > p.price : n(candles[k].close) < p.price;
+          if (reclaimed) {
+            if (last - k <= lookback && (!best || k > best.reclaimIdx)) {
+              let ext = side === 'low' ? Infinity : -Infinity;
+              for (let m = j; m <= k; m++) ext = side === 'low' ? Math.min(ext, n(candles[m].low)) : Math.max(ext, n(candles[m].high));
+              best = { dir: side === 'low' ? 'BULLISH' : 'BEARISH', sweepLevel: r5(p.price), sweepIdx: j, reclaimIdx: k, reclaimIso: candles[k].time, extreme: r5(ext) };
+            }
+            break;
+          }
+        }
+        break;
+      }
+    }
+  };
+  scan(lows, 'low');
+  scan(highs, 'high');
+  return best;
+}
+
+// Freshest displacement fair value gap in `dir`, created at/after sinceIdx.
+// Bullish FVG: candle3.low > candle1.high (gap below price). low/high = gap edges.
+function smcFreshFvg(candles, dir, atr, { sinceIdx = 0, minDispAtr = 0.6 } = {}) {
+  const lastIdx = candles.length - 1;
+  let best = null;
+  for (let i = Math.max(sinceIdx, 2); i <= lastIdx; i++) {
+    const c1 = candles[i - 2], c2 = candles[i - 1], c3 = candles[i];
+    const bull = n(c3.low) > n(c1.high) && n(c2.close) > n(c2.open);
+    const bear = n(c3.high) < n(c1.low) && n(c2.close) < n(c2.open);
+    if (dir === 'BULLISH' ? !bull : !bear) continue;
+    const disp = Math.abs(n(c2.close) - n(c2.open)) / (atr || 1);
+    if (disp < minDispAtr) continue;
+    const low = dir === 'BULLISH' ? n(c1.high) : n(c3.high);
+    const high = dir === 'BULLISH' ? n(c3.low) : n(c1.low);
+    best = { low: r5(low), high: r5(high), mid: r5((low + high) / 2), createIdx: i, createIso: c3.time, dispAtr: Math.round(disp * 100) / 100 };
+  }
+  return best;
+}
+
+// Dealing range = the most recent fractal swing high & low (external liquidity).
+function smcDealingRange(candles) {
+  const { highs, lows } = fractalSwings(candles);
+  if (!highs.length || !lows.length) return null;
+  const hi = highs[highs.length - 1], lo = lows[lows.length - 1];
+  const high = Math.max(hi.price, lo.price), low = Math.min(hi.price, lo.price);
+  if (!(high > low)) return null;
+  return { high: r5(high), low: r5(low), eq: r5((high + low) / 2), hiIdx: hi.i, loIdx: lo.i };
+}
+
+const smcGrade = (score) => (score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C');
+
+// ── SMC 1: Fair Value Gap — sweep → displacement FVG (after the sweep) → 50% entry ──
+function smcFvg(ctx) {
+  const { candles, h4Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minRR = config.minRR ?? 2;
+  if (!Array.isArray(candles) || candles.length < 60) return null;
+  const atr = atr14(candles); if (!atr) return null;
+
+  const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 50 });
+  if (!sweep) return null;                                          // no sweep, no trade
+  const dir = sweep.dir, decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
+  if (h4Trend === 'BULLISH' && decision === 'SELL') return null;
+  if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
+
+  const fvg = smcFreshFvg(candles, dir, atr, { sinceIdx: sweep.sweepIdx, minDispAtr: config.dispAtr ?? 0.6 });
+  if (!fvg) return null;                                            // FVG must form AFTER the sweep
+  const price = n(candles[candles.length - 1].close);
+  if (dir === 'BULLISH' ? price <= fvg.mid : price >= fvg.mid) return null; // pullback still pending
+
+  const buf = atr * (config.stopBufAtr ?? 0.2);
+  const entry = fvg.mid;
+  const stop = dir === 'BULLISH' ? sweep.extreme - buf : sweep.extreme + buf;
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, config)) return null;
+
+  const pools = detectLiquidityPools(candles);
+  const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
+  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk);
+  const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
+  if (!(rr >= minRR)) return null;
+
+  const range = smcDealingRange(candles);
+  const discountBuy = !!range && decision === 'BUY' && entry <= range.eq;
+  const premiumSell = !!range && decision === 'SELL' && entry >= range.eq;
+
+  let score = 50;
+  score += Math.min(18, Math.round(fvg.dispAtr * 12));
+  score += Math.min(15, Math.round((rr - minRR) * 5));
+  if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 10;
+  if (discountBuy || premiumSell) score += 8;
+  if (tgt && tgt.equal) score += 5;
+  score = Math.max(40, Math.min(95, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+    reason: `Sweep ${sweep.sweepLevel} reclaimed → FVG ${fvg.low}-${fvg.high} (disp ${fvg.dispAtr}×) → 50% @ ${r5(entry)}; draw ${tgt ? tgt.type + ' ' + tgt.price : '3R'}`,
+    barIso: fvg.createIso,
+    meta: { sweepLevel: sweep.sweepLevel, fvgLow: fvg.low, fvgHigh: fvg.high, dispAtr: fvg.dispAtr, location: discountBuy ? 'discount' : premiumSell ? 'premium' : 'mid' },
+  };
+}
+
+// ── SMC 2: Market Makers Model — sweep the range extreme, enter a discount/premium
+// FVG (smart-money reversal), target the OPPOSITE external extreme (orig. consolidation).
+function smcMmxm(ctx) {
+  const { candles, h4Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minRR = config.minRR ?? 2.5;
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const atr = atr14(candles); if (!atr) return null;
+
+  const range = smcDealingRange(candles);
+  if (!range) return null;
+  const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 60 });
+  if (!sweep) return null;
+  const dir = sweep.dir, decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
+  if (h4Trend === 'BULLISH' && decision === 'SELL') return null;
+  if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
+
+  // Must have swept the RANGE extreme (external liquidity), not an internal swing.
+  const tol = atr * (config.extremeTolAtr ?? 1.0);
+  if (dir === 'BULLISH' ? Math.abs(sweep.sweepLevel - range.low) > tol : Math.abs(sweep.sweepLevel - range.high) > tol) return null;
+
+  const fvg = smcFreshFvg(candles, dir, atr, { sinceIdx: sweep.sweepIdx, minDispAtr: config.dispAtr ?? 0.6 });
+  if (!fvg) return null;
+  const entry = fvg.mid;
+  if (decision === 'BUY' ? entry > range.eq : entry < range.eq) return null; // discount/premium only
+  const price = n(candles[candles.length - 1].close);
+  if (dir === 'BULLISH' ? price <= entry : price >= entry) return null;
+
+  const buf = atr * (config.stopBufAtr ?? 0.2);
+  const stop = dir === 'BULLISH' ? sweep.extreme - buf : sweep.extreme + buf;
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, config)) return null;
+
+  const target = decision === 'BUY' ? range.high : range.low;   // opposite external extreme
+  const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
+  if (!(rr >= minRR)) return null;
+
+  let score = 52;
+  score += Math.min(16, Math.round(fvg.dispAtr * 11));
+  score += Math.min(15, Math.round((rr - minRR) * 4));
+  if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 10;
+  score += 6;                                                   // external-extreme sweep required
+  score = Math.max(40, Math.min(95, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+    reason: `MMXM ${decision}: swept range ${dir === 'BULLISH' ? 'low' : 'high'} ${sweep.sweepLevel} → ${decision === 'BUY' ? 'discount' : 'premium'} FVG @ ${r5(entry)} → target ${decision === 'BUY' ? 'high' : 'low'} ${r5(target)}`,
+    barIso: fvg.createIso,
+    meta: { rangeHigh: range.high, rangeLow: range.low, eq: range.eq, sweepLevel: sweep.sweepLevel, dispAtr: fvg.dispAtr },
+  };
+}
+
+// ── SMC 3: Candle Continuity — after a sweep establishes the draw, each candle
+// follows the prior's direction; enter just beyond the OPENING price of the
+// continuation candle, stop beyond the sweep extreme, target opposing liquidity.
+function smcCct(ctx) {
+  const { candles, h4Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minRR = config.minRR ?? 2;
+  if (!Array.isArray(candles) || candles.length < 60) return null;
+  const atr = atr14(candles); if (!atr) return null;
+
+  const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 40 });
+  if (!sweep) return null;
+  const dir = sweep.dir, decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
+  if (h4Trend === 'BULLISH' && decision === 'SELL') return null;
+  if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
+  if (candles.length - 1 - sweep.reclaimIdx > (config.maxAgeBars ?? 6)) return null; // draw must be fresh
+
+  const last = candles.length - 1, c0 = candles[last], c1 = candles[last - 1];
+  const cont = dir === 'BULLISH'
+    ? (n(c0.close) > n(c0.open) && n(c1.close) > n(c1.open))
+    : (n(c0.close) < n(c0.open) && n(c1.close) < n(c1.open));
+  if (!cont) return null;                                       // two confirming closes in the draw direction
+
+  const entry = n(c0.open);                                     // continuation-candle open
+  const buf = atr * (config.stopBufAtr ?? 0.2);
+  const stop = dir === 'BULLISH' ? sweep.extreme - buf : sweep.extreme + buf;
+  const risk = Math.abs(entry - stop);
+  if (!(risk > 0) || stopTooTight(risk, atr, pip, config)) return null;
+
+  const pools = detectLiquidityPools(candles);
+  const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
+  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk);
+  const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
+  if (!(rr >= minRR)) return null;
+
+  const bodyAtr = Math.abs(n(c0.close) - n(c0.open)) / atr;
+  let score = 48;
+  score += Math.min(16, Math.round(bodyAtr * 12));
+  score += Math.min(15, Math.round((rr - minRR) * 5));
+  if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 10;
+  if (tgt && tgt.equal) score += 5;
+  score = Math.max(40, Math.min(95, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+    reason: `Candle continuity ${decision} after sweep ${sweep.sweepLevel}: ${dir === 'BULLISH' ? 'two bullish closes' : 'two bearish closes'} → enter open ${r5(entry)}; draw ${tgt ? tgt.type + ' ' + tgt.price : '3R'}`,
+    barIso: c0.time,
+    meta: { sweepLevel: sweep.sweepLevel, bodyAtr: Math.round(bodyAtr * 100) / 100 },
+  };
+}
+
+// ── Session helpers (New York / ET, DST-aware via Intl) ──────────────────────
+// The course's day-trading setups are anchored to New York time. We derive the ET
+// wall-clock from each candle's UTC time so EST↔EDT is handled automatically.
+function etMinutes(iso) {
+  const p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour12: false, hour: '2-digit', minute: '2-digit' }).formatToParts(new Date(iso));
+  const h = Number(p.find((x) => x.type === 'hour').value) % 24;
+  const m = Number(p.find((x) => x.type === 'minute').value);
+  return h * 60 + m;
+}
+// Most recent candle that OPENS at the target ET minute-of-day (within tolerance).
+function lastSessionOpen(candles, targetMin, tolMin = 8) {
+  for (let i = candles.length - 1; i >= 0; i--) {
+    if (Math.abs(etMinutes(candles[i].time) - targetMin) <= tolMin) return { idx: i, price: r5(n(candles[i].open)) };
+  }
+  return null;
+}
+
+// ── SMC 4: Two-Lines session reversal ────────────────────────────────────────
+// Lines = the 17:00 and 00:00 (midnight) ET opens. Price above BOTH → sell-bias,
+// below BOTH → buy-bias, between → no trade. Inside a kill zone, a weakness candle
+// (a swing extreme it rejected) + a confirming opposite-side close fires: enter the
+// 50% of the confirmation candle, stop beyond the weakness wick, fixed tpR target.
+function smcTwoLines(ctx) {
+  const { candles, config = {}, pip = 0.0001, h4Trend = null } = ctx;
+  const tpR = config.tpR ?? 3;
+  if (!Array.isArray(candles) || candles.length < 60) return null;
+  const atr = atr14(candles); if (!atr) return null;
+
+  const l17 = lastSessionOpen(candles, 17 * 60), l00 = lastSessionOpen(candles, 0);
+  if (!l17 || !l00) return null;
+  const last = candles.length - 1, conf = candles[last], weak = candles[last - 1];
+  const price = n(conf.close);
+  const above = price > l17.price && price > l00.price;
+  const below = price < l17.price && price < l00.price;
+  if (!above && !below) return null;                        // between the lines = stand aside
+
+  const em = etMinutes(conf.time);
+  const inKz = (em >= 120 && em <= 300) || (em >= 420 && em <= 600); // London 02–05, NY 07–10 ET
+  if ((config.killZones ?? true) && !inKz) return null;
+
+  const decision = below ? 'BUY' : 'SELL';
+  const win = candles.slice(Math.max(0, last - 7), last - 1);
+  let entry, stop;
+  if (decision === 'BUY') {
+    const priorLow = Math.min(...win.map((x) => n(x.low)));
+    if (!(n(weak.low) <= priorLow)) return null;            // weakness took a recent low
+    if (!(n(conf.close) > n(conf.open))) return null;       // confirmation closes bullish
+    entry = r5((n(conf.high) + n(conf.low)) / 2);           // 50% of the confirmation candle
+    stop = r5(n(weak.low) - atr * (config.stopBufAtr ?? 0.15));
+  } else {
+    const priorHigh = Math.max(...win.map((x) => n(x.high)));
+    if (!(n(weak.high) >= priorHigh)) return null;
+    if (!(n(conf.close) < n(conf.open))) return null;
+    entry = r5((n(conf.high) + n(conf.low)) / 2);
+    stop = r5(n(weak.high) + atr * (config.stopBufAtr ?? 0.15));
+  }
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, config)) return null;
+  const target = decision === 'BUY' ? r5(entry + tpR * risk) : r5(entry - tpR * risk);
+
+  const bodyAtr = Math.abs(n(conf.close) - n(conf.open)) / atr;
+  let score = 50;
+  score += Math.min(16, Math.round(bodyAtr * 12));
+  score += Math.min(10, tpR * 2);
+  if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 8;
+  if (em >= 120 && em <= 300) score += 4;                   // London kill zone (best)
+  score = Math.max(40, Math.min(95, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry, stopLoss: stop, ...ladder, riskRewardRatio: Math.round(Math.abs(target - entry) / risk * 100) / 100,
+    reason: `Two-lines ${decision}: price ${below ? 'below' : 'above'} 17:00(${l17.price}) & 00:00(${l00.price}) → weakness + confirmation, enter 50% @ ${entry} (${tpR}R)`,
+    barIso: conf.time,
+    meta: { line17: l17.price, line00: l00.price, bias: below ? 'buy' : 'sell', etMin: em },
+  };
+}
+
+// ── SMC 5: Asian Range Sweep ─────────────────────────────────────────────────
+// The Asian range (ET 20:00–24:00) is liquidity. In the London manipulation window
+// (01:30–05:00 ET) price sweeps the Asian high/low then reclaims — trade the reversal
+// toward the OPPOSITE Asian extreme. Stop beyond the swept extreme, min RR.
+function smcAsianSweep(ctx) {
+  const { candles, config = {}, pip = 0.0001, h4Trend = null } = ctx;
+  const minRR = config.minRR ?? 2;
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const atr = atr14(candles); if (!atr) return null;
+
+  const last = candles.length - 1;
+  const em = etMinutes(candles[last].time);
+  if ((config.windowOnly ?? true) && !(em >= 90 && em <= 300)) return null; // 01:30–05:00 ET
+
+  // Asian range = high/low of the most recent ET 20:00–24:00 block (look back bounded).
+  const look = config.asianLookback ?? 130;
+  let aHigh = -Infinity, aLow = Infinity, found = 0;
+  for (let i = last; i >= Math.max(0, last - look); i--) {
+    if (etMinutes(candles[i].time) >= 20 * 60) { aHigh = Math.max(aHigh, n(candles[i].high)); aLow = Math.min(aLow, n(candles[i].low)); found++; }
+    else if (found > 0) break;                              // exited the Asian block (contiguous)
+  }
+  if (found < 3 || !Number.isFinite(aHigh) || !Number.isFinite(aLow) || !(aHigh > aLow)) return null;
+
+  // Sweep + reclaim of an Asian extreme within the last few bars.
+  let decision = null, swept = null, ext = null;
+  for (let i = last; i >= Math.max(0, last - (config.sweepScan ?? 14)); i--) {
+    if (n(candles[i].high) > aHigh && n(candles[last].close) < aHigh) {
+      decision = 'SELL'; swept = r5(aHigh); ext = Math.max(...candles.slice(i, last + 1).map((x) => n(x.high))); break;
+    }
+    if (n(candles[i].low) < aLow && n(candles[last].close) > aLow) {
+      decision = 'BUY'; swept = r5(aLow); ext = Math.min(...candles.slice(i, last + 1).map((x) => n(x.low))); break;
+    }
+  }
+  if (!decision) return null;
+
+  const buf = atr * (config.stopBufAtr ?? 0.2);
+  const entry = r5(n(candles[last].close));
+  const stop = decision === 'BUY' ? r5(ext - buf) : r5(ext + buf);
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, config)) return null;
+  const target = decision === 'BUY' ? r5(aHigh) : r5(aLow);  // opposite Asian extreme
+  const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
+  if (!(rr >= minRR)) return null;
+
+  let score = 50;
+  score += Math.min(15, Math.round((rr - minRR) * 5));
+  if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 8;
+  score += 6;                                                // manipulation-window sweep
+  score = Math.max(40, Math.min(95, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry, stopLoss: stop, ...ladder, riskRewardRatio: rr,
+    reason: `Asian sweep ${decision}: swept Asian ${decision === 'BUY' ? 'low' : 'high'} ${swept} in London window → target opposite extreme ${target}`,
+    barIso: candles[last].time,
+    meta: { asianHigh: r5(aHigh), asianLow: r5(aLow), sweptLevel: swept, etMin: em },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ICT+ — an IMPROVED ICT breaker. Does NOT touch the original `ict-breaker`
+// (the live winner). Takes the same breaker base and stacks the course's A+
+// filters: a fair-value-gap SNIPER entry (50% of the displacement gap instead of
+// the breaker zone — tighter fill, better RR), a premium/discount gate, the
+// "never take the first drive" second-drive gate, dual HTF (H4+H1) alignment, an
+// equal-highs target, and a stacked-confluence floor. Higher RR bar, fewer/cleaner
+// signals. Reuses smcDealingRange/smcGrade above.
+// ═══════════════════════════════════════════════════════════════════════════
+function ictPlus(ctx) {
+  const { candles, h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minRR = config.minRR ?? 3;
+  const maxAgeBars = config.maxAgeBars ?? 3;
+  const minConfluences = config.minConfluences ?? 4;
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const atr = atr14(candles); if (!atr) return null;
+
+  const breaker = detectBreaker(candles, { maxAgeBars: 50 });
+  if (!breaker) return null;
+  if (breaker.ageBars > maxAgeBars) return null;                 // fresh breaker only
+  const disp = breaker.displacement;
+  if (!disp || !disp.present) return null;                       // ICT+ REQUIRES the displacement FVG
+
+  const dir = breaker.type, decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
+  if (h4Trend === 'BULLISH' && decision === 'SELL') return null; // HTF hard gate (same discipline)
+  if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
+
+  // Improvement 1 — FVG sniper entry: the 50% of the displacement gap, not the breaker zone.
+  const gapLow = Math.min(disp.gapLow, disp.gapHigh), gapHigh = Math.max(disp.gapLow, disp.gapHigh);
+  const entry = r5((gapLow + gapHigh) / 2);
+  const price = n(candles[candles.length - 1].close);
+  if (dir === 'BULLISH' ? price <= entry : price >= entry) return null; // pullback still pending
+
+  const stop = breaker.stop;                                     // beyond the sweep (robust anchor)
+  const risk = Math.abs(entry - stop);
+  if (!(risk > 0) || stopTooTight(risk, atr, pip, config)) return null;
+
+  const pools = detectLiquidityPools(candles);
+  const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
+  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + minRR * risk : entry - minRR * risk);
+  const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
+  if (!(rr >= minRR)) return null;
+
+  // ── Stacked confluences (the "+") ──
+  const range = smcDealingRange(candles);
+  const pdOk = !!range && (decision === 'BUY' ? entry <= range.eq : entry >= range.eq);   // discount/premium
+  const secondDrive = !!detectSecondDrive(candles, dir).isSecondDrive;                    // never the first drive
+  const htf4 = (decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH');
+  const htf1 = (decision === 'BUY' && h1Trend === 'BULLISH') || (decision === 'SELL' && h1Trend === 'BEARISH');
+  const strongDisp = disp.atrMultiple >= (config.strongDispAtr ?? 1.3);
+  const equalTarget = !!(tgt && tgt.equal);
+  const fresh = breaker.ageBars === 0;
+  const confluences = [pdOk, secondDrive, htf4, htf1, strongDisp, equalTarget, fresh].filter(Boolean).length;
+  if (confluences < minConfluences) return null;                 // only stacked, A-grade setups fire
+
+  let score = 55;
+  score += Math.min(16, Math.round(disp.atrMultiple * 8));
+  score += Math.min(12, Math.round((rr - minRR) * 4));
+  if (pdOk) score += 6;
+  if (secondDrive) score += 6;
+  if (htf4) score += 6;
+  if (htf1) score += 4;
+  if (equalTarget) score += 4;
+  if (fresh) score += 3;
+  score = Math.max(45, Math.min(98, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry, stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+    reason: `ICT+ ${dir} breaker → FVG 50% entry @ ${entry} (disp ${disp.atrMultiple}×, ${confluences} confluences${pdOk ? ', ' + (decision === 'BUY' ? 'discount' : 'premium') : ''}${secondDrive ? ', 2nd-drive' : ''}) → draw ${tgt ? tgt.type + ' ' + tgt.price : minRR + 'R'}`,
+    barIso: breaker.confirmedIso,
+    meta: {
+      breakerType: breaker.type, sweepLevel: breaker.sweepLevel, structureLevel: breaker.structureLevel,
+      fvgLow: r5(gapLow), fvgHigh: r5(gapHigh), dispAtr: disp.atrMultiple, confluences,
+      pd: pdOk ? (decision === 'BUY' ? 'discount' : 'premium') : 'off', secondDrive, htf4, htf1, equalTarget,
+    },
+  };
+}
+
 export const STRATEGIES = {
   'ict-breaker': {
     id: 'ict-breaker',
@@ -749,6 +1531,15 @@ export const STRATEGIES = {
     timeframes: ['M15', 'M30', 'H1'],
     config: { minRR: 2, maxAgeBars: 3 },
     evaluate: ictBreaker,
+  },
+  'ict-plus': {
+    id: 'ict-plus',
+    name: 'ICT+',
+    source: 'ICT breaker, upgraded — FVG sniper entry + premium/discount + second-drive + dual-HTF confluence',
+    description: 'An improved ICT breaker (the original ict-breaker is untouched). Same sweep → breaker + displacement base, then stacks A+ filters: enter the 50% of the displacement FAIR VALUE GAP (sniper fill, not the breaker zone) for a tighter stop and better RR; only in the discount (buy) / premium (sell) half of the dealing range; only on a SECOND drive (skips the first-drive fakeout); aligned with both H4 and H1; bonus for an equal-highs/lows target and a fresh breaker. Requires a minimum stacked-confluence count and a higher 3R floor — fewer, cleaner signals. Stop beyond the sweep.',
+    timeframes: ['M15', 'M30', 'H1', 'H4'],
+    config: { minRR: 3, maxAgeBars: 3, minConfluences: 4, strongDispAtr: 1.3 },
+    evaluate: ictPlus,
   },
   'market-mechanics-3step': {
     id: 'market-mechanics-3step',
@@ -785,6 +1576,60 @@ export const STRATEGIES = {
     timeframes: ['H1', 'H4', 'D1'],
     config: { minRR: 1.8, pullbackAtr: 1.0, tpR: 2.5 },
     evaluate: stageAnalysis,
+  },
+  'swing-structure-candles': {
+    id: 'swing-structure-candles',
+    name: 'Swing Structure Candles',
+    source: 'Swing structure (HH/HL · LH/LL) + candlestick triggers',
+    description: 'Reads the swing skeleton — higher highs + higher lows (uptrend) or lower highs + lower lows (downtrend) — and ranks its strength by the number of confirming swings (2 = weak/early, fires only on a strong pattern; 3 = preferred; 4+ = strongest, with an over-extension guard). Then a candlestick trigger gives the direction: CONTINUATION (bullish trigger at a pullback to the latest higher low → BUY; bearish trigger at the latest lower high → SELL), REVERSAL (strong bearish trigger rejecting a fresh higher high → SELL; strong bullish trigger at a fresh lower low → BUY), or a FLAT-BASE BREAKOUT (price coils under a horizontal equal-highs shelf, then a candle CLOSES above it → BUY; mirror equal-lows breakdown → SELL) — the breakout demands a confirmed close beyond the level (wick-through that closes back inside = trap, skipped) and rejects big-momentum climax candles. Pattern library: hammer/shooting-star/pin, dragonfly/gravestone doji, engulfing, piercing/dark-cloud, tweezers, morning/evening star — a neutral doji is never directional on its own. A VOLATILITY-CONTRACTION read (tight base / inside bar before the trigger) adds a quality bonus and tucks the stop to the base (better RR). Before firing, the setup is confirmed top-down against the next LOWER timeframe (M15→M5, M30→M15, H1→M30, H4→H1): the lower TF must agree — CONTRADICT → skip, NEUTRAL/MISSING → allowed only if the main setup is strong. Stop beyond the swing/base (+ATR buffer), TP1/TP2 = 1R/2R, TP3 = opposing swing / draw on liquidity / measured move. HTF-aligned, minimum 1.8R. Best on M15–H4.',
+    timeframes: ['M15', 'M30', 'H1', 'H4'],
+    config: { minRR: 1.8, minSwings: 2, nearAtr: 1.5, overextAtr: 3.0, tpR: 2.5, ltfRequired: true, ltfConfirmBonus: 6, ltfNeutralFloor: 70, contractionWindow: 5, contractionAtr: 1.5, contractionBonus: 6, contractionTightenStop: true, breakoutEnabled: true, breakoutBufferAtr: 0.05, breakoutMaxChaseAtr: 1.0, breakoutClimaxAtr: 2.2, breakoutBaseLookback: 20 },
+    evaluate: swingStructureCandles,
+  },
+  'smc-fvg': {
+    id: 'smc-fvg',
+    name: 'SMC Fair Value Gap',
+    source: 'Smart Money Concepts core — liquidity sweep → displacement FVG → 50% mitigation',
+    description: 'Liquidity sweep of a swing extreme (taken then reclaimed) → a displacement leg that prints a fair value gap AFTER the sweep → enter the 50% of that gap on the pullback, stop beyond the sweep, target the opposing resting liquidity (draw). Discount-for-buy / premium-for-sell bonus. HTF-aligned, minimum 2R.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: { minRR: 2, dispAtr: 0.6, sweepLookback: 50, stopBufAtr: 0.2 },
+    evaluate: smcFvg,
+  },
+  'smc-mmxm': {
+    id: 'smc-mmxm',
+    name: 'Market Makers Model',
+    source: 'Smart Money Concepts — market makers buy/sell model (external↔internal)',
+    description: 'Dealing range = most recent external swing high↔low. Price sweeps the range extreme (external liquidity), then a displacement FVG forms in the discount (buy) / premium (sell) half — the smart-money reversal. Enter the FVG 50%, stop beyond the swept extreme, target the OPPOSITE external extreme (original consolidation). HTF-aligned, minimum 2.5R.',
+    timeframes: ['M15', 'M30', 'H1', 'H4'],
+    config: { minRR: 2.5, dispAtr: 0.6, sweepLookback: 60, extremeTolAtr: 1.0, stopBufAtr: 0.2 },
+    evaluate: smcMmxm,
+  },
+  'smc-cct': {
+    id: 'smc-cct',
+    name: 'Candle Continuity',
+    source: 'Smart Money Concepts — candle continuity theory',
+    description: 'After a liquidity sweep establishes the draw, price delivers one direction: each candle follows the previous candle\'s direction. With two confirming closes in the draw direction, enter just beyond the OPENING price of the continuation candle, stop beyond the sweep extreme, target the opposing liquidity. Fires only on a fresh draw (recent reclaim) and with the HTF trend. Minimum 2R.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: { minRR: 2, sweepLookback: 40, maxAgeBars: 6, stopBufAtr: 0.2 },
+    evaluate: smcCct,
+  },
+  'smc-two-lines': {
+    id: 'smc-two-lines',
+    name: 'Two-Lines Session',
+    source: 'Smart Money Concepts — "two lines" (17:00 + midnight open) session reversal',
+    description: 'The 17:00 and 00:00 New York opens are the two lines. Price above BOTH = sell-bias, below BOTH = buy-bias, between = no trade. Inside a kill zone (London 02–05 / NY 07–10 ET), a weakness candle that rejected a recent swing extreme plus a confirming opposite-side close fires: enter the 50% of the confirmation candle, stop beyond the weakness wick, fixed 3R. ET clock is DST-aware. Intraday only.',
+    timeframes: ['M15', 'M30', 'H1'],
+    config: { tpR: 3, killZones: true, stopBufAtr: 0.15 },
+    evaluate: smcTwoLines,
+  },
+  'smc-asian-sweep': {
+    id: 'smc-asian-sweep',
+    name: 'Asian Range Sweep',
+    source: 'Smart Money Concepts — Asian range sweep / London manipulation',
+    description: 'The Asian range (ET 20:00–24:00 high/low) is resting liquidity. In the London manipulation window (01:30–05:00 ET) price sweeps the Asian high or low then reclaims — trade the reversal toward the OPPOSITE Asian extreme, stop beyond the swept extreme. ET clock is DST-aware. Fires only inside the window; intraday only. Minimum 2R.',
+    timeframes: ['M5', 'M15', 'M30'],
+    config: { minRR: 2, windowOnly: true, asianLookback: 130, sweepScan: 14, stopBufAtr: 0.2 },
+    evaluate: smcAsianSweep,
   },
 };
 
