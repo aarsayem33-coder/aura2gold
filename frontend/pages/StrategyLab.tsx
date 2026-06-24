@@ -120,10 +120,54 @@ function FtResultCell({ s }: { s: StrategySignal }) {
   );
 }
 
+// Strategy switcher for a live grid — one chip per strategy. Multi-select: click to add a
+// strategy to the view, click again to remove it. Pick one to view it alone, or two+ to see
+// their signals side by side (the grid then shows a Strategy column). At least one stays on.
+function StrategyChips({ list, selectedIds, onToggle }: { list: StrategyMeta[]; selectedIds: string[]; onToggle: (id: string) => void }) {
+  if (!list.length) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mr-0.5">Strategies</span>
+      {list.map((s) => {
+        const on = selectedIds.includes(s.id);
+        return (
+          <button key={s.id} type="button" onClick={() => onToggle(s.id)} aria-pressed={on}
+            className={`rounded-full px-2.5 py-1 text-[11px] font-bold transition ${on ? 'bg-violet-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+            {on ? '✓ ' : ''}{s.name}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Score + setup (direction) filters shared by both live grids. dir: '' = all, LONG = buy/up,
+// SHORT = sell/down. mode picks the wording (forex Buy/Sell vs fixed-time Up/Down).
+function GridFilters({ minScore, setMinScore, dir, setDir, mode }: { minScore: number; setMinScore: (n: number) => void; dir: string; setDir: (d: string) => void; mode: 'forex' | 'ftt' }) {
+  return (
+    <div className="flex items-center gap-2">
+      <select value={minScore} onChange={(e) => setMinScore(Number(e.target.value))} title="Minimum score" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+        <option value={0}>Any score</option>
+        <option value={90}>Score ≥ 90</option>
+        <option value={85}>Score ≥ 85</option>
+        <option value={80}>Score ≥ 80</option>
+        <option value={75}>Score ≥ 75</option>
+        <option value={70}>Score ≥ 70</option>
+        <option value={65}>Score ≥ 65</option>
+      </select>
+      <select value={dir} onChange={(e) => setDir(e.target.value)} title="Setup / direction" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+        <option value="">All setups</option>
+        <option value="LONG">{mode === 'ftt' ? 'Call UP ↑' : 'Buy / Long ↑'}</option>
+        <option value="SHORT">{mode === 'ftt' ? 'Call DOWN ↓' : 'Sell / Short ↓'}</option>
+      </select>
+    </div>
+  );
+}
+
 export default function StrategyLab() {
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [timeframes, setTimeframes] = useState<string[]>(LIVE_TFS);
-  const [selected, setSelected] = useState('');
+  const [selectedIds, setSelectedIds] = useState<string[]>([]); // strategies shown in the live grids (multi-select)
   const [liveTf, setLiveTf] = useState('M15');
   const [histTf, setHistTf] = useState('');
   const [histStrategy, setHistStrategy] = useState(''); // '' = all strategies (recent tables)
@@ -138,27 +182,47 @@ export default function StrategyLab() {
     fetchStrategies().then((m) => {
       setStrategies(m.strategies);
       if (m.timeframes?.length) setTimeframes(m.timeframes);
-      setSelected((c) => c || m.strategies[0]?.id || '');
+      setSelectedIds((c) => c.length ? c : (m.strategies[0]?.id ? [m.strategies[0].id] : []));
     }).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load strategies'));
   }, []);
 
   const stratName = useCallback((id: string) => strategies.find((s) => s.id === id)?.name || id, [strategies]);
 
+  // Toggle a strategy in/out of the live-grid view; never let the last one be removed.
+  const toggleStrategy = useCallback((id: string) => {
+    setSelectedIds((prev) => (prev.includes(id) ? (prev.length > 1 ? prev.filter((x) => x !== id) : prev) : [...prev, id]));
+  }, []);
+
   const loadData = useCallback(async () => {
-    if (!selected) return;
+    if (!selectedIds.length) return;
     setLoading(true);
-    // Live grid (per selected strategy) and the recent-signals table (ALL strategies) load
-    // independently — a hiccup in the live scan never blanks the recent history, and the
-    // recent table shows every logged signal regardless of which strategy is selected.
-    const livePromise = (tab === 'ftt' ? fetchStrategyLiveFtt(selected, liveTf) : fetchStrategyLive(selected, liveTf))
-      .then((lv) => { if (tab === 'ftt') setFtLive(lv as StrategyFttLiveResponse); else setLive(lv as StrategyLiveResponse); })
-      .catch(() => { /* live grid best-effort */ });
+    // Live grids merge every SELECTED strategy (one fetch each, tagged with its name). The
+    // recent-signals table loads independently (ALL strategies) so a live-scan hiccup never
+    // blanks the recent history.
+    const ids = selectedIds;
+    const livePromise = (async () => {
+      try {
+        if (tab === 'ftt') {
+          const results = await Promise.all(ids.map((id) => fetchStrategyLiveFtt(id, liveTf).then((r) => ({ id, r })).catch(() => null)));
+          const rows: StrategyFttLiveResponse['rows'] = [];
+          let expiryBars = 1; let strategyName = '';
+          for (const item of results) { if (!item) continue; expiryBars = item.r.expiryBars; strategyName = item.r.strategyName; for (const row of item.r.rows) rows.push({ ...row, strategyId: item.id, strategyName: item.r.strategyName }); }
+          setFtLive({ ok: true, strategy: ids.join(','), strategyName, timeframe: liveTf, expiryBars, rows, generatedAt: new Date().toISOString() });
+        } else {
+          const results = await Promise.all(ids.map((id) => fetchStrategyLive(id, liveTf).then((r) => ({ id, r })).catch(() => null)));
+          const rows: StrategyLiveResponse['rows'] = [];
+          let strategyName = '';
+          for (const item of results) { if (!item) continue; strategyName = item.r.strategyName; for (const row of item.r.rows) rows.push({ ...row, strategyId: item.id, strategyName: item.r.strategyName }); }
+          setLive({ ok: true, strategy: ids.join(','), strategyName, timeframe: liveTf, rows, generatedAt: new Date().toISOString() });
+        }
+      } catch { /* live grid best-effort */ }
+    })();
     const sigPromise = fetchStrategySignals(histStrategy || undefined, histTf || undefined)
       .then((sg) => { setSignals(sg.signals); setError(null); })
       .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load strategy signals'));
     await Promise.allSettled([livePromise, sigPromise]);
     setLoading(false);
-  }, [selected, liveTf, histTf, histStrategy, tab]);
+  }, [selectedIds, liveTf, histTf, histStrategy, tab]);
 
   useEffect(() => {
     void loadData();
@@ -166,9 +230,43 @@ export default function StrategyLab() {
     return () => clearInterval(t);
   }, [loadData]);
 
-  const activeMeta = useMemo(() => strategies.find((s) => s.id === selected) || null, [strategies, selected]);
-  const entries = (live?.rows || []).filter((r) => r.command === 'ENTRY');
-  const calls = (ftLive?.rows || []).filter((r) => r.command === 'CALL');
+  const selectedMetas = useMemo(() => strategies.filter((s) => selectedIds.includes(s.id)), [strategies, selectedIds]);
+  const multiStrategy = selectedIds.length > 1;
+  const liveTitle = selectedMetas.length === 1 ? selectedMetas[0].name : `${selectedIds.length} strategies`;
+  // Live-grid filters (apply to BOTH the forex and fixed-time live tables): minimum score +
+  // setup direction. When a filter is active — or when more than one strategy is selected —
+  // we show only the actionable rows that pass (HOLD/NO_DATA noise is hidden, which also
+  // keeps the merged multi-strategy view readable); otherwise the grid shows every row.
+  const [minScore, setMinScore] = useState(0);
+  const [dirFilter, setDirFilter] = useState(''); // '' | 'LONG' | 'SHORT'
+  const liveFilterActive = minScore > 0 || dirFilter !== '';
+  const actionableOnly = liveFilterActive || multiStrategy;
+  const forexRows = useMemo(() => {
+    const rows = live?.rows || [];
+    if (!actionableOnly) return rows;
+    return rows.filter((r) => r.command === 'ENTRY'
+      && (minScore === 0 || (r.score ?? 0) >= minScore)
+      && (!dirFilter || (dirFilter === 'LONG' ? /BUY/.test(r.direction || '') : /SELL/.test(r.direction || ''))));
+  }, [live, minScore, dirFilter, actionableOnly]);
+  const ftRows = useMemo(() => {
+    const rows = ftLive?.rows || [];
+    if (!actionableOnly) return rows;
+    return rows.filter((r) => r.command === 'CALL'
+      && (minScore === 0 || (r.score ?? 0) >= minScore)
+      && (!dirFilter || (dirFilter === 'LONG' ? r.direction === 'UP' : r.direction === 'DOWN')));
+  }, [ftLive, minScore, dirFilter, actionableOnly]);
+  const entries = forexRows.filter((r) => r.command === 'ENTRY');
+  const calls = ftRows.filter((r) => r.command === 'CALL');
+  // Fired fixed-time calls that are STILL within their expiry window — surfaced from the
+  // logged-signal feed (all strategies/TFs, DB-backed → reload-safe) so every call that
+  // fired a browser alert is visible in the signal portion, independent of the
+  // strategy/timeframe selectors and the live re-evaluation (which drops one-candle calls).
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNowTick(Date.now()), 1000); return () => clearInterval(t); }, []);
+  const liveCalls = useMemo(() => signals
+    .filter((s) => (s.ftOutcome || '').toUpperCase() === 'PENDING' && s.ftExpiryIso && new Date(s.ftExpiryIso).getTime() > nowTick)
+    .sort((a, b) => new Date(a.ftExpiryIso || 0).getTime() - new Date(b.ftExpiryIso || 0).getTime()),
+  [signals, nowTick]);
   const ftStats = useMemo(() => {
     let liveWin = 0, liveLoss = 0, win = 0, loss = 0, pending = 0;
     for (const s of signals) {
@@ -191,13 +289,6 @@ export default function StrategyLab() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <select value={selected} onChange={(e) => setSelected(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-semibold">
-            {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-          <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-semibold" title="Live grid timeframe">
-            <option value="ALL">All timeframes</option>
-            {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
           <Link to="/strategy-lab/reports" className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-bold text-slate-600 hover:bg-slate-50"><BarChart3 size={14} /> Reports</Link>
           <button type="button" onClick={() => void loadData()} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-bold text-white hover:bg-slate-700 disabled:opacity-50">
             {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
@@ -222,15 +313,26 @@ export default function StrategyLab() {
         <>
           {/* LIVE COMMAND GRID — top, dashboard-style */}
           <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
-              <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Live signals · {activeMeta?.name || selected} · {live?.timeframe || liveTf}</h3>
-              <span className="text-[11px] font-bold text-slate-400">{entries.length} ENTRY · {(live?.rows.length || 0) - entries.length} HOLD · auto-refresh 30s</span>
+            <div className="flex flex-col gap-2 border-b border-slate-100 px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Live signals · {liveTitle} · {liveTf}</h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="Live grid timeframe">
+                    <option value="ALL">All timeframes</option>
+                    {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                  <GridFilters minScore={minScore} setMinScore={setMinScore} dir={dirFilter} setDir={setDirFilter} mode="forex" />
+                  <span className="text-[11px] font-bold text-slate-400">{entries.length} ENTRY{actionableOnly ? ' (filtered)' : ` · ${(live?.rows.length || 0) - entries.length} HOLD`} · auto-refresh 30s</span>
+                </div>
+              </div>
+              <StrategyChips list={strategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[920px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
                     <th className="px-3 py-2">Command</th>
+                    {multiStrategy && <th className="px-3 py-2">Strategy</th>}
                     <th className="px-3 py-2">Entry timing</th>
                     <th className="px-3 py-2">Symbol</th>
                     <th className="px-3 py-2 text-right">Score</th>
@@ -243,9 +345,10 @@ export default function StrategyLab() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {live?.rows.length ? live.rows.map((r) => (
-                    <tr key={`${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${r.command === 'ENTRY' ? (/BUY/.test(r.direction || '') ? 'bg-emerald-50/30' : 'bg-rose-50/30') : ''}`}>
+                  {forexRows.length ? forexRows.map((r) => (
+                    <tr key={`${r.strategyId || ''}-${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${r.command === 'ENTRY' ? (/BUY/.test(r.direction || '') ? 'bg-emerald-50/30' : 'bg-rose-50/30') : ''}`}>
                       <td className="px-3 py-2"><CommandPill row={r} /></td>
+                      {multiStrategy && <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{r.strategyName || stratName(r.strategyId || '')}</td>}
                       <td className="px-3 py-2">{r.command === 'ENTRY' ? <TimingCell timing={r.timing} /> : <span className="text-slate-300">—</span>}</td>
                       <td className="px-3 py-2"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
                       <td className="px-3 py-2 text-right">{r.command === 'ENTRY' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
@@ -257,13 +360,13 @@ export default function StrategyLab() {
                       <td className="px-3 py-2 text-[11px] text-slate-500 max-w-[280px] truncate" title={r.reason || ''}>{r.command === 'ENTRY' ? r.reason : ''}</td>
                     </tr>
                   )) : (
-                    <tr><td colSpan={10} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
+                    <tr><td colSpan={multiStrategy ? 11 : 10} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No setups match the current score / setup filter.' : multiStrategy ? 'No live setups across the selected strategies right now.' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
             <div className="border-t border-slate-100 px-4 py-2 text-[11px] font-medium text-slate-400">
-              ENTRY = a fresh {activeMeta?.name || 'strategy'} setup right now · HOLD = no setup on this bar · isolated lab engine, not the main system.
+              ENTRY = a fresh {selectedMetas.length === 1 ? selectedMetas[0].name : 'strategy'} setup right now · HOLD = no setup on this bar · isolated lab engine, not the main system.
             </div>
           </div>
 
@@ -324,17 +427,77 @@ export default function StrategyLab() {
       {/* ──────────────────────── FIXED-TIME TAB ──────────────────────── */}
       {tab === 'ftt' && (
         <>
+          {/* JUST FIRED — every fixed-time call still inside its expiry window, across ALL
+              strategies & timeframes. This is what the browser alerts map to; it does NOT
+              depend on the strategy/timeframe selectors or the live re-evaluation below. */}
+          <div className="rounded-2xl border-2 border-amber-300 bg-amber-50/40 shadow-card overflow-hidden">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-200 bg-amber-100/50 px-4 py-3">
+              <h3 className="flex items-center gap-2 text-sm font-black uppercase tracking-wider text-amber-800"><Radio size={15} className={liveCalls.length ? 'animate-pulse' : ''} /> Just fired · live calls (all strategies)</h3>
+              <span className="text-[11px] font-bold text-amber-700/70">{liveCalls.length} actionable · these match your browser alerts · auto-refresh 30s</span>
+            </div>
+            {liveCalls.length ? (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[820px] text-left text-sm">
+                  <thead className="border-b border-amber-100 text-[10px] uppercase tracking-[0.15em] text-amber-700/70">
+                    <tr>
+                      <th className="px-3 py-2">Call</th>
+                      <th className="px-3 py-2">Strategy</th>
+                      <th className="px-3 py-2">Symbol</th>
+                      <th className="px-3 py-2 text-right">Score</th>
+                      <th className="px-3 py-2">Expires in</th>
+                      <th className="px-3 py-2">Live P/L</th>
+                      <th className="px-3 py-2">Why</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-amber-100 text-slate-700">
+                    {liveCalls.map((s) => {
+                      const up = /BUY/.test(s.direction);
+                      return (
+                        <tr key={s.id} className={`hover:bg-amber-50/60 ${up ? 'bg-emerald-50/20' : 'bg-rose-50/20'}`}>
+                          <td className="px-3 py-2">
+                            {up
+                              ? <span className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-2 py-0.5 text-[11px] font-black text-white"><TrendingUp size={12} /> CALL UP</span>
+                              : <span className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2 py-0.5 text-[11px] font-black text-white"><TrendingDown size={12} /> CALL DOWN</span>}
+                          </td>
+                          <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{stratName(s.strategy)}</td>
+                          <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
+                          <td className="px-3 py-2 text-right">{scoreBadge(s.score, s.grade)}</td>
+                          <td className="px-3 py-2 align-top"><ExpiryCountdown iso={s.ftExpiryIso} label="enter now — fixed-time is instant" /></td>
+                          <td className="px-3 py-2">{s.live ? <span className={`inline-flex rounded px-1.5 py-0.5 text-[11px] font-black ${s.live.status === 'WINNING' ? 'bg-emerald-100 text-emerald-700' : s.live.status === 'LOSING' ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-500'}`}>{s.live.pips > 0 ? '+' : ''}{s.live.pips} pips</span> : <span className="text-slate-300">—</span>}</td>
+                          <td className="px-3 py-2 text-[11px] text-slate-500 max-w-[260px] truncate" title={s.reason || ''}>{s.reason}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="px-4 py-6 text-center text-[12px] font-medium text-amber-700/60">No live calls right now — fired calls appear here the moment a setup triggers and stay until their expiry. The grid below re-scans the selected strategy/timeframe in real time.</div>
+            )}
+          </div>
+
           {/* LIVE FIXED-TIME CALL GRID */}
           <div className="rounded-2xl border border-violet-200 bg-white shadow-card overflow-hidden">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-violet-100 bg-violet-50/40 px-4 py-3">
-              <h3 className="text-sm font-black uppercase tracking-wider text-violet-700">Live fixed-time calls · {activeMeta?.name || selected} · {ftLive?.timeframe || liveTf}</h3>
-              <span className="text-[11px] font-bold text-slate-400">{calls.length} CALL · {(ftLive?.rows.length || 0) - calls.length} HOLD · expiry {ftLive?.expiryBars === 1 ? 'next candle' : `${ftLive?.expiryBars} candles`} · auto-refresh 30s</span>
+            <div className="flex flex-col gap-2 border-b border-violet-100 bg-violet-50/40 px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-black uppercase tracking-wider text-violet-700">Live fixed-time calls · {liveTitle} · {liveTf}</h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="Live grid timeframe">
+                    <option value="ALL">All timeframes</option>
+                    {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                  <GridFilters minScore={minScore} setMinScore={setMinScore} dir={dirFilter} setDir={setDirFilter} mode="ftt" />
+                  <span className="text-[11px] font-bold text-slate-400">{calls.length} CALL{actionableOnly ? ' (filtered)' : ` · ${(ftLive?.rows.length || 0) - calls.length} HOLD`} · expiry {ftLive?.expiryBars === 1 ? 'next candle' : `${ftLive?.expiryBars} candles`} · auto-refresh 30s</span>
+                </div>
+              </div>
+              <StrategyChips list={strategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[820px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
                     <th className="px-3 py-2">Call</th>
+                    {multiStrategy && <th className="px-3 py-2">Strategy</th>}
                     <th className="px-3 py-2">Symbol</th>
                     <th className="px-3 py-2 text-right">Score</th>
                     <th className="px-3 py-2 text-right">Reference</th>
@@ -343,9 +506,10 @@ export default function StrategyLab() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {ftLive?.rows.length ? ftLive.rows.map((r) => (
-                    <tr key={`${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${r.command === 'CALL' ? (r.direction === 'UP' ? 'bg-emerald-50/30' : 'bg-rose-50/30') : ''}`}>
+                  {ftRows.length ? ftRows.map((r) => (
+                    <tr key={`${r.strategyId || ''}-${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${r.command === 'CALL' ? (r.direction === 'UP' ? 'bg-emerald-50/30' : 'bg-rose-50/30') : ''}`}>
                       <td className="px-3 py-2"><FttCommandPill row={r} /></td>
+                      {multiStrategy && <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{r.strategyName || stratName(r.strategyId || '')}</td>}
                       <td className="px-3 py-2"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
                       <td className="px-3 py-2 text-right">{r.command === 'CALL' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
                       <td className="px-3 py-2 text-right font-mono text-[12px]">{r.reference != null ? num(r.reference) : '—'}</td>
@@ -353,7 +517,7 @@ export default function StrategyLab() {
                       <td className="px-3 py-2 text-[11px] text-slate-500 max-w-[280px] truncate" title={r.reason || ''}>{r.command === 'CALL' ? r.reason : ''}</td>
                     </tr>
                   )) : (
-                    <tr><td colSpan={6} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
+                    <tr><td colSpan={multiStrategy ? 7 : 6} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No calls match the current score / setup filter.' : multiStrategy ? 'No live calls across the selected strategies right now.' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
                   )}
                 </tbody>
               </table>

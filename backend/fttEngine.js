@@ -45,22 +45,16 @@ function expiryCategory(expiryMs) {
 // ── short-term momentum filters ─────────────────────────────────────
 
 function rsiTrendDirection(candles, indicators) {
-  // Look for RSI readings attached to the last 3 candles by time
-  const rsiReadings = [];
-  const sorted = [...candles].sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
-  const last3 = sorted.slice(-3);
-
-  for (const c of last3) {
-    const match = indicators.find(
-      (ind) =>
-        String(ind.indicator || ind.name || '').toUpperCase() === 'RSI' &&
-        ind.candleTime === c.time
-    );
-    if (match) {
-      const v = toNumber(match.value1 ?? match.rsi ?? match.value);
-      if (v !== null) rsiReadings.push(v);
-    }
-  }
+  // Take the most recent RSI readings directly from the indicator feed. (The old code
+  // joined RSI to candles via `ind.candleTime === c.time`, but the feed's candleTime is
+  // off-boundary / different precision than the candle's bar-open time, so the match
+  // NEVER succeeded → RSI momentum was always 0. Sort by time and take the last 3.)
+  const rsiReadings = [...indicators]
+    .filter((ind) => String(ind.indicator || ind.name || '').toUpperCase() === 'RSI')
+    .sort((a, b) => Date.parse(a.candleTime || a.time || 0) - Date.parse(b.candleTime || b.time || 0))
+    .slice(-3)
+    .map((e) => toNumber(e.value1 ?? e.rsi ?? e.value))
+    .filter((v) => v !== null);
 
   if (rsiReadings.length < 2) return { score: 0, reason: 'Insufficient RSI history' };
 
@@ -98,10 +92,15 @@ function macdHistogramMomentum(indicators) {
 function priceVsEma9(price, indicators) {
   if (price === null) return { score: 0, reason: 'No price data' };
 
-  const ema9Entry = indicators.find((ind) => {
-    const name = String(ind.indicator || ind.name || '').toUpperCase();
-    return name === 'EMA9' || name === 'EMA 9' || name === 'EMA_9';
-  });
+  // Use the LATEST EMA9. (The old `.find()` returned the FIRST match, but the indicator
+  // array is oldest-first, so it grabbed a stale EMA9 from hours ago → wrong sign.)
+  const ema9Entry = [...indicators]
+    .filter((ind) => {
+      const name = String(ind.indicator || ind.name || '').toUpperCase();
+      return name === 'EMA9' || name === 'EMA 9' || name === 'EMA_9';
+    })
+    .sort((a, b) => Date.parse(a.candleTime || a.time || 0) - Date.parse(b.candleTime || b.time || 0))
+    .pop();
 
   const ema9 = toNumber(ema9Entry?.value1);
   if (ema9 === null) return { score: 0, reason: 'EMA9 unavailable' };
@@ -520,13 +519,23 @@ export function generateFttPrediction({
   const latestCandle = aggregate.latestCandle;
   const close = toNumber(latestCandle?.close);
 
+  // Candle-pattern / volume momentum must read a COMPLETED bar — the last element of the
+  // series is usually the still-forming bar, whose body and volume are partial and flip as
+  // it builds (a noise/false-signal source). Drop a forming last bar for those two filters.
+  // (Entry price still uses the live `close` above — that part should be current.)
+  const candleTfMs = timeframeToMs(timeframe || tfConfig.entry);
+  const lastBar = candles[candles.length - 1];
+  const lastIsForming = lastBar && Number.isFinite(Date.parse(lastBar.time)) && (Date.parse(lastBar.time) + candleTfMs) > Date.now();
+  const closedCandles = lastIsForming ? candles.slice(0, -1) : candles;
+  const closedLast = closedCandles[closedCandles.length - 1] || lastBar;
+
   // 2. Apply short-term momentum filters
   const momentumFilters = [];
   momentumFilters.push(rsiTrendDirection(candles, indicators));
   momentumFilters.push(macdHistogramMomentum(indicators));
   momentumFilters.push(priceVsEma9(close, indicators));
-  momentumFilters.push(candleBodyRatio(latestCandle));
-  momentumFilters.push(volumeSpikeDetection(candles));
+  momentumFilters.push(candleBodyRatio(closedLast));
+  momentumFilters.push(volumeSpikeDetection(closedCandles));
 
   // 3. Weight momentum vs trend based on expiry category
   let momentumWeight, trendWeight;

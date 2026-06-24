@@ -21,7 +21,7 @@ import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive } from './liquidityEngine.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
-import { listStrategies, evaluateStrategy, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
+import { listStrategies, evaluateStrategy, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini } from './geminiEngine.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
 import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
@@ -1360,6 +1360,43 @@ async function loadSignalCacheFromDatabase() {
 
   // Populate the per-series analysis store from the boot-loaded candles.
   indexCandleSeriesBatch(candles);
+
+  // Per-series HTF hydration (data-load only — does NOT change any signal/scoring logic).
+  // The global "newest N" load above is dominated by fast timeframes, so higher timeframes
+  // (M15..D1) come back thin/old after a restart, leaving HTF bias/ADR stale for the first
+  // minutes. Top up each (symbol, timeframe) series with its most-recent bars so HTF reads
+  // are fresh-to-last-closed immediately on boot. Bounded per-TF caps keep memory in check;
+  // window function (MariaDB/MySQL 8+) with silent fallback if unsupported.
+  try {
+    const [htfRows] = await pool.query(
+      `SELECT * FROM (
+         SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol, timeframe ORDER BY candle_time DESC) AS rn
+         FROM mt5_candles
+         WHERE timeframe IN ('M15','M30','H1','H4','D1','W1')
+       ) t
+       WHERE t.rn <= CASE t.timeframe WHEN 'D1' THEN 60 WHEN 'W1' THEN 30 ELSE 200 END`,
+    );
+    if (htfRows.length) {
+      indexCandleSeriesBatch(htfRows.map((row) => ({
+        id: row.id,
+        symbol: row.symbol,
+        timeframe: row.timeframe,
+        time: row.candle_time ? new Date(row.candle_time).toISOString() : new Date().toISOString(),
+        open: row.open_price === null ? null : Number(row.open_price),
+        high: row.high === null ? null : Number(row.high),
+        low: row.low === null ? null : Number(row.low),
+        close: row.close_price === null ? null : Number(row.close_price),
+        volume: row.volume === null ? null : Number(row.volume),
+        spread: row.spread === null ? null : Number(row.spread),
+        receivedAt: row.received_at ? new Date(row.received_at).toISOString() : new Date().toISOString(),
+        sourceIp: row.source_ip,
+        raw: parseJsonField(row.raw_json, {}),
+      })));
+      console.log(`[MySQL] Per-series HTF candle hydration: ${htfRows.length} rows (M15..D1) for fresh bias/ADR after restart.`);
+    }
+  } catch (e) {
+    console.warn('[MySQL] Per-series HTF hydration skipped (continuing with global load):', e.message);
+  }
 
   trades.splice(0, trades.length, ...tradeRows.map((row) => ({
     id: row.id,
@@ -10252,6 +10289,80 @@ function strategyForexAdvisory(symbol, timeframe, sig) {
   return `WAIT for a pullback — ${t.message.replace(/^Wait — /, '')}. If price runs away without tagging the entry, skip it and wait for the next setup.${conv}`;
 }
 
+// Advisory trading notes — MEASURED and beginner-friendly. Plain-English guidance with
+// this trade's actual numbers, distilled from the Chart Fanatics interviews (Massi Safi —
+// "Little Rizzy"; Fabio Valentino — auction/order-flow scalping). Educational only:
+// appended to emails. Does NOT affect scoring/signals/strategies/outcomes.
+function strategyAdvisoryNotes(strategy, sig, { symbol, timeframe, fixedTime = false } = {}) {
+  const pip = pipSizeForSymbol(symbol) || 0.0001;
+  const buy = /BUY/.test(String(sig.decision));
+  const entry = Number(sig.entry), stop = Number(sig.stopLoss), tp1 = Number(sig.takeProfit1), tp3 = Number(sig.takeProfit3);
+  const pips = (a, b) => (Number.isFinite(a) && Number.isFinite(b) ? Math.round(Math.abs(a - b) / pip) : null);
+  let price = NaN;
+  try { const c = getRecentCandles(symbol, timeframe, 2); if (c && c.length) price = Number(c[c.length - 1].close); } catch { /* ignore */ }
+  const notes = [];
+
+  // D1 Stage Analysis advisory filter (Weinstein/Ted Zack). Context overlay only — it does
+  // NOT change the score, the signal, or whether the email fires. With-trend = stronger;
+  // against = weaker/skip; Stage 1 (base) / Stage 3 (top) = choppy wait zone.
+  let stageNote = null;
+  try {
+    const d1Stage = computeStage(getRecentCandles(symbol, 'D1', 70));
+    if (d1Stage) {
+      let verdict;
+      if ((buy && d1Stage.stage === 2) || (!buy && d1Stage.stage === 4)) verdict = 'WITH the dominant trend — stronger ✓';
+      else if ((buy && d1Stage.stage === 4) || (!buy && d1Stage.stage === 2)) verdict = 'AGAINST the dominant trend — weaker; consider skipping ✗';
+      else verdict = `a choppy "wait" zone (Stage ${d1Stage.stage}) — lower conviction`;
+      stageNote = `Stage filter (D1): ${d1Stage.label}. This ${buy ? 'BUY' : 'SELL'} is ${verdict}.`;
+    }
+  } catch { /* advisory best-effort */ }
+
+  if (fixedTime) {
+    // Fixed-time = a one-candle directional bet; no stop/target to manage.
+    notes.push(`This is a ONE-CANDLE bet: it wins only if price closes ${buy ? 'HIGHER' : 'LOWER'} than now by the end of this ${timeframe} candle.`);
+    notes.push('There is no stop or target to manage — it just settles at the candle close. Enter now, before the candle ends.');
+    notes.push('Skip if the market looks flat or choppy — fixed-time works best when price is clearly moving.');
+    notes.push('Quality over quantity — if it is not clear, skip it; the next one will come.');
+    if (stageNote) notes.unshift(stageNote);
+    return notes.slice(0, 5);
+  }
+
+  const riskPips = pips(entry, stop);
+  const tp1Pips = pips(tp1, entry);
+  const tp3Pips = pips(tp3, entry);
+  const rr = sig.riskRewardRatio != null ? Math.round(Number(sig.riskRewardRatio) * 10) / 10 : null;
+  const sizing = strategyLabSizing(symbol, entry, stop, { tp1, tp2: sig.takeProfit2, tp3 });
+  const lossTxt = sizing?.lossAtStop != null ? ` (≈ ${px2(sizing.lossAtStop)})` : '';
+
+  if (riskPips != null) notes.push(`Max loss ≈ ${riskPips} pips${lossTxt} if it hits the stop ${px(stop, symbol)}. That is the MOST you should lose — never move the stop further away.`);
+  if (tp1Pips != null) notes.push(`When price reaches TP1 ${px(tp1, symbol)} (+${tp1Pips} pips), move your stop to your entry ${px(entry, symbol)} — after that you cannot lose on this trade.`);
+  if (tp3Pips != null && rr != null) notes.push(`Main target TP3 ${px(tp3, symbol)} (+${tp3Pips} pips) ≈ ${rr}× your risk. Don't aim past it — reaching for more lowers your odds of being right.`);
+
+  if (strategy === 'little-rizzy') {
+    const mm = sig.meta && Number.isFinite(sig.meta.measuredMove) ? Math.round(sig.meta.measuredMove / pip) : null;
+    if (mm != null) notes.push(`Why this target: the last move was about ${mm} pips, and this pattern usually repeats that distance.`);
+    notes.push(`Price is near the ${buy ? 'bottom' : 'top'} of its recent range (Bollinger), so there is room to ${buy ? 'rise' : 'fall'} toward the target.`);
+  } else if (strategy === 'ict-breaker' || strategy === 'liquidity-trap') {
+    notes.push('Confirm first: only valid once a candle CLOSES the move — a quick wick touching the level is not enough.');
+  } else if (strategy === 'market-mechanics-3step') {
+    notes.push('Only valid with the bigger (H4) trend and at a good price zone — no location, no trade.');
+  }
+
+  // Don't-chase, measured against the live price when available.
+  const distPips = Number.isFinite(price) ? pips(price, entry) : null;
+  if (distPips != null) {
+    const atZone = distPips <= Math.max(2, Math.round((riskPips || 10) * 0.3));
+    notes.push(atZone
+      ? `Price is right at the entry (${distPips} pips away) — you can take it now.`
+      : `Don't chase: entry is ${px(entry, symbol)}, price is ${distPips} pips away. Wait for it to pull back; if it runs off without you, skip and wait for the next setup.`);
+  } else {
+    notes.push(`Don't chase: get in near ${px(entry, symbol)}. If price already ran far past it, skip and wait for the next setup.`);
+  }
+
+  if (stageNote) notes.unshift(stageNote);
+  return notes.slice(0, 6);
+}
+
 // High-score Strategy Lab signal → live popup (SSE) + optional email. Gated by score
 // so the every-timeframe scan doesn't flood; signals are already deduped per breaker.
 // `kind` (NEW / IMPROVED / RE-ENTRY / CONFIRMED) is set by the notification lifecycle so
@@ -10309,6 +10420,9 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
     `Signal made:   ${timing.made}   [candle→signal ${timing.candleToSignal}]`,
     `Email sent:    ${timing.sent}   [signal→email ${timing.signalToEmail}]`,
     `Why: ${sig.reason || ''}`,
+    '',
+    'Trader notes (advisory):',
+    ...strategyAdvisoryNotes(strategy, sig, { symbol, timeframe }).map((nNote) => `• ${nNote}`),
     'Isolated strategy-lab signal (not the main system). Advisory — not financial advice.',
   ].join('\n');
   const dirColor = /BUY/.test(sig.decision) ? '#047857' : '#b91c1c';
@@ -10329,6 +10443,10 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Email sent</td><td>${timing.sent} <span style="color:#94a3b8">· signal→email ${timing.signalToEmail}</span></td></tr>
     </table>
     <p style="font-size:12px;color:#475569;margin:6px 0 0">${sig.reason || ''}</p>
+    <div style="margin:8px 0 0;padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px">
+      <p style="margin:0 0 4px;font-size:10px;font-weight:700;letter-spacing:.1em;color:#64748b;text-transform:uppercase">Trader notes (advisory)</p>
+      <ul style="margin:0;padding-left:16px;font-size:12px;color:#475569">${strategyAdvisoryNotes(strategy, sig, { symbol, timeframe }).map((nNote) => `<li style="margin:2px 0">${nNote}</li>`).join('')}</ul>
+    </div>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Volume sized at ${sizing?.riskPercent ?? '?'}% risk on ${px2(sizing?.equity || 0)} equity, scaled to the ${timeframe} stop. Isolated strategy-lab signal — not the main system. Advisory only. — Aura Gold Strategy Lab</p></div>`;
   try {
     await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `stratlab:${id}` });
@@ -10396,6 +10514,9 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
     `Signal made:   ${timing.made}   [candle→signal ${timing.candleToSignal}]`,
     `Email sent:    ${timing.sent}   [signal→email ${timing.signalToEmail}]`,
     `Why: ${sig.reason || ''}`,
+    '',
+    'Trader notes (advisory):',
+    ...strategyAdvisoryNotes(strategy, sig, { symbol, timeframe, fixedTime: true }).map((nNote) => `• ${nNote}`),
     'Isolated strategy-lab fixed-time signal (not the main system / not the FTT engine). Advisory — not financial advice.',
   ].join('\n');
   const dirColor = ftDir === 'UP' ? '#047857' : '#b91c1c';
@@ -10413,6 +10534,10 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Email sent</td><td>${timing.sent} <span style="color:#94a3b8">· signal→email ${timing.signalToEmail}</span></td></tr>
     </table>
     <p style="font-size:12px;color:#475569;margin:6px 0 0">${sig.reason || ''}</p>
+    <div style="margin:8px 0 0;padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px">
+      <p style="margin:0 0 4px;font-size:10px;font-weight:700;letter-spacing:.1em;color:#64748b;text-transform:uppercase">Trader notes (advisory)</p>
+      <ul style="margin:0;padding-left:16px;font-size:12px;color:#475569">${strategyAdvisoryNotes(strategy, sig, { symbol, timeframe, fixedTime: true }).map((nNote) => `<li style="margin:2px 0">${nNote}</li>`).join('')}</ul>
+    </div>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Fixed-time call (direction at next-candle expiry). Isolated strategy-lab signal — not the main system or FTT engine. Advisory only. — Aura Gold Strategy Lab</p></div>`;
   try {
     await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `stratlabftt:${id}` });
@@ -10420,13 +10545,19 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
   } catch (e) { console.error('[StrategyLab] FTT email failed:', e.message); }
 }
 
+// Next-higher timeframe in the lab ladder — used for multi-timeframe stage agreement.
+const NEXT_HIGHER_TF = { M1: 'M5', M5: 'M15', M15: 'M30', M30: 'H1', H1: 'H4', H4: 'D1', D1: null };
+
 function buildStrategyContext(symbol, tf) {
   const candles = getRecentCandles(symbol, tf, 400);
   if (!candles || candles.length < 60) return null;
+  const htfTf = NEXT_HIGHER_TF[tf] || null;
+  const htfCandles = htfTf ? getRecentCandles(symbol, htfTf, 200) : null;
   return {
     symbol, timeframe: tf, candles, pip: pipSizeForSymbol(symbol),
     h4Trend: getTimeframeTrend(getRecentCandles(symbol, 'H4', 150)),
     h1Trend: getTimeframeTrend(getRecentCandles(symbol, 'H1', 150)),
+    htfTimeframe: htfTf, htfCandles,
   };
 }
 
@@ -10967,9 +11098,10 @@ app.get('/api/strategy-lab/live-ftt', (req, res) => {
         const sig = evaluateStrategy(strategy, ctx);
         if (sig && sig.decision && sig.decision !== 'HOLD') {
           const expiry = strategyLabFttExpiry(tf);
+          const ftDir = /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN';
           rows.push({
             symbol, timeframe: tf, command: 'CALL',
-            direction: /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN',
+            direction: ftDir,
             score: sig.score ?? null, grade: sig.grade ?? null,
             reference: Number.isFinite(price) ? price : null,
             expiryIso: expiry?.expiryIso ?? null, secondsToExpiry: expiry?.secondsToExpiry ?? null,
@@ -11043,6 +11175,9 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
           outcome: r.outcome, profitLossPips: num(r.profit_loss_pips), tpHitLevel: r.tp_hit_level === null ? null : Number(r.tp_hit_level),
           ftOutcome: r.ft_outcome, ftPips: num(r.ft_pips),
           ftActionable: (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; return (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, r.timeframe, st) : null; })(),
+          // Real fixed-time expiry (signal-bar close + expiry candles) so the live "just fired"
+          // panel can show a true countdown and drop a call once its expiry has passed.
+          ftExpiryIso: (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const tfMs = (timeframeMinutes(r.timeframe) || 0) * 60000; return (Number.isFinite(bt) && tfMs > 0) ? new Date(bt + STRATEGY_LAB_FT_EXPIRY_BARS * tfMs).toISOString() : null; })(),
           live: strategyLabFtLivePosition(r),
           popupSent: r.popup_sent === null || r.popup_sent === undefined ? null : !!r.popup_sent,
           emailSent: r.email_sent === null || r.email_sent === undefined ? null : !!r.email_sent,
@@ -11064,6 +11199,37 @@ app.get('/api/strategy-lab/performance', async (req, res) => {
       ok: true, ...perf,
       note: 'Each strategy is isolated (never blended with the live system). Scored two ways: forex (TP/SL) and fixed-time (direction at next-candle expiry). A strategy/timeframe is only trustworthy once its sample confidence is usable — don\'t crown a winner on a thin sample.',
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// TEMP test utility: render the REAL strategy-lab advisory emails (forex + fixed-time)
+// from a sample signal so you can preview the format. POST /api/strategy-lab/test-email
+// ?strategy=&symbol=&timeframe=&dir=BUY|SELL . Safe to remove — sends only to the
+// configured alert recipient; does not log, score, or affect any strategy.
+app.post('/api/strategy-lab/test-email', async (req, res) => {
+  try {
+    const strategy = req.query.strategy ? String(req.query.strategy) : 'little-rizzy';
+    const symbol = (req.query.symbol ? String(req.query.symbol) : 'EURUSDM').toUpperCase();
+    const tf = (req.query.timeframe ? String(req.query.timeframe) : 'M30').toUpperCase();
+    const buy = String(req.query.dir || 'SELL').toUpperCase() === 'BUY';
+    // Realistic forex sample (EURUSD-style numbers): measured-move continuation.
+    const entry = 1.08500;
+    const stop = buy ? 1.08320 : 1.08680;
+    const tp1 = buy ? 1.08680 : 1.08320;
+    const tp2 = buy ? 1.08860 : 1.08140;
+    const tp3 = buy ? 1.09800 : 1.07200;
+    const sig = {
+      decision: buy ? 'BUY' : 'SELL', score: 88, grade: 'A+',
+      entry, stopLoss: stop, takeProfit1: tp1, takeProfit2: tp2, takeProfit3: tp3,
+      riskRewardRatio: Math.round((Math.abs(entry - tp3) / Math.abs(stop - entry)) * 100) / 100,
+      reason: 'TEST sample — pullback to a lower/higher extreme after an impulse; measured-move continuation',
+      barIso: new Date().toISOString(),
+      meta: { measuredMove: Math.abs(entry - tp3), bbMid: 1.0855, bbUpper: 1.0875, bbLower: 1.0835, legAgeBars: 1 },
+    };
+    const id = `test:${Date.now()}`;
+    await emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: false, email: true, kind: 'NEW' });
+    await emitStrategyLabFttSignal({ id: `${id}:ftt`, strategy, symbol, timeframe: tf, sig, refClose: entry, popup: false, email: true, kind: 'NEW' });
+    res.json({ ok: true, sentTo: SIGNAL_ALERT_EMAIL_TO, alertsEnabled: SIGNAL_ALERTS_ENABLED, strategy, symbol, timeframe: tf, dir: buy ? 'BUY' : 'SELL' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -11849,6 +12015,3 @@ server.on('upgrade', async (request, socket, head) => {
     socket.destroy();
   }
 });
-
-// TEMP restart trigger (2026-06-23): bumped to pick up STRATEGY_LAB_SCAN_MS=60000 for a
-// faster live-call demo. Safe to remove together with the env line when reverting.

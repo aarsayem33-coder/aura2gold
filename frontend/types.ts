@@ -618,6 +618,7 @@ export interface StrategySignal {
   ftOutcome: string;
   ftPips: number | null;
   ftActionable?: boolean | null;
+  ftExpiryIso?: string | null;
   live?: { currentPrice: number; reference: number; pips: number; status: 'WINNING' | 'LOSING' | 'FLAT' } | null;
   popupSent?: boolean | null;
   emailSent?: boolean | null;
@@ -667,6 +668,8 @@ export interface StrategyPerformanceResponse {
 export interface StrategyLiveRow {
   symbol: string;
   timeframe: string;
+  strategyId?: string;   // set client-side when merging a multi-strategy live view
+  strategyName?: string;
   command: 'ENTRY' | 'HOLD' | 'NO_DATA';
   direction?: string;
   score?: number | null;
@@ -691,6 +694,8 @@ export interface StrategyLiveResponse {
 export interface StrategyFttLiveRow {
   symbol: string;
   timeframe: string;
+  strategyId?: string;   // set client-side when merging a multi-strategy live view
+  strategyName?: string;
   command: 'CALL' | 'HOLD' | 'NO_DATA';
   direction?: 'UP' | 'DOWN';
   score?: number | null;
