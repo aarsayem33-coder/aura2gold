@@ -1029,3 +1029,139 @@ export async function analyzeAiSignalsWithGemini({
     return fallback;
   }
 }
+
+// ─── AI CHART IMAGE ANALYSIS (vision) ─────────────────────────────────────
+// Reads an uploaded chart screenshot with Gemini vision and RECONCILES the read
+// against the deterministic GROUND TRUTH (live symbol|timeframe math) passed in.
+// On any failure (no auth, fetch error, non-OK, parse fail) it returns
+// { available:false } so the route can fall back to pure system analysis. This
+// function is read-only and isolated — it never touches live signal scoring.
+
+function buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth }) {
+  const gt = groundTruth || {};
+  return `${TRADER_DOCTRINE}
+
+=== TASK: CHART IMAGE ANALYSIS (VISION) ===
+The user uploaded a CHART SCREENSHOT for ${symbol} on the ${timeframe} timeframe.
+Trade mode requested: ${tradeMode}.
+
+STEP 1 — READ THE IMAGE: identify candlesticks, swing structure (HH/HL/LH/LL), the
+trend, support/resistance zones, notable chart/candle patterns, and any BREAKOUT
+(PRE = compressing into a level, or CONFIRMED = a candle closed decisively beyond it).
+
+STEP 2 — RECONCILE WITH GROUND TRUTH: a deterministic engine already analysed the LIVE
+${symbol} ${timeframe} data. Treat its numeric levels as ground truth. For any PRICE you
+output (entry/SL/TP/level), PREFER these live numbers; only use a value read from the
+image if the engine has nothing, and then mark it approximate. If the image clearly
+disagrees with the live math (e.g. a stale screenshot), say so and trust the live data.
+
+--- DETERMINISTIC GROUND TRUTH (live ${symbol} ${timeframe}) ---
+${JSON.stringify(gt, null, 2)}
+
+RULES:
+- Apply the capital-protection doctrine. "NO TRADE / WAIT" is valid. Confidence <= 95, never a guarantee.
+- Forex plan: entry, logical stop loss (structural invalidation), TP1/TP2/TP3, reward:risk >= 1.5. (Lot size is recomputed by the server — you may omit it.)
+- FTT plan: direction (UP/DOWN/HOLD), a suitable expiry + timeframe, an estimate of how many candles price tends to stay in that direction (use the ground-truth persistence estimate), and a conditional time trigger ("at <time> trade only if price ABOVE/BELOW <level>, else ignore"). Use the ground-truth timeTrigger when present.
+- Report a breakout read (phase + direction + the level), reconciled with the ground-truth breakout.
+
+Return STRICT JSON ONLY:
+{
+  "verdict": "TRADE_ALLOWED|WAIT|NO_TRADE|TRADE_REJECTED",
+  "confidence": 0-95,
+  "detection": {
+    "trend": "BULLISH|BEARISH|RANGING|UNCLEAR",
+    "structure": ["short structure notes (HH/HL/BOS/CHoCH/sweep)"],
+    "srZones": [{"type":"SUPPORT|RESISTANCE","level":number,"note":"string"}],
+    "patterns": ["e.g. bull flag, double top"],
+    "breakout": {"phase":"NONE|PRE|CONFIRMED","direction":"UP|DOWN|NONE","level":number}
+  },
+  "forexPlan": {"decision":"BUY|SELL|HOLD","entry":number,"stopLoss":number,"takeProfit1":number,"takeProfit2":number,"takeProfit3":number,"riskReward":number,"invalidation":"string"},
+  "fttPlan": {"direction":"UP|DOWN|HOLD","expiry":"2m|3m|5m|15m|30m|1h","suggestedTimeframe":"M1|M5|M15|M30|H1","expectedCandlesInDirection":number,"timeTrigger":{"atLabel":"string","condition":"ABOVE|BELOW","level":number,"elseAction":"IGNORE"}},
+  "reasoning": "concise professional write-up: image read, reconciliation with live math, invalidation, expectancy, final verdict",
+  "key_factors": ["..."]
+}`;
+}
+
+export async function analyzeChartImageWithGemini({
+  projectId, location = 'global', model = 'gemini-2.5-flash',
+  imageBase64, mimeType = 'image/jpeg', symbol, timeframe, tradeMode = 'BOTH', groundTruth = {},
+}) {
+  const unavailable = { available: false };
+  if (!isGeminiConfigured(projectId) || !imageBase64) return unavailable;
+
+  const prompt = buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth });
+
+  let response;
+  try {
+    response = await geminiGenerateContent({
+      projectId,
+      location,
+      model,
+      contents: [{ role: 'user', parts: [
+        { text: prompt },
+        { inlineData: { mimeType, data: imageBase64 } },
+      ] }],
+      generationConfig: {
+        temperature: 0.2,
+        topP: 0.95,
+        maxOutputTokens: 8192,
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    });
+  } catch (error) {
+    console.error(`[Chart Vision Gemini] Request failed (${geminiAuthMode()}):`, error.message);
+    return unavailable;
+  }
+
+  if (!response.ok) {
+    const message = await response.text().catch(() => '');
+    if (model === 'gemini-2.5-pro') {
+      console.warn(`[Chart Vision Gemini] pro failed (${response.status}); retrying with flash.`);
+      return analyzeChartImageWithGemini({ projectId, location, model: 'gemini-2.5-flash', imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth });
+    }
+    console.error(`[Chart Vision Gemini] API error ${response.status}:`, message);
+    return unavailable;
+  }
+
+  try {
+    const data = await response.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+    const parsed = JSON.parse(stripCodeFences(text));
+
+    const verdict = String(parsed.verdict || '').toUpperCase();
+    const fx = parsed.forexPlan || {};
+    let fxDecision = normalizeDecision(fx.decision);
+    let fttDir = String(parsed.fttPlan?.direction || 'HOLD').toUpperCase();
+    if (['NO_TRADE', 'WAIT', 'TRADE_REJECTED'].includes(verdict)) { fxDecision = 'HOLD'; fttDir = 'HOLD'; }
+
+    return {
+      available: true,
+      verdict: verdict || null,
+      confidence: capConfidence(parsed.confidence ?? 50),
+      detection: parsed.detection || {},
+      forexPlan: {
+        decision: fxDecision,
+        entry: fx.entry ?? null,
+        stopLoss: fx.stopLoss ?? null,
+        takeProfit1: fx.takeProfit1 ?? null,
+        takeProfit2: fx.takeProfit2 ?? null,
+        takeProfit3: fx.takeProfit3 ?? null,
+        riskReward: fx.riskReward ?? null,
+        invalidation: fx.invalidation ? enforceHonesty(String(fx.invalidation)) : null,
+      },
+      fttPlan: {
+        direction: ['UP', 'DOWN', 'HOLD'].includes(fttDir) ? fttDir : 'HOLD',
+        expiry: parsed.fttPlan?.expiry ?? null,
+        suggestedTimeframe: parsed.fttPlan?.suggestedTimeframe ?? null,
+        expectedCandlesInDirection: parsed.fttPlan?.expectedCandlesInDirection ?? null,
+        timeTrigger: parsed.fttPlan?.timeTrigger ?? null,
+      },
+      reasoning: enforceHonesty(String(parsed.reasoning || 'No reasoning provided.')),
+      key_factors: (Array.isArray(parsed.key_factors) ? parsed.key_factors : []).map((f) => enforceHonesty(String(f))),
+    };
+  } catch (error) {
+    console.error('[Chart Vision Gemini] Failed to parse response:', error.message);
+    return unavailable;
+  }
+}

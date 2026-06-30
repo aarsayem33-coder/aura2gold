@@ -21,6 +21,7 @@ export default function ForexOutcomes() {
   const [error, setError] = useState<string | null>(null);
   const [reports, setReports] = useState<SignalEmailReport[]>([]);
   const [summary, setSummary] = useState<TradeReportSummary | null>(null);
+  const [forexActive, setForexActive] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -29,6 +30,7 @@ export default function ForexOutcomes() {
       const res = await fetchForexEmailReports({ ...rangeToParams(range), limit: 300 });
       setReports(res.reports);
       setSummary(res.summary);
+      setForexActive(res.forexActive !== false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load forex outcomes');
     } finally {
@@ -48,7 +50,7 @@ export default function ForexOutcomes() {
     <div className="space-y-6">
       <ReportsHeader
         title="Forex Outcomes"
-        subtitle="Tracked outcomes for forex trade alerts sent by email"
+        subtitle="Outcomes for ALL forex setups (emailed + filtered) from the system signal log — gated by the Forex Scanner toggle"
         range={range} setRange={setRange} onRefresh={() => void load()} loading={loading}
       />
       <ReportsTabs />
@@ -139,8 +141,17 @@ export default function ForexOutcomes() {
         {!loading && !filtered.length && (
           <div className="p-12 text-center">
             <TrendingDown size={32} className="mx-auto text-slate-300 mb-3" />
-            <p className="text-sm font-medium text-slate-400">No emailed forex signals in this period yet.</p>
-            <p className="text-xs text-slate-400 mt-1">Reports are created when the scanner sends alert emails.</p>
+            {forexActive ? (
+              <>
+                <p className="text-sm font-medium text-slate-400">No forex signals in this period yet.</p>
+                <p className="text-xs text-slate-400 mt-1">Outcomes populate as the system logs forex setups and they resolve.</p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm font-medium text-slate-400">Forex tracking is turned OFF.</p>
+                <p className="text-xs text-slate-400 mt-1">Turn the <b>Forex Scanner</b> toggle on in Notification Settings to track forex outcomes here.</p>
+              </>
+            )}
           </div>
         )}
       </div>

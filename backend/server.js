@@ -19,12 +19,14 @@ import { WebSocketServer, WebSocket } from 'ws';
 import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
-import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive } from './liquidityEngine.js';
+import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
-import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini } from './geminiEngine.js';
+import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
+import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
 import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
+import { buildBreakoutCandidate, breakoutFollowThrough, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
 import { computeProjections } from './projectionEngine.js';
 import { evaluateTrackedProjection, extractInvalidationPrice } from './trackedProjectionEngine.js';
 import { setEconomicEvents, upsertEvents, getEconomicEvents, getStore as getCalendarStore, getUpcomingForSymbol, startCalendarFallback, fetchTradingEconomicsOnce } from './economicCalendar.js';
@@ -628,6 +630,34 @@ async function initializeDatabase() {
         )
       `);
 
+      // Breakout alerts: compact record of every graded breakout alert that was
+      // emitted (PRE/CONFIRMED), for a track record + dedup audit. Deliberately
+      // tiny (no blobs) and retention-pruned so it never re-bloats the DB.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_breakout_alerts (
+          id VARCHAR(120) PRIMARY KEY,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          phase VARCHAR(12) NOT NULL,
+          direction VARCHAR(8) NOT NULL,
+          grade VARCHAR(2) NOT NULL,
+          score DECIMAL(5,1) NOT NULL,
+          trend VARCHAR(8) NULL,
+          level DOUBLE NULL,
+          level_strength INT NULL,
+          price DOUBLE NULL,
+          atr DOUBLE NULL,
+          distance_atr DECIMAL(6,2) NULL,
+          body_atr DECIMAL(6,2) NULL,
+          displacement TINYINT(1) NOT NULL DEFAULT 0,
+          channel VARCHAR(16) NOT NULL,
+          bar_time DATETIME(3) NULL,
+          created_at DATETIME(3) NOT NULL,
+          KEY idx_bk_symbol_tf (symbol, timeframe),
+          KEY idx_bk_created (created_at)
+        )
+      `);
+
       // Execution forecasts: one CURRENT forecast row per (symbol, timeframe),
       // upserted each hourly scan. Predicts WHEN a favorable setup becomes
       // executable. Deliberately compact (no LONGTEXT blob) and retention-pruned
@@ -763,6 +793,15 @@ async function initializeDatabase() {
       // surfaced as a live popup and/or sent by email when it was first logged.
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'popup_sent', 'TINYINT NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'email_sent', 'TINYINT NULL');
+      // AS-TRADED fixed-time outcome (realistic): reference = the LIVE price captured when the
+      // signal fired (at_ref_price), expiry = signal_time + one TF candle. Settled close-to-the-
+      // expiry-instant. Distinct from the idealized ft_outcome (signal-bar close → next-bar close).
+      // at_ref_price NULL = logged before this feature → never settled (no sub-bar history).
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_ref_price', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_outcome', 'VARCHAR(16) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_exit_price', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_pips', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_expiry_time', 'DATETIME(3) NULL');
 
       return pool;
     })().catch((error) => {
@@ -1067,10 +1106,11 @@ async function persistAccountSnapshot(snapshot) {
       // payload, ~600KB each) were filling the DB. Scoring uses the in-memory live
       // snapshot, and the boot-restore only needs the scalar columns above, so we
       // no longer persist these blobs. (Nothing reads them except a brief boot seed
-      // that the first heartbeat overwrites within seconds.)
+      // that the first heartbeat overwrites within seconds.) raw_json is NOT NULL in
+      // the schema, so write '{}' (same trick as candles) rather than null.
       null,
       null,
-      null,
+      '{}',
     ]
   );
 }
@@ -1581,60 +1621,94 @@ function latestByDate(items, getValue) {
 }
 
 function isWeekend() {
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Dhaka',
-    hour12: false,
-    weekday: 'short',
-    hour: 'numeric',
-  });
-  const parts = formatter.formatToParts(new Date());
-  const partMap = Object.fromEntries(parts.map(p => [p.type, p.value]));
-  
-  const weekday = partMap.weekday; // "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
-  const hour = Number(partMap.hour);
-  
-  // Market closes Friday 22:00 UTC, which is Saturday 04:00 AM in Dhaka
-  // Market opens Sunday 22:00 UTC, which is Monday 04:00 AM in Dhaka
-  
-  if (weekday === 'Sat') {
-    return hour >= 4; // closed after 4 AM Saturday
-  }
-  if (weekday === 'Sun') {
-    return true; // closed all day Sunday
-  }
-  if (weekday === 'Mon') {
-    return hour < 4; // closed before 4 AM Monday
-  }
-  
-  return false;
+  // Forex trades ~24/5: it CLOSES Friday 17:00 and REOPENS Sunday 17:00 America/New_York.
+  // Deriving the boundary from the New York session clock makes it DST-correct year-round:
+  //   Fri 17:00 NY = 21:00 UTC = ~03:00 BD in summer (EDT) / 22:00 UTC = ~04:00 BD in winter (EST).
+  // A fixed Dhaka hour (the old "4 AM") drifts an hour with US daylight saving, so we read the
+  // NY clock directly instead.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour12: false, weekday: 'short', hour: '2-digit',
+  }).formatToParts(new Date());
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const weekday = map.weekday;          // "Sun" … "Sat"
+  const hour = Number(map.hour) % 24;   // 0..23 (Intl can emit "24" at midnight)
+
+  if (weekday === 'Sat') return true;          // all Saturday = closed
+  if (weekday === 'Fri') return hour >= 17;    // Friday from 17:00 NY = closed
+  if (weekday === 'Sun') return hour < 17;     // Sunday before 17:00 NY = still closed
+  return false;                                // Mon–Thu = open
 }
 
-function isCandleCurrent(candle, timeframe) {
-  if (!candle) return false;
-  if (isWeekend()) return true; // Bypass freshness check during weekends (market closed)
+// Forex market open/closed state, derived from the NY session boundary in isWeekend().
+// Single source of truth for "is the market trading right now". The UI uses this to show
+// "Market Closed" (an expected, non-error state) as distinct from "Disconnected" (an actual
+// telemetry problem). Kept separate from candle freshness on purpose: freshness reflects data
+// FLOW (is MT5 streaming), marketStatus reflects the trading CALENDAR (is it a session) — and
+// both must hold for a live signal, because some brokers stream fresh synthetic weekend bars.
+function getForexMarketStatus() {
+  const closed = isWeekend();
+  return {
+    open: !closed,
+    state: closed ? 'CLOSED' : 'OPEN',
+    reason: closed
+      ? 'Forex market is closed for the weekend (Fri 17:00 – Sun 17:00 New York ≈ Sat 03:00 – Mon 03:00 BD, DST-aware). Live signals resume when the market reopens.'
+      : 'Forex market is open.',
+  };
+}
 
-  // Use the backend receive time (when the candle last arrived from MT5) rather than
-  // the candle open time, which would wrongly age out candles whose open is hours ago
-  // but whose close data is still being streamed (e.g. D1 candles, H4 candles).
-  // Fall back to candle.time only when no receive timestamp is available.
-  const receiveTimeStr = candle.receivedAt || candle.raw?.receivedAt;
-  const referenceMs = receiveTimeStr
-    ? new Date(receiveTimeStr).getTime()
+// HARD weekend guard for EMISSION: when the market is calendar-closed, no LIVE signal may be
+// emitted (email / popup / topbar / SSE) or surfaced as actionable — even if the broker streams
+// fresh weekend bars (so candleFreshness() alone would pass). Background scanning + DB logging
+// still run, so strategy ranking / system signal log stay intact. This is the chokepoint every
+// emit path checks in addition to its existing freshness gate.
+function liveSignalsAllowed() {
+  return getForexMarketStatus().open === true;
+}
+
+// SINGLE SOURCE OF TRUTH for "did this candle come from a live MT5 feed?".
+// Returns the four observability fields every signal-bearing response should expose so the
+// gating logic can never drift between paths and a consumer can always see, per row, whether
+// the data is live or stored:
+//   dataFresh        — boolean gate (true = safe to act / alert)
+//   sourceReceivedAt — when MT5 last pushed this candle (or null)
+//   staleSeconds     — age of that receive vs now (null if unknown)
+//   marketStatus     — open/closed weekend state (expected-closed vs actual-disconnect)
+//
+// NOTE: there is intentionally NO weekend bypass. When the forex market is closed MT5 stops
+// streaming, so the latest stored candle is Friday's frozen bar. Treating that as "current"
+// would let scanners generate live BUY/SELL signals from stale data even though the market is
+// shut. Freshness must reflect real data flow; market-closed state is surfaced separately.
+function candleFreshness(candle, timeframe) {
+  const marketStatus = getForexMarketStatus();
+  if (!candle) return { dataFresh: false, sourceReceivedAt: null, staleSeconds: null, marketStatus };
+
+  // Use the backend receive time (when the candle last arrived from MT5) rather than the
+  // candle open time, which would wrongly age out candles whose open is hours ago but whose
+  // close data is still being streamed (e.g. D1, H4). Fall back to candle.time only when no
+  // receive timestamp is available.
+  const sourceReceivedAt = candle.receivedAt || candle.raw?.receivedAt || null;
+  const referenceMs = sourceReceivedAt
+    ? new Date(sourceReceivedAt).getTime()
     : new Date(candle.time).getTime();
 
-  if (isNaN(referenceMs)) return false;
+  if (Number.isNaN(referenceMs)) return { dataFresh: false, sourceReceivedAt, staleSeconds: null, marketStatus };
 
-  const nowMs = Date.now();
-  const diffSec = (nowMs - referenceMs) / 1000;
+  const diffSec = (Date.now() - referenceMs) / 1000;
+  // Stale if the backend hasn't received an update within the heartbeat timeout (default 120s),
+  // hard-capped at 5 minutes.
+  const MAX_STALE_SEC = Math.min(CONNECTION_TIMEOUT_MS / 1000, 300);
 
-  // Candle data is stale if the backend hasn't received an update in more than 3× the
-  // snapshot interval (5s × 3 = 15s for active symbol) or at most 5 minutes.
-  const MAX_STALE_SEC = Math.min(
-    CONNECTION_TIMEOUT_MS / 1000, // same as heartbeat timeout (default 120s)
-    300                            // hard cap at 5 minutes
-  );
+  return {
+    dataFresh: diffSec >= 0 && diffSec <= MAX_STALE_SEC,
+    sourceReceivedAt,
+    staleSeconds: Math.round(diffSec),
+    marketStatus,
+  };
+}
 
-  return diffSec >= 0 && diffSec <= MAX_STALE_SEC;
+// Thin boolean wrapper — all the existing scanner gates keep calling this unchanged.
+function isCandleCurrent(candle, timeframe) {
+  return candleFreshness(candle, timeframe).dataFresh;
 }
 
 function compareTimeDescending(timeA, timeB) {
@@ -2492,6 +2566,7 @@ function getMt5Status() {
 
   return {
     connected,
+    marketStatus: getForexMarketStatus(),
     lastHeartbeatAt: connected ? mt5State.lastHeartbeatAt : null,
     lastSignalAt: mt5State.lastSignalAt,
     account: connected ? mt5State.account : null,
@@ -2979,6 +3054,11 @@ app.get('/api/trade-news/fixed', (req, res) => {
 // Latest cached FOREX system signals (non-HOLD) from the background scanner — instant read
 // for the Future Predictions page's "Forex Trade Signals" section. No news dependency.
 app.get('/api/signals/latest', (req, res) => {
+  // Calendar gate: surface NO actionable forex signals while the market is closed (weekend),
+  // even if the cache holds setups computed from fresh weekend bars.
+  if (!liveSignalsAllowed()) {
+    return res.json({ signals: [], count: 0, marketClosed: true, generatedAt: new Date().toISOString(), status: getMt5Status() });
+  }
   const minGradeRank = SIGNAL_ALERT_MIN_GRADE_RANK; // B+ by default
   const out = [];
   const seen = new Set();
@@ -3400,6 +3480,124 @@ app.post('/api/mt5/snapshot', async (req, res) => {
   sendStreamEvent('snapshot', { signals: [], candles: [], trades: [], indicators: [], counts: storedCounts, status });
   sendStreamEvent('status', status);
   res.status(201).json({ ok: true, counts: storedCounts, status, activeSymbol: mt5State.activeSymbol, activeTimeframe: mt5State.activeTimeframe });
+});
+
+// ── AI Chart Image analysis (vision) ─────────────────────────────────────────
+// Upload a chart screenshot → Gemini vision detects structure/S-R/breakout and gives a
+// forex + fixed-time plan, RECONCILED with the live symbol|timeframe math. If Gemini is
+// unavailable it falls back to pure deterministic system analysis of the LIVE data (it
+// cannot read the image without a vision model). READ-ONLY + ISOLATED: it reuses the live
+// engines but never writes signals, never changes scoring, never touches the scanners.
+app.post('/api/ai/analyze-chart', async (req, res) => {
+  try {
+    const body = parseMt5Body(req.body);
+    const imageBase64 = String(body.imageBase64 || body.image || '').replace(/^data:[^;]+;base64,/, '');
+    const mimeType = String(body.mimeType || 'image/jpeg');
+    const tradeMode = String(body.tradeMode || 'BOTH').toUpperCase();
+    const rawSymbol = String(body.symbol || '').trim();
+    const timeframe = String(body.timeframe || 'M15').toUpperCase();
+    if (!rawSymbol) return res.status(400).json({ error: 'symbol is required — it grounds the AI read and powers the deterministic fallback.' });
+
+    // Resolve the real broker symbol case-insensitively (Trap #2).
+    const status = getMt5Status();
+    const availableSymbols = Array.from(new Set([...(status.symbols || []), ...signals.map((s) => s.symbol), ...candles.map((c) => c.symbol)].filter(Boolean)));
+    const symbol = availableSymbols.find((s) => s.toUpperCase() === rawSymbol.toUpperCase()) || rawSymbol;
+
+    const candleList = getRecentCandles(symbol, timeframe, 300);
+    if (!candleList || candleList.length < 30) {
+      return res.status(400).json({ error: `Not enough live candle data for ${symbol} ${timeframe}. Pick a streamed symbol/timeframe (needed to ground the AI and run the fallback).` });
+    }
+
+    // Freshness stamp: this is an ON-DEMAND, user-initiated analysis, so we LABEL rather than
+    // block — a weekend/last-session chart can still be studied, but the response says plainly
+    // whether the underlying math ran on live or stored candles.
+    const fresh = candleFreshness(candleList[candleList.length - 1], timeframe);
+
+    // ── Deterministic GROUND TRUTH from the live engines (read-only) ──
+    const indicators = getRecentIndicators(symbol, timeframe, 500);
+    const h4Candles = getRecentCandles(symbol, 'H4', 150);
+    const h1Candles = getRecentCandles(symbol, 'H1', 150);
+    const signalSummary = aggregateSignals({ symbol, timeframe, candles: candleList, indicators, marketLevels: [], accountSnapshot: mt5State.accountSnapshot, h4Candles, h1Candles });
+    const sd = signalSummary.systemDecision || {};
+    const fttPrediction = generateFttPrediction({ symbol, expiry: '5m', timeframe, candles: candleList, indicators, marketLevels: [], accountSnapshot: mt5State.accountSnapshot, h4Candles, h1Candles });
+    const breakout = buildBreakoutCandidate({ symbol, timeframe, candles: candleList });
+    const sizing = strategyLabSizing(symbol, sd.entryPrice, sd.stopLoss, { tp1: sd.takeProfit1, tp2: sd.takeProfit2, tp3: sd.takeProfit3 });
+
+    // Enabled strategies' read (so the decision "can use strategies" — respects the controller).
+    let strategies = [];
+    try {
+      const ctx = buildStrategyContext(symbol, timeframe);
+      if (ctx) {
+        strategies = enabledStrategyIds().map((id) => {
+          const sig = evaluateStrategy(id, ctx);
+          return sig && sig.decision && sig.decision !== 'HOLD'
+            ? { id, name: STRATEGY_LAB_REGISTRY[id]?.name || id, decision: sig.decision, score: sig.score ?? null, grade: sig.grade ?? null }
+            : null;
+        }).filter(Boolean);
+      }
+    } catch { /* strategies are advisory; never block the analysis */ }
+
+    const dir = normalizeChartDir(fttPrediction.direction) !== 'NONE' ? normalizeChartDir(fttPrediction.direction) : normalizeChartDir(sd.decision);
+    const persistence = estimateDirectionalPersistence(candleList, dir);
+    const level = pickTriggerLevel({ breakout, supportResistance: sd.supportResistance, direction: dir, price: sd.entryPrice });
+    const timeTrigger = buildConditionalTimeTrigger({ candles: candleList, timeframe, level, direction: dir, timezone: process.env.APP_TIME_ZONE || 'Asia/Dhaka' });
+
+    const groundTruth = {
+      systemDecision: { decision: sd.decision, entry: sd.entryPrice, stopLoss: sd.stopLoss, takeProfit1: sd.takeProfit1, takeProfit2: sd.takeProfit2, takeProfit3: sd.takeProfit3, riskReward: sd.riskRewardRatio, grade: sd.grade, regime: sd.regime, htfBias: sd.htfBias, confidence: sd.confidence },
+      supportResistance: sd.supportResistance || { support: [], resistance: [] },
+      breakout, persistence, timeTrigger,
+      ftt: { direction: fttPrediction.direction, confidence: fttPrediction.confidence, timeframeMapping: fttPrediction.indicators?.timeframeMapping || null },
+      suggestedLots: sizing?.suggestedLots ?? null,
+      strategies,
+    };
+
+    // Deterministic fallback (built once; used if Gemini can't read the image).
+    const systemAnalysis = buildSystemChartAnalysis({ symbol, timeframe, tradeMode, systemDecision: sd, fttPrediction, breakout, sizing, candles: candleList, strategies, supportResistance: sd.supportResistance, timezone: process.env.APP_TIME_ZONE || 'Asia/Dhaka' });
+
+    // ── PRIMARY: Gemini vision ──
+    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: GEMINI_MODEL, imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth });
+
+    if (vision.available) {
+      // Recompute lots server-side from the vision entry/SL (never trust the model's lot).
+      const vSizing = strategyLabSizing(symbol, vision.forexPlan?.entry, vision.forexPlan?.stopLoss, { tp1: vision.forexPlan?.takeProfit1, tp2: vision.forexPlan?.takeProfit2, tp3: vision.forexPlan?.takeProfit3 });
+      const forexPlan = (tradeMode === 'FTT') ? null : {
+        ...vision.forexPlan,
+        lots: vSizing?.suggestedLots ?? sizing?.suggestedLots ?? null,
+        stopPips: vSizing?.stopPips ?? null,
+        lossAtStop: vSizing?.lossAtStop ?? null,
+      };
+      const fttPlan = (tradeMode === 'FOREX') ? null : {
+        ...vision.fttPlan,
+        expectedCandlesInDirection: vision.fttPlan?.expectedCandlesInDirection ?? persistence.expectedCandles,
+        persistenceRange: persistence.p25 != null ? { low: persistence.p25, high: persistence.p75, basis: persistence.basis } : null,
+        timeTrigger: vision.fttPlan?.timeTrigger ?? timeTrigger,
+      };
+      return res.json({
+        ok: true, source: 'gemini-vision', symbol, timeframe, tradeMode,
+        verdict: vision.verdict, confidence: vision.confidence,
+        detection: vision.detection, forexPlan, fttPlan,
+        breakout: systemAnalysis.breakout, strategies,
+        reasoning: vision.reasoning, keyFactors: vision.key_factors,
+        system: systemAnalysis, // deterministic read alongside, for comparison
+        dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds, marketStatus: fresh.marketStatus,
+        honesty: [
+          `Chart read by Gemini vision, reconciled with live ${symbol} ${timeframe} math. Lots recomputed server-side. Estimates, not guarantees.`,
+          ...(fresh.dataFresh ? [] : [`Underlying ${symbol} ${timeframe} candles are NOT live (${fresh.marketStatus.state === 'CLOSED' ? 'market closed' : 'feed stale'}, last data ${fresh.staleSeconds}s ago) — treat as last-session study, not a live signal.`]),
+        ],
+      });
+    }
+
+    // ── FALLBACK: deterministic system analysis of the LIVE data (not the image) ──
+    return res.json({
+      ok: true, source: 'system-fallback', symbol, timeframe, tradeMode,
+      ...systemAnalysis,
+      dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds, marketStatus: fresh.marketStatus,
+      note: `AI vision unavailable — analysed ${fresh.dataFresh ? 'live' : (fresh.marketStatus.state === 'CLOSED' ? 'last-session (market closed)' : 'stale')} ${symbol} ${timeframe} data, not your uploaded image.`,
+    });
+  } catch (error) {
+    console.error('[AI Chart] analyze-chart failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/ai/analyze', async (req, res) => {
@@ -4485,7 +4683,22 @@ app.get('/api/reports/forex', async (req, res) => {
     const outcome = req.query.outcome ? String(req.query.outcome).toUpperCase() : null;
     const limit = req.query.limit ? Number(req.query.limit) : 200;
     const win = preset ? reportDateWindow({ preset }) : null;
-    const reports = await querySignalEmailReports('forex', { symbol, days: win ? null : days, from: win ? win.from : null, to: win ? win.to : null, outcome, limit });
+    // Forex Outcomes tracks BOTH emailed and non-emailed forex setups, sourced from the
+    // system signal log — but gated by the Forex Scanner toggle. Forex OFF → report is
+    // intentionally empty ("if I turned off forex, do not report"); forex ON → read the
+    // full log and report every forex signal's outcome (emailed flag preserved per row).
+    const forexActive = loadEmailAlertSettings().forexScanner !== false;
+    let reports = [];
+    if (forexActive) {
+      const { rows } = await querySystemSignalLog({ symbol, days: win ? null : days, from: win ? win.from : null, to: win ? win.to : null, outcome, limit: Math.min(Math.max(Number(limit) || 200, 1), 1000) });
+      reports = rows.map((r) => ({
+        id: r.id, signalType: 'forex', symbol: r.symbol, timeframe: r.timeframe, direction: r.direction,
+        entryPrice: r.entryPrice, exitPrice: r.exitPrice, stopLoss: r.stopLoss, takeProfit1: r.takeProfit1,
+        profitLossPips: r.profitLossPips, confidence: r.confidence, grade: r.grade, outcome: r.outcome,
+        signalTime: r.signalTime, resolvedAt: r.resolvedAt, emailSentAt: null, emailed: r.emailed, alertDelaySeconds: null,
+        payload: { ...(r.payload || {}), signalQuality: r.signalQuality, strategyType: r.strategyType },
+      }));
+    }
     const stats = buildGroupedStats(
       reports,
       ['symbol', 'timeframe', 'direction', 'grade', 'confidenceBucket'],
@@ -4515,6 +4728,7 @@ app.get('/api/reports/forex', async (req, res) => {
       },
       groups: stats.groups,
       filters: { symbol, days, outcome, limit },
+      forexActive,
       window: win ? { label: win.label, from: win.fromIso, to: win.toIso, preset: win.preset } : null,
       status: getMt5Status(),
     });
@@ -7036,6 +7250,10 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   aiTracked: false,
   forecast: true,
   signalTracker: true,
+  // Breakout alerts: master email toggle + min grade (B | A | A+). Browser desktop
+  // notifications are NOT gated by this (generous by design) — only email is.
+  breakout: true,
+  breakoutEmailMinGrade: 'A',
   strategyLab: false,
   strategyLabFixedTime: false,
   forexMinGrade: 'A_SETUP',
@@ -7052,14 +7270,22 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   strategyLabFttMinScore: 75,
   strategyLabFttMinGrade: 'ANY',   // ANY | B | A | A+
   strategyLabFttStrategies: {},    // { [strategyId]: boolean } — empty = all enabled
+  // Strategy Controller (master per-strategy switch — gates EVERYTHING user-facing:
+  // popups, emails, SSE, the recent-signals table and reports). Missing entry = fully
+  // enabled. Optional per-strategy refinements gate DELIVERY (alerts): minScore, a
+  // direction/"setup" filter, and which timeframes may alert. DB logging always continues
+  // (Mute), so the win-rate ranking keeps measuring even muted strategies.
+  //   strategyControls: { [id]: { enabled, minScore?, direction?: ANY|LONG|SHORT, timeframes?: [] } }
+  strategyControls: {},
 };
-const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast', 'signalTracker', 'strategyLab', 'strategyLabFixedTime'];
+const EMAIL_BOOLEAN_SETTING_KEYS = ['forexScanner', 'fixedTime', 'postNewsForex', 'postNewsFixed', 'highImpactNews', 'aiTracked', 'forecast', 'signalTracker', 'breakout', 'strategyLab', 'strategyLabFixedTime'];
 const EMAIL_SELECT_SETTING_VALUES = {
   forexMinGrade: ['B_SETUP', 'A_SETUP', 'A_PLUS_SETUP'],
   forexMinQuality: ['B_SIGNAL', 'A_SIGNAL', 'A_PLUS_SIGNAL'],
   fixedTimeMinTier: ['QUALITY_SIGNAL', 'TRADE_SIGNAL'],
   postNewsForexMinGrade: ['B_NEWS_SETUP', 'A_NEWS_SETUP', 'A_PLUS_NEWS_SETUP'],
   postNewsFixedMinTier: ['QUALITY_SIGNAL', 'TRADE_SIGNAL'],
+  breakoutEmailMinGrade: ['B', 'A', 'A+'],
 };
 let emailAlertSettingsCache = null;
 
@@ -7117,6 +7343,28 @@ function saveEmailAlertSettings(nextSettings) {
     for (const [k, v] of Object.entries(nextSettings.strategyLabFttStrategies)) map[String(k)] = Boolean(v);
     sanitized.strategyLabFttStrategies = map;
   }
+  // Strategy Controller — replace the whole map on save (frontend sends the full object).
+  if (nextSettings && nextSettings.strategyControls && typeof nextSettings.strategyControls === 'object') {
+    const out = {};
+    for (const [id, ctrl] of Object.entries(nextSettings.strategyControls)) {
+      if (!ctrl || typeof ctrl !== 'object') continue;
+      const c = {};
+      if (Object.prototype.hasOwnProperty.call(ctrl, 'enabled')) c.enabled = Boolean(ctrl.enabled);
+      if (ctrl.minScore !== undefined && ctrl.minScore !== null && ctrl.minScore !== '') {
+        const v = Number(ctrl.minScore);
+        if (Number.isFinite(v)) c.minScore = Math.max(40, Math.min(95, Math.round(v)));
+      }
+      if (ctrl.direction !== undefined) {
+        const d = String(ctrl.direction || 'ANY').toUpperCase();
+        if (['ANY', 'LONG', 'SHORT'].includes(d)) c.direction = d;
+      }
+      if (Array.isArray(ctrl.timeframes)) {
+        c.timeframes = [...new Set(ctrl.timeframes.map((t) => String(t).toUpperCase()).filter(Boolean))];
+      }
+      out[String(id)] = c;
+    }
+    sanitized.strategyControls = out;
+  }
   emailAlertSettingsCache = sanitized;
   fs.mkdirSync(path.dirname(EMAIL_ALERT_SETTINGS_FILE), { recursive: true });
   fs.writeFileSync(EMAIL_ALERT_SETTINGS_FILE, JSON.stringify(sanitized, null, 2), 'utf8');
@@ -7138,7 +7386,7 @@ function strategyLabEmailAllowed(strategy, score, grade) {
   const minG = String(s.strategyLabMinGrade || 'ANY').toUpperCase();
   if (minG !== 'ANY' && (STRATEGY_GRADE_RANK[String(grade || '').toUpperCase()] ?? 0) < (STRATEGY_GRADE_RANK[minG] ?? 0)) return false;
   const map = s.strategyLabStrategies || {};
-  if (Object.keys(map).length && map[strategy] !== true) return false;  // explicit per-strategy selection
+  if (map[strategy] === false) return false;  // only an EXPLICIT opt-out blocks; missing = enabled (matches the UI's `?? true`)
   return true;
 }
 
@@ -7152,8 +7400,40 @@ function strategyLabFttEmailAllowed(strategy, score, grade) {
   const minG = String(s.strategyLabFttMinGrade || 'ANY').toUpperCase();
   if (minG !== 'ANY' && (STRATEGY_GRADE_RANK[String(grade || '').toUpperCase()] ?? 0) < (STRATEGY_GRADE_RANK[minG] ?? 0)) return false;
   const map = s.strategyLabFttStrategies || {};
-  if (Object.keys(map).length && map[strategy] !== true) return false;  // explicit per-strategy selection
+  if (map[strategy] === false) return false;  // only an EXPLICIT opt-out blocks; missing = enabled (matches the UI's `?? true`)
   return true;
+}
+
+// Strategy Controller (Settings → Strategy Controller). The master per-strategy switch that
+// gates DELIVERY of any signal — popups, emails, SSE. OFF = silent everywhere. When ON, the
+// optional refinements (minScore, direction/"setup", timeframes) further gate the alert.
+// Missing entry = fully enabled so the live setup is unchanged until the user toggles.
+function strategyDelivers(stratId, { score, direction, timeframe } = {}) {
+  const ctrl = (loadEmailAlertSettings().strategyControls || {})[stratId];
+  if (!ctrl) return true;
+  if (ctrl.enabled === false) return false;
+  if (Number.isFinite(Number(ctrl.minScore)) && (Number(score) || 0) < Number(ctrl.minScore)) return false;
+  const dir = String(ctrl.direction || 'ANY').toUpperCase();
+  if (dir === 'LONG' && direction !== 'BUY') return false;
+  if (dir === 'SHORT' && direction !== 'SELL') return false;
+  if (Array.isArray(ctrl.timeframes) && ctrl.timeframes.length && timeframe && !ctrl.timeframes.includes(String(timeframe).toUpperCase())) return false;
+  return true;
+}
+// Strategies whose signals belong in the aggregated recent-signals table + reports (enabled
+// set). Uses only the on/off flag — the per-signal score/setup/timeframe filters live in the
+// dashboard's own grid filters. DB logging always continues, so muted strategies keep ranking.
+function enabledStrategyIds() {
+  const controls = loadEmailAlertSettings().strategyControls || {};
+  return listStrategies().map((m) => m.id).filter((id) => controls[id]?.enabled !== false);
+}
+// True when the Strategy Controller master switch is explicitly OFF for this strategy.
+// Disabled strategies must vanish from every USER-FACING surface (live page, dropdowns,
+// signal log, reports, popups, emails) while still being scanned + logged in the background
+// so the win-rate ranking keeps accumulating (see strategyControls design). Admin/debug
+// callers can still see them by passing includeMuted=1.
+function strategyMuted(stratId) {
+  const ctrl = (loadEmailAlertSettings().strategyControls || {})[stratId];
+  return ctrl ? ctrl.enabled === false : false;
 }
 
 async function persistEmailedPostNewsForexReport(sig, referenceId) {
@@ -8698,6 +8978,268 @@ function refreshPostNewsSignals(now = Date.now()) {
   postNewsSignals.splice(0, postNewsSignals.length, ...next.sort((a, b) => b.confidence - a.confidence));
 }
 
+// ─── Breakout alerts (graded, two-tier notification controller) ──────────────
+// Additive + ISOLATED: detects PRE (approaching a strong level) and CONFIRMED
+// (decisive close beyond it) breakouts on WELL-FORMED charts only, grades each
+// A+/A/B/C, then routes through a two-tier controller:
+//   • EMAIL  — strict, anti-flood: grade-gated (configurable min), per-level
+//              dedup, and a hard hourly budget. PRE is held to a higher bar
+//              (>= A) than CONFIRMED (>= configured min, default B) because a
+//              pre-warning is a prediction. M5 gets the CONFIRMED email only.
+//   • BROWSER — generous: SSE desktop notification for any B+ candidate, once
+//               per bar/phase. Never gated by the email budget.
+// Reuses buildBreakoutCandidate (pure) — never touches live signal logic.
+const BREAKOUT_ENABLED = String(process.env.BREAKOUT_ENABLED || 'true').toLowerCase() !== 'false';
+const BREAKOUT_TIMEFRAMES = String(process.env.BREAKOUT_TIMEFRAMES || 'M5,M15,M30,H1')
+  .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+const BREAKOUT_APPROACH_ATR = Math.max(0.05, Number(process.env.BREAKOUT_APPROACH_ATR || 0.3));
+const BREAKOUT_MIN_BREAK_BODY_ATR = Math.max(0.1, Number(process.env.BREAKOUT_MIN_BREAK_BODY_ATR || 0.5));
+const BREAKOUT_EMAIL_MAX_PER_HOUR = Math.max(1, Number(process.env.BREAKOUT_EMAIL_MAX_PER_HOUR || 4));
+const BREAKOUT_EMAIL_MIN_GAP_MS = Math.max(0, Number(process.env.BREAKOUT_EMAIL_MIN_GAP_MIN || 30)) * 60 * 1000;
+const BREAKOUT_BROWSER_MIN_GRADE = String(process.env.BREAKOUT_BROWSER_MIN_GRADE || 'B').toUpperCase();
+const BREAKOUT_RETENTION_DAYS = Math.max(1, Number(process.env.BREAKOUT_RETENTION_DAYS || 14));
+
+const breakoutBrowserBars = new Map();   // `${symbol}|${tf}|${phase}` -> bar time (browser dedup)
+const breakoutEmailTimes = [];           // rolling timestamps of emails sent in the last hour
+
+// Hard hourly email budget: anti-flood ceiling so a volatile day cannot spam the
+// inbox. Lower-priority candidates simply fall back to browser-only when spent.
+function spendBreakoutEmailBudget(now = Date.now()) {
+  const cutoff = now - 60 * 60 * 1000;
+  while (breakoutEmailTimes.length && breakoutEmailTimes[0] < cutoff) breakoutEmailTimes.shift();
+  if (breakoutEmailTimes.length >= BREAKOUT_EMAIL_MAX_PER_HOUR) return false;
+  breakoutEmailTimes.push(now);
+  return true;
+}
+function refundBreakoutEmailBudget() { breakoutEmailTimes.pop(); }
+
+function breakoutEmailMinRank() {
+  const v = String(loadEmailAlertSettings().breakoutEmailMinGrade || 'A').toUpperCase();
+  return BREAKOUT_GRADE_RANK[v] ?? BREAKOUT_GRADE_RANK.A;
+}
+
+// Bucket the level so re-tests of the SAME level don't re-fire (dedup key).
+function breakoutLevelBucket(cand) {
+  if (cand.atr && cand.atr > 0) return Math.round(cand.level / (0.25 * cand.atr));
+  return Math.round(cand.level * 100);
+}
+
+function buildBreakoutPayload(cand) {
+  return {
+    id: `breakout:${cand.symbol}:${cand.timeframe}:${cand.phase}:${cand.bar}`,
+    kind: 'BREAKOUT',
+    phase: cand.phase,
+    symbol: cand.symbol,
+    timeframe: cand.timeframe,
+    direction: cand.direction,
+    grade: cand.grade,
+    score: cand.score,
+    trend: cand.trend,
+    level: cand.level,
+    levelStrength: cand.levelStrength,
+    price: cand.price,
+    atr: cand.atr,
+    distanceAtr: cand.distanceAtr,
+    bodyAtr: cand.bodyAtr,
+    displacement: cand.displacement
+      ? { present: cand.displacement.present, strong: cand.displacement.strong, atrMultiple: cand.displacement.atrMultiple }
+      : null,
+    reasons: cand.reasons,
+    bar: cand.bar,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function buildBreakoutEmail(cand) {
+  const dirWord = cand.direction === 'BUY' ? 'UP' : 'DOWN';
+  const arrow = cand.direction === 'BUY' ? '▲' : '▼';
+  const when = formatAlertDateTime(cand.bar);
+  const phaseLabel = cand.phase === 'PRE' ? 'APPROACHING BREAKOUT' : 'BREAKOUT CONFIRMED';
+  const icon = cand.phase === 'PRE' ? '⚠️' : '✅';
+  const levelTxt = px(cand.level, cand.symbol);
+  const priceTxt = px(cand.price, cand.symbol);
+  const dispTxt = cand.displacement && cand.displacement.present
+    ? `${cand.displacement.strong ? 'strong ' : ''}displacement (${cand.displacement.atrMultiple}x ATR)`
+    : 'no displacement';
+
+  const subject = `${icon} [${cand.grade}] ${cand.symbol} ${cand.timeframe} ${dirWord} ${cand.phase === 'PRE' ? 'approaching' : 'breakout'} ${levelTxt}`;
+
+  const lines = [
+    `${phaseLabel} — ${cand.symbol} ${cand.timeframe}`,
+    '',
+    `Grade:      ${cand.grade}  (score ${cand.score}/100)`,
+    `Direction:  ${dirWord} ${arrow}`,
+    `Level:      ${levelTxt}${cand.levelStrength > 1 ? `  (multi-touch ${cand.levelStrength}x)` : ''}`,
+    `Price now:  ${priceTxt}`,
+    cand.phase === 'PRE'
+      ? `Distance:   ${cand.distanceAtr}x ATR from the level (compressing)`
+      : `Break body: ${cand.bodyAtr}x ATR · ${dispTxt}`,
+    `Structure:  ${cand.trend === 'UP' ? 'higher highs / higher lows' : 'lower highs / lower lows'}`,
+    '',
+    'Why this chart qualified:',
+    ...cand.reasons.map((r) => `  • ${r}`),
+    '',
+    `Time (BDT): ${when}`,
+    '',
+    cand.phase === 'PRE'
+      ? 'Pre-breakout warning — price is coiling into a strong level. Wait for a confirmed close before acting.'
+      : 'Confirmed breakout — a candle has closed decisively beyond the level.',
+    'Advisory only — not financial advice.',
+  ];
+
+  const color = cand.direction === 'BUY' ? '#047857' : '#b91c1c';
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:640px">
+      <h2 style="margin:0 0 4px;color:${cand.phase === 'PRE' ? '#b45309' : color}">${icon} ${phaseLabel} — ${cand.symbol} ${cand.timeframe}</h2>
+      <p style="font-size:15px;margin:0 0 8px">
+        <b style="background:${color};color:#fff;padding:2px 8px;border-radius:6px">${dirWord} ${arrow}</b>
+        <span style="margin-left:8px">Grade <b>${cand.grade}</b> · score ${cand.score}/100</span>
+      </p>
+      <table style="width:100%;font-size:13px;border-collapse:collapse;margin-bottom:10px">
+        <tr><td style="padding:3px 0;color:#64748b">Level</td><td><b>${levelTxt}</b>${cand.levelStrength > 1 ? ` <span style="color:#64748b">(multi-touch ${cand.levelStrength}x)</span>` : ''}</td></tr>
+        <tr><td style="padding:3px 0;color:#64748b">Price now</td><td><b>${priceTxt}</b></td></tr>
+        ${cand.phase === 'PRE'
+          ? `<tr><td style="padding:3px 0;color:#64748b">Distance</td><td>${cand.distanceAtr}x ATR (compressing)</td></tr>`
+          : `<tr><td style="padding:3px 0;color:#64748b">Break body</td><td>${cand.bodyAtr}x ATR · ${dispTxt}</td></tr>`}
+        <tr><td style="padding:3px 0;color:#64748b">Structure</td><td>${cand.trend === 'UP' ? 'higher highs / higher lows' : 'lower highs / lower lows'}</td></tr>
+        <tr><td style="padding:3px 0;color:#64748b">Time (BDT)</td><td>${when}</td></tr>
+      </table>
+      <div style="font-size:12px;color:#475569;background:#f8fafc;padding:8px;border-radius:6px">
+        ${cand.reasons.map((r) => `• ${r}`).join('<br>')}
+      </div>
+      <p style="font-size:12px;color:#475569;margin-top:8px">${cand.phase === 'PRE'
+        ? 'Pre-breakout warning — price is coiling into a strong level. Wait for a confirmed close before acting.'
+        : 'Confirmed breakout — a candle has closed decisively beyond the level.'}</p>
+      <p style="font-size:11px;color:#94a3b8">Advisory only — not financial advice. — Aura Gold Breakout Engine</p>
+    </div>`;
+
+  return { subject, text: lines.join('\n'), html };
+}
+
+async function persistBreakoutAlert(cand, channel) {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  try {
+    await pool.execute(
+      `INSERT INTO mt5_breakout_alerts (
+         id, symbol, timeframe, phase, direction, grade, score, trend, level,
+         level_strength, price, atr, distance_atr, body_atr, displacement, channel,
+         bar_time, created_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE channel=VALUES(channel)`,
+      [
+        `breakout:${cand.symbol}:${cand.timeframe}:${cand.phase}:${cand.bar}`,
+        cand.symbol, cand.timeframe, cand.phase, cand.direction, cand.grade, cand.score,
+        cand.trend, cand.level, cand.levelStrength, cand.price, cand.atr,
+        cand.distanceAtr, cand.bodyAtr,
+        cand.displacement && cand.displacement.present ? 1 : 0,
+        channel,
+        cand.bar ? toMysqlDate(new Date(cand.bar)) : null,
+        toMysqlDate(new Date()),
+      ],
+    );
+  } catch (e) {
+    // Read-only / over-quota DB (Trap #6): never let logging break alerting.
+    console.warn('[Breakout] persist failed:', e.message);
+  }
+}
+
+async function pruneOldBreakoutAlerts() {
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `DELETE FROM mt5_breakout_alerts
+        WHERE created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+        LIMIT 5000`,
+      [BREAKOUT_RETENTION_DAYS],
+    );
+  } catch (e) {
+    console.error('[Breakout] Prune failed:', e.message);
+  }
+}
+
+// Two-tier router for a single graded candidate.
+async function routeBreakout(cand) {
+  const gradeRankVal = BREAKOUT_GRADE_RANK[cand.grade] ?? 0;
+
+  // ── Tier 1: Browser desktop notification (generous, never budget-gated) ──
+  const browserMinRank = BREAKOUT_GRADE_RANK[BREAKOUT_BROWSER_MIN_GRADE] ?? BREAKOUT_GRADE_RANK.B;
+  if (gradeRankVal >= browserMinRank) {
+    const bkey = `${cand.symbol}|${cand.timeframe}|${cand.phase}`;
+    if (breakoutBrowserBars.get(bkey) !== cand.bar) {
+      breakoutBrowserBars.set(bkey, cand.bar);
+      sendStreamEvent('breakout', buildBreakoutPayload(cand));
+      // Persist on the BROWSER tier too so the tracker page has a full history of
+      // every surfaced alert (the email tier later upgrades channel → EMAIL).
+      void persistBreakoutAlert(cand, 'BROWSER');
+    }
+  }
+
+  // ── Tier 2: Email (strict, anti-flood) ──
+  if (!(SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && isEmailSystemEnabled('breakout'))) return;
+
+  // Asymmetric bar: PRE (a prediction) requires at least A; CONFIRMED uses the
+  // configured minimum (default B). Both respect the user's configured floor.
+  const configuredMin = breakoutEmailMinRank();
+  const requiredRank = cand.phase === 'PRE'
+    ? Math.max(configuredMin, BREAKOUT_GRADE_RANK.A)
+    : configuredMin;
+  if (gradeRankVal < requiredRank) return;
+
+  // Per-level dedup: at most 1 PRE + 1 CONFIRMED per level (bucketed), with cooldown.
+  const key = `breakout-${cand.phase === 'PRE' ? 'pre' : 'confirm'}:${cand.symbol}:${cand.timeframe}:${breakoutLevelBucket(cand)}`;
+  if (!canAlert(key, cand.bar, { minGapMs: BREAKOUT_EMAIL_MIN_GAP_MS })) return;
+
+  if (!spendBreakoutEmailBudget()) {
+    console.log(`[Breakout] Hourly email budget spent → ${cand.symbol} ${cand.timeframe} ${cand.phase} ${cand.grade} stays browser-only`);
+    return;
+  }
+
+  const { subject, text, html } = buildBreakoutEmail(cand);
+  try {
+    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: key });
+    recordAlert(key, cand.bar);
+    void persistBreakoutAlert(cand, 'EMAIL');
+    console.log(`[Breakout] Emailed ${cand.phase} ${cand.grade} ${cand.direction} ${cand.symbol} ${cand.timeframe} @ ${cand.level}`);
+  } catch (e) {
+    refundBreakoutEmailBudget();
+    console.warn('[Breakout] email failed:', e.message);
+  }
+}
+
+// Scan curated symbols × breakout timeframes for graded breakouts. Strongest
+// candidates are routed first so they win the email budget on busy cycles.
+async function runBreakoutScan(symbols) {
+  if (!BREAKOUT_ENABLED || !Array.isArray(symbols) || !symbols.length) return;
+  if (!liveSignalsAllowed()) return; // no breakout alerts while the market is calendar-closed (weekend)
+  const candidates = [];
+  for (const symbol of symbols) {
+    for (const tf of BREAKOUT_TIMEFRAMES) {
+      try {
+        const candles = getRecentCandles(symbol, tf, 200);
+        if (!candles || candles.length < 40) continue;
+        const latest = candles[candles.length - 1];
+        if (!isCandleCurrent(latest, tf)) continue;          // skip stale/disconnected feeds
+        const cand = buildBreakoutCandidate({ symbol, timeframe: tf, candles }, {
+          approachAtr: BREAKOUT_APPROACH_ATR,
+          minBreakBodyAtr: BREAKOUT_MIN_BREAK_BODY_ATR,
+        });
+        if (!cand || cand.grade === 'C') continue;            // only well-formed, graded charts
+        if (tf === 'M5' && cand.phase === 'PRE') continue;    // M5 = confirmation only (1 email)
+        candidates.push(cand);
+      } catch { /* per-symbol resilience */ }
+    }
+  }
+  if (!candidates.length) return;
+  // Strongest first: grade rank, then score → budget priority on busy cycles.
+  candidates.sort((a, b) => (BREAKOUT_GRADE_RANK[b.grade] - BREAKOUT_GRADE_RANK[a.grade]) || (b.score - a.score));
+  for (const cand of candidates) {
+    await routeBreakout(cand);
+  }
+}
+
+
 let scanCycleRunning = false;
 async function runScanCycle() {
   if (scanCycleRunning) return;
@@ -8731,7 +9273,9 @@ async function runScanCycle() {
           if (lastFttBar.get(dedupKey) !== bar) {
             lastFttBar.set(dedupKey, bar);
             const tradeStatus = fttTradeStatus(pred.direction, pred.confidence, pred.indicators);
-            if (pred.direction !== 'HOLD' && fttTierAllowed(tradeStatus, 'fixedTimeMinTier') && isEmailSystemEnabled('fixedTime')) {
+            // Calendar gate: no live fixed-time prediction is persisted/streamed/emailed while
+            // the market is closed (weekend), even on fresh weekend bars.
+            if (liveSignalsAllowed() && pred.direction !== 'HOLD' && fttTierAllowed(tradeStatus, 'fixedTimeMinTier') && isEmailSystemEnabled('fixedTime')) {
               const now = new Date();
               const prediction = {
                 id: `ftt_sys_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -8771,7 +9315,10 @@ async function runScanCycle() {
           if (!r) continue;
           results.push(r);
           const sd = r.systemDecision;
-          if (!r.outdated && isTopbarForexSignal(sd)) {
+          // Calendar gate: never emit a live forex alert (topbar/SSE/email) while the market is
+          // closed, even on fresh weekend bars. logSystemSignal below still records it for reports.
+          const marketOpen = liveSignalsAllowed();
+          if (marketOpen && !r.outdated && isTopbarForexSignal(sd)) {
             const topbarKey = `${symbol}|${tf}`;
             if (topbarForexAlertBars.get(topbarKey) !== r.bar) {
               topbarForexAlertBars.set(topbarKey, r.bar);
@@ -8779,7 +9326,7 @@ async function runScanCycle() {
             }
           }
           let emailed = false;
-          if (!r.outdated && forexScannerEmailAllowed(sd)) {
+          if (marketOpen && !r.outdated && forexScannerEmailAllowed(sd)) {
             recordForexDailyBestCandidate(r);
             // Email (dedup: once per symbol/bar + min gap).
             if (SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && isEmailSystemEnabled('forexScanner')) {
@@ -8804,6 +9351,7 @@ async function runScanCycle() {
     refreshPostNewsSignals(Date.now());
     await reforecastActiveForecasts();
     await scanNewsReactions();
+    await runBreakoutScan(symbols);
     pruneAlerts();
   } catch (err) {
     console.error('[Scanner] cycle error:', err.message);
@@ -9603,6 +10151,8 @@ function startExecutionForecastScanner() {
   setTimeout(() => void runExecutionForecastScan(), 20000); // warm shortly after boot
   const pruneTimer = setInterval(() => void pruneOldExecutionForecasts(), 6 * 60 * 60 * 1000);
   if (typeof pruneTimer.unref === 'function') pruneTimer.unref();
+  const breakoutPruneTimer = setInterval(() => void pruneOldBreakoutAlerts(), 6 * 60 * 60 * 1000);
+  if (typeof breakoutPruneTimer.unref === 'function') breakoutPruneTimer.unref();
   console.log(`[Forecast] Execution forecast scanner started. TFs=${FORECAST_TIMEFRAMES.join(',')} every ${Math.round(FORECAST_SCAN_INTERVAL_MS / 60000)}m.`);
 }
 startExecutionForecastScanner();
@@ -10094,6 +10644,8 @@ function buildStructureDesk(symbol, tf) {
     breaker,
     liquidityPlan,
     drive,
+    // Institutional liquidity map (PDH/PDL, session H/L, round numbers, equal highs/lows, swings).
+    keyLevels: detectKeyLiquidityLevels(candles, { symbol, dailyCandles: getRecentCandles(symbol, 'D1', 8) }),
     rejectionReasons: Array.isArray(sd?.rejectionReasons) ? sd.rejectionReasons.slice(0, 3) : [],
   };
 }
@@ -10126,6 +10678,236 @@ app.get('/api/day-trading/desk', async (req, res) => {
   }
 });
 
+
+// ─── Live Market Tracker — pre-entry decision cockpit ────────────────────────
+// One honest live read for "should I enter right now?". REUSES the Day Trading Desk's
+// structural read (buildStructureDesk) plus the raw detectors, and adds: order-block
+// proximity/quality, a buyer/seller PRESSURE PROXY, and a single entry verdict — all gated
+// by the freshness + market-calendar guards. The pressure model is explicitly a PROXY from
+// candle anatomy + tick volume; this feed carries no real order-flow / bid-ask / trader counts.
+const lmtRound5 = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v) * 1e5) / 1e5 : null);
+
+function lmtAtr14(candles, period = 14) {
+  if (!candles || candles.length < period + 1) return null;
+  let sum = 0;
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const h = Number(candles[i].high), l = Number(candles[i].low), pc = Number(candles[i - 1].close);
+    if (![h, l, pc].every(Number.isFinite)) continue;
+    sum += Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+  }
+  return sum / period;
+}
+
+function lmtCandleAnatomy(c) {
+  const o = Number(c.open), h = Number(c.high), l = Number(c.low), cl = Number(c.close);
+  const range = Math.max(h - l, 1e-9);
+  const body = Math.abs(cl - o);
+  return {
+    bullish: cl > o,
+    bodyRatio: body / range,
+    upperWickRatio: (h - Math.max(o, cl)) / range,
+    lowerWickRatio: (Math.min(o, cl) - l) / range,
+    closePos: (cl - l) / range, // 0 = closed at the low, 1 = closed at the high
+    vol: Number(c.volume) || 0,
+  };
+}
+
+// Buyer/seller PRESSURE PROXY. Honest by construction: blends candle body, wick rejection,
+// close position in range, and tick-volume ratio over the last few bars. NOT real order flow.
+function lmtPressureProxy(candles, lookback = 20) {
+  const recent = candles.slice(-lookback);
+  const avgVol = recent.length ? recent.reduce((a, c) => a + (Number(c.volume) || 0), 0) / recent.length : 0;
+  const last = lmtCandleAnatomy(candles[candles.length - 1]);
+  const volRatio = avgVol > 0 ? last.vol / avgVol : 1;
+
+  // Recent-weighted buyer/seller tug-of-war over the last 5 bars (latest weighted heaviest).
+  const window = candles.slice(-5).map(lmtCandleAnatomy);
+  let buy = 0, sell = 0, wsum = 0;
+  window.forEach((a, idx) => {
+    const w = idx + 1; wsum += w;
+    buy += ((a.closePos * 0.5) + (a.bullish ? a.bodyRatio * 0.3 : 0) + (a.lowerWickRatio * 0.2)) * w;
+    sell += (((1 - a.closePos) * 0.5) + (!a.bullish ? a.bodyRatio * 0.3 : 0) + (a.upperWickRatio * 0.2)) * w;
+  });
+  buy /= wsum; sell /= wsum;
+  const total = (buy + sell) || 1;
+  const buyerPressure = Math.round((buy / total) * 100);
+  const sellerPressure = 100 - buyerPressure;
+  // Aggression needs conviction: a big decisive body on above-average tick volume.
+  const aggressiveBuying = Math.round(Math.min(100, (last.bullish ? last.bodyRatio : 0) * last.closePos * Math.min(2, volRatio) * 100));
+  const aggressiveSelling = Math.round(Math.min(100, (!last.bullish ? last.bodyRatio : 0) * (1 - last.closePos) * Math.min(2, volRatio) * 100));
+
+  return {
+    isProxy: true,
+    basis: 'Proxy from candle body/wick/close-position + tick volume. NOT real order-flow, bid/ask volume, or trader counts (this feed has none).',
+    buyerPressure, sellerPressure,
+    dominant: buyerPressure > sellerPressure ? 'BUYERS' : sellerPressure > buyerPressure ? 'SELLERS' : 'BALANCED',
+    aggressiveBuying, aggressiveSelling,
+    volumeRatio: Math.round(volRatio * 100) / 100,
+    volumeState: volRatio >= 1.5 ? 'HIGH' : volRatio >= 0.8 ? 'NORMAL' : 'LOW',
+    lastCandle: { bullish: last.bullish, bodyPct: Math.round(last.bodyRatio * 100), closePosPct: Math.round(last.closePos * 100) },
+  };
+}
+
+// Score + position every detected order block relative to the current price.
+function lmtAnalyzeOrderBlocks(candles, obs, fvgs, price, atr, pip, dirBias) {
+  const out = obs.map((ob) => {
+    const low = Math.min(Number(ob.top), Number(ob.bottom));
+    const high = Math.max(Number(ob.top), Number(ob.bottom));
+    const inside = price >= low && price <= high;
+    const dist = inside ? 0 : (price < low ? low - price : price - high);
+    const distAtr = atr ? Math.round((dist / atr) * 100) / 100 : null;
+    const imbalance = fvgs.some((f) => f.type === ob.type && Number(f.bottom) <= high && Number(f.top) >= low);
+    // Mitigated = price has traded back into the zone since it formed. Also gather zone activity.
+    const obMs = Date.parse(ob.time);
+    let mitigated = false, zoneVol = 0, reactions = 0;
+    for (const c of candles) {
+      const t = Date.parse(c.time || '');
+      if (!Number.isFinite(t) || t <= obMs) continue;
+      const ch = Number(c.high), clo = Number(c.low);
+      if (Number.isFinite(ch) && Number.isFinite(clo) && ch >= low && clo <= high) { mitigated = true; zoneVol += Number(c.volume) || 0; reactions++; }
+    }
+    let score = 40;
+    if (dirBias && ob.type === dirBias) score += 20; // aligned with bias
+    if (!mitigated) score += 20;                      // fresh / unmitigated
+    if (imbalance) score += 15;                        // displacement / imbalance present
+    if (distAtr !== null && distAtr <= 0.5) score += 10; // price is close to it
+    if (inside) score += 10;
+    score = Math.min(100, score);
+    return {
+      type: ob.type, kind: ob.type === 'BULLISH' ? 'DEMAND' : 'SUPPLY',
+      low: lmtRound5(low), high: lmtRound5(high), mid: lmtRound5((low + high) / 2),
+      inside, distancePips: Math.round((dist / pip) * 10) / 10, distanceAtr: distAtr,
+      imbalance, displacement: imbalance, mitigated,
+      zoneActivity: { tickVolume: zoneVol, reactions, note: 'Tick-volume that transacted inside the zone (honest stand-in for "buyers/sellers in the OB").' },
+      score, grade: score >= 80 ? 'A' : score >= 65 ? 'B' : 'C', time: ob.time,
+    };
+  });
+  out.sort((a, b) => (b.score - a.score) || ((a.distanceAtr ?? 99) - (b.distanceAtr ?? 99)));
+  return out;
+}
+
+// The single entry verdict: WAIT / WATCH / ARMED_IF_CONFIRMED / NO_TRADE / STALE_DATA / MARKET_CLOSED.
+// Deliberately strict — "good location" only when fresh + open + at a strong aligned OB in the
+// right premium/discount half + liquidity swept + imbalance + pressure agrees.
+function lmtVerdict({ fresh, marketOpen, desk, obAnalysis, pressure }) {
+  if (!marketOpen) return { verdict: 'MARKET_CLOSED', canEnter: false, direction: null, checklist: null, reasons: ['Forex market is calendar-closed (weekend). Informational read only.'] };
+  if (!fresh) return { verdict: 'STALE_DATA', canEnter: false, direction: null, checklist: null, reasons: ['Live feed is stale — not judging entries on old candles.'] };
+
+  const dec = String(desk.decision || 'HOLD').toUpperCase();
+  const dir = desk.zone ? (desk.zone.kind === 'DEMAND' ? 'BUY' : 'SELL')
+    : dec.includes('BUY') ? 'BUY' : dec.includes('SELL') ? 'SELL'
+    : desk.htfBias === 'BULLISH' ? 'BUY' : desk.htfBias === 'BEARISH' ? 'SELL' : null;
+
+  const nearStrongOb = obAnalysis.find((o) => o.score >= 65 && (o.inside || (o.distanceAtr !== null && o.distanceAtr <= 0.5))) || null;
+  const inDiscount = desk.premiumDiscount && desk.premiumDiscount.zone === 'DISCOUNT';
+  const inPremium = desk.premiumDiscount && desk.premiumDiscount.zone === 'PREMIUM';
+  const goodLocation = (dir === 'BUY' && inDiscount) || (dir === 'SELL' && inPremium);
+  const swept = Boolean(desk.sweep);
+  const imbalance = Boolean(nearStrongOb && nearStrongOb.imbalance);
+  const pressureAligns = dir === 'BUY' ? pressure.dominant === 'BUYERS' : dir === 'SELL' ? pressure.dominant === 'SELLERS' : false;
+  const notExtended = !desk.extended;
+
+  const checklist = { hasBias: !!dir, nearStrongOb: !!nearStrongOb, goodLocation, liquiditySwept: swept, imbalance, pressureAligns, notExtended };
+  const reasons = [];
+  let verdict;
+  if (!dir) { verdict = 'NO_TRADE'; reasons.push('No clear directional bias.'); }
+  else if (desk.extended) { verdict = 'NO_TRADE'; reasons.push('Price is over-extended from the mean — do not chase.'); }
+  else if (nearStrongOb && goodLocation && swept && imbalance && pressureAligns) {
+    verdict = 'ARMED_IF_CONFIRMED';
+    reasons.push(`At a ${nearStrongOb.grade}-grade ${nearStrongOb.kind} zone in ${dir === 'BUY' ? 'discount' : 'premium'}, liquidity swept, imbalance present, ${pressure.dominant.toLowerCase()} in control — wait for your confirmation candle, then enter.`);
+  } else if (nearStrongOb && goodLocation) {
+    verdict = 'WATCH'; reasons.push(`Price at a ${nearStrongOb.kind} zone in the right half of the range — watch for a sweep + confirmation.`);
+  } else {
+    verdict = 'WAIT';
+    if (!nearStrongOb) reasons.push('Not at a strong order block yet.');
+    if (!goodLocation && dir) reasons.push(`Not in ${dir === 'BUY' ? 'discount' : 'premium'} — wait for a better location.`);
+  }
+  return { verdict, canEnter: verdict === 'ARMED_IF_CONFIRMED', direction: dir, checklist, reasons };
+}
+
+function buildLiveMarketTracker(symbol, tf) {
+  const candles = getRecentCandles(symbol, tf, 250);
+  if (!candles || candles.length < 30) return null;
+  const desk = buildStructureDesk(symbol, tf);
+  if (!desk) return null;
+  const fresh = candleFreshness(candles[candles.length - 1], tf);
+  const marketOpen = liveSignalsAllowed();
+  const price = Number(candles[candles.length - 1].close);
+  const atr = lmtAtr14(candles);
+  const pip = pipSizeForSymbol(symbol) || 0.0001;
+  const dirBias = desk.htfBias === 'BULLISH' || desk.phase === 'UPTREND' ? 'BULLISH'
+    : desk.htfBias === 'BEARISH' || desk.phase === 'DOWNTREND' ? 'BEARISH' : null;
+
+  const obAnalysis = lmtAnalyzeOrderBlocks(candles, detectOrderBlocks(candles), detectFVGs(candles), price, atr, pip, dirBias).slice(0, 6);
+  const pressure = lmtPressureProxy(candles);
+  const verdict = lmtVerdict({ fresh: fresh.dataFresh, marketOpen, desk, obAnalysis, pressure });
+  // Institutional liquidity map (computed once in buildStructureDesk): PDH/PDL, session H/L,
+  // round numbers, equal highs/lows, major swings.
+  const keyLevels = desk.keyLevels || { levels: [], nearestAbove: null, nearestBelow: null };
+  // High-probability sweep grade (5-component model) for the current chart — same engine as the
+  // liquidity-sweep-pro strategy. minGrade 'C' so the cockpit shows borderline reads too.
+  const sweepGrade = gradeSweep(candles, { symbol, dailyCandles: getRecentCandles(symbol, 'D1', 8), h4Trend: desk.htfBias || null, h1Trend: dirBias, minGrade: 'C' });
+
+  const nearestDemand = obAnalysis.filter((o) => o.kind === 'DEMAND').sort((a, b) => (a.distanceAtr ?? 99) - (b.distanceAtr ?? 99))[0] || null;
+  const nearestSupply = obAnalysis.filter((o) => o.kind === 'SUPPLY').sort((a, b) => (a.distanceAtr ?? 99) - (b.distanceAtr ?? 99))[0] || null;
+  const pdPct = desk.premiumDiscount?.pct ?? null;
+
+  return {
+    symbol, timeframe: tf, price: lmtRound5(price), atr: lmtRound5(atr),
+    feedState: !marketOpen ? 'MARKET_CLOSED' : fresh.dataFresh ? 'LIVE' : 'STALE',
+    dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds, marketStatus: fresh.marketStatus,
+    session: strategyLabSession(new Date().toISOString()),
+    pricePosition: desk.premiumDiscount ? {
+      pct: pdPct, zone: desk.premiumDiscount.zone,
+      label: pdPct < 33 ? 'NEAR RANGE LOW' : pdPct > 66 ? 'NEAR RANGE HIGH' : 'MID-RANGE',
+      rangeHigh: desk.premiumDiscount.rangeHigh, rangeLow: desk.premiumDiscount.rangeLow, equilibrium: desk.premiumDiscount.equilibrium,
+    } : null,
+    bias: dirBias, phase: desk.phase, regime: desk.regime, decision: desk.decision, grade: desk.grade, score: desk.score,
+    extended: desk.extended, emaDistanceAtr: desk.emaDistanceAtr,
+    pressure,
+    orderBlocks: obAnalysis, nearestDemand, nearestSupply,
+    liquidity: desk.liquidity, recentSweep: desk.sweep, breaker: desk.breaker, plan: desk.plan,
+    keyLevels: keyLevels.levels.slice(0, 14), nearestKeyAbove: keyLevels.nearestAbove, nearestKeyBelow: keyLevels.nearestBelow,
+    sweepGrade,
+    verdict,
+  };
+}
+
+// GET /api/live-market-tracker?symbol=&timeframe= — the pre-entry cockpit read for one symbol
+// plus a compact watchlist (verdict + pressure) across curated symbols on the same timeframe.
+app.get('/api/live-market-tracker', (req, res) => {
+  try {
+    const tf = (req.query.timeframe ? String(req.query.timeframe) : 'M5').toUpperCase();
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    const want = req.query.symbol ? String(req.query.symbol).toUpperCase() : (symbols[0] || 'XAUUSDM');
+    const sym = symbols.find((s) => s.toUpperCase() === want) || want;
+    const tracker = buildLiveMarketTracker(sym, tf);
+    if (!tracker) return res.status(404).json({ error: `Not enough candle data for ${sym} ${tf}. Pick a streamed symbol/timeframe.` });
+
+    const watchlist = [];
+    for (const s of symbols) {
+      try {
+        const t = buildLiveMarketTracker(s, tf);
+        if (t) watchlist.push({
+          symbol: s, price: t.price, feedState: t.feedState, bias: t.bias,
+          verdict: t.verdict.verdict, buyerPressure: t.pressure.buyerPressure, sellerPressure: t.pressure.sellerPressure,
+          nearestDistanceAtr: Math.min(t.nearestDemand?.distanceAtr ?? 99, t.nearestSupply?.distanceAtr ?? 99),
+        });
+      } catch { /* per-symbol resilience */ }
+    }
+    watchlist.sort((a, b) => (a.nearestDistanceAtr - b.nearestDistanceAtr));
+
+    res.json({
+      ok: true, ...tracker, watchlist,
+      generatedAt: new Date().toISOString(),
+      honesty: [
+        'Buyer/seller pressure is a PROXY from candle anatomy + tick volume — not real order-flow, bid/ask volume, or trader counts.',
+        ...(tracker.marketStatus.open ? [] : ['Market is closed (weekend) — this read is informational only, not an actionable signal.']),
+        ...(tracker.dataFresh ? [] : ['Feed is stale — values reflect the last received candle, not live price.']),
+      ],
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ─── Strategy Lab — isolated single-strategy signals (forex + fixed-time, all TFs) ──
 // Completely separate from aggregateSignals. Runs each registered strategy over every
@@ -10459,6 +11241,15 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
 // after the signal bar. For a signal that just formed on the last closed bar, that expiry
 // is the close of the current forming bar (+ any extra expiry bars). Returns the expiry
 // timestamp + seconds remaining so the UI/email can frame it as a fixed-time trade.
+// Human duration for a trade-time in minutes: "5 min", "1 hr 30 min", "1 day".
+function formatTradeMinutes(min) {
+  if (!(min > 0)) return '—';
+  if (min < 60) return `${min} min`;
+  if (min < 1440) { const h = Math.floor(min / 60), m = min % 60; return m ? `${h} hr ${m} min` : `${h} hr`; }
+  const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60);
+  return h ? `${d} day ${h} hr` : `${d} day`;
+}
+
 function strategyLabFttExpiry(timeframe) {
   const tfMin = timeframeMinutes(timeframe);
   if (!(tfMin > 0)) return null;
@@ -10466,12 +11257,81 @@ function strategyLabFttExpiry(timeframe) {
   const now = Date.now();
   const nextBoundary = Math.ceil(now / tfMs) * tfMs;                 // current forming bar closes here
   const expiryMs = nextBoundary + (STRATEGY_LAB_FT_EXPIRY_BARS - 1) * tfMs;
+  // The DURATION to set on a fixed-time/binary platform = one timeframe period × expiry bars.
+  // (A call is judged at the candle close, so entering at the candle OPEN and setting this
+  // duration lines the expiry up with the close. Entering mid-bar → set secondsToExpiry instead.)
+  const tradeMinutes = tfMin * STRATEGY_LAB_FT_EXPIRY_BARS;
+  const tradeTimeLabel = formatTradeMinutes(tradeMinutes);
   return {
     expiryIso: new Date(expiryMs).toISOString(),
     secondsToExpiry: Math.max(0, Math.round((expiryMs - now) / 1000)),
     expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS,
-    durationLabel: STRATEGY_LAB_FT_EXPIRY_BARS === 1 ? `next ${timeframe} close` : `${STRATEGY_LAB_FT_EXPIRY_BARS} × ${timeframe}`,
+    tradeMinutes,
+    tradeTimeLabel,
+    durationLabel: STRATEGY_LAB_FT_EXPIRY_BARS === 1
+      ? `${tradeTimeLabel} expiry (next ${timeframe} close)`
+      : `${STRATEGY_LAB_FT_EXPIRY_BARS} × ${timeframe} = ${tradeTimeLabel}`,
   };
+}
+
+// Candle-pattern read for a FIXED-TIME entry, right now. A fixed-time trade is entered at
+// market and judged at the very next candle close, so what matters is the immediate price
+// action — not a limit level. We read the last ~5 closed candles + the most recent one and
+// ask: is the recent momentum + the latest candle confirming the call's direction, is price
+// stretched to a local extreme (likely to snap back), or is it reversing / indecisive against
+// the call? Returns a verdict the trader can act on without re-reading the chart:
+//   ENTER_NOW     — recent action confirms the call direction and price isn't over-extended.
+//   WAIT_PULLBACK — direction agrees but price is at a local high/low or the bar is indecisive.
+//   NO_ENTRY      — the latest action contradicts the call (reversal/drive against it).
+function fixedTimeCandleRead(candles, ftDir, lookback = 5) {
+  if (!Array.isArray(candles) || candles.length < lookback + 1) return null;
+  const up = String(ftDir).toUpperCase() === 'UP';
+  const recent = candles.slice(-lookback);
+  const last = candles[candles.length - 1];
+  const o = Number(last.open), c = Number(last.close), hi = Number(last.high), lo = Number(last.low);
+  const range = Math.max(hi - lo, 1e-9);
+  const body = Math.abs(c - o);
+  const upperWick = hi - Math.max(c, o);
+  const lowerWick = Math.min(c, o) - lo;
+
+  // Momentum/trend over the lookback: how many of the last N candles closed up vs down.
+  let bull = 0, bear = 0;
+  for (const k of recent) { const kc = Number(k.close), ko = Number(k.open); if (kc > ko) bull += 1; else if (kc < ko) bear += 1; }
+  const momentum = bull > bear ? 'UP' : bear > bull ? 'DOWN' : 'MIXED';
+
+  // Most-recent candle pattern (the decisive bar for a next-candle bet).
+  const doji = body <= range * 0.18;                       // indecision — no conviction either way
+  const bullPin = !doji && lowerWick >= body * 1.5 && c >= o; // long lower wick → rejection of lows
+  const bearPin = !doji && upperWick >= body * 1.5 && c <= o; // long upper wick → rejection of highs
+  const driveUp = !doji && c > o && body >= range * 0.6;   // strong bullish body
+  const driveDown = !doji && c < o && body >= range * 0.6; // strong bearish body
+  const pattern = doji ? 'indecision' : bullPin ? 'reversal-up' : bearPin ? 'reversal-down'
+    : driveUp ? 'drive-up' : driveDown ? 'drive-down' : 'neutral';
+
+  // Local extreme over the lookback — is the latest bar making/at the highest high or lowest low?
+  const maxH = Math.max(...recent.map((k) => Number(k.high)));
+  const minL = Math.min(...recent.map((k) => Number(k.low)));
+  const atHigh = hi >= maxH - range * 0.1;
+  const atLow = lo <= minL + range * 0.1;
+  const atExtreme = atHigh && !atLow ? 'HIGH' : atLow && !atHigh ? 'LOW' : null;
+
+  const confirms = up ? (momentum === 'UP' || pattern === 'reversal-up' || pattern === 'drive-up')
+                      : (momentum === 'DOWN' || pattern === 'reversal-down' || pattern === 'drive-down');
+  const contradicts = up ? (pattern === 'reversal-down' || pattern === 'drive-down')
+                         : (pattern === 'reversal-up' || pattern === 'drive-up');
+  const overExtended = up ? atHigh : atLow;   // call wants to continue but price is already at the extreme
+
+  let verdict;
+  if (pattern === 'indecision') verdict = 'WAIT_PULLBACK';
+  else if (contradicts) verdict = 'NO_ENTRY';
+  else if (confirms && overExtended) verdict = 'WAIT_PULLBACK';
+  else if (confirms) verdict = 'ENTER_NOW';
+  else verdict = 'WAIT_PULLBACK';
+
+  const bits = [`${up ? bull : bear}/${lookback} ${up ? 'up' : 'down'}`];
+  if (pattern !== 'neutral') bits.push(pattern.replace('-', ' '));
+  if (atExtreme) bits.push(`at ${lookback}-bar ${atExtreme.toLowerCase()}`);
+  return { verdict, momentum, pattern, atExtreme, note: bits.join(' · ') };
 }
 
 // Fixed-time framing of a Strategy Lab signal → dedicated live popup (SSE event
@@ -10490,6 +11350,7 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
       id, strategy, strategyName, symbol, timeframe, direction: ftDir,
       score: sig.score ?? null, grade: sig.grade ?? null,
       reference, expiryIso: expiry?.expiryIso ?? null, secondsToExpiry: expiry?.secondsToExpiry ?? null,
+      tradeMinutes: expiry?.tradeMinutes ?? null, tradeTimeLabel: expiry?.tradeTimeLabel ?? null,
       durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null, kind, at,
     });
   }
@@ -10547,17 +11408,24 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
 
 // Next-higher timeframe in the lab ladder — used for multi-timeframe stage agreement.
 const NEXT_HIGHER_TF = { M1: 'M5', M5: 'M15', M15: 'M30', M30: 'H1', H1: 'H4', H4: 'D1', D1: null };
+// One step DOWN — for strategies that confirm a main-TF setup against lower-TF timing
+// (e.g. swing-structure-candles: M15 setup confirmed on M5). M1 is intentionally not a
+// confirmation source on its own (too noisy); M5 maps to M1 only as a last resort.
+const NEXT_LOWER_TF = { D1: 'H4', H4: 'H1', H1: 'M30', M30: 'M15', M15: 'M5', M5: 'M1', M1: null };
 
 function buildStrategyContext(symbol, tf) {
   const candles = getRecentCandles(symbol, tf, 400);
   if (!candles || candles.length < 60) return null;
   const htfTf = NEXT_HIGHER_TF[tf] || null;
   const htfCandles = htfTf ? getRecentCandles(symbol, htfTf, 200) : null;
+  const ltfTf = NEXT_LOWER_TF[tf] || null;
+  const ltfCandles = ltfTf ? getRecentCandles(symbol, ltfTf, 200) : null;
   return {
     symbol, timeframe: tf, candles, pip: pipSizeForSymbol(symbol),
     h4Trend: getTimeframeTrend(getRecentCandles(symbol, 'H4', 150)),
     h1Trend: getTimeframeTrend(getRecentCandles(symbol, 'H1', 150)),
     htfTimeframe: htfTf, htfCandles,
+    ltfTimeframe: ltfTf, ltfCandles,
   };
 }
 
@@ -10625,6 +11493,17 @@ function strategyNotifyDecide(strategy, symbol, tf, sig) {
 
 // Send the popup/email for a decided signal (respecting the existing score/email gates).
 async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date.now()) {
+  // Strategy Controller master gate — OFF (or refined out) = no popup/email/SSE. DB logging
+  // (caller) is unaffected, so the strategy keeps being measured for the ranking.
+  if (!strategyDelivers(strategy, { score: sig.score, direction: sig.decision, timeframe: tf })) return { popupSent: false, emailSent: false, kind: null };
+  // Freshness gate: the caller still LOGS every evaluation (win-rate / ranking data stays
+  // intact), but we never popup/email a setup built off a stale candle (weekend / feed-hold).
+  // Bail BEFORE strategyNotifyDecide so the de-spam state isn't polluted — the setup then
+  // fires cleanly as a NEW alert when live data resumes.
+  const lastCandle = ctx?.candles?.length ? ctx.candles[ctx.candles.length - 1] : null;
+  if (!isCandleCurrent(lastCandle, tf) || !liveSignalsAllowed()) {
+    return { popupSent: false, emailSent: false, kind: null, stale: true };
+  }
   const kind = strategyNotifyDecide(strategy, symbol, tf, sig);
   if (!kind) return { popupSent: false, emailSent: false, kind: null };
   const wantPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
@@ -10652,10 +11531,14 @@ async function processStrategyNotifyConfirms() {
   for (const [key, st] of strategyNotifyState) {
     if (now - st.updatedAt > STRATEGY_NOTIFY_PRUNE_MS) { strategyNotifyState.delete(key); continue; }
     if (st.confirmedSent || now < st.createdBarCloseMs) continue;
+    if (!strategyDelivers(st.strategy, { score: st.firstScore, direction: st.direction, timeframe: st.tf })) continue; // controller OFF
     st.confirmedSent = true; // mark once so we never nag
     try {
       const ctx = buildStrategyContext(st.symbol, st.tf);
       if (!ctx) continue;
+      // Never confirm off a stale candle (feed-hold) or while the market is calendar-closed
+      // (weekend). Re-arm so the confirmation can still fire once trading resumes and re-validates.
+      if (!isCandleCurrent(ctx.candles[ctx.candles.length - 1], st.tf) || !liveSignalsAllowed()) { st.confirmedSent = false; continue; }
       const sig = evaluateStrategy(st.strategy, ctx);
       if (!sig || sig.decision !== st.direction) continue; // didn't hold at the close
       const wantPopup = (st.firstScore ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
@@ -10688,7 +11571,7 @@ async function runStrategyNotifyPass(pairs) {
           const barMs = Date.parse(sig.barIso || ctx.candles[ctx.candles.length - 1].time);
           if (Number.isFinite(barMs)) {
             try {
-              const { id } = await persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs);
+              const { id } = await persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, new Date(), Number(ctx.candles[ctx.candles.length - 1]?.close));
               const sent = await maybeNotifyStrategy(stratId, symbol, tf, sig, ctx);
               if (sent.popupSent || sent.emailSent) {
                 try { await pool.execute('UPDATE mt5_strategy_signals SET popup_sent=?, email_sent=? WHERE id=?', [sent.popupSent ? 1 : 0, sent.emailSent ? 1 : 0, id]); } catch { /* best-effort */ }
@@ -10707,18 +11590,23 @@ async function runStrategyNotifyPass(pairs) {
 // Persist one strategy signal row (logging). Shared by the periodic scan and the
 // real-time notify pass so detection = logging on EVERY path — nothing detected escapes
 // the report. Idempotent: ON DUPLICATE keeps the first score/grade for that bar.
-async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, nowDate = new Date()) {
+async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, nowDate = new Date(), livePrice = null) {
   const id = `${stratId}:${symbol}:${tf}:${barMs}`;
+  // The realistic AS-TRADED reference: the live price at the instant the signal fires (i.e. when
+  // you'd see the alert / get the email). Kept from the FIRST insert for this bar (COALESCE), so a
+  // re-detect on the same bar never overwrites the original fill price.
+  const atRef = Number.isFinite(Number(livePrice)) ? Number(livePrice) : null;
   const [res] = await pool.execute(
     `INSERT INTO mt5_strategy_signals
        (id, strategy, symbol, timeframe, bar_time, signal_time, direction, score, grade,
         entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
-        risk_reward, reason, outcome, ft_outcome, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?)
-     ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade))`,
+        risk_reward, reason, outcome, ft_outcome, at_ref_price, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?,?)
+     ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade)),
+       at_ref_price = COALESCE(at_ref_price, VALUES(at_ref_price))`,
     [id, stratId, symbol, tf, toMysqlDate(new Date(barMs)), toMysqlDate(nowDate), sig.decision, sig.score ?? null, sig.grade ?? null,
      sig.entry ?? null, sig.stopLoss ?? null, sig.takeProfit1 ?? null, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
-     sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), toMysqlDate(nowDate)],
+     sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), atRef, toMysqlDate(nowDate)],
   );
   return { id, affectedRows: res.affectedRows };
 }
@@ -10743,7 +11631,7 @@ async function runStrategyLabScan() {
           const barMs = Date.parse(sig.barIso || ctx.candles[ctx.candles.length - 1].time);
           if (!Number.isFinite(barMs)) continue;
           try {
-            const { id, affectedRows } = await persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, now);
+            const { id, affectedRows } = await persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, now, Number(ctx.candles[ctx.candles.length - 1]?.close));
             if (affectedRows === 1) logged += 1;
             // Notifications run every pass (not only on a new DB row) so improvements
             // during a forming candle are caught; the lifecycle de-dups continuation
@@ -10797,6 +11685,31 @@ function resolveStrategyFixedTime(row, candles) {
   return { outcome: diff > 0 ? 'WIN' : diff < 0 ? 'LOSS' : 'DRAW', exitPrice: expiryClose, pips: Math.round((diff / pip) * 10) / 10 };
 }
 
+// AS-TRADED fixed-time outcome (realistic): enter at the live price captured when the signal
+// fired (row.at_ref_price), expire exactly one TF candle later (signal_time + tradeMinutes). The
+// expiry price is the close of the candle covering the expiry instant, once it has closed — the
+// nearest available stand-in for a tick-exact fill. Returns null until it can settle.
+function resolveStrategyAsTraded(row, candles, nowMs = Date.now()) {
+  const ref = Number(row.at_ref_price);
+  if (!Number.isFinite(ref)) return null;                       // pre-feature row → never settle
+  const sigMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+  const tfMs = (timeframeMinutes(row.timeframe) || 0) * 60000;
+  if (!Number.isFinite(sigMs) || tfMs <= 0) return null;
+  const expiryMs = sigMs + tfMs * STRATEGY_LAB_FT_EXPIRY_BARS;
+  if (nowMs < expiryMs) return null;                            // duration not elapsed yet
+  if (!candles || !candles.length) return null;
+  let expC = null;                                              // candle covering the expiry instant (largest open <= expiryMs)
+  for (const c of candles) { const t = Date.parse(c.time); if (Number.isFinite(t) && t <= expiryMs) expC = c; else break; }
+  if (!expC) return null;                                       // expiry window not in the buffer
+  if (!(Date.parse(expC.time) + tfMs <= nowMs)) return null;    // covering candle still forming
+  const exit = Number(expC.close);
+  if (!Number.isFinite(exit)) return null;
+  const pip = pipSizeForSymbol(row.symbol) || 0.0001;
+  const buy = /BUY/.test(String(row.direction).toUpperCase());
+  const diff = buy ? exit - ref : ref - exit;
+  return { outcome: diff > 0 ? 'WIN' : diff < 0 ? 'LOSS' : 'DRAW', exitPrice: exit, pips: Math.round((diff / pip) * 10) / 10, expiryIso: new Date(expiryMs).toISOString() };
+}
+
 async function processStrategyLabOutcomes() {
   const pool = await initializeDatabase();
   if (!pool) return;
@@ -10826,8 +11739,28 @@ async function processStrategyLabOutcomes() {
                 ELSE 0.0001 END)
         LIMIT 5000`,
     );
+    // Bulk-expire anything past the 72h resolution horizon BEFORE the row-by-row pass — one
+    // server-side UPDATE (UTC_TIMESTAMP vs the stored signal_time, both DB-side so no driver-tz
+    // ambiguity). Without it, un-resolvable rows (post-signal candles already evicted from the
+    // in-memory buffer, so the replay can never see where TP/SL hit) pile up faster than the row
+    // loop reaches them and the whole table appears stuck on PENDING.
+    await pool.execute(
+      "UPDATE mt5_strategy_signals SET outcome='EXPIRED', resolved_at=UTC_TIMESTAMP() WHERE outcome='PENDING' AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
+    );
+    await pool.execute(
+      "UPDATE mt5_strategy_signals SET ft_outcome='EXPIRED' WHERE ft_outcome='PENDING' AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
+    );
+    await pool.execute(
+      "UPDATE mt5_strategy_signals SET at_outcome='EXPIRED' WHERE at_ref_price IS NOT NULL AND at_outcome IS NULL AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
+    );
+    // NEWEST-first: the bulk-expire above already clears the >72h tail, so the row-by-row pass
+    // should prioritise recent signals — those are the ones whose post-signal candles are still
+    // in memory (so they CAN resolve to a real WIN/LOSS) and the ones the user is actually
+    // trading. Oldest-first starved them: the resolver spun on the un-resolvable old cluster
+    // (post-signal candles long evicted) and never reached today's signals. Older un-resolvable
+    // rows simply wait for the 72h bulk-expire.
     const [rows] = await pool.query(
-      "SELECT * FROM mt5_strategy_signals WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') OR ft_outcome = 'PENDING' ORDER BY signal_time ASC LIMIT 300",
+      "SELECT * FROM mt5_strategy_signals WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') OR ft_outcome = 'PENDING' OR (at_ref_price IS NOT NULL AND at_outcome IS NULL) ORDER BY signal_time DESC LIMIT 800",
     );
     for (const row of rows) {
       const signalMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
@@ -10872,6 +11805,17 @@ async function processStrategyLabOutcomes() {
           await pool.execute("UPDATE mt5_strategy_signals SET ft_outcome='EXPIRED' WHERE id=?", [row.id]);
         }
       }
+
+      // AS-TRADED outcome (realistic: live entry @ at_ref_price, expiry = signal_time + 1 candle).
+      // Independent of the idealized ft_outcome above; only rows with a captured ref settle here.
+      if (row.at_ref_price != null && (row.at_outcome == null || String(row.at_outcome).toUpperCase() === 'PENDING')) {
+        const at = candles && candles.length ? resolveStrategyAsTraded(row, candles, nowMs) : null;
+        if (at) {
+          await pool.execute("UPDATE mt5_strategy_signals SET at_outcome=?, at_exit_price=?, at_pips=?, at_expiry_time=? WHERE id=?", [at.outcome, at.exitPrice, at.pips, toMysqlDate(new Date(at.expiryIso)), row.id]);
+        } else if (ageHrs > 72) {
+          await pool.execute("UPDATE mt5_strategy_signals SET at_outcome='EXPIRED' WHERE id=?", [row.id]);
+        }
+      }
     }
   } catch (e) {
     console.error('[StrategyLab] outcome resolver error:', e.message);
@@ -10909,9 +11853,14 @@ function strategyLabAccumulate(b, row) {
   const ftAct = (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, row.timeframe, st) : true;
   if (fto === 'PENDING') b.ftPending += 1;
   else if (ftAct) { if (fto === 'WIN') b.ftWins += 1; else if (fto === 'LOSS') b.ftLosses += 1; else if (fto === 'DRAW') b.ftDraws += 1; }
+  // AS-TRADED (realistic): entered at the live price when the signal fired — tradable by
+  // construction, so no ftActionable gate. Only counts rows that captured a ref (going-forward).
+  const ato = String(row.at_outcome || '').toUpperCase();
+  if (ato === 'WIN') b.atWins += 1; else if (ato === 'LOSS') b.atLosses += 1; else if (ato === 'DRAW') b.atDraws += 1;
+  if (Number.isFinite(Number(row.at_pips)) && (ato === 'WIN' || ato === 'LOSS')) { b.atNetPips += Number(row.at_pips); b.atPipsN += 1; }
 }
 function strategyLabBucket() {
-  return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0 };
+  return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0, atWins: 0, atLosses: 0, atDraws: 0, atNetPips: 0, atPipsN: 0 };
 }
 function strategyLabFinalize(b) {
   const fxScored = b.fxWins + b.fxLosses;
@@ -10932,6 +11881,18 @@ function strategyLabFinalize(b) {
       winRate: ftScored ? Math.round((b.ftWins / ftScored) * 1000) / 10 : null,
       confidence: sampleConfidence(ftScored),
     },
+    // As-traded: the realistic win rate (live entry at signal time, expiry at +duration). The
+    // gap vs fixedTime.winRate = how much the signal→entry delay costs. Going-forward data only.
+    asTraded: (() => {
+      const atScored = b.atWins + b.atLosses;
+      return {
+        wins: b.atWins, losses: b.atLosses, draws: b.atDraws,
+        winLossSettled: atScored,
+        winRate: atScored ? Math.round((b.atWins / atScored) * 1000) / 10 : null,
+        expectancyPips: b.atPipsN ? Math.round((b.atNetPips / b.atPipsN) * 10) / 10 : null,
+        confidence: sampleConfidence(atScored),
+      };
+    })(),
   };
 }
 
@@ -10962,10 +11923,10 @@ function strategyLabReportWindow({ days = 90, preset = null } = {}) {
 async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
   const pool = await initializeDatabase();
   const win = strategyLabReportWindow({ days, preset });
-  const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
+  const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], sessionBreakdown: [], scoreRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
-    "SELECT strategy, symbol, timeframe, direction, entry_price, stop_loss, outcome, profit_loss_pips, ft_outcome, signal_time, bar_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
+    "SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
     [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
   );
   const byStrat = new Map();
@@ -10974,10 +11935,24 @@ async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
   const globalTf = new Map();
   const globalSymbol = new Map();
   const globalSession = new Map();
+  const globalScore = new Map(); // score-band (A+/A/B/C/unscored) -> bucket
+  // Map a numeric score to its grade band — same thresholds the strategies grade with.
+  const scoreBand = (score) => {
+    const v = Number(score);
+    if (!Number.isFinite(v)) return { key: 'unscored', label: 'Unscored', range: '—', order: 5 };
+    if (v >= 85) return { key: 'aplus', label: 'A+', range: '85–100', order: 1 };
+    if (v >= 75) return { key: 'a', label: 'A', range: '75–84', order: 2 };
+    if (v >= 65) return { key: 'b', label: 'B', range: '65–74', order: 3 };
+    return { key: 'c', label: 'C', range: 'below 65', order: 4 };
+  };
   // strategy×symbol×timeframe combos — the most granular ranking ("best edge anywhere").
   const comboMap = new Map();
+  // Per-SESSION breakdown — within each trading session, which strategies / symbols /
+  // timeframes actually work (forex + fixed-time). Answers "what to trade in this session".
+  const sessionBreakdown = new Map(); // sessionKey -> { meta, byStrategy:Map, bySymbol:Map, byTf:Map }
+  const bumpBreakdown = (map, key, r) => { if (!map.has(key)) map.set(key, strategyLabBucket()); const b = map.get(key); b.total += 1; strategyLabAccumulate(b, r); };
   for (const r of rows) {
-    if (!byStrat.has(r.strategy)) byStrat.set(r.strategy, { overall: strategyLabBucket(), byTf: new Map(), bySymbol: new Map(), bySession: new Map() });
+    if (!byStrat.has(r.strategy)) byStrat.set(r.strategy, { overall: strategyLabBucket(), byTf: new Map(), bySymbol: new Map(), bySession: new Map(), byScore: new Map() });
     const s = byStrat.get(r.strategy);
     s.overall.total += 1; strategyLabAccumulate(s.overall, r);
     if (!s.byTf.has(r.timeframe)) s.byTf.set(r.timeframe, strategyLabBucket());
@@ -11000,6 +11975,20 @@ async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
     const ckey = `${r.strategy}|${r.symbol}|${r.timeframe}`;
     if (!comboMap.has(ckey)) comboMap.set(ckey, { strategy: r.strategy, symbol: r.symbol, timeframe: r.timeframe, b: strategyLabBucket() });
     const cb = comboMap.get(ckey); cb.b.total += 1; strategyLabAccumulate(cb.b, r);
+
+    // Per-session breakdown accumulation.
+    if (!sessionBreakdown.has(sess.key)) sessionBreakdown.set(sess.key, { meta: sess, byStrategy: new Map(), bySymbol: new Map(), byTf: new Map() });
+    const sbd = sessionBreakdown.get(sess.key);
+    bumpBreakdown(sbd.byStrategy, r.strategy, r);
+    bumpBreakdown(sbd.bySymbol, r.symbol, r);
+    bumpBreakdown(sbd.byTf, r.timeframe, r);
+
+    // Score band (grade) — per strategy + global. "Do higher-score setups actually win more?"
+    const band = scoreBand(r.score);
+    if (!s.byScore.has(band.key)) s.byScore.set(band.key, { meta: band, b: strategyLabBucket() });
+    const ssc = s.byScore.get(band.key); ssc.b.total += 1; strategyLabAccumulate(ssc.b, r);
+    if (!globalScore.has(band.key)) globalScore.set(band.key, { meta: band, b: strategyLabBucket() });
+    const gsc = globalScore.get(band.key); gsc.b.total += 1; strategyLabAccumulate(gsc.b, r);
   }
   const meta = Object.fromEntries(listStrategies().map((m) => [m.id, m]));
   // Rank by win rate, but only once a bucket has enough settled samples to trust — thin
@@ -11019,10 +12008,23 @@ async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
       .sort(rankByWin),
     bySession: [...s.bySession.values()].map(({ meta: m, b }) => ({ session: m.key, sessionLabel: m.label, bdRange: m.bdRange, ...strategyLabFinalize(b) }))
       .sort(rankByWin),
+    byScore: [...s.byScore.values()].map(({ meta: m, b }) => ({ band: m.key, label: m.label, range: m.range, order: m.order, ...strategyLabFinalize(b) }))
+      .sort((a, b) => a.order - b.order),
   })).sort(rankByWin);
   out.timeframeRanking = [...globalTf.entries()].map(([timeframe, b]) => ({ timeframe, ...strategyLabFinalize(b) })).sort(rankByWin);
   out.symbolRanking = [...globalSymbol.entries()].map(([symbol, b]) => ({ symbol, ...strategyLabFinalize(b) })).sort(rankByWin);
   out.sessionRanking = [...globalSession.values()].map(({ meta: m, b }) => ({ session: m.key, sessionLabel: m.label, bdRange: m.bdRange, ...strategyLabFinalize(b) })).sort(rankByWin);
+  // Score-band ranking (across all strategies) — kept in grade order (A+→C) so the win-rate
+  // gradient is readable; the UI re-ranks by the chosen metric on demand.
+  out.scoreRanking = [...globalScore.values()].map(({ meta: m, b }) => ({ band: m.key, label: m.label, range: m.range, order: m.order, ...strategyLabFinalize(b) })).sort((a, b) => a.order - b.order);
+  // Per-session breakdown: keep the same session ordering as the global session ranking.
+  const sessionOrder = out.sessionRanking.map((s) => s.session);
+  out.sessionBreakdown = [...sessionBreakdown.values()].map(({ meta: m, byStrategy, bySymbol, byTf }) => ({
+    session: m.key, sessionLabel: m.label, bdRange: m.bdRange,
+    byStrategy: [...byStrategy.entries()].map(([id, b]) => ({ id, name: meta[id]?.name || id, ...strategyLabFinalize(b) })).sort(rankByWin),
+    bySymbol: [...bySymbol.entries()].map(([symbol, b]) => ({ symbol, ...strategyLabFinalize(b) })).sort(rankByWin),
+    byTimeframe: [...byTf.entries()].map(([timeframe, b]) => ({ timeframe, ...strategyLabFinalize(b) })).sort(rankByWin),
+  })).sort((a, b) => sessionOrder.indexOf(a.session) - sessionOrder.indexOf(b.session));
   out.combos = [...comboMap.values()]
     .map((c) => ({ strategy: c.strategy, strategyName: meta[c.strategy]?.name || c.strategy, symbol: c.symbol, timeframe: c.timeframe, ...strategyLabFinalize(c.b) }))
     .filter((c) => (c.forex.winLossSettled ?? 0) > 0 || (c.fixedTime.winLossSettled ?? 0) > 0)
@@ -11031,18 +12033,148 @@ async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
   return out;
 }
 
+// ─── Confluence analysis: do 2-3 strategies AGREEING produce better signals? ──
+// A "moment" = (symbol, timeframe, bar_time, direction). Strategies that fire on the SAME
+// moment "agree". Because the fixed-time outcome (next-candle direction vs the signal-bar
+// close) depends only on the moment — not the strategy — every strategy agreeing on a moment
+// shares ONE WIN/LOSS, so confluence is cleanly measurable on the fixed-time + as-traded sides.
+function confluenceBucket() { return { moments: 0, ftW: 0, ftL: 0, ftD: 0, atW: 0, atL: 0, atD: 0 }; }
+function confluenceFinalize(b) {
+  const ftS = b.ftW + b.ftL, atS = b.atW + b.atL;
+  return {
+    moments: b.moments,
+    fixedTime: { wins: b.ftW, losses: b.ftL, draws: b.ftD, settled: ftS, winRate: ftS ? Math.round((b.ftW / ftS) * 1000) / 10 : null, confidence: sampleConfidence(ftS) },
+    asTraded: { wins: b.atW, losses: b.atL, draws: b.atD, settled: atS, winRate: atS ? Math.round((b.atW / atS) * 1000) / 10 : null, confidence: sampleConfidence(atS) },
+  };
+}
+function confluenceAccumulate(b, m) {
+  b.moments += 1;
+  if (m.ftOut === 'WIN') b.ftW += 1; else if (m.ftOut === 'LOSS') b.ftL += 1; else if (m.ftOut === 'DRAW') b.ftD += 1;
+  if (m.atOut === 'WIN') b.atW += 1; else if (m.atOut === 'LOSS') b.atL += 1; else if (m.atOut === 'DRAW') b.atD += 1;
+}
+
+async function buildStrategyLabConfluence({ days = 90, preset = null, timeframe = null, symbol = null, strategies = [] } = {}) {
+  const pool = await initializeDatabase();
+  const win = strategyLabReportWindow({ days, preset });
+  const minSample = 12; // confluence samples are sparser than single-signal → a lower bar
+  const out = { ok: true, window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSample, agreementLadder: [], topPairs: [], combo: null, generatedAt: new Date().toISOString() };
+  if (!pool) return out;
+  const params = [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))];
+  let sql = "SELECT strategy, symbol, timeframe, bar_time, direction, ft_outcome, at_outcome FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ?";
+  if (timeframe) { sql += " AND timeframe = ?"; params.push(String(timeframe).toUpperCase()); }
+  if (symbol) { sql += " AND symbol = ?"; params.push(String(symbol).toUpperCase()); }
+  sql += " LIMIT 50000";
+  const [rows] = await pool.query(sql, params);
+
+  // Collapse rows into moments. The fixed-time / as-traded outcome is shared across strategies
+  // on the same moment, so keep the first settled WIN/LOSS/DRAW we see.
+  const moments = new Map();
+  for (const r of rows) {
+    const dir = /BUY|UP/.test(String(r.direction).toUpperCase()) ? 'UP' : 'DOWN';
+    const key = `${r.symbol}|${r.timeframe}|${new Date(r.bar_time).getTime()}|${dir}`;
+    let m = moments.get(key);
+    if (!m) { m = { symbol: r.symbol, timeframe: r.timeframe, direction: dir, strategies: new Set(), ftOut: null, atOut: null }; moments.set(key, m); }
+    m.strategies.add(r.strategy);
+    const fo = String(r.ft_outcome || '').toUpperCase();
+    if (!m.ftOut && (fo === 'WIN' || fo === 'LOSS' || fo === 'DRAW')) m.ftOut = fo;
+    const ao = String(r.at_outcome || '').toUpperCase();
+    if (!m.atOut && (ao === 'WIN' || ao === 'LOSS' || ao === 'DRAW')) m.atOut = ao;
+  }
+
+  const meta = Object.fromEntries(listStrategies().map((x) => [x.id, x.name]));
+  // 1) Agreement ladder: bucket every moment by how many strategies agreed (1 / 2 / 3 / 4+).
+  const ladder = new Map(); // bucketKey -> confluenceBucket
+  // 2) Per-pair: every co-occurring pair gets credited on each moment they share.
+  const pairs = new Map(); // "a|b" (sorted) -> confluenceBucket
+  // Solo per-strategy (all moments a strategy appears in) for comparison.
+  const solo = new Map(); // id -> confluenceBucket
+  for (const m of moments.values()) {
+    const ids = [...m.strategies].sort();
+    const n = ids.length;
+    const bk = n >= 4 ? '4+' : String(n);
+    if (!ladder.has(bk)) ladder.set(bk, confluenceBucket());
+    confluenceAccumulate(ladder.get(bk), m);
+    for (const id of ids) { if (!solo.has(id)) solo.set(id, confluenceBucket()); confluenceAccumulate(solo.get(id), m); }
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      const pk = `${ids[i]}|${ids[j]}`;
+      if (!pairs.has(pk)) pairs.set(pk, confluenceBucket());
+      confluenceAccumulate(pairs.get(pk), m);
+    }
+  }
+  const ladderOrder = ['1', '2', '3', '4+'];
+  out.agreementLadder = ladderOrder.filter((k) => ladder.has(k)).map((k) => ({ agree: k, ...confluenceFinalize(ladder.get(k)) }));
+
+  // Top pairs by fixed-time win rate (sample-gated), with each member's solo win rate for lift.
+  out.topPairs = [...pairs.entries()].map(([pk, b]) => {
+    const [a, c] = pk.split('|');
+    const f = confluenceFinalize(b);
+    const sa = solo.get(a) ? confluenceFinalize(solo.get(a)) : null;
+    const sc = solo.get(c) ? confluenceFinalize(solo.get(c)) : null;
+    return {
+      a, b: c, aName: meta[a] || a, bName: meta[c] || c,
+      moments: f.moments, fixedTime: f.fixedTime, asTraded: f.asTraded,
+      soloA: sa ? { winRate: sa.fixedTime.winRate, settled: sa.fixedTime.settled } : null,
+      soloB: sc ? { winRate: sc.fixedTime.winRate, settled: sc.fixedTime.settled } : null,
+    };
+  }).filter((p) => p.fixedTime.settled >= minSample)
+    .sort((x, y) => (y.fixedTime.winRate ?? -1) - (x.fixedTime.winRate ?? -1) || y.fixedTime.settled - x.fixedTime.settled)
+    .slice(0, 25);
+
+  // 3) Custom combo: moments where ALL the selected strategies fired together.
+  const sel = (Array.isArray(strategies) ? strategies : []).filter(Boolean);
+  if (sel.length >= 2) {
+    const comboB = confluenceBucket();
+    const bySymbol = new Map();
+    for (const m of moments.values()) {
+      if (!sel.every((id) => m.strategies.has(id))) continue;
+      confluenceAccumulate(comboB, m);
+      if (!bySymbol.has(m.symbol)) bySymbol.set(m.symbol, confluenceBucket());
+      confluenceAccumulate(bySymbol.get(m.symbol), m);
+    }
+    out.combo = {
+      strategies: sel, names: sel.map((id) => meta[id] || id),
+      ...confluenceFinalize(comboB),
+      solos: sel.map((id) => ({ id, name: meta[id] || id, ...(solo.get(id) ? confluenceFinalize(solo.get(id)) : confluenceFinalize(confluenceBucket())) })),
+      bySymbol: [...bySymbol.entries()].map(([sym, b]) => ({ symbol: sym, ...confluenceFinalize(b) })).sort((x, y) => (y.fixedTime.winRate ?? -1) - (x.fixedTime.winRate ?? -1)),
+    };
+  }
+  return out;
+}
+
+// GET /api/strategy-lab/confluence?days=&preset=&timeframe=&symbol=&strategies=a,b,c
+app.get('/api/strategy-lab/confluence', async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(Number(req.query.days) || 90, 365));
+    const preset = req.query.preset ? String(req.query.preset) : null;
+    const timeframe = req.query.timeframe ? String(req.query.timeframe) : null;
+    const symbol = req.query.symbol ? String(req.query.symbol) : null;
+    const strategies = req.query.strategies ? String(req.query.strategies).split(',').map((s) => s.trim()).filter(Boolean) : [];
+    res.json(await buildStrategyLabConfluence({ days, preset, timeframe, symbol, strategies }));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/strategy-lab/strategies — registry metadata.
 app.get('/api/strategy-lab/strategies', (req, res) => {
-  res.json({ ok: true, strategies: listStrategies(), timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
+  const controls = loadEmailAlertSettings().strategyControls || {};
+  // Attach each strategy's controller state (default = enabled) so the Settings page and
+  // dashboard can render the on/off switch + refinements and grey muted strategies.
+  const strategies = listStrategies().map((m) => ({ ...m, control: controls[m.id] || { enabled: true } }));
+  res.json({ ok: true, strategies, timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
 });
 
 // GET /api/strategy-lab/live?strategy=&timeframe= — LIVE command per curated symbol on
 // one timeframe (like the fixed-time scan): ENTRY (with plan) or HOLD / NO-DATA.
 app.get('/api/strategy-lab/live', (req, res) => {
   try {
-    const strategy = req.query.strategy ? String(req.query.strategy) : Object.keys(STRATEGY_LAB_REGISTRY)[0];
+    const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
+    const strategy = req.query.strategy ? String(req.query.strategy) : (enabledStrategyIds()[0] || Object.keys(STRATEGY_LAB_REGISTRY)[0]);
     if (!STRATEGY_LAB_REGISTRY[strategy]) return res.status(404).json({ error: 'Unknown strategy.' });
     const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'M15').toUpperCase();
+    // Disabled in the Strategy Controller → hidden everywhere (return no rows) unless an
+    // admin view explicitly asks for muted strategies.
+    if (!includeMuted && strategyMuted(strategy)) {
+      return res.json({ ok: true, hidden: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, rows: [], generatedAt: new Date().toISOString() });
+    }
     // "ALL" → scan every lab timeframe and return one row per symbol×timeframe.
     const tfs = tfParam === 'ALL' ? STRATEGY_LAB_TIMEFRAMES : [tfParam];
     const symbols = getCuratedSymbols(getMt5Status().symbols);
@@ -11052,8 +12184,9 @@ app.get('/api/strategy-lab/live', (req, res) => {
         const ctx = buildStrategyContext(symbol, tf);
         if (!ctx) { rows.push({ symbol, timeframe: tf, command: 'NO_DATA' }); continue; }
         const price = Number(ctx.candles[ctx.candles.length - 1].close);
+        const fresh = candleFreshness(ctx.candles[ctx.candles.length - 1], tf);
         const sig = evaluateStrategy(strategy, ctx);
-        if (sig && sig.decision && sig.decision !== 'HOLD') {
+        if (sig && sig.decision && sig.decision !== 'HOLD' && liveSignalsAllowed()) {
           const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
           rows.push({
             symbol, timeframe: tf, command: 'ENTRY', direction: sig.decision,
@@ -11064,9 +12197,10 @@ app.get('/api/strategy-lab/live', (req, res) => {
             lots: sizing?.suggestedLots ?? null, stopPips: sizing?.stopPips ?? null,
             lossAtStop: sizing?.lossAtStop ?? null, riskPercent: sizing?.riskPercent ?? null,
             timing: strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss),
+            dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds,
           });
         } else {
-          rows.push({ symbol, timeframe: tf, command: 'HOLD', price });
+          rows.push({ symbol, timeframe: tf, command: 'HOLD', price, dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds });
         }
       }
     }
@@ -11075,7 +12209,7 @@ app.get('/api/strategy-lab/live', (req, res) => {
       const rank = (r) => (r.command === 'ENTRY' ? 2 : r.command === 'HOLD' ? 1 : 0);
       return (rank(b) - rank(a)) || ((b.score || 0) - (a.score || 0));
     });
-    res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, rows, generatedAt: new Date().toISOString() });
+    res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, marketStatus: getForexMarketStatus(), rows, generatedAt: new Date().toISOString() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -11084,9 +12218,14 @@ app.get('/api/strategy-lab/live', (req, res) => {
 // TP/SL plan). One row per curated symbol×timeframe: CALL (UP/DOWN) or HOLD / NO-DATA.
 app.get('/api/strategy-lab/live-ftt', (req, res) => {
   try {
-    const strategy = req.query.strategy ? String(req.query.strategy) : Object.keys(STRATEGY_LAB_REGISTRY)[0];
+    const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
+    const strategy = req.query.strategy ? String(req.query.strategy) : (enabledStrategyIds()[0] || Object.keys(STRATEGY_LAB_REGISTRY)[0]);
     if (!STRATEGY_LAB_REGISTRY[strategy]) return res.status(404).json({ error: 'Unknown strategy.' });
     const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'M15').toUpperCase();
+    // Disabled strategies are hidden everywhere (see /live) unless includeMuted.
+    if (!includeMuted && strategyMuted(strategy)) {
+      return res.json({ ok: true, hidden: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, rows: [], generatedAt: new Date().toISOString() });
+    }
     const tfs = tfParam === 'ALL' ? STRATEGY_LAB_TIMEFRAMES : [tfParam];
     const symbols = getCuratedSymbols(getMt5Status().symbols);
     const rows = [];
@@ -11095,8 +12234,9 @@ app.get('/api/strategy-lab/live-ftt', (req, res) => {
         const ctx = buildStrategyContext(symbol, tf);
         if (!ctx) { rows.push({ symbol, timeframe: tf, command: 'NO_DATA' }); continue; }
         const price = Number(ctx.candles[ctx.candles.length - 1].close);
+        const fresh = candleFreshness(ctx.candles[ctx.candles.length - 1], tf);
         const sig = evaluateStrategy(strategy, ctx);
-        if (sig && sig.decision && sig.decision !== 'HOLD') {
+        if (sig && sig.decision && sig.decision !== 'HOLD' && liveSignalsAllowed()) {
           const expiry = strategyLabFttExpiry(tf);
           const ftDir = /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN';
           rows.push({
@@ -11104,11 +12244,14 @@ app.get('/api/strategy-lab/live-ftt', (req, res) => {
             direction: ftDir,
             score: sig.score ?? null, grade: sig.grade ?? null,
             reference: Number.isFinite(price) ? price : null,
+            candleRead: fixedTimeCandleRead(ctx.candles, ftDir),
             expiryIso: expiry?.expiryIso ?? null, secondsToExpiry: expiry?.secondsToExpiry ?? null,
+            tradeMinutes: expiry?.tradeMinutes ?? null, tradeTimeLabel: expiry?.tradeTimeLabel ?? null,
             durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null,
+            dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds,
           });
         } else {
-          rows.push({ symbol, timeframe: tf, command: 'HOLD', reference: Number.isFinite(price) ? price : null });
+          rows.push({ symbol, timeframe: tf, command: 'HOLD', reference: Number.isFinite(price) ? price : null, dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds });
         }
       }
     }
@@ -11117,7 +12260,7 @@ app.get('/api/strategy-lab/live-ftt', (req, res) => {
       const rank = (r) => (r.command === 'CALL' ? 2 : r.command === 'HOLD' ? 1 : 0);
       return (rank(b) - rank(a)) || ((b.score || 0) - (a.score || 0));
     });
-    res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, rows, generatedAt: new Date().toISOString() });
+    res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, marketStatus: getForexMarketStatus(), rows, generatedAt: new Date().toISOString() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -11151,10 +12294,20 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
   try {
     const strategy = req.query.strategy ? String(req.query.strategy) : null;
     const timeframe = req.query.timeframe ? String(req.query.timeframe).toUpperCase() : null;
+    const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 200, 500));
+    // A disabled strategy is hidden everywhere: even an explicit pick returns nothing
+    // (unless includeMuted), so its signal log can't leak onto any visible surface.
+    if (strategy && !includeMuted && strategyMuted(strategy)) {
+      return res.json({ ok: true, signals: [] });
+    }
     let sql = 'SELECT * FROM mt5_strategy_signals WHERE 1=1';
     const params = [];
-    if (strategy) { sql += ' AND strategy = ?'; params.push(strategy); }
+    if (strategy) { sql += ' AND strategy = ?'; params.push(strategy); }       // explicit pick wins
+    else if (!includeMuted) {                                                  // "all" view = enabled only
+      const ids = enabledStrategyIds();
+      if (ids.length) { sql += ` AND strategy IN (${ids.map(() => '?').join(',')})`; params.push(...ids); }
+    }
     if (timeframe) { sql += ' AND timeframe = ?'; params.push(timeframe); }
     sql += ' ORDER BY signal_time DESC LIMIT ?'; params.push(limit);
     const [rows] = await pool.query(sql, params);
@@ -11174,6 +12327,11 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
           timing: strategyLabTiming(r),
           outcome: r.outcome, profitLossPips: num(r.profit_loss_pips), tpHitLevel: r.tp_hit_level === null ? null : Number(r.tp_hit_level),
           ftOutcome: r.ft_outcome, ftPips: num(r.ft_pips),
+          // As-traded (realistic) outcome alongside the idealized ft_outcome. atRefPrice null = logged
+          // before this feature (no retroactive settle). atGapPips = how much the signal→entry delay cost.
+          atOutcome: r.at_outcome || null, atRefPrice: num(r.at_ref_price), atExitPrice: num(r.at_exit_price), atPips: num(r.at_pips),
+          atGapPips: (r.at_pips != null && r.ft_pips != null) ? Math.round((Number(r.at_pips) - Number(r.ft_pips)) * 10) / 10 : null,
+          atExpiryIso: r.at_expiry_time ? new Date(r.at_expiry_time).toISOString() : (() => { const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; const tfMs = (timeframeMinutes(r.timeframe) || 0) * 60000; return (Number.isFinite(st) && tfMs > 0) ? new Date(st + STRATEGY_LAB_FT_EXPIRY_BARS * tfMs).toISOString() : null; })(),
           ftActionable: (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; return (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, r.timeframe, st) : null; })(),
           // Real fixed-time expiry (signal-bar close + expiry candles) so the live "just fired"
           // panel can show a true countdown and drop a call once its expiry has passed.
@@ -11194,10 +12352,150 @@ app.get('/api/strategy-lab/performance', async (req, res) => {
   try {
     const days = req.query.days ? Number(req.query.days) : 90;
     const preset = req.query.preset ? String(req.query.preset) : null;
+    const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
     const perf = await buildStrategyLabPerformance({ days, preset });
+    if (!includeMuted) {
+      const enabled = new Set(enabledStrategyIds());
+      perf.strategies = (perf.strategies || []).filter((s) => enabled.has(s.id));
+    }
     res.json({
       ok: true, ...perf,
       note: 'Each strategy is isolated (never blended with the live system). Scored two ways: forex (TP/SL) and fixed-time (direction at next-candle expiry). A strategy/timeframe is only trustworthy once its sample confidence is usable — don\'t crown a winner on a thin sample.',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/strategy-lab/entry-watch — high-conviction ICT / ICT+ / SMC forex signals
+// (grade A / A+, score ≥ threshold ~80) that are still PENDING entry, with LIVE price
+// vs the limit entry so you can watch the moment price reaches entry. Read-only — never
+// scores, settles, or sends anything. Powers the Signal Tracker "Entry Watch" tab.
+const ENTRY_WATCH_STRATEGIES = ['ict-breaker', 'ict-plus', 'smc-fvg', 'smc-mmxm', 'smc-cct', 'smc-two-lines', 'smc-asian-sweep'];
+const ENTRY_WATCH_MIN_SCORE = Math.max(0, Number(process.env.STRATEGY_ENTRY_WATCH_MIN_SCORE || 80));
+const ENTRY_WATCH_WINDOW_HOURS = Math.max(1, Number(process.env.STRATEGY_ENTRY_WATCH_WINDOW_HOURS || 48));
+app.get('/api/strategy-lab/entry-watch', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const minScore = req.query.minScore ? Math.max(0, Number(req.query.minScore)) : ENTRY_WATCH_MIN_SCORE;
+    const placeholders = ENTRY_WATCH_STRATEGIES.map(() => '?').join(',');
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_strategy_signals
+        WHERE strategy IN (${placeholders})
+          AND outcome = 'PENDING'
+          AND score >= ?
+          AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)
+        ORDER BY signal_time DESC
+        LIMIT 200`,
+      [...ENTRY_WATCH_STRATEGIES, minScore, ENTRY_WATCH_WINDOW_HOURS],
+    );
+    const num = (v) => (v === null || v === undefined ? null : Number(v));
+    // Per-request caches so re-evaluating the live strength never rebuilds the same
+    // multi-timeframe context twice (several signals can share a symbol×timeframe).
+    const ctxCache = new Map();    // `${symbol}|${tf}` → context | null
+    const liveCache = new Map();   // `${strategy}|${symbol}|${tf}` → live sig | null
+    const getCtx = (symbol, tf) => {
+      const k = `${symbol}|${tf}`;
+      if (!ctxCache.has(k)) { try { ctxCache.set(k, buildStrategyContext(symbol, tf)); } catch { ctxCache.set(k, null); } }
+      return ctxCache.get(k);
+    };
+    const getLive = (strategy, symbol, tf) => {
+      const k = `${strategy}|${symbol}|${tf}`;
+      if (!liveCache.has(k)) {
+        const ctx = getCtx(symbol, tf);
+        let sig = null;
+        try { sig = ctx ? evaluateStrategy(strategy, ctx) : null; } catch { sig = null; }
+        liveCache.set(k, sig);
+      }
+      return liveCache.get(k);
+    };
+    const items = rows.map((r) => {
+      const pip = pipSizeForSymbol(r.symbol) || 0.0001;
+      const buy = /BUY/.test(String(r.direction).toUpperCase());
+      let current = null;
+      try { const c = getRecentCandles(r.symbol, r.timeframe, 2); if (c && c.length) current = Number(c[c.length - 1].close); } catch { /* feed gap */ }
+      const entry = num(r.entry_price);
+      // Signed pips still needed to REACH the limit entry: >0 = price must come in toward
+      // entry, ≤0 = price has reached / passed the entry. BUY fills on a pullback (price
+      // drops to entry), SELL fills on a rally (price rises to entry).
+      const pipsToEntry = (current != null && entry != null)
+        ? Math.round(((buy ? current - entry : entry - current) / pip) * 10) / 10
+        : null;
+      const timing = strategyLabTiming(r);
+      const entryStatus = timing.status === 'TRADABLE' ? 'AT_ENTRY'
+        : timing.status === 'EXPIRED' ? 'MISSED'
+        : 'WAIT';
+      const sizing = strategyLabSizing(r.symbol, r.entry_price, r.stop_loss, { tp1: r.take_profit_1, tp2: r.take_profit_2, tp3: r.take_profit_3 });
+
+      // ── CURRENT-TIME strength: re-run the strategy live and compare to the logged
+      // strength so the row reflects how strong the setup is RIGHT NOW, not when it fired.
+      const loggedScore = num(r.score);
+      const live = getLive(r.strategy, r.symbol, r.timeframe);
+      let currentScore = null, currentGrade = null, currentDirection = null, sameDir = false;
+      if (live && live.decision && String(live.decision).toUpperCase() !== 'HOLD') {
+        currentDirection = live.decision;
+        currentScore = live.score ?? null;
+        currentGrade = live.grade ?? null;
+        sameDir = /BUY/.test(String(live.decision).toUpperCase()) === buy;
+      }
+      // STRONGER / SAME / WEAKER vs the logged score, or GONE when the setup no longer
+      // confirms live (strategy now HOLDs or flipped direction).
+      let strengthTrend;
+      if (!sameDir || currentScore == null) strengthTrend = 'GONE';
+      else if (loggedScore != null && currentScore >= loggedScore + 2) strengthTrend = 'STRONGER';
+      else if (loggedScore != null && currentScore <= loggedScore - 2) strengthTrend = 'WEAKER';
+      else strengthTrend = 'SAME';
+
+      // ── Executability verdict: take it now, wait for a better position, or be cautious.
+      let executability, execMessage;
+      if (entryStatus === 'MISSED') {
+        executability = 'MISSED';
+        execMessage = timing.message;
+      } else if (entryStatus === 'AT_ENTRY') {
+        if (strengthTrend === 'GONE') {
+          executability = 'CAUTION';
+          execMessage = 'Price is at entry but the setup no longer confirms live — be cautious / skip.';
+        } else {
+          executability = 'EXECUTE_NOW';
+          execMessage = `Executable now — price at entry and the setup still confirms (${currentGrade || '—'} ${currentScore != null ? Math.round(currentScore) : '—'}).`;
+        }
+      } else { // WAIT — price not yet at the limit entry
+        const away = pipsToEntry != null ? Math.abs(pipsToEntry) : null;
+        if (strengthTrend === 'GONE') {
+          executability = 'CAUTION';
+          execMessage = `Wait — the live setup has weakened; only take it if it re-confirms when price reaches entry${away != null ? ` (${away}p away)` : ''}.`;
+        } else {
+          executability = 'WAIT';
+          execMessage = `Wait for a better position — ${away != null ? `${away}p ` : ''}${buy ? 'pullback' : 'rally'} to entry ${px(entry, r.symbol)}.`;
+        }
+      }
+
+      return {
+        id: r.id, strategy: r.strategy,
+        strategyName: STRATEGY_LAB_REGISTRY[r.strategy]?.name || r.strategy,
+        symbol: r.symbol, timeframe: r.timeframe,
+        signalTime: r.signal_time ? new Date(r.signal_time).toISOString() : null,
+        direction: r.direction, score: loggedScore, grade: r.grade || null,
+        currentScore, currentGrade, currentDirection, strengthTrend,
+        executability, execMessage,
+        entryPrice: entry, currentPrice: current, pipsToEntry,
+        stopLoss: num(r.stop_loss),
+        takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
+        riskReward: num(r.risk_reward),
+        lots: sizing?.suggestedLots ?? null, lossAtStop: sizing?.lossAtStop ?? null,
+        entryStatus, reachedEntry: entryStatus === 'AT_ENTRY',
+        executableNow: executability === 'EXECUTE_NOW',
+        timingMessage: timing.message, reason: r.reason || null,
+        popupSent: r.popup_sent == null ? null : !!r.popup_sent,
+        emailSent: r.email_sent == null ? null : !!r.email_sent,
+      };
+    });
+    // EXECUTE NOW first (most actionable), then WAIT (nearest to entry), CAUTION, MISSED.
+    const rank = (s) => (s === 'EXECUTE_NOW' ? 3 : s === 'WAIT' ? 2 : s === 'CAUTION' ? 1 : 0);
+    items.sort((a, b) => (rank(b.executability) - rank(a.executability))
+      || (Math.abs(a.pipsToEntry ?? 1e9) - Math.abs(b.pipsToEntry ?? 1e9)));
+    res.json({
+      ok: true, minScore, windowHours: ENTRY_WATCH_WINDOW_HOURS,
+      strategies: ENTRY_WATCH_STRATEGIES, items, generatedAt: new Date().toISOString(),
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -11230,6 +12528,159 @@ app.post('/api/strategy-lab/test-email', async (req, res) => {
     await emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: false, email: true, kind: 'NEW' });
     await emitStrategyLabFttSignal({ id: `${id}:ftt`, strategy, symbol, timeframe: tf, sig, refClose: entry, popup: false, email: true, kind: 'NEW' });
     res.json({ ok: true, sentTo: SIGNAL_ALERT_EMAIL_TO, alertsEnabled: SIGNAL_ALERTS_ENABLED, strategy, symbol, timeframe: tf, dir: buy ? 'BUY' : 'SELL' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Breakout tracker (read-only views for the dedicated /breakout page) ─────
+// GET /api/breakout/live?timeframe=ALL|M5|M15|… — scan curated symbols × breakout
+// timeframes and return every ACTIVE candidate (PRE approaching a strong level /
+// CONFIRMED decisive break) on a well-formed chart, graded A+/A/B/C. Uses the SAME
+// pure detector the alert scanner uses; never mutates state or sends anything.
+// C-grade is INCLUDED here (the alert scanner drops it) so the page also shows
+// setups that are still forming and have not yet earned an alert.
+app.get('/api/breakout/live', (req, res) => {
+  try {
+    const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'ALL').toUpperCase();
+    const tfs = tfParam === 'ALL' ? BREAKOUT_TIMEFRAMES : [tfParam];
+    const symbols = getCuratedSymbols(getMt5Status().symbols);
+    const browserMinRank = BREAKOUT_GRADE_RANK[BREAKOUT_BROWSER_MIN_GRADE] ?? BREAKOUT_GRADE_RANK.B;
+    const emailMinGrade = String(loadEmailAlertSettings().breakoutEmailMinGrade || 'A').toUpperCase();
+    const rows = [];
+    for (const symbol of symbols) {
+      for (const tf of tfs) {
+        if (!BREAKOUT_TIMEFRAMES.includes(tf)) continue;
+        let candles;
+        try { candles = getRecentCandles(symbol, tf, 200); } catch { candles = null; }
+        if (!candles || candles.length < 40) continue;
+        const latest = candles[candles.length - 1];
+        const fresh = isCandleCurrent(latest, tf);
+        let cand = null;
+        try {
+          cand = buildBreakoutCandidate({ symbol, timeframe: tf, candles }, {
+            approachAtr: BREAKOUT_APPROACH_ATR,
+            minBreakBodyAtr: BREAKOUT_MIN_BREAK_BODY_ATR,
+          });
+        } catch { /* per-symbol resilience */ }
+        if (!cand) continue;
+        rows.push({
+          symbol, timeframe: tf,
+          phase: cand.phase, direction: cand.direction, trend: cand.trend,
+          grade: cand.grade, score: cand.score,
+          level: cand.level, levelStrength: cand.levelStrength,
+          price: cand.price, atr: cand.atr,
+          distanceAtr: cand.distanceAtr, bodyAtr: cand.bodyAtr,
+          displacement: cand.displacement
+            ? { present: cand.displacement.present, strong: cand.displacement.strong }
+            : null,
+          reasons: cand.reasons, bar: cand.bar, stale: !fresh,
+          meetsBrowserBar: (BREAKOUT_GRADE_RANK[cand.grade] ?? 0) >= browserMinRank,
+        });
+      }
+    }
+    // CONFIRMED first, then by grade rank, then score → strongest setups on top.
+    rows.sort((a, b) => {
+      const ph = (r) => (r.phase === 'CONFIRMED' ? 1 : 0);
+      return (ph(b) - ph(a))
+        || ((BREAKOUT_GRADE_RANK[b.grade] ?? 0) - (BREAKOUT_GRADE_RANK[a.grade] ?? 0))
+        || (b.score - a.score);
+    });
+    res.json({
+      ok: true, enabled: BREAKOUT_ENABLED, timeframe: tfParam,
+      timeframes: BREAKOUT_TIMEFRAMES,
+      browserMinGrade: BREAKOUT_BROWSER_MIN_GRADE, emailMinGrade,
+      confirmed: rows.filter((r) => r.phase === 'CONFIRMED').length,
+      pre: rows.filter((r) => r.phase === 'PRE').length,
+      rows, generatedAt: new Date().toISOString(),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/breakout/alerts?limit=&symbol= — recent persisted breakout alerts that
+// were actually surfaced (track record of what fired + on which channel). Browser
+// alerts persist as BROWSER; emails upgrade the row's channel to EMAIL.
+app.get('/api/breakout/alerts', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 150, 500));
+    const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
+    let sql = 'SELECT * FROM mt5_breakout_alerts WHERE 1=1';
+    const params = [];
+    if (symbol) { sql += ' AND symbol = ?'; params.push(symbol); }
+    sql += ' ORDER BY created_at DESC LIMIT ?'; params.push(limit);
+    const [rows] = await pool.query(sql, params);
+    const num = (v) => (v === null || v === undefined ? null : Number(v));
+    res.json({
+      ok: true,
+      alerts: rows.map((r) => ({
+        id: r.id, symbol: r.symbol, timeframe: r.timeframe, phase: r.phase,
+        direction: r.direction, grade: r.grade, score: num(r.score), trend: r.trend,
+        level: num(r.level),
+        levelStrength: r.level_strength === null || r.level_strength === undefined ? null : Number(r.level_strength),
+        price: num(r.price), atr: num(r.atr), distanceAtr: num(r.distance_atr), bodyAtr: num(r.body_atr),
+        displacement: !!r.displacement, channel: r.channel,
+        barTime: r.bar_time ? new Date(r.bar_time).toISOString() : null,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+      })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/breakout/tracking?windowHours=&timeframe= — CONFIRMED breakouts with LIVE
+// follow-through status. Pure read-side replay (no schema change): each recent confirmed
+// alert is measured against current candles to show whether the break EXTENDED or FAILED.
+// active = still developing (FOLLOWING_THROUGH / STALLING); settled = TARGET_HIT / FAILED.
+app.get('/api/breakout/tracking', async (req, res) => {
+  const pool = await initializeDatabase();
+  if (!pool) return res.status(500).json({ error: 'Database not available.' });
+  try {
+    const windowHours = Math.max(1, Math.min(Number(req.query.windowHours) || 72, 240));
+    const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'ALL').toUpperCase();
+    const [rows] = await pool.query(
+      "SELECT * FROM mt5_breakout_alerts WHERE phase='CONFIRMED' AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) ORDER BY bar_time ASC, created_at ASC",
+      [windowHours],
+    );
+    // One entry per distinct breakout: earliest confirm per (symbol,tf,direction,level).
+    const seen = new Map();
+    for (const r of rows) {
+      if (tfParam !== 'ALL' && String(r.timeframe).toUpperCase() !== tfParam) continue;
+      const key = `${r.symbol}|${r.timeframe}|${r.direction}|${Number(r.level).toFixed(5)}`;
+      if (!seen.has(key)) seen.set(key, r);                 // rows ASC → keep the first (origin) confirm
+    }
+    const active = [], settled = [];
+    for (const r of seen.values()) {
+      let candles; try { candles = getRecentCandles(r.symbol, r.timeframe, 200); } catch { candles = null; }
+      if (!candles || candles.length < 5) continue;
+      const ft = breakoutFollowThrough(
+        { direction: r.direction, level: r.level, price: r.price, atr: r.atr, barTime: r.bar_time ? new Date(r.bar_time).toISOString() : null },
+        candles,
+      );
+      if (!ft) continue;
+      const pip = pipSizeForSymbol(r.symbol) || 0.0001;
+      const confirmIso = r.bar_time ? new Date(r.bar_time).toISOString() : (r.created_at ? new Date(r.created_at).toISOString() : null);
+      const ageMs = confirmIso ? Date.now() - Date.parse(confirmIso) : null;
+      const latest = candles[candles.length - 1];
+      const entry = {
+        id: r.id, symbol: r.symbol, timeframe: r.timeframe, direction: r.direction, trend: r.trend,
+        grade: r.grade, score: Number(r.score), levelStrength: r.level_strength === null ? null : Number(r.level_strength),
+        confirmIso, ageHours: ageMs != null ? Math.round((ageMs / 3.6e6) * 10) / 10 : null,
+        stale: !isCandleCurrent(latest, r.timeframe),
+        ...ft,
+        beyondPips: Math.round((ft.beyond / pip) * 10) / 10,
+        mfePips: Math.round((ft.mfe / pip) * 10) / 10,
+        maePips: Math.round((ft.mae / pip) * 10) / 10,
+      };
+      (ft.state === 'TARGET_HIT' || ft.state === 'FAILED' ? settled : active).push(entry);
+    }
+    active.sort((a, b) => (b.progressPct - a.progressPct) || (b.score - a.score));
+    settled.sort((a, b) => Date.parse(b.confirmIso || 0) - Date.parse(a.confirmIso || 0));
+    const targetHit = settled.filter((s) => s.state === 'TARGET_HIT').length;
+    const failed = settled.filter((s) => s.state === 'FAILED').length;
+    res.json({
+      ok: true, timeframe: tfParam, windowHours, active, settled,
+      stats: { active: active.length, targetHit, failed, winRate: (targetHit + failed) ? Math.round((targetHit / (targetHit + failed)) * 100) : null },
+      generatedAt: new Date().toISOString(),
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

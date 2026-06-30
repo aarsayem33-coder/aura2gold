@@ -10,7 +10,8 @@
 //              takeProfit3?, riskRewardRatio, reason, barIso, meta }
 // Pure: no I/O. New strategies = add one entry to STRATEGIES.
 
-import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive } from './liquidityEngine.js';
+import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep } from './liquidityEngine.js';
+import { buildBreakoutCandidate, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
 const n = (v) => Number(v);
@@ -1522,7 +1523,419 @@ function ictPlus(ctx) {
   };
 }
 
+// ── Strategy: 3-Candle Safety Check (Exhaustion → Indecision → Confirmation) ──
+// "Don't trade single candles — trade a SEQUENCE that tells a story." Reads the last
+// three CLOSED candles as an ordered combo and validates it through 5 context filters
+// (structure, level, HTF momentum, session, volume). Two modes: REVERSAL (combo against
+// the local move at a level) and CONTINUATION (HTF-aligned pullback that resumes). Pure;
+// reuses detectCandlePatterns / fractalSwings / atr14 / tpLadder. Isolated lab strategy.
+function isInsideBar(inner, outer) {
+  return n(inner.high) <= n(outer.high) && n(inner.low) >= n(outer.low);
+}
+// Session quality from a candle's UTC hour. London 07–16, New York 12–21 (overlap = best);
+// Asian (~21–07) is low-participation "retail noise" per the playbook.
+function sessionQuality(timeIso) {
+  const ms = Date.parse(timeIso);
+  if (!Number.isFinite(ms)) return { session: 'UNKNOWN', score: 0 };
+  const h = new Date(ms).getUTCHours();
+  const london = h >= 7 && h < 16;
+  const ny = h >= 12 && h < 21;
+  if (london && ny) return { session: 'LONDON/NY', score: 8 };
+  if (london || ny) return { session: london ? 'LONDON' : 'NEWYORK', score: 6 };
+  return { session: 'ASIAN', score: -4 };
+}
+// Volume story. REVERSAL: confirmation volume expands (new direction takes control).
+// CONTINUATION: pullback (c2,c1) quieter than the trend baseline, then confirmation explodes.
+// Gracefully no-ops (ok:true, bonus:0) when the feed carries no usable volume.
+function volumePattern(closed, kind, idxC0) {
+  const vol = (c) => { const v = Number(c && c.volume); return Number.isFinite(v) && v > 0 ? v : null; };
+  const c0v = vol(closed[idxC0]); const c1v = vol(closed[idxC0 - 1]); const c2v = vol(closed[idxC0 - 2]);
+  const base = [];
+  for (let k = Math.max(0, idxC0 - 12); k <= idxC0 - 3; k++) { const v = vol(closed[k]); if (v) base.push(v); }
+  const avg = base.length ? base.reduce((a, b) => a + b, 0) / base.length : null;
+  if (c0v == null || avg == null) return { ok: true, bonus: 0, note: 'no-vol-data' };
+  if (kind === 'CONTINUATION') {
+    const pb = [c2v, c1v].filter((v) => v != null);
+    const pbAvg = pb.length ? pb.reduce((a, b) => a + b, 0) / pb.length : avg;
+    const decreasing = pbAvg <= avg;
+    const expanding = c0v >= avg * 1.1;
+    let bonus = 0; if (decreasing) bonus += 4; if (expanding) bonus += 5;
+    return { ok: expanding, bonus, note: `pullback${decreasing ? '↓' : '~'}·conf${expanding ? '↑' : '~'}` };
+  }
+  const increasing = c0v >= avg * 1.1;
+  return { ok: increasing, bonus: increasing ? 6 : 0, note: `conf${increasing ? '↑' : '~'}` };
+}
+
+function threeCandleCombo(ctx) {
+  const { candles, h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minRR = config.minRR ?? 1.8;
+  if (!Array.isArray(candles) || candles.length < 40) return null;
+  const closed = candles;                 // lab feeds CLOSED bars; last = the just-closed confirmation
+  const i = closed.length - 1;
+  const atr = atr14(closed);
+  if (!(atr > 0)) return null;
+
+  const c0 = candleParts(closed[i]);      // confirmation
+  const c1 = candleParts(closed[i - 1]);  // indecision
+  const c2 = candleParts(closed[i - 2]);  // exhaustion
+  if (!(c0.range > 0) || !(c1.range > 0) || !(c2.range > 0)) return null;
+
+  // ── Step 1 — Exhaustion (c2): rejection wick / small body / spinning top ──
+  const smallBody2 = c2.body <= c2.range * 0.4;
+  const bearExhaust = smallBody2 && c2.upper >= c2.range * 0.4 && c2.upper >= c2.lower; // shooting-star-like → SELL bias
+  const bullExhaust = smallBody2 && c2.lower >= c2.range * 0.4 && c2.lower >= c2.upper; // hammer-like → BUY bias
+  const spin = smallBody2 && c2.upper >= c2.range * 0.25 && c2.lower >= c2.range * 0.25;
+  if (!(bearExhaust || bullExhaust || spin)) return null;
+  const exPat = detectCandlePatterns(closed.slice(0, i - 1)); // pattern read AT c2 (last of the slice)
+
+  // ── Step 2 — Indecision (c1): doji / inside bar / small body ──
+  const isDoji = c1.body <= c1.range * 0.1;
+  const inside = isInsideBar(closed[i - 1], closed[i - 2]);
+  const smallBody1 = c1.body <= c1.range * 0.4;
+  if (!(isDoji || inside || smallBody1)) return null;
+  const indecisionLabel = isDoji ? 'doji' : inside ? 'inside-bar' : 'small-body';
+
+  // ── Step 3 — Confirmation (c0): strong body / engulfing / gap, taking out BOTH prior candles ──
+  const confPat = detectCandlePatterns(closed);
+  const priorHigh = Math.max(c1.hi, c2.hi);
+  const priorLow = Math.min(c1.lo, c2.lo);
+  const bullEngulf = !!(confPat.bull && confPat.bull.name === 'bullish engulfing');
+  const bearEngulf = !!(confPat.bear && confPat.bear.name === 'bearish engulfing');
+  const strongBull = c0.bull && c0.body >= c0.range * 0.6 && c0.upper <= c0.body * 0.6;
+  const strongBear = c0.bear && c0.body >= c0.range * 0.6 && c0.lower <= c0.body * 0.6;
+  const gapUp = c0.o > priorHigh;
+  const gapDown = c0.o < priorLow;
+  const confBuy = (strongBull || bullEngulf || gapUp) && c0.cl > priorHigh;   // closed beyond BOTH prior candles
+  const confSell = (strongBear || bearEngulf || gapDown) && c0.cl < priorLow;
+
+  // Candidate direction: from the exhaustion bias, else (spinning top) from the confirmation.
+  let dir = bullExhaust ? 'BUY' : bearExhaust ? 'SELL' : (confBuy ? 'BUY' : confSell ? 'SELL' : null);
+  if (!dir) return null;
+  if (dir === 'BUY' && !confBuy) return null;
+  if (dir === 'SELL' && !confSell) return null;
+  const confLabel = (dir === 'BUY' ? (bullEngulf ? 'bullish engulfing' : gapUp ? 'gap-up' : 'strong bull') : (bearEngulf ? 'bearish engulfing' : gapDown ? 'gap-down' : 'strong bear'));
+
+  // ── Filter 3 — HTF momentum (hard gate): never fight a clear higher-timeframe trend ──
+  if (dir === 'BUY' && h4Trend === 'BEARISH') return null;
+  if (dir === 'SELL' && h4Trend === 'BULLISH') return null;
+  const htfAligned = (dir === 'BUY' && h4Trend === 'BULLISH') || (dir === 'SELL' && h4Trend === 'BEARISH');
+  const kind = htfAligned ? 'CONTINUATION' : 'REVERSAL';
+
+  // ── Filter 2 — Level significance: exhaustion extreme sits at a prior swing level ──
+  const { highs, lows } = fractalSwings(closed);
+  const exTreme = dir === 'SELL' ? c2.hi : c2.lo;
+  const levels = dir === 'SELL' ? highs : lows;
+  const atLevel = levels.some((s) => s.i < i - 2 && Math.abs(n(s.price) - exTreme) <= 0.6 * atr);
+  if ((config.requireLevel ?? true) && kind === 'REVERSAL' && !atLevel) return null; // reversal at a random level = noise
+
+  // ── Filter 4 — Session timing ──
+  const sess = sessionQuality(closed[i].time);
+  if ((config.sessionFilter ?? false) && sess.score < 0) return null;
+
+  // ── Filter 5 — Volume confirmation ──
+  const volp = volumePattern(closed, kind, i);
+  if ((config.volumeFilter ?? true) && !volp.ok) return null;
+
+  // ── Levels: entry = confirmation close; stop beyond the whole combo; structural TP3 ──
+  const entry = c0.cl;
+  const buffer = 0.1 * atr;
+  const stop = dir === 'BUY' ? priorLow - buffer : priorHigh + buffer;
+  let risk = dir === 'BUY' ? entry - stop : stop - entry;
+  if (!(risk > 0) || risk / atr > 8) return null;
+  if (stopTooTight(risk, atr, pip, config)) return null;
+  const oppSwing = dir === 'BUY'
+    ? (highs.length ? n(highs[highs.length - 1].price) : null)
+    : (lows.length ? n(lows[lows.length - 1].price) : null);
+  const finalTarget = (Number.isFinite(oppSwing) && (dir === 'BUY' ? oppSwing > entry : oppSwing < entry)) ? oppSwing : null;
+  const ladder = tpLadder(dir, entry, risk, finalTarget);
+  const rr = Math.abs(ladder.takeProfit3 - entry) / risk;
+  if (!(rr >= minRR)) return null;
+
+  // ── Score & grade ──
+  let score = 50;
+  const exWick = dir === 'SELL' ? c2.upper : c2.lower;
+  score += Math.min(10, Math.round((exWick / atr) * 6));                          // exhaustion rejection strength
+  const exWeight = dir === 'SELL' ? (exPat.bear?.weight ?? 0) : (exPat.bull?.weight ?? 0);
+  score += Math.min(8, exWeight);                                                 // named exhaustion pattern
+  if (bullEngulf || bearEngulf) score += 8; else score += Math.min(8, Math.round((c0.body / c0.range) * 8));
+  if (gapUp || gapDown) score += 4;                                               // gap conviction
+  score += kind === 'CONTINUATION' ? 6 : -2;                                      // continuation (HTF-aligned) is safer
+  if (atLevel) score += 6;                                                        // F2
+  score += sess.score;                                                           // F4
+  score += volp.bonus;                                                          // F5
+  if (htfAligned) score += 6;                                                    // F3
+  if (h1Trend && ((dir === 'BUY' && h1Trend === 'BULLISH') || (dir === 'SELL' && h1Trend === 'BEARISH'))) score += 3;
+  score = Math.max(40, Math.min(95, Math.round(score)));
+  const grade = score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C';
+
+  return {
+    decision: dir, score, grade,
+    entry: r5(entry), stopLoss: r5(stop), ...ladder,
+    riskRewardRatio: Math.round(rr * 100) / 100,
+    reason: `${kind === 'CONTINUATION' ? 'Continuation' : 'Reversal'} ${dir}: ${dir === 'SELL' ? 'shooting-star' : 'hammer'}/exhaustion → ${indecisionLabel} → ${confLabel} taking out the prior 2 candles${atLevel ? ' at level' : ''} · ${sess.session} · vol ${volp.note} · ${htfAligned ? 'HTF aligned' : 'HTF neutral'} (${rr.toFixed(1)}R)`,
+    barIso: closed[i].time,
+    meta: {
+      v: 1, kind,
+      exhaustion: { type: bullExhaust ? 'hammer' : bearExhaust ? 'shootingStar' : 'spinningTop', pattern: dir === 'SELL' ? exPat.bear?.name : exPat.bull?.name, wickAtr: Math.round((exWick / atr) * 100) / 100 },
+      indecision: indecisionLabel,
+      confirmation: { type: confLabel, brokeBothCandles: true },
+      filters: { atLevel, session: sess.session, sessionScore: sess.score, volume: volp.note, htfAligned, h4Trend, h1Trend },
+    },
+  };
+}
+
+// ── Strategy: Failed-Break Reversion (the "ICT broke and reverted" condition) ──
+// This is the COMPLEMENT to a breakout/BOS strategy, NOT a change to it. It fires ONLY
+// when a break of a recent N-bar high/low CLOSES beyond the level and then FAILS — a
+// later candle (within `confirmBars`) closes back INSIDE. That failed break is exactly
+// the whipsaw that traps continuation traders ("market took it back to the previous
+// position"). We fade it: enter on the reclaim close, stop beyond the failed-break
+// extreme, target the opposite side of the broken range (the reversion). Self-selecting:
+// it only exists in the reverting condition, so the lab measures whether that condition
+// is tradable the other way. Pure price action, dedup by the reclaim bar. Untouched ICT.
+function failedBreakReversion(ctx) {
+  const { candles, h4Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const ref = config.ref ?? 10;              // bars that define the broken level
+  const confirmBars = config.confirmBars ?? 3; // window to reclaim back inside
+  const maxAgeBars = config.maxAgeBars ?? 2;   // reclaim must be fresh (near the last bar)
+  const minRR = config.minRR ?? 1.5;
+  const stopBufAtr = config.stopBufAtr ?? 0.1;
+  if (!Array.isArray(candles) || candles.length < ref + confirmBars + 6) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const lastIdx = candles.length - 1;
+
+  const build = (dir, entry, stop, target, brkIdx, reclaimIdx, level) => {
+    const risk = dir === 'BUY' ? entry - stop : stop - entry;
+    const reward = dir === 'BUY' ? target - entry : entry - target;
+    if (!(risk > 0) || !(reward > 0)) return null;
+    const rr = reward / risk;
+    if (rr < minRR) return null;
+    if (stopTooTight(risk, atr, pip, config)) return null;
+    const ladder = tpLadder(dir, entry, risk, target);   // TP3 = the reversion target (opposite range side)
+    let score = 52;
+    score += Math.min(15, Math.round((rr - minRR) * 6));                 // RR above the floor
+    // A failed break that was COUNTER to the higher-timeframe trend = the cleanest fade
+    // (a real trap against the dominant flow), so the reversion aligns WITH the H4 trend.
+    if ((dir === 'SELL' && h4Trend === 'BEARISH') || (dir === 'BUY' && h4Trend === 'BULLISH')) score += 12;
+    if (lastIdx - reclaimIdx === 0) score += 6;                          // reclaim just closed (freshest)
+    if (reclaimIdx - brkIdx === 1) score += 4;                          // immediate failure (sharp trap)
+    score = Math.max(40, Math.min(95, score));
+    return {
+      decision: dir,
+      score,
+      grade: score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C',
+      entry: r5(entry),
+      stopLoss: r5(stop),
+      ...ladder,
+      riskRewardRatio: Math.round(rr * 100) / 100,
+      reason: `Failed ${dir === 'SELL' ? 'up-break' : 'down-break'}: close beyond ${r5(level)} reverted back inside (trap) → fade to opposite range side ${r5(target)}`,
+      barIso: candles[reclaimIdx].time,        // dedup: one signal per reclaim bar
+      meta: { brokenLevel: r5(level), failExtreme: r5(dir === 'SELL' ? stop - stopBufAtr * atr : stop + stopBufAtr * atr), target: r5(target), ageBars: lastIdx - reclaimIdx, h4Trend },
+    };
+  };
+
+  // Scan the freshest reclaim bars; for each, look back up to confirmBars for the break it undid.
+  for (let reclaim = lastIdx; reclaim >= lastIdx - maxAgeBars && reclaim > ref + 1; reclaim--) {
+    for (let brk = reclaim - 1; brk >= reclaim - confirmBars && brk > ref; brk--) {
+      const refHigh = Math.max(...candles.slice(brk - ref, brk).map((c) => n(c.high)).filter(Number.isFinite));
+      const refLow = Math.min(...candles.slice(brk - ref, brk).map((c) => n(c.low)).filter(Number.isFinite));
+      if (!Number.isFinite(refHigh) || !Number.isFinite(refLow)) continue;
+      const brkClose = n(candles[brk].close);
+      // Failed UP-break (bull trap) → SELL the reversion.
+      if (brkClose > refHigh && n(candles[reclaim].close) < refHigh) {
+        const failHigh = Math.max(...candles.slice(brk, reclaim + 1).map((c) => n(c.high)));
+        const sig = build('SELL', n(candles[reclaim].close), failHigh + stopBufAtr * atr, refLow, brk, reclaim, refHigh);
+        if (sig) return sig;
+      }
+      // Failed DOWN-break (bear trap) → BUY the reversion.
+      if (brkClose < refLow && n(candles[reclaim].close) > refLow) {
+        const failLow = Math.min(...candles.slice(brk, reclaim + 1).map((c) => n(c.low)));
+        const sig = build('BUY', n(candles[reclaim].close), failLow - stopBufAtr * atr, refHigh, brk, reclaim, refLow);
+        if (sig) return sig;
+      }
+    }
+  }
+  return null;
+}
+
+// ─── Fixed-Time Fusion — ENSEMBLE engine (meta, not a single tutorial) ───────
+// Purpose-built for FIXED-TIME (next-candle direction) trades. It does NOT invent a new
+// edge; it VOTES: it polls a panel of the existing lab strategies, a confirmed breakout, a
+// native live-market read (EMA trend + slope + structure), and a short-horizon next-candle
+// read, weights each vote, and only fires when enough independent sources AGREE (selective).
+// A clear H4 conflict is a hard veto. Honest by design: it's framed fixed-time and the lab's
+// fixed-time win-rate measures whether the fusion actually beats its components.
+function ftfEma(values, period) {
+  if (!values.length) return NaN;
+  const k = 2 / (period + 1);
+  let e = values[0];
+  for (let i = 1; i < values.length; i++) e = values[i] * k + e * (1 - k);
+  return e;
+}
+
+// Native "live market" read from candles: EMA9 vs EMA21 + recent slope. Pure, fast — this is
+// the in-module stand-in for the live aggregateSignals direction (strategyLab stays isolated).
+function ftfLiveRead(candles) {
+  const closes = candles.slice(-40).map((c) => Number(c.close)).filter(Number.isFinite);
+  if (closes.length < 25) return { dir: null, strength: 0, note: '' };
+  const e9 = ftfEma(closes.slice(-30), 9);
+  const e21 = ftfEma(closes.slice(-30), 21);
+  const slope = closes[closes.length - 1] - closes[closes.length - 5];
+  if (e9 > e21 && slope > 0) return { dir: 'BUY', strength: 0.85, note: 'EMA9>21 + rising' };
+  if (e9 < e21 && slope < 0) return { dir: 'SELL', strength: 0.85, note: 'EMA9<21 + falling' };
+  return { dir: null, strength: 0, note: '' };
+}
+
+// Short-horizon next-candle read: the last candle's body/close-position + 3-bar momentum.
+function ftfShortHorizon(candles) {
+  const c = candles.slice(-4);
+  if (c.length < 4) return { dir: null, strength: 0, note: '' };
+  const last = c[c.length - 1];
+  const o = Number(last.open), h = Number(last.high), l = Number(last.low), cl = Number(last.close);
+  const range = Math.max(h - l, 1e-9);
+  const closePos = (cl - l) / range;
+  const bull = cl > o;
+  let up = 0, dn = 0;
+  for (let i = 1; i < c.length; i++) { if (Number(c[i].close) > Number(c[i - 1].close)) up++; else dn++; }
+  if (bull && closePos > 0.6 && up > dn) return { dir: 'BUY', strength: 0.5 + closePos * 0.5, note: `close@${Math.round(closePos * 100)}%` };
+  if (!bull && closePos < 0.4 && dn > up) return { dir: 'SELL', strength: 0.5 + (1 - closePos) * 0.5, note: `close@${Math.round(closePos * 100)}%` };
+  return { dir: null, strength: 0, note: '' };
+}
+
+// Session weight from the bar's UTC hour: London–NY overlap best, Asian quiet weakest.
+function ftfSessionWeight(iso) {
+  const h = new Date(iso).getUTCHours();
+  if (!Number.isFinite(h)) return 1;
+  if (h >= 12 && h < 16) return 1.12;                       // London–NY overlap
+  if ((h >= 7 && h < 12) || (h >= 16 && h < 21)) return 1.0; // London or NY single
+  if (h >= 21 || h < 3) return 0.9;                          // Sydney / late
+  return 0.85;                                               // Asian quiet
+}
+
+function fixedTimeFusion(ctx) {
+  const { candles, config = {} } = ctx;
+  if (!candles || candles.length < 60) return null;
+  const last = candles[candles.length - 1];
+  const close = Number(last.close);
+  const atr = atr14(candles) || 0;
+  if (!(close > 0) || !(atr > 0)) return null;
+
+  const votes = []; // { src, dir, weight }
+
+  // 1) Panel of existing lab strategies — each casts a weighted directional vote.
+  const panel = [
+    ['ICT breaker', ictBreaker, 1.0], ['Liquidity trap', liquidityTrap, 1.0],
+    ['Market mechanics', marketMechanics3Step, 1.0], ['Little Rizzy', littleRizzy, 0.8],
+    ['SMC FVG', smcFvg, 0.8], ['Stage analysis', stageAnalysis, 0.7], ['3-candle combo', threeCandleCombo, 0.9],
+  ];
+  for (const [name, fn, w] of panel) {
+    let s = null;
+    try { s = fn({ ...ctx, config: {} }); } catch { s = null; }
+    if (s && (s.decision === 'BUY' || s.decision === 'SELL')) {
+      const conf = Math.min(1, Math.max(0.4, (Number(s.score) || 60) / 100));
+      votes.push({ src: name, dir: s.decision, weight: w * conf });
+    }
+  }
+
+  // 2) Breakout vote — a confirmed, well-graded break in a direction.
+  try {
+    const bk = buildBreakoutCandidate({ symbol: ctx.symbol, timeframe: ctx.timeframe, candles });
+    if (bk && bk.phase === 'CONFIRMED' && bk.grade !== 'C' && (bk.direction === 'BUY' || bk.direction === 'SELL')) {
+      votes.push({ src: 'Breakout', dir: bk.direction, weight: (BREAKOUT_GRADE_RANK[bk.grade] >= 2 ? 1.2 : 1.0) });
+    }
+  } catch { /* breakout is one optional voter */ }
+
+  // 3) Native live-market read. 4) Short-horizon next-candle read.
+  const live = ftfLiveRead(candles);
+  if (live.dir) votes.push({ src: 'Live read', dir: live.dir, weight: live.strength });
+  const sh = ftfShortHorizon(candles);
+  if (sh.dir) votes.push({ src: 'Momentum', dir: sh.dir, weight: 0.9 * sh.strength });
+
+  if (!votes.length) return null;
+  let buy = 0, sell = 0;
+  for (const v of votes) { if (v.dir === 'BUY') buy += v.weight; else sell += v.weight; }
+  const total = buy + sell;
+  if (total <= 0) return null;
+  const dir = buy >= sell ? 'BUY' : 'SELL';
+  const agreement = Math.max(buy, sell) / total;
+  const agreeVoters = votes.filter((v) => v.dir === dir).length;
+
+  // HTF alignment (h4Trend/h1Trend come from the context).
+  const htfAligned = (dir === 'BUY' && (ctx.h4Trend === 'BULLISH' || ctx.h1Trend === 'BULLISH'))
+    || (dir === 'SELL' && (ctx.h4Trend === 'BEARISH' || ctx.h1Trend === 'BEARISH'));
+  const htfConflict = (dir === 'BUY' && ctx.h4Trend === 'BEARISH') || (dir === 'SELL' && ctx.h4Trend === 'BULLISH');
+  if (htfConflict) return null; // never fight a clear H4 trend
+
+  const sess = ftfSessionWeight(last.time);
+  let score = Math.min(98, Math.round((40 + agreement * 45 + Math.min(agreeVoters, 5) * 3) * sess));
+  if (htfAligned) score = Math.min(98, score + 5);
+
+  // Selective gates (config-tunable).
+  const minScore = config.minScore ?? 72;
+  const minAgreement = config.minAgreement ?? 0.68;
+  const minVoters = config.minVoters ?? 3;
+  if (agreeVoters < minVoters || agreement < minAgreement || score < minScore) return null;
+
+  const slDist = atr;
+  const tpDist = atr * 1.5;
+  const stopLoss = dir === 'BUY' ? close - slDist : close + slDist;
+  const takeProfit1 = dir === 'BUY' ? close + tpDist : close - tpDist;
+  const topVoters = votes.filter((v) => v.dir === dir).sort((a, b) => b.weight - a.weight).slice(0, 4).map((v) => v.src);
+  return {
+    decision: dir,
+    score,
+    grade: score >= 85 ? 'A+' : score >= 78 ? 'A' : 'B',
+    entry: close, stopLoss, takeProfit1,
+    takeProfit2: dir === 'BUY' ? close + tpDist * 1.5 : close - tpDist * 1.5,
+    riskRewardRatio: 1.5,
+    reason: `Fusion ${dir} — ${agreeVoters}/${votes.length} sources agree (${Math.round(agreement * 100)}%): ${topVoters.join(', ')}${htfAligned ? ' · H4 aligned' : ''}`,
+    barIso: last.time,
+    meta: {
+      agreement: Math.round(agreement * 100), agreeVoters, totalVoters: votes.length,
+      buyWeight: Math.round(buy * 100) / 100, sellWeight: Math.round(sell * 100) / 100,
+      htfAligned, sessionWeight: sess,
+      sources: votes.map((v) => ({ src: v.src, dir: v.dir, w: Math.round(v.weight * 100) / 100 })),
+    },
+  };
+}
+
+// Liquidity Sweep Pro — thin wrapper over gradeSweep (the 5-component model). gradeSweep returns
+// a fully-formed lab signal (or null). No dailyCandles in the lab ctx, so PDH/PDL aren't in the
+// obvious-pool set here — session highs/lows, round numbers, and equal highs/lows are.
+function liquiditySweepPro(ctx) {
+  const cfg = ctx.config || {};
+  return gradeSweep(ctx.candles, { symbol: ctx.symbol, h4Trend: ctx.h4Trend, h1Trend: ctx.h1Trend, minRR: cfg.minRR ?? 1.8, minGrade: cfg.minGrade ?? 'B' });
+}
+
 export const STRATEGIES = {
+  'liquidity-sweep-pro': {
+    id: 'liquidity-sweep-pro',
+    name: 'Liquidity Sweep Pro',
+    source: 'High-probability 5-component sweep model (advanced sweep tutorial)',
+    description: 'Only takes a sweep when all 5 institutional checks line up: (1) HTF context (never fights a clear H4/H1 trend); (2) the swept level is an OBVIOUS pool — session high/low, round number, or equal highs/lows (strength≥3), not a random swing; (3) a REJECTION candle (≥30% wick that closed back inside the level); (4) DISPLACEMENT (a strong opposite-direction move / FVG after the sweep); (5) a MARKET-STRUCTURE SHIFT (close beyond the prior minor swing in the new direction). Enter at the rejection close, stop beyond the sweep wick, target the opposing fresh liquidity (≥1.8R). Grades each sweep A+→F and only fires ≥B — the tutorial discipline: never enter on the sweep alone. Reuses detectKeyLiquidityLevels + detectDisplacement + fractal structure. Isolated lab strategy.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: { minRR: 1.8, minGrade: 'B' },
+    evaluate: liquiditySweepPro,
+  },
+  'fixed-time-fusion': {
+    id: 'fixed-time-fusion',
+    name: 'Fixed-Time Fusion',
+    source: 'Ensemble (meta) — existing lab strategies + live-market read + breakout, voted for next-candle direction',
+    description: 'A DEDICATED fixed-time (next-candle) engine. It does not add a new edge — it VOTES. Each pass it polls a panel of the existing lab strategies (ICT breaker, liquidity trap, market-mechanics, little-rizzy, SMC-FVG, stage analysis, 3-candle combo), a CONFIRMED graded breakout, a native live-market read (EMA9/21 + slope), and a short-horizon next-candle read (last-candle body/close-position + 3-bar momentum). Each source casts a weighted UP/DOWN vote; the call fires ONLY when ≥3 independent sources agree, agreement ≥68%, the confluence score ≥72, and there is no opposing H4 trend (hard veto). London–NY overlap is weighted up, Asian hours down. Deliberately SELECTIVE — it stays silent far more often than it speaks. Entry at the close; the lab measures it BOTH ways (fixed-time direction win-rate + a 1.5R forex framing) so you can see honestly whether the fusion beats its parts.',
+    timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
+    config: { minScore: 72, minAgreement: 0.68, minVoters: 3 },
+    evaluate: fixedTimeFusion,
+  },
+  'three-candle-combo': {
+    id: 'three-candle-combo',
+    name: '3-Candle Safety Check',
+    source: 'Exhaustion → Indecision → Confirmation sequence + 5 context filters',
+    description: 'Trades a 3-candle SEQUENCE, not a single candle: (1) EXHAUSTION — a shooting-star / hammer / spinning-top rejection; (2) INDECISION — a doji, inside bar, or small-bodied stalemate; (3) CONFIRMATION — a strong-bodied / engulfing / gapping candle that closes beyond BOTH prior candles ("takes out the previous two"). Two modes: REVERSAL (combo against the local move at a significant level) and CONTINUATION (HTF-aligned pullback that resumes). Five context filters gate/score it: market structure, level significance (exhaustion at a prior swing level), HTF momentum alignment (hard gate — never fight a clear H4 trend), session timing (London/NY > Asian), and volume confirmation (reversals expand into confirmation; continuations show a quiet pullback then an explosive confirmation). Entry at the confirmation close, stop beyond the whole combo (+ATR), TP1/TP2 = 1R/2R, TP3 = opposing swing / measured move. Minimum 1.8R. Isolated lab strategy — never blends into live signals.',
+    timeframes: ['M5', 'M15', 'M30', 'H1', 'H4'],
+    config: { minRR: 1.8, requireLevel: true, sessionFilter: false, volumeFilter: true },
+    evaluate: threeCandleCombo,
+  },
   'ict-breaker': {
     id: 'ict-breaker',
     name: 'ICT Breaker',
@@ -1621,6 +2034,15 @@ export const STRATEGIES = {
     timeframes: ['M15', 'M30', 'H1'],
     config: { tpR: 3, killZones: true, stopBufAtr: 0.15 },
     evaluate: smcTwoLines,
+  },
+  'failed-break-reversion': {
+    id: 'failed-break-reversion',
+    name: 'Failed Break Reversion',
+    source: 'Complement to ICT/breakout — fades the breakout that fails and reverts (the whipsaw condition)',
+    description: 'Fires ONLY when a break of a recent N-bar high/low CLOSES beyond the level and then FAILS — a later candle (within confirmBars) closes back inside. That failed break is the trap that catches continuation traders (price "takes it back to the previous position"). Fades it: enter on the reclaim close, stop beyond the failed-break extreme, target the opposite side of the broken range. Self-selecting — it only exists in the reverting/whipsaw condition that hurts breakout systems, so the lab measures whether that condition is tradable the other way. Higher quality when the failed break was counter to the H4 trend (the reversion then aligns with H4). Pure price action, dedup by the reclaim bar. Completely separate from the live ICT signal engine.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: { ref: 10, confirmBars: 3, maxAgeBars: 2, minRR: 1.5, stopBufAtr: 0.1 },
+    evaluate: failedBreakReversion,
   },
   'smc-asian-sweep': {
     id: 'smc-asian-sweep',

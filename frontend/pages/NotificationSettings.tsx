@@ -16,6 +16,8 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   aiTracked: false,
   forecast: true,
   signalTracker: true,
+  breakout: true,
+  breakoutEmailMinGrade: 'A',
   strategyLab: false,
   strategyLabMinScore: 75,
   strategyLabMinGrade: 'ANY',
@@ -31,8 +33,8 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   postNewsFixedMinTier: 'QUALITY_SIGNAL',
 };
 
-type EmailRouteKey = 'forexScanner' | 'fixedTime' | 'postNewsForex' | 'postNewsFixed' | 'highImpactNews' | 'aiTracked' | 'forecast' | 'signalTracker' | 'strategyLab' | 'strategyLabFixedTime';
-type EmailSelectKey = 'forexMinGrade' | 'forexMinQuality' | 'fixedTimeMinTier' | 'postNewsForexMinGrade' | 'postNewsFixedMinTier';
+type EmailRouteKey = 'forexScanner' | 'fixedTime' | 'postNewsForex' | 'postNewsFixed' | 'highImpactNews' | 'aiTracked' | 'forecast' | 'signalTracker' | 'breakout' | 'strategyLab' | 'strategyLabFixedTime';
+type EmailSelectKey = 'forexMinGrade' | 'forexMinQuality' | 'fixedTimeMinTier' | 'postNewsForexMinGrade' | 'postNewsFixedMinTier' | 'breakoutEmailMinGrade';
 
 const emailSignalOptions: Array<{ key: EmailRouteKey; title: string; description: string; note: string }> = [
   { key: 'forexScanner', title: 'Forex Scanner Signals', description: 'Regular Forex scanner trade emails with SL/TP plans.', note: 'Uses backend minimum grade' },
@@ -43,6 +45,7 @@ const emailSignalOptions: Array<{ key: EmailRouteKey; title: string; description
   { key: 'aiTracked', title: 'AI Tracked Projection Emails', description: 'Emails when tracked AI entry projections trigger.', note: 'Tracked entries only' },
   { key: 'forecast', title: 'Execution Forecast Emails', description: 'When a favorable setup is forecast to become executable: created + ~10m, ~5m, and at the predicted time.', note: 'Timing forecast · score ≥ 60 · times in BDT' },
   { key: 'signalTracker', title: 'Signal Tracker — Close / Manage Alerts', description: 'Live trade management: emails to CLOSE NOW on danger (near stop, opposite signal, news, counter-breaker) or MANAGE on TP hit / profit give-back.', note: 'Active trades only · advisory early warning' },
+  { key: 'breakout', title: 'Breakout Alerts (Pre + Confirmed)', description: 'Graded breakouts on well-formed charts (HH/HL or LH/LL into a strong level). Pre-breakout warning (M15/M30/H1) + confirmed-close email (M5/M15/M30/H1). Browser desktop notifications fire generously regardless of this; this gates email only.', note: 'Anti-flood: per-level dedup + hourly cap · pre held to ≥ A' },
   { key: 'strategyLab', title: 'Strategy Lab — High-Score Signals', description: 'Emails for isolated single-strategy signals (ICT breaker, etc.) that score ≥ 75. Popups fire regardless; this just adds email.', note: 'Score ≥ 75 only · isolated lab, not the main system' },
   { key: 'strategyLabFixedTime', title: 'Strategy Lab — Fixed-Time Calls', description: 'Fixed-time (UP/DOWN at next-candle expiry) emails for the same isolated strategy signals. Separate from the Forex strategy-lab emails above.', note: 'Direction call · isolated lab, not the main FTT engine' },
 ];
@@ -68,6 +71,12 @@ const newsGradeOptions = [
   { value: 'B_NEWS_SETUP', label: 'B News Setup and above' },
   { value: 'A_NEWS_SETUP', label: 'A News Setup and above' },
   { value: 'A_PLUS_NEWS_SETUP', label: 'A+ News Setup only' },
+] as const;
+
+const breakoutGradeOptions = [
+  { value: 'B', label: 'B and above (confirmed); pre still ≥ A' },
+  { value: 'A', label: 'A and above' },
+  { value: 'A+', label: 'A+ only' },
 ] as const;
 
 export default function NotificationSettings() {
@@ -212,6 +221,34 @@ export default function NotificationSettings() {
       if (Object.keys(map).length === 0) for (const s of labStrategies) map[s.id] = true;
       map[id] = !(map[id] ?? true);
       return { ...current, strategyLabFttStrategies: map };
+    });
+    setEmailSettingsStatus(null);
+  };
+
+  // ── Strategy Controller (master per-strategy switch + refinements) ──
+  const ctrlOf = (id: string) => (emailSettings.strategyControls || {})[id] || { enabled: true };
+  const updateStrategyControl = (id: string, patch: Partial<NonNullable<EmailAlertSettings['strategyControls']>[string]>) => {
+    setEmailSettings((current) => {
+      const controls = { ...(current.strategyControls || {}) };
+      controls[id] = { ...(controls[id] || { enabled: true }), ...patch };
+      return { ...current, strategyControls: controls };
+    });
+    setEmailSettingsStatus(null);
+  };
+  const handleStrategyEnabledToggle = (id: string) => updateStrategyControl(id, { enabled: !(ctrlOf(id).enabled !== false) });
+  const handleStrategyMinScore = (id: string, value: string) => updateStrategyControl(id, { minScore: value === '' ? undefined : Math.max(40, Math.min(95, Math.round(Number(value)))) });
+  const handleStrategyDirection = (id: string, value: string) => updateStrategyControl(id, { direction: value as 'ANY' | 'LONG' | 'SHORT' });
+  const handleStrategyTimeframe = (id: string, tf: string) => {
+    const cur = ctrlOf(id).timeframes || [];
+    const set = new Set(cur);
+    if (set.has(tf)) set.delete(tf); else set.add(tf);
+    updateStrategyControl(id, { timeframes: [...set] });
+  };
+  const setAllStrategiesEnabled = (on: boolean) => {
+    setEmailSettings((current) => {
+      const controls = { ...(current.strategyControls || {}) };
+      for (const s of labStrategies) controls[s.id] = { ...(controls[s.id] || {}), enabled: on };
+      return { ...current, strategyControls: controls };
     });
     setEmailSettingsStatus(null);
   };
@@ -480,6 +517,16 @@ export default function NotificationSettings() {
                   {fttTierOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </div>
+              <div>
+                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Breakout Email Minimum Grade</label>
+                <select
+                  value={emailSettings.breakoutEmailMinGrade}
+                  onChange={(event) => handleEmailSettingSelect('breakoutEmailMinGrade', event.target.value)}
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
+                >
+                  {breakoutGradeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </div>
             </div>
             <div className="mt-5 rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800">
               WATCH_ONLY and NO_TRADE are never emailed. Fixed-time filters only choose between QUALITY_SIGNAL-only and TRADE_SIGNAL-or-better.
@@ -498,6 +545,75 @@ export default function NotificationSettings() {
               </button>
             </div>
             {emailSettingsStatus && <p className="mt-3 text-xs font-bold text-slate-500">{emailSettingsStatus}</p>}
+          </div>
+
+          {/* Strategy Controller — master per-strategy switch (gates EVERYTHING) */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
+            <div className="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-lg font-bold text-slate-900">Strategy Controller</h3>
+                <p className="mt-1 text-xs font-semibold text-slate-500">Master on/off per strategy. <b>Off</b> = no signals anywhere — dashboard tables, reports, browser popups and emails all go silent for that strategy. It keeps being measured in the background, so its win-rate ranking still accumulates (turn it back on anytime). Optional per-strategy <b>min score / setup / timeframes</b> further filter which signals actually alert.</p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button type="button" onClick={() => setAllStrategiesEnabled(true)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-bold text-slate-600 hover:bg-slate-50">All on</button>
+                <button type="button" onClick={() => setAllStrategiesEnabled(false)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-bold text-slate-600 hover:bg-slate-50">All off</button>
+              </div>
+            </div>
+
+            <div className="space-y-2.5">
+              {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
+              {labStrategies.map((s) => {
+                const c = ctrlOf(s.id);
+                const on = c.enabled !== false;
+                const tfs = c.timeframes || [];
+                return (
+                  <div key={s.id} className={`rounded-xl border p-3.5 transition-colors ${on ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50'}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <h4 className={`truncate text-sm font-bold ${on ? 'text-slate-800' : 'text-slate-400'}`}>{s.name}</h4>
+                          {s.id === 'ict-breaker' && <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700">LIVE WINNER</span>}
+                          {!on && <span className="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">MUTED</span>}
+                        </div>
+                        <p className="mt-0.5 truncate text-[11px] font-medium text-slate-400">{s.id} · {s.timeframes.join(' / ')}</p>
+                      </div>
+                      <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                        <input type="checkbox" checked={on} onChange={() => handleStrategyEnabledToggle(s.id)} className="sr-only peer" />
+                        <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
+                      </label>
+                    </div>
+                    {on && (
+                      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-100 pt-3">
+                        <label className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500">Min score
+                          <select value={c.minScore ?? ''} onChange={(e) => handleStrategyMinScore(s.id, e.target.value)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-xs font-semibold text-slate-700">
+                            <option value="">Any</option>
+                            {[65, 70, 75, 80, 85, 90].map((v) => <option key={v} value={v}>≥ {v}</option>)}
+                          </select>
+                        </label>
+                        <label className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500">Setup
+                          <select value={c.direction ?? 'ANY'} onChange={(e) => handleStrategyDirection(s.id, e.target.value)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-xs font-semibold text-slate-700">
+                            <option value="ANY">Both</option>
+                            <option value="LONG">Long only</option>
+                            <option value="SHORT">Short only</option>
+                          </select>
+                        </label>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[11px] font-bold text-slate-500">Timeframes</span>
+                          {s.timeframes.map((tf) => {
+                            const active = tfs.length === 0 || tfs.includes(tf);
+                            return (
+                              <button key={tf} type="button" onClick={() => handleStrategyTimeframe(s.id, tf)}
+                                className={`rounded-md px-1.5 py-1 text-[11px] font-bold transition-colors ${active ? 'bg-gold-500 text-white' : 'bg-slate-100 text-slate-400'}`}>{tf}</button>
+                            );
+                          })}
+                          {tfs.length === 0 && <span className="text-[10px] font-medium text-slate-400">(all)</span>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
           {/* Strategy Lab email rules — which strategies / score / grade send email */}

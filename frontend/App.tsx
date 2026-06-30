@@ -11,7 +11,9 @@ import TradeTheNews from './pages/TradeTheNews.tsx';
 import FuturePredictions from './pages/FuturePredictions.tsx';
 import DayTradingBrief from './pages/DayTradingBrief.tsx';
 import DayTradingDesk from './pages/DayTradingDesk.tsx';
+import LiveMarketTracker from './pages/LiveMarketTracker.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
+import BreakoutTracker from './pages/BreakoutTracker.tsx';
 import StrategyLab from './pages/StrategyLab.tsx';
 import StrategyLabReports from './pages/StrategyLabReports.tsx';
 import Projections from './pages/Projections.tsx';
@@ -89,7 +91,9 @@ export default function App() {
           <Route path="news-high-impact" element={<HighImpactNews />} />
           <Route path="day-trading" element={<DayTradingBrief />} />
           <Route path="day-trading-desk" element={<DayTradingDesk />} />
+          <Route path="live-market-tracker" element={<LiveMarketTracker />} />
           <Route path="signal-tracker" element={<SignalTracker />} />
+          <Route path="breakout" element={<BreakoutTracker />} />
           <Route path="strategy-lab" element={<StrategyLab />} />
           <Route path="strategy-lab/reports" element={<StrategyLabReports />} />
           <Route path="trade-news" element={<TradeTheNews />} />

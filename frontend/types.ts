@@ -54,6 +54,7 @@ export interface NotificationLog {
 
 export interface Mt5Status {
   connected: boolean;
+  marketStatus?: { open: boolean; state: 'OPEN' | 'CLOSED'; reason: string };
   lastHeartbeatAt: string | null;
   lastSignalAt: string | null;
   account: string | null;
@@ -382,6 +383,8 @@ export interface EmailAlertSettings {
   aiTracked: boolean;
   forecast: boolean;
   signalTracker: boolean;
+  breakout: boolean;
+  breakoutEmailMinGrade: 'B' | 'A' | 'A+';
   strategyLab: boolean;
   strategyLabFixedTime: boolean;
   forexMinGrade: 'B_SETUP' | 'A_SETUP' | 'A_PLUS_SETUP';
@@ -397,6 +400,16 @@ export interface EmailAlertSettings {
   strategyLabFttMinScore: number;
   strategyLabFttMinGrade: 'ANY' | 'B' | 'A' | 'A+';
   strategyLabFttStrategies: Record<string, boolean>;
+  // Strategy Controller — master per-strategy switch (gates table, reports, popups, emails,
+  // SSE). Missing entry = enabled. Optional refinements gate alert delivery.
+  strategyControls?: Record<string, StrategyControl>;
+}
+
+export interface StrategyControl {
+  enabled?: boolean;
+  minScore?: number;
+  direction?: 'ANY' | 'LONG' | 'SHORT';
+  timeframes?: string[];
 }
 
 export interface EmailAlertSettingsResponse {
@@ -548,7 +561,7 @@ export interface FttPredictResponse {
 
 export interface TopbarMarketAlert {
   id: string;
-  kind: 'FOREX' | 'FIXED_TIME';
+  kind: 'FOREX' | 'FIXED_TIME' | 'BREAKOUT';
   symbol: string;
   timeframe?: string | null;
   expiry?: string | null;
@@ -577,6 +590,158 @@ export interface TopbarMarketAlert {
   currentPips?: number | null;
   // Strategy Lab signals — distinct source label so they read as a separate engine.
   strategySource?: string | null;
+  // Breakout alerts (graded PRE/CONFIRMED) — additive top-bar + desktop alert.
+  phase?: 'PRE' | 'CONFIRMED' | null;
+  level?: number | null;
+  levelStrength?: number | null;
+  score?: number | null;
+  trend?: 'UP' | 'DOWN' | null;
+  distanceAtr?: number | null;
+  bodyAtr?: number | null;
+  reasons?: string[] | null;
+}
+
+// ── Breakout tracker (graded PRE/CONFIRMED breakouts on well-formed charts) ──
+export interface BreakoutLiveRow {
+  symbol: string;
+  timeframe: string;
+  phase: 'PRE' | 'CONFIRMED';
+  direction: 'BUY' | 'SELL';
+  trend: 'UP' | 'DOWN';
+  grade: 'A+' | 'A' | 'B' | 'C';
+  score: number;
+  level: number;
+  levelStrength: number;
+  price: number;
+  atr: number | null;
+  distanceAtr: number | null;
+  bodyAtr: number | null;
+  displacement: { present: boolean; strong: boolean } | null;
+  reasons: string[];
+  bar: string;
+  stale: boolean;
+  meetsBrowserBar: boolean;
+}
+
+export interface BreakoutLiveResponse {
+  ok: boolean;
+  enabled: boolean;
+  timeframe: string;
+  timeframes: string[];
+  browserMinGrade: string;
+  emailMinGrade: string;
+  confirmed: number;
+  pre: number;
+  rows: BreakoutLiveRow[];
+  generatedAt: string;
+}
+
+export interface BreakoutAlert {
+  id: string;
+  symbol: string;
+  timeframe: string;
+  phase: 'PRE' | 'CONFIRMED';
+  direction: 'BUY' | 'SELL';
+  grade: string;
+  score: number | null;
+  trend: 'UP' | 'DOWN' | null;
+  level: number | null;
+  levelStrength: number | null;
+  price: number | null;
+  atr: number | null;
+  distanceAtr: number | null;
+  bodyAtr: number | null;
+  displacement: boolean;
+  channel: string;
+  barTime: string | null;
+  createdAt: string | null;
+}
+
+export interface BreakoutAlertsResponse {
+  ok: boolean;
+  alerts: BreakoutAlert[];
+}
+
+// ── Confirmed-breakout follow-through tracking (did the break extend or fail?) ─
+export type BreakoutTrackState = 'FOLLOWING_THROUGH' | 'STALLING' | 'TARGET_HIT' | 'FAILED';
+export interface BreakoutTrackingRow {
+  id: string;
+  symbol: string;
+  timeframe: string;
+  direction: 'BUY' | 'SELL';
+  trend: string | null;
+  grade: string;
+  score: number;
+  levelStrength: number | null;
+  confirmIso: string | null;
+  ageHours: number | null;
+  stale: boolean;
+  state: BreakoutTrackState;
+  level: number;
+  confirmPrice: number;
+  currentPrice: number;
+  targetPrice: number;
+  beyond: number; beyondAtr: number; sinceConfirm: number;
+  mfe: number; mfeAtr: number; mae: number; maeAtr: number;
+  beyondPips: number; mfePips: number; maePips: number;
+  progressPct: number; barsSince: number; atr: number;
+  failed: boolean; reachedTarget: boolean;
+  liveScore: number; liveGrade: string; retentionPct: number;
+}
+export interface BreakoutTrackingResponse {
+  ok: boolean;
+  timeframe: string;
+  windowHours: number;
+  active: BreakoutTrackingRow[];
+  settled: BreakoutTrackingRow[];
+  stats: { active: number; targetHit: number; failed: number; winRate: number | null };
+  generatedAt: string;
+}
+
+// ── Strategy entry-watch (A/A+ ICT · ICT+ · SMC forex signals awaiting entry) ─
+export interface StrategyEntryWatchItem {
+  id: string;
+  strategy: string;
+  strategyName: string;
+  symbol: string;
+  timeframe: string;
+  signalTime: string | null;
+  direction: string;
+  score: number | null;
+  grade: string | null;
+  // Current-time re-evaluation of the same setup (how strong it is RIGHT NOW).
+  currentScore: number | null;
+  currentGrade: string | null;
+  currentDirection: string | null;
+  strengthTrend: 'STRONGER' | 'SAME' | 'WEAKER' | 'GONE';
+  executability: 'EXECUTE_NOW' | 'WAIT' | 'CAUTION' | 'MISSED';
+  execMessage: string | null;
+  entryPrice: number | null;
+  currentPrice: number | null;
+  pipsToEntry: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  takeProfit3: number | null;
+  riskReward: number | null;
+  lots: number | null;
+  lossAtStop: number | null;
+  entryStatus: 'WAIT' | 'AT_ENTRY' | 'MISSED';
+  reachedEntry: boolean;
+  executableNow: boolean;
+  timingMessage: string | null;
+  reason: string | null;
+  popupSent: boolean | null;
+  emailSent: boolean | null;
+}
+
+export interface StrategyEntryWatchResponse {
+  ok: boolean;
+  minScore: number;
+  windowHours: number;
+  strategies: string[];
+  items: StrategyEntryWatchItem[];
+  generatedAt: string;
 }
 
 // ── Strategy Lab (isolated single-strategy signals) ─────────────────────────
@@ -586,6 +751,7 @@ export interface StrategyMeta {
   source: string | null;
   description: string;
   timeframes: string[];
+  control?: StrategyControl; // controller state from /strategies (default = enabled)
 }
 export interface StrategyTiming {
   status: 'WAIT' | 'TRADABLE' | 'EXPIRED' | 'SETTLED';
@@ -619,6 +785,14 @@ export interface StrategySignal {
   ftPips: number | null;
   ftActionable?: boolean | null;
   ftExpiryIso?: string | null;
+  // As-traded (realistic) fixed-time outcome: entered at the live price when the signal fired,
+  // expired at signal_time + duration. atGapPips = atPips − ftPips (cost of the signal→entry delay).
+  atOutcome?: string | null;
+  atRefPrice?: number | null;
+  atExitPrice?: number | null;
+  atPips?: number | null;
+  atGapPips?: number | null;
+  atExpiryIso?: string | null;
   live?: { currentPrice: number; reference: number; pips: number; status: 'WINNING' | 'LOSING' | 'FLAT' } | null;
   popupSent?: boolean | null;
   emailSent?: boolean | null;
@@ -635,6 +809,13 @@ export interface StrategyFtBucket {
   winLossSettled: number; winRate: number | null;
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
+// As-traded (realistic) fixed-time bucket: live entry at signal time, expiry at +duration.
+export interface StrategyAtBucket {
+  wins: number; losses: number; draws: number;
+  winLossSettled: number; winRate: number | null;
+  expectancyPips: number | null;
+  confidence: 'weak' | 'early' | 'usable' | 'strong';
+}
 export interface StrategyTfRow {
   timeframe: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
 }
@@ -649,18 +830,59 @@ export interface StrategyComboRow {
   strategy: string; strategyName: string; symbol: string; timeframe: string;
   total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
 }
+export interface StrategySessionStrategyRow {
+  id: string; name: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+}
+export interface StrategyScoreRow {
+  band: string; label: string; range: string; order: number;
+  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+}
+export interface StrategySessionBreakdown {
+  session: string; sessionLabel: string; bdRange: string;
+  byStrategy: StrategySessionStrategyRow[];
+  bySymbol: StrategySymbolRow[];
+  byTimeframe: StrategyTfRow[];
+}
 export interface StrategyPerf {
   id: string; name: string; source: string | null; total: number;
-  forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
   byTimeframe: StrategyTfRow[];
   bySymbol: StrategySymbolRow[];
   bySession: StrategySessionRow[];
+  byScore?: StrategyScoreRow[];
 }
+// ── Confluence (combined-strategy agreement) analysis ──
+export interface ConfluenceWin {
+  wins: number; losses: number; draws: number; settled: number;
+  winRate: number | null; confidence: 'weak' | 'early' | 'usable' | 'strong';
+}
+export interface ConfluenceLadderRow { agree: string; moments: number; fixedTime: ConfluenceWin; asTraded: ConfluenceWin }
+export interface ConfluencePair {
+  a: string; b: string; aName: string; bName: string; moments: number;
+  fixedTime: ConfluenceWin; asTraded: ConfluenceWin;
+  soloA: { winRate: number | null; settled: number } | null;
+  soloB: { winRate: number | null; settled: number } | null;
+}
+export interface ConfluenceComboSymbol { symbol: string; moments: number; fixedTime: ConfluenceWin; asTraded: ConfluenceWin }
+export interface ConfluenceCombo {
+  strategies: string[]; names: string[]; moments: number;
+  fixedTime: ConfluenceWin; asTraded: ConfluenceWin;
+  solos: { id: string; name: string; moments: number; fixedTime: ConfluenceWin; asTraded: ConfluenceWin }[];
+  bySymbol: ConfluenceComboSymbol[];
+}
+export interface ConfluenceResponse {
+  ok: boolean; window: { label: string }; minSample: number;
+  agreementLadder: ConfluenceLadderRow[]; topPairs: ConfluencePair[]; combo: ConfluenceCombo | null;
+  generatedAt: string; error?: string;
+}
+
 export interface StrategyPerformanceResponse {
   ok: boolean; strategies: StrategyPerf[];
   timeframeRanking: StrategyTfRow[];
   symbolRanking: StrategySymbolRow[];
   sessionRanking: StrategySessionRow[];
+  sessionBreakdown?: StrategySessionBreakdown[];
+  scoreRanking?: StrategyScoreRow[];
   combos: StrategyComboRow[];
   window?: { from: string; to: string; label: string; preset: string | null; days: number };
   minSampleToRank: number; generatedAt: string; note: string;
@@ -701,8 +923,17 @@ export interface StrategyFttLiveRow {
   score?: number | null;
   grade?: string | null;
   reference?: number | null;
+  candleRead?: {
+    verdict: 'ENTER_NOW' | 'WAIT_PULLBACK' | 'NO_ENTRY';
+    momentum: 'UP' | 'DOWN' | 'MIXED';
+    pattern: string;
+    atExtreme: 'HIGH' | 'LOW' | null;
+    note: string;
+  } | null;
   expiryIso?: string | null;
   secondsToExpiry?: number | null;
+  tradeMinutes?: number | null;
+  tradeTimeLabel?: string | null;
   durationLabel?: string | null;
   reason?: string | null;
 }
@@ -1020,6 +1251,116 @@ export interface DayTradingBriefResponse {
   news: DayTradingBriefNews[];
   dailyRisk: DayTradingDailyRisk;
   note: string;
+}
+
+// ── Live Market Tracker (pre-entry cockpit) ──────────────────────────────────
+export interface LmtMarketStatus { open: boolean; state: 'OPEN' | 'CLOSED'; reason: string }
+export interface LmtPressure {
+  isProxy: boolean;
+  basis: string;
+  buyerPressure: number;
+  sellerPressure: number;
+  dominant: 'BUYERS' | 'SELLERS' | 'BALANCED';
+  aggressiveBuying: number;
+  aggressiveSelling: number;
+  volumeRatio: number;
+  volumeState: 'HIGH' | 'NORMAL' | 'LOW';
+  lastCandle: { bullish: boolean; bodyPct: number; closePosPct: number };
+}
+export interface LmtOrderBlock {
+  type: 'BULLISH' | 'BEARISH';
+  kind: 'DEMAND' | 'SUPPLY';
+  low: number;
+  high: number;
+  mid: number;
+  inside: boolean;
+  distancePips: number;
+  distanceAtr: number | null;
+  imbalance: boolean;
+  displacement: boolean;
+  mitigated: boolean;
+  zoneActivity: { tickVolume: number; reactions: number; note: string };
+  score: number;
+  grade: 'A' | 'B' | 'C';
+  time: string;
+}
+export interface LmtPricePosition {
+  pct: number | null;
+  zone: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM';
+  label: string;
+  rangeHigh: number;
+  rangeLow: number;
+  equilibrium: number;
+}
+export interface LmtVerdict {
+  verdict: 'WAIT' | 'WATCH' | 'ARMED_IF_CONFIRMED' | 'NO_TRADE' | 'STALE_DATA' | 'MARKET_CLOSED';
+  canEnter: boolean;
+  direction: 'BUY' | 'SELL' | null;
+  checklist: Record<string, boolean> | null;
+  reasons: string[];
+}
+export interface LmtWatchRow {
+  symbol: string;
+  price: number;
+  feedState: string;
+  bias: string | null;
+  verdict: string;
+  buyerPressure: number;
+  sellerPressure: number;
+  nearestDistanceAtr: number;
+}
+export interface LmtKeyLevel {
+  type: string; label: string; price: number; side: 'above' | 'below';
+  distance: number; distancePips: number; distanceAtr: number | null;
+  swept: boolean; fresh: boolean; strength: number;
+}
+export interface LmtSweepGrade {
+  decision: 'BUY' | 'SELL';
+  score: number;
+  grade: string;
+  entry: number; stopLoss: number; takeProfit1: number; takeProfit2: number; takeProfit3: number;
+  riskRewardRatio: number;
+  reason: string; barIso: string;
+  meta: { sweptLevel: { type: string; price: number; strength: number }; components: Record<string, unknown>; checklist: string[] };
+}
+export interface LiveMarketTrackerResponse {
+  ok: boolean;
+  symbol: string;
+  timeframe: string;
+  price: number;
+  atr: number | null;
+  feedState: 'LIVE' | 'STALE' | 'MARKET_CLOSED';
+  dataFresh: boolean;
+  sourceReceivedAt: string | null;
+  staleSeconds: number | null;
+  marketStatus: LmtMarketStatus;
+  session: { label?: string; bdTime?: string | null; key?: string } | null;
+  pricePosition: LmtPricePosition | null;
+  bias: 'BULLISH' | 'BEARISH' | null;
+  phase: string;
+  regime: string | null;
+  decision: string;
+  grade: string | null;
+  score: number | null;
+  extended: boolean;
+  emaDistanceAtr: number | null;
+  pressure: LmtPressure;
+  orderBlocks: LmtOrderBlock[];
+  nearestDemand: LmtOrderBlock | null;
+  nearestSupply: LmtOrderBlock | null;
+  liquidity: { targetAbove: LiquidityPool | null; targetBelow: LiquidityPool | null; recentSweep: unknown; buySide: LiquidityPool[]; sellSide: LiquidityPool[] } | null;
+  keyLevels?: LmtKeyLevel[];
+  nearestKeyAbove?: LmtKeyLevel | null;
+  nearestKeyBelow?: LmtKeyLevel | null;
+  sweepGrade?: LmtSweepGrade | null;
+  recentSweep: string | null;
+  breaker: unknown;
+  plan: { entry: number; sl: number; tp: number | null; rr: number | null } | null;
+  verdict: LmtVerdict;
+  watchlist: LmtWatchRow[];
+  generatedAt: string;
+  honesty: string[];
+  error?: string;
 }
 
 export interface ForecastOutcomeResponse {
@@ -1445,7 +1786,70 @@ export interface SignalEmailReportsResponse {
   reports: SignalEmailReport[];
   summary: TradeReportSummary;
   filters: Record<string, unknown>;
+  forexActive?: boolean; // forex report only: false when the Forex Scanner toggle is OFF (report intentionally empty)
   status?: Mt5Status;
+}
+
+// ─── AI Chart Image analysis (upload a screenshot → trade plan) ───
+export interface ChartForexPlan {
+  decision: string;
+  entry: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  takeProfit3: number | null;
+  riskReward: number | null;
+  lots: number | null;
+  stopPips?: number | null;
+  lossAtStop?: number | null;
+  riskLevel?: string;
+  invalidation?: string | null;
+  grade?: string | null;
+}
+export interface ChartTimeTrigger {
+  atIso: string | null;
+  atLabel: string | null;
+  condition: 'ABOVE' | 'BELOW' | null;
+  level: number | null;
+  direction?: string;
+  elseAction: string;
+  basis?: string;
+}
+export interface ChartFttPlan {
+  direction: string;
+  confidence?: number | null;
+  expiry?: string | null;
+  suggestedTimeframe?: string | null;
+  expectedCandlesInDirection?: number | null;
+  persistenceRange?: { low: number | null; high: number | null; basis: string } | null;
+  timeTrigger?: ChartTimeTrigger | null;
+  reasoning?: string | null;
+}
+export interface ChartAnalysisResponse {
+  ok: boolean;
+  source: 'gemini-vision' | 'system-fallback';
+  symbol: string;
+  timeframe: string;
+  tradeMode: string;
+  verdict?: string | null;
+  confidence?: number | null;
+  detection: {
+    trend?: string | null;
+    regime?: string | null;
+    structure?: unknown[];
+    srZones?: unknown;
+    patterns?: string[];
+    breakout?: { phase?: string; direction?: string; grade?: string; level?: number; displacement?: boolean } | null;
+    grade?: string | null;
+  };
+  forexPlan: ChartForexPlan | null;
+  fttPlan: ChartFttPlan | null;
+  breakout?: { phase?: string; direction?: string; grade?: string } | null;
+  strategies?: Array<{ id: string; name: string; decision: string; score: number | null; grade: string | null }>;
+  reasoning?: string;
+  keyFactors?: string[];
+  honesty?: string[];
+  note?: string;
 }
 
 export interface CalibrationGroupStat {

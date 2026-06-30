@@ -54,12 +54,19 @@ import type {
   ForecastOutcomeResponse,
   DayTradingBriefResponse,
   StructureDeskResponse,
+  LiveMarketTrackerResponse,
   SignalTrackerResponse,
   StrategyMeta,
   StrategySignal,
   StrategyPerformanceResponse,
+  ConfluenceResponse,
+  ChartAnalysisResponse,
   StrategyLiveResponse,
   StrategyFttLiveResponse,
+  StrategyEntryWatchResponse,
+  BreakoutLiveResponse,
+  BreakoutAlertsResponse,
+  BreakoutTrackingResponse,
 } from './types';
 import { playAlertSound, showBrowserNotification } from './utils/notifications';
 
@@ -293,6 +300,26 @@ export async function triggerAiAnalysis(symbol: string, timeframe = 'M5'): Promi
   return { ...payload, decision: normalizeAiDecision(payload.decision) };
 }
 
+// Upload a chart screenshot (base64) → AI vision trade plan, with deterministic fallback.
+export async function fetchChartAnalysis(payload: {
+  imageBase64: string;
+  mimeType: string;
+  symbol: string;
+  timeframe: string;
+  tradeMode: 'FOREX' | 'FTT' | 'BOTH';
+}): Promise<ChartAnalysisResponse> {
+  const response = await fetch('/api/ai/analyze-chart', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error?.error || `Chart analysis failed: ${response.status}`);
+  }
+  return (await response.json()) as ChartAnalysisResponse;
+}
+
 export async function triggerAllSymbolsScan(timeframe = 'M5', symbols?: string[]): Promise<ScanAllResponse> {
   const response = await fetch('/api/signals/scan-all', {
     method: 'POST',
@@ -383,22 +410,38 @@ export async function fetchSignalTracker(): Promise<SignalTrackerResponse> {
   return fetchJson<SignalTrackerResponse>('/api/signal-tracker');
 }
 
+export async function fetchLiveMarketTracker(symbol?: string, timeframe = 'M5'): Promise<LiveMarketTrackerResponse> {
+  const params = new URLSearchParams({ timeframe });
+  if (symbol) params.set('symbol', symbol);
+  return fetchJson<LiveMarketTrackerResponse>(`/api/live-market-tracker?${params.toString()}`);
+}
+
 export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; timeframes: string[]; ftExpiryBars: number }> {
   return fetchJson('/api/strategy-lab/strategies');
 }
-export async function fetchStrategySignals(strategy?: string, timeframe?: string): Promise<{ ok: boolean; signals: StrategySignal[] }> {
+export async function fetchStrategySignals(strategy?: string, timeframe?: string, includeMuted?: boolean): Promise<{ ok: boolean; signals: StrategySignal[] }> {
   const p = new URLSearchParams();
   if (strategy) p.set('strategy', strategy);
   if (timeframe) p.set('timeframe', timeframe);
+  if (includeMuted) p.set('includeMuted', '1');
   const qs = p.toString();
   return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
 }
-export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string } = {}): Promise<StrategyPerformanceResponse> {
+export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; includeMuted?: boolean } = {}): Promise<StrategyPerformanceResponse> {
   const opts = typeof params === 'number' ? { days: params } : params;
   const q = new URLSearchParams();
+  if (opts.includeMuted) q.set('includeMuted', '1');
   if (opts.preset) q.set('preset', opts.preset);
   else q.set('days', String(opts.days ?? 90));
   return fetchJson<StrategyPerformanceResponse>(`/api/strategy-lab/performance?${q.toString()}`);
+}
+export async function fetchStrategyConfluence(opts: { days?: number; preset?: string; timeframe?: string; symbol?: string; strategies?: string[] } = {}): Promise<ConfluenceResponse> {
+  const q = new URLSearchParams();
+  if (opts.preset) q.set('preset', opts.preset); else q.set('days', String(opts.days ?? 90));
+  if (opts.timeframe) q.set('timeframe', opts.timeframe);
+  if (opts.symbol) q.set('symbol', opts.symbol);
+  if (opts.strategies?.length) q.set('strategies', opts.strategies.join(','));
+  return fetchJson<ConfluenceResponse>(`/api/strategy-lab/confluence?${q.toString()}`);
 }
 export async function fetchStrategyLive(strategy: string, timeframe = 'M15'): Promise<StrategyLiveResponse> {
   const p = new URLSearchParams({ strategy, timeframe });
@@ -407,6 +450,28 @@ export async function fetchStrategyLive(strategy: string, timeframe = 'M15'): Pr
 export async function fetchStrategyLiveFtt(strategy: string, timeframe = 'M15'): Promise<StrategyFttLiveResponse> {
   const p = new URLSearchParams({ strategy, timeframe });
   return fetchJson<StrategyFttLiveResponse>(`/api/strategy-lab/live-ftt?${p.toString()}`);
+}
+
+export async function fetchStrategyEntryWatch(minScore?: number): Promise<StrategyEntryWatchResponse> {
+  const qs = minScore != null ? `?minScore=${minScore}` : '';
+  return fetchJson<StrategyEntryWatchResponse>(`/api/strategy-lab/entry-watch${qs}`);
+}
+
+export async function fetchBreakoutLive(timeframe = 'ALL'): Promise<BreakoutLiveResponse> {
+  const p = new URLSearchParams({ timeframe });
+  return fetchJson<BreakoutLiveResponse>(`/api/breakout/live?${p.toString()}`);
+}
+export async function fetchBreakoutAlerts(options?: { symbol?: string; limit?: number }): Promise<BreakoutAlertsResponse> {
+  const p = new URLSearchParams();
+  if (options?.symbol) p.set('symbol', options.symbol);
+  if (options?.limit) p.set('limit', String(options.limit));
+  const qs = p.toString();
+  return fetchJson<BreakoutAlertsResponse>(`/api/breakout/alerts${qs ? `?${qs}` : ''}`);
+}
+export async function fetchBreakoutTracking(timeframe = 'ALL', windowHours?: number): Promise<BreakoutTrackingResponse> {
+  const p = new URLSearchParams({ timeframe });
+  if (windowHours) p.set('windowHours', String(windowHours));
+  return fetchJson<BreakoutTrackingResponse>(`/api/breakout/tracking?${p.toString()}`);
 }
 
 export async function markSignalTrackerDone(id: string): Promise<{ ok: boolean; id: string }> {
@@ -692,6 +757,50 @@ export function Mt5StreamProvider({ children }: { children: React.ReactNode }) {
         });
       } catch {
         setError('Failed to parse quality forex signal');
+      }
+    });
+
+    source.addEventListener('breakout', (event) => {
+      try {
+        const p = JSON.parse((event as MessageEvent).data) as {
+          id: string; phase: 'PRE' | 'CONFIRMED'; symbol: string; timeframe: string;
+          direction: 'BUY' | 'SELL'; grade: string; score: number; trend: 'UP' | 'DOWN';
+          level: number; levelStrength: number; price: number; distanceAtr: number | null;
+          bodyAtr: number | null; reasons?: string[]; bar?: string; createdAt: string;
+        };
+        const dirWord = p.direction === 'BUY' ? 'UP ▲' : 'DOWN ▼';
+        const alert: TopbarMarketAlert = {
+          id: p.id,
+          kind: 'BREAKOUT',
+          symbol: p.symbol,
+          timeframe: p.timeframe,
+          direction: p.direction,
+          grade: p.grade,
+          confidence: p.score,
+          entryPrice: p.price,
+          createdAt: p.createdAt || new Date().toISOString(),
+          phase: p.phase,
+          level: p.level,
+          levelStrength: p.levelStrength,
+          score: p.score,
+          trend: p.trend,
+          distanceAtr: p.distanceAtr,
+          bodyAtr: p.bodyAtr,
+          reasons: p.reasons || null,
+        };
+        // Generous browser channel: top-bar alert + desktop notification + sound.
+        addTopbarAlert(alert, true);
+        const title = p.phase === 'PRE'
+          ? `⚠️ ${p.grade} Approaching breakout: ${p.symbol} ${p.timeframe}`
+          : `✅ ${p.grade} Breakout confirmed: ${p.symbol} ${p.timeframe}`;
+        showBrowserNotification(title, {
+          body: p.phase === 'PRE'
+            ? `${dirWord} into ${p.level} · ${p.distanceAtr ?? '?'}× ATR away · score ${p.score}/100`
+            : `${dirWord} through ${p.level} · break body ${p.bodyAtr ?? '?'}× ATR · score ${p.score}/100`,
+          tag: p.id,
+        });
+      } catch {
+        setError('Failed to parse breakout alert');
       }
     });
 

@@ -29,6 +29,7 @@ import {
   Sunrise,
   LineChart,
   Radar,
+  Gauge,
   ChevronDown,
   X
 } from 'lucide-react';
@@ -95,6 +96,10 @@ function alertTitle(alert: TopbarMarketAlert) {
   if (alert.alertKind === 'CLOSE') return `⚠ CLOSE TRADE · ${alert.direction.replace('_', ' ')}`;
   if (alert.alertKind === 'MANAGE') return `MANAGE TRADE · ${alert.direction.replace('_', ' ')}`;
   if (alert.strategySource) return `${alert.grade || ''} ${alert.strategySource} · ${alert.direction.replace('_', ' ')}`.trim();
+  if (alert.kind === 'BREAKOUT') {
+    const verb = alert.phase === 'PRE' ? 'APPROACHING' : 'BREAKOUT';
+    return `${alert.grade || 'B'} ${verb} ${alert.direction === 'BUY' ? 'UP ▲' : 'DOWN ▼'}`;
+  }
   return alert.kind === 'FOREX'
     ? `${alert.grade || 'A'} FOREX ${alert.direction.replace('_', ' ')}`
     : `${alert.quality || alert.grade || 'A'} FIXED-TIME ${alert.direction}`;
@@ -165,7 +170,7 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
         <div className="absolute right-0 top-12 z-50 w-[360px] overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-900/15">
           <div className="flex items-start justify-between gap-3 border-b border-amber-100 bg-gradient-to-r from-amber-50 to-white p-4">
             <div>
-              <p className={`text-[10px] font-black uppercase tracking-[0.22em] ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-600' : displayAlert.strategySource ? 'text-violet-600' : 'text-amber-600'}`}>{displayAlert.alertKind ? 'Trade management alert' : displayAlert.strategySource ? `Strategy Lab · ${displayAlert.strategySource}` : 'Live quality signal'}</p>
+              <p className={`text-[10px] font-black uppercase tracking-[0.22em] ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-600' : displayAlert.strategySource ? 'text-violet-600' : displayAlert.kind === 'BREAKOUT' ? (displayAlert.phase === 'PRE' ? 'text-amber-600' : 'text-emerald-600') : 'text-amber-600'}`}>{displayAlert.alertKind ? 'Trade management alert' : displayAlert.strategySource ? `Strategy Lab · ${displayAlert.strategySource}` : displayAlert.kind === 'BREAKOUT' ? (displayAlert.phase === 'PRE' ? 'Approaching breakout' : 'Breakout confirmed') : 'Live quality signal'}</p>
               <h3 className={`mt-1 text-base font-black ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-700' : 'text-slate-950'}`}>{alertTitle(displayAlert)}</h3>
               <p className="text-xs font-bold text-slate-500">{displayAlert.symbol} {displayAlert.timeframe || displayAlert.expiry || ''} · {displayAlert.alertKind ? (displayAlert.currentR != null ? `${displayAlert.currentR}R` : '') : `${displayAlert.confidence}/100`} · {alertAgeLabel(displayAlert)}</p>
             </div>
@@ -182,6 +187,22 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
                 </div>
                 {displayAlert.reason && <p className={`rounded-xl p-2 font-semibold ${displayAlert.alertKind === 'CLOSE' ? 'bg-rose-50 text-rose-800' : 'bg-amber-50 text-amber-800'}`}>{displayAlert.reason}</p>}
                 {displayAlert.action && <p className="rounded-xl bg-slate-900 p-2 font-bold text-white">→ {displayAlert.action}</p>}
+              </>
+            ) : displayAlert.kind === 'BREAKOUT' ? (
+              <>
+                <div className="grid grid-cols-2 gap-2 font-mono text-slate-700">
+                  <div className="rounded-xl bg-slate-50 p-2"><span className="block text-[10px] font-bold uppercase text-slate-400">Level</span>{price(displayAlert.level, displayAlert.symbol)}{(displayAlert.levelStrength ?? 0) > 1 ? ` ·${displayAlert.levelStrength}x` : ''}</div>
+                  <div className="rounded-xl bg-slate-50 p-2"><span className="block text-[10px] font-bold uppercase text-slate-400">Price now</span>{price(displayAlert.entryPrice, displayAlert.symbol)}</div>
+                  <div className={`col-span-2 rounded-xl p-2 ${displayAlert.phase === 'PRE' ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                    <span className="block text-[10px] font-bold uppercase opacity-70">{displayAlert.phase === 'PRE' ? 'Approaching' : 'Confirmed'} · {displayAlert.trend === 'UP' ? 'HH/HL' : 'LH/LL'}</span>
+                    {displayAlert.phase === 'PRE'
+                      ? `${displayAlert.distanceAtr ?? '?'}× ATR from level`
+                      : `break body ${displayAlert.bodyAtr ?? '?'}× ATR`}
+                  </div>
+                </div>
+                {Array.isArray(displayAlert.reasons) && displayAlert.reasons.length > 0 && (
+                  <p className="rounded-xl bg-slate-50 p-2 font-semibold text-slate-600">{displayAlert.reasons.slice(0, 3).join(' · ')}</p>
+                )}
               </>
             ) : displayAlert.kind === 'FOREX' ? (
               <>
@@ -208,8 +229,8 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
               <div className="border-t border-slate-100 pt-2">
                 {recentAlerts.filter((alert) => alert.id !== displayAlert.id).slice(0, 4).map((alert) => (
                   <div key={alert.id} className="flex items-center justify-between py-1 text-[11px] font-bold text-slate-500">
-                    <span>{alert.kind === 'FOREX' ? 'FX' : 'FTT'} · {alert.symbol} {alert.timeframe || alert.expiry}</span>
-                    <span>{alert.confidence}/100 · {alertAgeLabel(alert)}</span>
+                    <span>{alert.kind === 'FOREX' ? 'FX' : alert.kind === 'BREAKOUT' ? 'BO' : 'FTT'} · {alert.symbol} {alert.timeframe || alert.expiry}</span>
+                    <span>{alert.kind === 'BREAKOUT' ? `${alert.grade || 'B'} · ${alert.phase === 'PRE' ? 'pre' : 'conf'}` : `${alert.confidence}/100`} · {alertAgeLabel(alert)}</span>
                   </div>
                 ))}
               </div>
@@ -293,7 +314,9 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/future-predictions', icon: Brain, label: 'Future Predictions' },
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
     { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
+    { path: '/live-market-tracker', icon: Gauge, label: 'Live Market Tracker' },
     { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },
+    { path: '/breakout', icon: Crosshair, label: 'Breakout Tracker' },
     {
       path: '/strategy-lab', icon: FlaskConical, label: 'Strategy Lab',
       children: [
@@ -431,12 +454,25 @@ export default function Layout({ onLogout }: LayoutProps) {
               {activeStopHunts.length > 2 && <span className="text-[10px]">+{activeStopHunts.length - 2}</span>}
             </div>
             <TopbarMarketAlerts alerts={topbarAlerts} />
-            <div className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 md:flex ${status.connected ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
-              <div className={`w-2 h-2 rounded-full ${status.connected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></div>
-              <span className={`text-sm font-medium ${status.connected ? 'text-emerald-700' : 'text-amber-700'}`}>
-                {status.connected ? 'MT5 Connected' : 'MT5 Waiting'}
-              </span>
-            </div>
+            {(() => {
+              const marketClosed = status.marketStatus?.open === false;
+              // Market closed is an expected, non-error state (weekend) → neutral slate, no pulse.
+              // Otherwise fall back to the live connection indicator (emerald = up, amber = waiting).
+              const tone = marketClosed
+                ? { wrap: 'border-slate-200 bg-slate-50', dot: 'bg-slate-400', text: 'text-slate-600', label: 'Market Closed' }
+                : status.connected
+                  ? { wrap: 'border-emerald-200 bg-emerald-50', dot: 'bg-emerald-500 animate-pulse', text: 'text-emerald-700', label: 'MT5 Connected' }
+                  : { wrap: 'border-amber-200 bg-amber-50', dot: 'bg-amber-500', text: 'text-amber-700', label: 'MT5 Waiting' };
+              return (
+                <div
+                  title={marketClosed ? status.marketStatus?.reason : undefined}
+                  className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 md:flex ${tone.wrap}`}
+                >
+                  <div className={`w-2 h-2 rounded-full ${tone.dot}`}></div>
+                  <span className={`text-sm font-medium ${tone.text}`}>{tone.label}</span>
+                </div>
+              );
+            })()}
             <div className="flex items-center gap-3 border-l border-slate-200 pl-4">
               <div className="flex h-10 w-10 items-center justify-center rounded-full border border-amber-200 bg-amber-50 shadow-sm">
                 <span className="text-sm font-bold text-amber-700">AD</span>

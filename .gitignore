@@ -38,3 +38,4 @@ Thumbs.db
 *.ex5
 *.ex4
 *.sql
+.gstack/

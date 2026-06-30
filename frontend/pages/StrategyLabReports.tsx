@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio } from 'lucide-react';
+import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals } from '../mt5Api';
+import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence } from '../mt5Api';
 import type {
-  StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyFtBucket,
+  StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyFtBucket, StrategyAtBucket,
   StrategyTfRow, StrategySymbolRow, StrategySessionRow, StrategyComboRow, StrategySignal,
+  StrategySessionBreakdown, StrategySessionStrategyRow, StrategyScoreRow,
+  ConfluenceResponse, ConfluenceWin,
 } from '../types';
 
 const REFRESH_MS = 60000;
@@ -43,8 +45,21 @@ function rankByMetric<T extends AnyBucketRow>(rows: T[], m: Metric, minSample: n
 const wrColor = (wr: number | null) => (wr === null ? 'text-slate-400' : wr >= 60 ? 'text-emerald-600' : wr >= 50 ? 'text-blue-600' : 'text-rose-600');
 const barColor = (wr: number | null) => (wr === null ? 'bg-slate-200' : wr >= 60 ? 'bg-emerald-500' : wr >= 50 ? 'bg-blue-500' : 'bg-rose-500');
 
+// Case-insensitive "any field contains query" — empty query matches everything.
+const matchq = (q: string, ...fields: (string | null | undefined)[]) => {
+  const needle = q.trim().toLowerCase();
+  if (!needle) return true;
+  return fields.some((f) => (f || '').toLowerCase().includes(needle));
+};
+
+// Small uppercase group heading to organise the page into clear sections.
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return <h2 className="px-1 pt-1 text-[11px] font-black uppercase tracking-[0.2em] text-slate-400">{children}</h2>;
+}
+
 // Win-rate cell with a tiny progress bar + confidence chip.
-function WinCell({ b, minSample, bar = true }: { b: StrategyForexBucket | StrategyFtBucket; minSample: number; bar?: boolean }) {
+function WinCell({ b, minSample, bar = true }: { b: StrategyForexBucket | StrategyFtBucket | StrategyAtBucket | null | undefined; minSample: number; bar?: boolean }) {
+  if (!b) return <div className="min-w-[92px] text-right text-sm font-bold text-slate-300">—</div>;
   const settled = b.winLossSettled ?? 0;
   const trusted = settled >= minSample;
   return (
@@ -140,12 +155,19 @@ export default function StrategyLabReports() {
   const [perf, setPerf] = useState<StrategyPerformanceResponse | null>(null);
   const [signals, setSignals] = useState<StrategySignal[]>([]);
   const [range, setRange] = useState<RangeKey>('last7');
-  const [metric, setMetric] = useState<Metric>('forex');
+  const [tab, setTab] = useState<'forex' | 'ftt' | 'confluence'>('forex');
+  const metric: Metric = tab === 'ftt' ? 'ftt' : 'forex';
+  const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchStrategies().then((m) => { setStrategies(m.strategies); setSelected((c) => c || m.strategies[0]?.id || ''); }).catch(() => {});
+    fetchStrategies().then((m) => {
+      // Disabled strategies are hidden from reports too (manage them on Settings).
+      const visible = (m.strategies || []).filter((s) => s.control?.enabled !== false);
+      setStrategies(visible);
+      setSelected((c) => c || visible[0]?.id || '');
+    }).catch(() => {});
   }, []);
 
   const load = useCallback(async () => {
@@ -180,10 +202,16 @@ export default function StrategyLabReports() {
   const rankedTf = useMemo(() => rankByMetric(perf?.timeframeRanking || [], metric, minSample), [perf, metric, minSample]);
   const rankedSymbols = useMemo(() => rankByMetric(perf?.symbolRanking || [], metric, minSample), [perf, metric, minSample]);
   const rankedSessions = useMemo(() => rankByMetric(perf?.sessionRanking || [], metric, minSample), [perf, metric, minSample]);
+  const rankedScore = useMemo(() => rankByMetric(perf?.scoreRanking || [], metric, minSample), [perf, metric, minSample]);
   const rankedCombos = useMemo(() => rankByMetric(perf?.combos || [], metric, minSample), [perf, metric, minSample]);
+  // Search filter (applies to the leaderboard + combos).
+  const visibleStrategies = useMemo(() => rankedStrategies.filter((s) => matchq(query, s.name, s.source, s.id)), [rankedStrategies, query]);
+  const visibleCombos = useMemo(() => rankedCombos.filter((c) => matchq(query, c.strategyName, c.symbol, c.timeframe)), [rankedCombos, query]);
+  const sessionBreakdown = perf?.sessionBreakdown || [];
   const tfBySel = useMemo(() => rankByMetric(activePerf?.byTimeframe || [], metric, minSample), [activePerf, metric, minSample]);
   const symBySel = useMemo(() => rankByMetric(activePerf?.bySymbol || [], metric, minSample), [activePerf, metric, minSample]);
   const sessBySel = useMemo(() => rankByMetric(activePerf?.bySession || [], metric, minSample), [activePerf, metric, minSample]);
+  const scoreBySel = useMemo(() => rankByMetric(activePerf?.byScore || [], metric, minSample), [activePerf, metric, minSample]);
 
   // Signal log filtered to the selected date window (matches the performance window).
   const logSignals = useMemo(() => {
@@ -208,8 +236,9 @@ export default function StrategyLabReports() {
 
   const MetricToggle = (
     <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-0.5">
-      <button type="button" onClick={() => setMetric('forex')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${metric === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Forex</button>
-      <button type="button" onClick={() => setMetric('ftt')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${metric === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Fixed-Time</button>
+      <button type="button" onClick={() => setTab('forex')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Forex</button>
+      <button type="button" onClick={() => setTab('ftt')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Fixed-Time</button>
+      <button type="button" onClick={() => setTab('confluence')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'confluence' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}><Layers size={12} />Confluence</button>
     </div>
   );
 
@@ -236,9 +265,24 @@ export default function StrategyLabReports() {
         </div>
       </div>
 
+      {tab === 'confluence' && <ConfluenceTab strategies={strategies} rangeParams={rangeToParams(range)} rangeLabel={perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label || ''} />}
+
+      {tab !== 'confluence' && (<>
+      {/* SEARCH — filters the strategy leaderboard, combos & per-session strategy lists */}
+      <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-card">
+        <Search size={16} className="shrink-0 text-slate-400" />
+        <input
+          type="text" value={query} onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search strategies, symbols or timeframes…"
+          className="w-full bg-transparent text-sm font-semibold text-slate-700 placeholder:font-medium placeholder:text-slate-400 focus:outline-none"
+        />
+        {query && <button type="button" onClick={() => setQuery('')} className="shrink-0 rounded-md px-2 py-0.5 text-xs font-bold text-slate-400 hover:bg-slate-100 hover:text-slate-600">Clear</button>}
+      </div>
+
       {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</div>}
 
       {/* TOP PICKS — best in each dimension, by the chosen metric */}
+      <SectionLabel>Overview · best in each dimension</SectionLabel>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <PickCard icon={<Award size={12} />} label={`Best strategy · ${metric === 'ftt' ? 'fixed-time' : 'forex'}`} title={bestStrategy?.name || '—'} subtitle={`${bestStrategy?.total ?? 0} signals`} b={bestStrategy ? pick(bestStrategy, metric) : null} minSample={minSample} />
         <PickCard icon={<Clock size={12} />} label="Best timeframe" title={bestTf?.timeframe || '—'} subtitle={`${bestTf?.total ?? 0} signals (all strategies)`} b={bestTf ? pick(bestTf, metric) : null} minSample={minSample} />
@@ -247,11 +291,12 @@ export default function StrategyLabReports() {
       </div>
 
       {/* STRATEGY LEADERBOARD */}
+      <SectionLabel>Leaderboards · ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
         <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
           <Trophy size={16} className="text-amber-500" />
           <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Strategy leaderboard · {perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label}</h3>
-          <span className="ml-1 text-[11px] font-semibold text-slate-400">ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate · trusted once ≥ {minSample} scored · {totalSignals} signals total</span>
+          <span className="ml-1 text-[11px] font-semibold text-slate-400">ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate · trusted once ≥ {minSample} scored · {totalSignals} signals total{query ? ` · filtered: “${query}”` : ''}</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[820px] text-left text-sm">
@@ -261,30 +306,32 @@ export default function StrategyLabReports() {
                 <th className="px-4 py-2">Strategy</th>
                 <th className="px-4 py-2 text-right">Forex win%</th>
                 <th className="px-4 py-2 text-right">Expectancy</th>
-                <th className="px-4 py-2 text-right">Fixed-time win%</th>
+                <th className="px-4 py-2 text-right" title="Idealized: signal-bar close → next-bar close.">Fixed-time win%</th>
+                <th className="px-4 py-2 text-right" title="As-traded: live entry when the signal fired, expiry at +duration. The realistic number.">As-traded win%</th>
                 <th className="px-4 py-2 text-right">Signals</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700">
-              {rankedStrategies.length ? rankedStrategies.map((s, i) => (
+              {visibleStrategies.length ? visibleStrategies.map((s, i) => (
                 <tr key={s.id} className={`hover:bg-slate-50/70 cursor-pointer ${s.id === selected ? 'bg-violet-50/50' : ''}`} onClick={() => setSelected(s.id)}>
                   <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
                   <td className="px-4 py-2"><span className="font-bold text-slate-800">{s.name}</span>{s.source && <span className="block text-[10px] font-semibold text-slate-400 max-w-[260px] truncate" title={s.source}>{s.source}</span>}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.forex} minSample={minSample} /></div></td>
                   <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(s.forex)}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.fixedTime} minSample={minSample} /></div></td>
+                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.asTraded} minSample={minSample} /></div></td>
                   <td className="px-4 py-2 text-right font-mono font-bold">{s.total}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No strategies match “${query}”.` : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
               )}
             </tbody>
           </table>
         </div>
       </div>
 
-      {/* TIMEFRAME + SYMBOL + SESSION global rankings (across all strategies) */}
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+      {/* TIMEFRAME + SYMBOL + SESSION + SCORE global rankings (across all strategies) */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2 xl:grid-cols-4">
         <RankTable
           title="Timeframe ranking" sub="all strategies" icon={<Clock size={16} className="text-blue-500" />}
           colLabel="TF" rows={rankedTf} keyOf={(r) => (r as StrategyTfRow).timeframe} render={(r) => (r as StrategyTfRow).timeframe} metric={metric} minSample={minSample}
@@ -302,9 +349,23 @@ export default function StrategyLabReports() {
           }}
           metric={metric} minSample={minSample}
         />
+        <RankTable
+          title="Setup score ranking" sub="grade band · all strategies" icon={<Award size={16} className="text-emerald-500" />}
+          colLabel="Setup" rows={rankedScore} keyOf={(r) => (r as StrategyScoreRow).band}
+          render={(r) => {
+            const s = r as StrategyScoreRow;
+            return (<><span className="font-black text-slate-800">{s.label}</span><span className="block text-[10px] font-semibold text-slate-400">{s.range}</span></>);
+          }}
+          metric={metric} minSample={minSample}
+        />
       </div>
 
+      {/* SESSION-WISE TOP PERFORMERS — per session: top strategies / symbols / timeframes */}
+      <SectionLabel>Session-wise top performers · {metric === 'ftt' ? 'fixed-time' : 'forex'}</SectionLabel>
+      <SessionBreakdownSection data={sessionBreakdown} metric={metric} minSample={minSample} query={query} loading={loading} />
+
       {/* BEST COMBOS — strategy × symbol × timeframe */}
+      <SectionLabel>Sharpest edges</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
         <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
           <Target size={16} className="text-violet-500" />
@@ -326,7 +387,7 @@ export default function StrategyLabReports() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700">
-              {rankedCombos.length ? rankedCombos.slice(0, 25).map((c, i) => (
+              {visibleCombos.length ? visibleCombos.slice(0, 25).map((c, i) => (
                 <tr key={`${c.strategy}-${c.symbol}-${c.timeframe}`} className="hover:bg-slate-50/70">
                   <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
                   <td className="px-4 py-2 font-bold text-slate-700">{c.strategyName}</td>
@@ -338,7 +399,7 @@ export default function StrategyLabReports() {
                   <td className="px-4 py-2 text-right font-mono font-bold">{c.total}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No combos settled yet.'}</td></tr>
+                <tr><td colSpan={8} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No combos match “${query}”.` : 'No combos settled yet.'}</td></tr>
               )}
             </tbody>
           </table>
@@ -346,6 +407,7 @@ export default function StrategyLabReports() {
       </div>
 
       {/* SELECTED STRATEGY DEEP-DIVE: by timeframe + by symbol */}
+      <SectionLabel>Deep dive · selected strategy</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
           <div className="flex items-center gap-2">
@@ -356,11 +418,14 @@ export default function StrategyLabReports() {
             {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
-        <div className="grid grid-cols-1 gap-0 lg:grid-cols-3 lg:divide-x lg:divide-slate-100">
+        <div className="grid grid-cols-1 gap-0 lg:grid-cols-2 xl:grid-cols-4 lg:divide-x lg:divide-slate-100">
           <BreakdownTable title="By timeframe" colLabel="TF" rows={tfBySel} keyOf={(r) => (r as StrategyTfRow).timeframe} render={(r) => (r as StrategyTfRow).timeframe} minSample={minSample} loading={loading} />
           <BreakdownTable title="By symbol" colLabel="Symbol" rows={symBySel} keyOf={(r) => (r as StrategySymbolRow).symbol} render={(r) => (r as StrategySymbolRow).symbol} minSample={minSample} loading={loading} />
           <BreakdownTable title="By session (BD time)" colLabel="Session" rows={sessBySel} keyOf={(r) => (r as StrategySessionRow).session}
             render={(r) => { const s = r as StrategySessionRow; return (<><span className="font-bold">{s.sessionLabel}</span><span className="block text-[10px] font-semibold text-slate-400">{s.bdRange}</span></>); }}
+            minSample={minSample} loading={loading} />
+          <BreakdownTable title="By setup score" colLabel="Setup" rows={scoreBySel} keyOf={(r) => (r as StrategyScoreRow).band}
+            render={(r) => { const s = r as StrategyScoreRow; return (<><span className="font-bold">{s.label}</span><span className="block text-[10px] font-semibold text-slate-400">{s.range}</span></>); }}
             minSample={minSample} loading={loading} />
         </div>
       </div>
@@ -423,16 +488,166 @@ export default function StrategyLabReports() {
       </div>
 
       {perf?.note && <p className="text-[11px] font-medium text-slate-400 px-1">{perf.note}</p>}
+      </>)}
     </div>
   );
 }
 
 // Global rank table (timeframe / symbol / session) — both win rates + signals, ranked.
+// ─── Confluence tab: do strategies AGREEING produce more accurate signals? ────
+function ConfluenceTab({ strategies, rangeParams, rangeLabel }: {
+  strategies: StrategyMeta[]; rangeParams: { days?: number; preset?: string }; rangeLabel: string;
+}) {
+  const [data, setData] = useState<ConfluenceResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [combo, setCombo] = useState<string[]>([]);
+  const [basis, setBasis] = useState<'ft' | 'at'>('ft');
+  const rp = `${rangeParams.preset || ''}|${rangeParams.days || ''}`;
+  const cs = combo.join(',');
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    fetchStrategyConfluence({ ...rangeParams, strategies: combo })
+      .then((d) => { if (alive) setData(d); })
+      .catch(() => {})
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [rp, cs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const minSample = data?.minSample ?? 12;
+  const pickW = (o: { fixedTime: ConfluenceWin; asTraded: ConfluenceWin }) => (basis === 'at' ? o.asTraded : o.fixedTime);
+  const toggle = (id: string) => setCombo((c) => (c.includes(id) ? c.filter((x) => x !== id) : (c.length >= 3 ? c : [...c, id])));
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-indigo-50/50 px-4 py-3">
+        <div className="flex items-start gap-2">
+          <Layers className="mt-0.5 shrink-0 text-indigo-600" size={18} />
+          <div>
+            <h3 className="text-sm font-black text-indigo-900">Confluence — do strategies agreeing produce more accurate signals?</h3>
+            <p className="text-[11px] font-medium text-indigo-700/80">When 2+ strategies fire the SAME direction on the SAME candle for a symbol, that&apos;s a confluence. Win rate = the next-candle outcome (shared by all agreeing strategies). {rangeLabel}.</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-1 rounded-lg border border-indigo-200 bg-white p-0.5">
+          <button type="button" onClick={() => setBasis('ft')} className={`rounded-md px-2.5 py-1 text-[11px] font-bold ${basis === 'ft' ? 'bg-violet-600 text-white' : 'text-slate-500'}`}>Fixed-time</button>
+          <button type="button" onClick={() => setBasis('at')} className={`rounded-md px-2.5 py-1 text-[11px] font-bold ${basis === 'at' ? 'bg-violet-600 text-white' : 'text-slate-500'}`}>As-traded</button>
+        </div>
+      </div>
+
+      {loading && !data && <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center text-slate-400"><Loader2 className="mx-auto animate-spin" /> Loading confluence…</div>}
+
+      <SectionLabel>Agreement ladder · more strategies agreeing = higher win rate?</SectionLabel>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {(data?.agreementLadder || []).map((r) => {
+          const w = pickW(r);
+          return (
+            <div key={r.agree} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
+              <div className="text-[10px] font-black uppercase tracking-wider text-slate-400">{r.agree === '1' ? '1 strategy' : `${r.agree} agree`}</div>
+              <div className={`mt-1 text-2xl font-black ${wrColor(w.winRate)}`}>{w.winRate === null ? '—' : `${w.winRate}%`}</div>
+              <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-slate-100"><div className={`h-full rounded-full ${barColor(w.winRate)}`} style={{ width: `${w.winRate ?? 0}%` }} /></div>
+              <div className="mt-1 text-[10px] font-bold text-slate-400">{r.moments} moments · {w.settled} scored</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <SectionLabel>Best 2-strategy pairs · when both agree (≥{minSample} scored)</SectionLabel>
+      <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-left text-sm">
+            <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+              <tr>
+                <th className="px-4 py-2 w-8">#</th>
+                <th className="px-4 py-2">Pair (agree, same candle)</th>
+                <th className="px-4 py-2 text-right">Combined win%</th>
+                <th className="px-4 py-2 text-right">Solo A / B</th>
+                <th className="px-4 py-2 text-right">Lift</th>
+                <th className="px-4 py-2 text-right">Moments</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-700">
+              {(data?.topPairs || []).length ? data!.topPairs.map((p, i) => {
+                const w = pickW(p);
+                const soloAvg = (p.soloA?.winRate != null && p.soloB?.winRate != null) ? (p.soloA.winRate + p.soloB.winRate) / 2 : null;
+                const lift = (w.winRate != null && soloAvg != null) ? Math.round((w.winRate - soloAvg) * 10) / 10 : null;
+                return (
+                  <tr key={`${p.a}|${p.b}`} className="hover:bg-slate-50/70">
+                    <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
+                    <td className="px-4 py-2 font-bold text-slate-800">{p.aName} <span className="text-indigo-400">+</span> {p.bName}</td>
+                    <td className="px-4 py-2 text-right"><span className={`font-black ${wrColor(w.winRate)}`}>{w.winRate === null ? '—' : `${w.winRate}%`}</span> <span className="text-[10px] text-slate-400">({w.settled})</span></td>
+                    <td className="px-4 py-2 text-right font-mono text-xs text-slate-500">{p.soloA?.winRate ?? '—'} / {p.soloB?.winRate ?? '—'}</td>
+                    <td className={`px-4 py-2 text-right font-black ${lift == null ? 'text-slate-300' : lift > 0 ? 'text-emerald-600' : 'text-rose-600'}`}>{lift == null ? '—' : `${lift > 0 ? '+' : ''}${lift}`}</td>
+                    <td className="px-4 py-2 text-right font-mono">{p.moments}</td>
+                  </tr>
+                );
+              }) : <tr><td colSpan={6} className="px-4 py-8 text-center text-sm text-slate-400">{loading ? 'Loading…' : 'No pairs with enough shared signals yet — confluence data builds as the lab logs more.'}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <SectionLabel>Custom combo · pick 2–3 strategies to test together</SectionLabel>
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
+        <div className="flex flex-wrap gap-1.5">
+          {strategies.map((s) => {
+            const on = combo.includes(s.id);
+            return <button key={s.id} type="button" onClick={() => toggle(s.id)} className={`rounded-full border px-2.5 py-1 text-[11px] font-bold transition ${on ? 'border-indigo-500 bg-indigo-600 text-white' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} ${!on && combo.length >= 3 ? 'opacity-40' : ''}`}>{s.name}</button>;
+          })}
+        </div>
+        {combo.length < 2 && <p className="mt-3 text-xs font-semibold text-slate-400">Select at least 2 strategies to see their combined win rate vs each alone — e.g. ICT Breaker + 3-Candle on gold.</p>}
+        {combo.length >= 2 && data?.combo && (() => {
+          const w = pickW(data.combo);
+          return (
+            <div className="mt-4 space-y-3">
+              <div className="flex flex-wrap items-end gap-4 rounded-xl border border-indigo-200 bg-indigo-50/50 p-4">
+                <div>
+                  <div className="text-[10px] font-black uppercase text-indigo-500">When all {combo.length} agree</div>
+                  <div className={`text-3xl font-black ${wrColor(w.winRate)}`}>{w.winRate === null ? '—' : `${w.winRate}%`}</div>
+                  <div className="text-[11px] font-bold text-slate-500">{data.combo.moments} moments · {w.settled} scored</div>
+                </div>
+                <div className="flex-1 space-y-1">
+                  {data.combo.solos.map((s) => { const sw = pickW(s); return (
+                    <div key={s.id} className="flex items-center gap-2 text-[11px]">
+                      <span className="w-44 truncate font-semibold text-slate-500">{s.name} alone</span>
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div className={`h-full ${barColor(sw.winRate)}`} style={{ width: `${sw.winRate ?? 0}%` }} /></div>
+                      <span className={`w-12 text-right font-bold ${wrColor(sw.winRate)}`}>{sw.winRate === null ? '—' : `${sw.winRate}%`}</span>
+                    </div>
+                  ); })}
+                  <div className="flex items-center gap-2 text-[11px]">
+                    <span className="w-44 truncate font-black text-indigo-700">All agree together</span>
+                    <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100"><div className={`h-full ${barColor(w.winRate)}`} style={{ width: `${w.winRate ?? 0}%` }} /></div>
+                    <span className={`w-12 text-right font-black ${wrColor(w.winRate)}`}>{w.winRate === null ? '—' : `${w.winRate}%`}</span>
+                  </div>
+                </div>
+              </div>
+              {data.combo.bySymbol.length > 0 && (
+                <div>
+                  <div className="mb-1 text-[10px] font-black uppercase tracking-wider text-slate-400">By symbol (all agree)</div>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+                    {data.combo.bySymbol.map((b) => { const bw = pickW(b); return (
+                      <div key={b.symbol} className="rounded-lg border border-slate-200 p-2">
+                        <div className="text-[11px] font-black text-slate-700">{b.symbol}</div>
+                        <div className={`text-lg font-black ${wrColor(bw.winRate)}`}>{bw.winRate === null ? '—' : `${bw.winRate}%`}</div>
+                        <div className="text-[9px] font-bold text-slate-400">{bw.settled} scored</div>
+                      </div>
+                    ); })}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+    </div>
+  );
+}
+
 function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, minSample }: {
   title: string; sub: string; icon: React.ReactNode; colLabel: string;
-  rows: (StrategyTfRow | StrategySymbolRow | StrategySessionRow)[];
-  keyOf: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => string;
-  render: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => React.ReactNode;
+  rows: (StrategyTfRow | StrategySymbolRow | StrategySessionRow | StrategyScoreRow)[];
+  keyOf: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow | StrategyScoreRow) => string;
+  render: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow | StrategyScoreRow) => React.ReactNode;
   metric: Metric; minSample: number;
 }) {
   return (
@@ -474,9 +689,9 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
 
 // Per-strategy breakdown table (timeframe / symbol / session) with expectancy.
 function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loading }: {
-  title: string; colLabel: string; rows: (StrategyTfRow | StrategySymbolRow | StrategySessionRow)[];
-  keyOf: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => string;
-  render: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow) => React.ReactNode;
+  title: string; colLabel: string; rows: (StrategyTfRow | StrategySymbolRow | StrategySessionRow | StrategyScoreRow)[];
+  keyOf: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow | StrategyScoreRow) => string;
+  render: (r: StrategyTfRow | StrategySymbolRow | StrategySessionRow | StrategyScoreRow) => React.ReactNode;
   minSample: number; loading: boolean;
 }) {
   return (
@@ -507,6 +722,94 @@ function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loadi
             )}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+
+// One ranked mini-list (top strategies / symbols / timeframes) inside a session card.
+function MiniRank<T extends AnyBucketRow & { total: number }>({ title, icon, rows, keyOf, render, metric, minSample, empty }: {
+  title: string; icon: React.ReactNode; rows: T[];
+  keyOf: (r: T) => string; render: (r: T) => React.ReactNode;
+  metric: Metric; minSample: number; empty: string;
+}) {
+  const ranked = rankByMetric(rows, metric, minSample);
+  return (
+    <div className="overflow-hidden">
+      <div className="flex items-center gap-1.5 px-4 py-2.5 text-[11px] font-black uppercase tracking-wider text-slate-400">{icon}{title}</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-sm">
+          <thead className="border-y border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+            <tr>
+              <th className="px-3 py-2 w-7">#</th>
+              <th className="px-3 py-2">{title.replace('Top ', '')}</th>
+              <th className={`px-3 py-2 text-right ${metric === 'forex' ? 'text-slate-700' : ''}`}>Forex</th>
+              <th className={`px-3 py-2 text-right ${metric === 'ftt' ? 'text-violet-600' : ''}`}>Fixed-time</th>
+              <th className="px-3 py-2 text-right">Sig</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100 text-slate-700">
+            {ranked.length ? ranked.slice(0, 8).map((r, i) => (
+              <tr key={keyOf(r)} className="hover:bg-slate-50/70">
+                <td className="px-3 py-2 font-black text-slate-400">{i + 1}</td>
+                <td className="px-3 py-2 font-bold text-slate-800">{render(r)}</td>
+                <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
+                <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
+                <td className="px-3 py-2 text-right font-mono font-bold">{r.total}</td>
+              </tr>
+            )) : (
+              <tr><td colSpan={5} className="px-3 py-6 text-center text-[12px] font-medium text-slate-400">{empty}</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Session tabs + 3 ranked mini-lists (top strategies / symbols / timeframes) for the picked
+// session. Each row shows BOTH forex & fixed-time win rates; the active metric drives the order.
+function SessionBreakdownSection({ data, metric, minSample, query, loading }: {
+  data: StrategySessionBreakdown[]; metric: Metric; minSample: number; query: string; loading: boolean;
+}) {
+  const [tab, setTab] = useState('');
+  useEffect(() => {
+    if (!data.length) return;
+    setTab((cur) => (data.some((d) => d.session === cur) ? cur : data[0].session));
+  }, [data]);
+  if (!data.length) {
+    return (
+      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-8 text-center text-sm font-medium text-slate-400 shadow-card">
+        {loading ? 'Loading…' : 'No session data yet — populates as the lab scans and outcomes resolve.'}
+      </div>
+    );
+  }
+  const active = data.find((d) => d.session === tab) || data[0];
+  const strategyRows = active.byStrategy.filter((s) => matchq(query, s.name, s.id));
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-100 px-3 py-2.5">
+        <Globe size={15} className="mr-1 text-violet-500" />
+        {data.map((d) => {
+          const on = d.session === active.session;
+          return (
+            <button key={d.session} type="button" onClick={() => setTab(d.session)} title={d.bdRange}
+              className={`rounded-lg px-3 py-1 text-xs font-bold transition ${on ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-100'}`}>
+              {d.sessionLabel}
+            </button>
+          );
+        })}
+        <span className="ml-auto text-[11px] font-semibold text-slate-400">{active.bdRange} · ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win%</span>
+      </div>
+      <div className="grid grid-cols-1 gap-0 lg:grid-cols-3 lg:divide-x lg:divide-slate-100">
+        <MiniRank<StrategySessionStrategyRow> title="Top strategies" icon={<Award size={13} className="text-amber-500" />} rows={strategyRows}
+          keyOf={(r) => r.id} render={(r) => r.name} metric={metric} minSample={minSample}
+          empty={query ? `No strategies match “${query}”.` : 'No data.'} />
+        <MiniRank<StrategySymbolRow> title="Top symbols" icon={<Coins size={13} className="text-amber-500" />} rows={active.bySymbol}
+          keyOf={(r) => r.symbol} render={(r) => r.symbol} metric={metric} minSample={minSample} empty="No data." />
+        <MiniRank<StrategyTfRow> title="Top timeframes" icon={<Clock size={13} className="text-blue-500" />} rows={active.byTimeframe}
+          keyOf={(r) => r.timeframe} render={(r) => r.timeframe} metric={metric} minSample={minSample} empty="No data." />
       </div>
     </div>
   );
