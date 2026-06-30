@@ -353,7 +353,11 @@ export default function LiveMarketTracker() {
           <div className="grid gap-4 lg:grid-cols-3">
             <div className="lg:col-span-2 rounded-2xl border border-slate-200 bg-white p-2">
               {candles.length > 0
-                ? <Mt5CandlestickChart candles={candles} signals={[]} symbol={data.symbol} timeframe={timeframe} levels={levels} />
+                ? <Mt5CandlestickChart
+                    candles={candles} signals={[]} symbol={data.symbol} timeframe={timeframe} levels={levels}
+                    symbolOptions={symbolOptions} timeframeOptions={TF_OPTIONS}
+                    onSymbolChange={setSymbol} onTimeframeChange={setTimeframe}
+                  />
                 : <div className="flex h-72 items-center justify-center text-sm text-slate-400">No candle data for {data.symbol} {timeframe}.</div>}
             </div>
             <ZoneMap t={data} />

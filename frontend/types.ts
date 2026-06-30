@@ -403,6 +403,18 @@ export interface EmailAlertSettings {
   // Strategy Controller — master per-strategy switch (gates table, reports, popups, emails,
   // SSE). Missing entry = enabled. Optional refinements gate alert delivery.
   strategyControls?: Record<string, StrategyControl>;
+  // Per-strategy EMAIL refinements (score / grade / symbols / direction). DELIVERY-only — cuts
+  // email noise per strategy without touching signal generation, logging, popups, or ranking.
+  // Applies to BOTH the forex and fixed-time strategy-lab email framings. symbols empty/absent =
+  // all symbols; minScore/minGrade present = override that framing's global minimum for the strategy.
+  strategyLabRules?: Record<string, StrategyEmailRule>;
+}
+
+export interface StrategyEmailRule {
+  minScore?: number;
+  minGrade?: 'ANY' | 'B' | 'A' | 'A+';
+  symbols?: string[];
+  direction?: 'ANY' | 'LONG' | 'SHORT';
 }
 
 export interface StrategyControl {

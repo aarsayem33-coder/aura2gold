@@ -26,6 +26,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   strategyLabFttMinScore: 75,
   strategyLabFttMinGrade: 'ANY',
   strategyLabFttStrategies: {},
+  strategyLabRules: {},
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
@@ -91,6 +92,7 @@ export default function NotificationSettings() {
   const [savingEmailSettings, setSavingEmailSettings] = useState(false);
   const [emailSettingsMeta, setEmailSettingsMeta] = useState<{ emailTo?: string | null; newsEmailTo?: string | null; smtpConfigured?: boolean }>({});
   const [labStrategies, setLabStrategies] = useState<StrategyMeta[]>([]);
+  const [labSymbols, setLabSymbols] = useState<string[]>([]);
 
   const [browserNotifications, setBrowserNotifications] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -131,7 +133,7 @@ export default function NotificationSettings() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchStrategies().then((r) => { if (!cancelled) setLabStrategies(r.strategies || []); }).catch(() => {});
+    fetchStrategies().then((r) => { if (!cancelled) { setLabStrategies(r.strategies || []); setLabSymbols(r.symbols || []); } }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
@@ -221,6 +223,37 @@ export default function NotificationSettings() {
       if (Object.keys(map).length === 0) for (const s of labStrategies) map[s.id] = true;
       map[id] = !(map[id] ?? true);
       return { ...current, strategyLabFttStrategies: map };
+    });
+    setEmailSettingsStatus(null);
+  };
+
+  // ── Per-strategy EMAIL filters (score / grade / symbols / direction) ──
+  // Delivery-only refinement layered on the strategy-lab email gates. An absent entry = no
+  // extra filtering (the global strategy-lab rules apply). Symbols empty = all symbols.
+  const ruleOf = (id: string) => (emailSettings.strategyLabRules || {})[id] || {};
+  const updateLabRule = (id: string, patch: Partial<NonNullable<EmailAlertSettings['strategyLabRules']>[string]>) => {
+    setEmailSettings((current) => {
+      const rules = { ...(current.strategyLabRules || {}) };
+      rules[id] = { ...(rules[id] || {}), ...patch };
+      return { ...current, strategyLabRules: rules };
+    });
+    setEmailSettingsStatus(null);
+  };
+  const handleLabRuleMinScore = (id: string, value: string) => updateLabRule(id, { minScore: value === '' ? undefined : Math.max(40, Math.min(95, Math.round(Number(value)))) });
+  const handleLabRuleMinGrade = (id: string, value: string) => updateLabRule(id, { minGrade: (value || 'ANY') as NonNullable<EmailAlertSettings['strategyLabRules']>[string]['minGrade'] });
+  const handleLabRuleDirection = (id: string, value: string) => updateLabRule(id, { direction: (value || 'ANY') as 'ANY' | 'LONG' | 'SHORT' });
+  const handleLabRuleSymbol = (id: string, symbol: string) => {
+    const cur = ruleOf(id).symbols || [];
+    const set = new Set(cur.map((s) => s.toUpperCase()));
+    const sym = symbol.toUpperCase();
+    if (set.has(sym)) set.delete(sym); else set.add(sym);
+    updateLabRule(id, { symbols: [...set] });
+  };
+  const clearLabRule = (id: string) => {
+    setEmailSettings((current) => {
+      const rules = { ...(current.strategyLabRules || {}) };
+      delete rules[id];
+      return { ...current, strategyLabRules: rules };
     });
     setEmailSettingsStatus(null);
   };
@@ -742,6 +775,77 @@ export default function NotificationSettings() {
             <div className="mt-5 flex justify-end">
               <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
                 <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Fixed-Time Rules'}
+              </button>
+            </div>
+          </div>
+
+          {/* Per-strategy EMAIL filters — score / symbols / setup, to cut email noise per strategy */}
+          <div className="bg-white rounded-2xl border border-emerald-200 p-6 sm:p-8 shadow-card">
+            <div className="mb-5 border-b border-slate-100 pb-3">
+              <h3 className="text-lg font-bold text-slate-900">Per-Strategy Email Filters</h3>
+              <p className="mt-1 text-xs font-semibold text-slate-500">Fine-tune <b>which symbols and setups each strategy emails</b> to cut noise. Applies to <b>both</b> the Forex and Fixed-Time strategy-lab emails above. A strategy with no filter set behaves exactly as before. <span className="font-bold text-emerald-700">Delivery-only</span> — signal generation, logging, popups, and win-rate ranking are never affected, so signal quality and count are untouched.</p>
+            </div>
+
+            <div className="space-y-3">
+              {labStrategies.map((s) => {
+                const rule = ruleOf(s.id);
+                const selectedSymbols = (rule.symbols || []).map((x) => x.toUpperCase());
+                const active = Boolean(rule.minScore !== undefined || (rule.minGrade && rule.minGrade !== 'ANY') || selectedSymbols.length || (rule.direction && rule.direction !== 'ANY'));
+                return (
+                  <div key={s.id} className={`rounded-xl border p-4 ${active ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200 bg-slate-50'}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <h5 className="text-sm font-bold text-slate-800">{s.name}{active && <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-black uppercase tracking-wider text-emerald-700">Filtered</span>}</h5>
+                        {s.source && <p className="text-[10px] font-semibold text-slate-400">{s.source}</p>}
+                      </div>
+                      {active && <button onClick={() => clearLabRule(s.id)} className="shrink-0 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-500 transition hover:border-red-200 hover:text-red-600">Reset</button>}
+                    </div>
+
+                    <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                      <div>
+                        <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Min score</label>
+                        <input type="number" min={40} max={95} step={1} value={rule.minScore ?? ''} placeholder="default" onChange={(e) => handleLabRuleMinScore(s.id, e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500" />
+                      </div>
+                      <div>
+                        <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Min grade</label>
+                        <select value={rule.minGrade || 'ANY'} onChange={(e) => handleLabRuleMinGrade(s.id, e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500">
+                          <option value="ANY">Any grade</option>
+                          <option value="B">B and above</option>
+                          <option value="A">A and above</option>
+                          <option value="A+">A+ only</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Setup (direction)</label>
+                        <select value={rule.direction || 'ANY'} onChange={(e) => handleLabRuleDirection(s.id, e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500">
+                          <option value="ANY">Both (long &amp; short)</option>
+                          <option value="LONG">Long only (BUY)</option>
+                          <option value="SHORT">Short only (SELL)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="mt-3">
+                      <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Symbols {selectedSymbols.length ? <span className="text-emerald-700">({selectedSymbols.length} selected)</span> : <span className="text-slate-400">(none = all symbols)</span>}</label>
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {labSymbols.map((sym) => {
+                          const on = selectedSymbols.includes(sym.toUpperCase());
+                          return (
+                            <button key={sym} onClick={() => handleLabRuleSymbol(s.id, sym)} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{sym}</button>
+                          );
+                        })}
+                        {!labSymbols.length && <p className="text-xs font-medium text-slate-400">No symbols available (MT5 feed offline) — leave empty to email all symbols.</p>}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
+            </div>
+
+            <div className="mt-5 flex justify-end">
+              <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
+                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Per-Strategy Filters'}
               </button>
             </div>
           </div>

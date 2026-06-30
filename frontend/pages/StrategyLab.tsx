@@ -7,6 +7,23 @@ import type { StrategyMeta, StrategySignal, StrategyLiveResponse, StrategyLiveRo
 const REFRESH_MS = 30000;
 const FAST_REFRESH_MS = 10000; // live fixed-time grid on fast timeframes (M1/M5) — see the poll effect
 const LIVE_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+// Score-bucket filter for the recent tables.
+const SCORE_BUCKETS: { key: string; label: string }[] = [
+  { key: '', label: 'All scores' },
+  { key: '60-75', label: '60–75' },
+  { key: '75-80', label: '75–80' },
+  { key: '80-85', label: '80–85' },
+  { key: '85-90', label: '85–90' },
+  { key: '90+', label: '90+' },
+];
+function inScoreBucket(score: number | null | undefined, key: string): boolean {
+  if (!key) return true;
+  const v = Number(score);
+  if (!Number.isFinite(v)) return false;
+  if (key === '90+') return v >= 90;
+  const [lo, hi] = key.split('-').map(Number);
+  return v >= lo && v < hi;
+}
 const num = (v: number | null | undefined, d = 2) => (v === null || v === undefined ? '—' : Number(v).toFixed(d));
 
 type Tab = 'forex' | 'ftt';
@@ -214,6 +231,8 @@ export default function StrategyLab() {
   const [liveTf, setLiveTf] = useState('M15');
   const [histTf, setHistTf] = useState('');
   const [histStrategy, setHistStrategy] = useState(''); // '' = all strategies (recent tables)
+  const [scoreBucket, setScoreBucket] = useState(''); // score-range filter for the recent tables
+  const [symbolFilter, setSymbolFilter] = useState(''); // symbol filter for the recent tables
   const [showMuted, setShowMuted] = useState(false);    // reveal strategies muted in the Strategy Controller
   const [tab, setTab] = useState<Tab>('forex');
   const [live, setLive] = useState<StrategyLiveResponse | null>(null);
@@ -320,6 +339,12 @@ export default function StrategyLab() {
   }, [ftLive, minScore, dirFilter, actionableOnly]);
   const entries = forexRows.filter((r) => r.command === 'ENTRY');
   const calls = ftRows.filter((r) => r.command === 'CALL');
+  // Recent-table filters: symbol + score bucket (applied to BOTH recent tables).
+  const histSymbolOptions = useMemo(() => Array.from(new Set(signals.map((s) => s.symbol))).sort(), [signals]);
+  const filteredSignals = useMemo(
+    () => signals.filter((s) => (!symbolFilter || s.symbol === symbolFilter) && inScoreBucket(s.score, scoreBucket)),
+    [signals, symbolFilter, scoreBucket],
+  );
   // Fired fixed-time calls that are STILL within their expiry window — surfaced from the
   // logged-signal feed (all strategies/TFs, DB-backed → reload-safe) so every call that
   // fired a browser alert is visible in the signal portion, independent of the
@@ -426,7 +451,7 @@ export default function StrategyLab() {
                       <td className="px-3 py-2 text-right font-mono text-[12px] text-rose-600">{r.command === 'ENTRY' ? num(r.stopLoss) : '—'}</td>
                       <td className="px-3 py-2 text-right font-mono text-[11px] text-emerald-600">{r.command === 'ENTRY' ? <>{num(r.takeProfit1)} / {num(r.takeProfit2)} / {num(r.takeProfit3)}</> : '—'}</td>
                       <td className="px-3 py-2 text-right font-mono">{r.command === 'ENTRY' && r.riskReward != null ? `1:${num(r.riskReward, 1)}` : '—'}</td>
-                      <td className="px-3 py-2 text-[11px] text-slate-500 max-w-[280px] truncate" title={r.reason || ''}>{r.command === 'ENTRY' ? r.reason : ''}</td>
+                      <td className="px-3 py-2 text-[11px] text-slate-500 min-w-[220px] max-w-[360px] whitespace-normal break-words leading-snug align-top" title={r.reason || ''}>{r.command === 'ENTRY' ? r.reason : ''}</td>
                     </tr>
                   )) : (
                     <tr><td colSpan={multiStrategy ? 11 : 10} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No setups match the current score / setup filter.' : multiStrategy ? 'No live setups across the selected strategies right now.' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
@@ -453,6 +478,13 @@ export default function StrategyLab() {
                   <option value="">All TFs</option>
                   {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
                 </select>
+                <select value={scoreBucket} onChange={(e) => setScoreBucket(e.target.value)} title="Filter by score range" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  {SCORE_BUCKETS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+                </select>
+                <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)} title="Filter by symbol" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  <option value="">All symbols</option>
+                  {histSymbolOptions.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
+                </select>
               </div>
             </div>
             <div className="overflow-x-auto">
@@ -469,7 +501,7 @@ export default function StrategyLab() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {signals.length ? signals.map((s) => (
+                  {filteredSignals.length ? filteredSignals.map((s) => (
                     <tr key={s.id} className="hover:bg-slate-50/70">
                       <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{stratName(s.strategy)}</td>
                       <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
@@ -485,7 +517,7 @@ export default function StrategyLab() {
                       <td className="px-3 py-2"><TimingCell timing={s.timing} /></td>
                     </tr>
                   )) : (
-                    <tr><td colSpan={12} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No signals logged yet for this strategy.'}</td></tr>
+                    <tr><td colSpan={12} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No signals match the score / symbol filter.' : 'No signals logged yet for this strategy.')}</td></tr>
                   )}
                 </tbody>
               </table>
@@ -537,7 +569,7 @@ export default function StrategyLab() {
                       <td className="px-3 py-2 text-right font-mono text-[12px]">{r.reference != null ? num(r.reference) : '—'}</td>
                       <td className="px-3 py-2">{r.command === 'CALL' ? <ExpiryCountdown iso={r.expiryIso} tradeTime={r.tradeTimeLabel} /> : <span className="text-slate-300">—</span>}</td>
                       <td className="px-3 py-2">{r.command === 'CALL' ? <CandleReadCell read={r.candleRead} /> : <span className="text-slate-300">—</span>}</td>
-                      <td className="px-3 py-2 text-[11px] text-slate-500 max-w-[280px] truncate" title={r.reason || ''}>{r.command === 'CALL' ? r.reason : ''}</td>
+                      <td className="px-3 py-2 text-[11px] text-slate-500 min-w-[220px] max-w-[360px] whitespace-normal break-words leading-snug align-top" title={r.reason || ''}>{r.command === 'CALL' ? r.reason : ''}</td>
                     </tr>
                   )) : (
                     <tr><td colSpan={multiStrategy ? 8 : 7} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No calls match the current score / setup filter.' : multiStrategy ? 'No live calls across the selected strategies right now.' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
@@ -572,6 +604,13 @@ export default function StrategyLab() {
                   <option value="">All TFs</option>
                   {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
                 </select>
+                <select value={scoreBucket} onChange={(e) => setScoreBucket(e.target.value)} title="Filter by score range" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  {SCORE_BUCKETS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+                </select>
+                <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)} title="Filter by symbol" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+                  <option value="">All symbols</option>
+                  {histSymbolOptions.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
+                </select>
               </div>
             </div>
             <div className="overflow-x-auto">
@@ -588,7 +627,7 @@ export default function StrategyLab() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {signals.length ? signals.map((s) => {
+                  {filteredSignals.length ? filteredSignals.map((s) => {
                     const up = /BUY/.test(s.direction);
                     const liveTint = s.live ? (s.live.status === 'WINNING' ? 'bg-emerald-50/40' : s.live.status === 'LOSING' ? 'bg-rose-50/40' : '') : '';
                     return (
@@ -607,7 +646,7 @@ export default function StrategyLab() {
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={7} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No fixed-time calls logged yet for this strategy.'}</td></tr>
+                    <tr><td colSpan={7} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No calls match the score / symbol filter.' : 'No fixed-time calls logged yet for this strategy.')}</td></tr>
                   )}
                 </tbody>
               </table>

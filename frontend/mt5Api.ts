@@ -416,7 +416,7 @@ export async function fetchLiveMarketTracker(symbol?: string, timeframe = 'M5'):
   return fetchJson<LiveMarketTrackerResponse>(`/api/live-market-tracker?${params.toString()}`);
 }
 
-export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; timeframes: string[]; ftExpiryBars: number }> {
+export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; symbols: string[]; timeframes: string[]; ftExpiryBars: number }> {
   return fetchJson('/api/strategy-lab/strategies');
 }
 export async function fetchStrategySignals(strategy?: string, timeframe?: string, includeMuted?: boolean): Promise<{ ok: boolean; signals: StrategySignal[] }> {
@@ -427,17 +427,20 @@ export async function fetchStrategySignals(strategy?: string, timeframe?: string
   const qs = p.toString();
   return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
 }
-export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; includeMuted?: boolean } = {}): Promise<StrategyPerformanceResponse> {
+export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; from?: string; to?: string; includeMuted?: boolean } = {}): Promise<StrategyPerformanceResponse> {
   const opts = typeof params === 'number' ? { days: params } : params;
   const q = new URLSearchParams();
   if (opts.includeMuted) q.set('includeMuted', '1');
-  if (opts.preset) q.set('preset', opts.preset);
+  if (opts.from && opts.to) { q.set('from', opts.from); q.set('to', opts.to); }
+  else if (opts.preset) q.set('preset', opts.preset);
   else q.set('days', String(opts.days ?? 90));
   return fetchJson<StrategyPerformanceResponse>(`/api/strategy-lab/performance?${q.toString()}`);
 }
-export async function fetchStrategyConfluence(opts: { days?: number; preset?: string; timeframe?: string; symbol?: string; strategies?: string[] } = {}): Promise<ConfluenceResponse> {
+export async function fetchStrategyConfluence(opts: { days?: number; preset?: string; from?: string; to?: string; timeframe?: string; symbol?: string; strategies?: string[] } = {}): Promise<ConfluenceResponse> {
   const q = new URLSearchParams();
-  if (opts.preset) q.set('preset', opts.preset); else q.set('days', String(opts.days ?? 90));
+  if (opts.from && opts.to) { q.set('from', opts.from); q.set('to', opts.to); }
+  else if (opts.preset) q.set('preset', opts.preset);
+  else q.set('days', String(opts.days ?? 90));
   if (opts.timeframe) q.set('timeframe', opts.timeframe);
   if (opts.symbol) q.set('symbol', opts.symbol);
   if (opts.strategies?.length) q.set('strategies', opts.strategies.join(','));

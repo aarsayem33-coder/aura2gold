@@ -11,7 +11,7 @@ import type {
 
 const REFRESH_MS = 60000;
 type Metric = 'forex' | 'ftt';
-type RangeKey = 'today' | 'yesterday' | 'last7' | 'd30' | 'd60' | 'd90' | 'd180';
+type RangeKey = 'today' | 'yesterday' | 'last7' | 'd30' | 'd60' | 'd90' | 'd180' | 'custom';
 const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: 'today', label: 'Today' },
   { key: 'yesterday', label: 'Yesterday' },
@@ -20,9 +20,13 @@ const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: 'd60', label: '60 days' },
   { key: 'd90', label: '90 days' },
   { key: 'd180', label: '180 days' },
+  { key: 'custom', label: 'Custom range…' },
 ];
-function rangeToParams(r: RangeKey): { days?: number; preset?: string } {
-  return (r === 'today' || r === 'yesterday' || r === 'last7') ? { preset: r } : { days: Number(r.slice(1)) };
+type ReportParams = { days?: number; preset?: string; from?: string; to?: string };
+function rangeToParams(r: RangeKey): ReportParams {
+  if (r === 'today' || r === 'yesterday' || r === 'last7') return { preset: r };
+  if (r === 'custom') return { preset: 'last7' }; // fallback until both custom dates are picked
+  return { days: Number(r.slice(1)) };
 }
 
 const confClass: Record<string, string> = {
@@ -155,6 +159,8 @@ export default function StrategyLabReports() {
   const [perf, setPerf] = useState<StrategyPerformanceResponse | null>(null);
   const [signals, setSignals] = useState<StrategySignal[]>([]);
   const [range, setRange] = useState<RangeKey>('last7');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
   const [tab, setTab] = useState<'forex' | 'ftt' | 'confluence'>('forex');
   const metric: Metric = tab === 'ftt' ? 'ftt' : 'forex';
   const [query, setQuery] = useState('');
@@ -170,12 +176,18 @@ export default function StrategyLabReports() {
     }).catch(() => {});
   }, []);
 
+  // Resolve the active date window: a valid custom from–to wins, else the preset/day range.
+  const reportParams: ReportParams = useMemo(
+    () => (range === 'custom' && customFrom && customTo && customFrom <= customTo) ? { from: customFrom, to: customTo } : rangeToParams(range),
+    [range, customFrom, customTo],
+  );
+
   const load = useCallback(async () => {
     setLoading(true);
-    try { setPerf(await fetchStrategyPerformance(rangeToParams(range))); setError(null); }
+    try { setPerf(await fetchStrategyPerformance(reportParams)); setError(null); }
     catch (err) { setError(err instanceof Error ? err.message : 'Failed to load performance'); }
     finally { setLoading(false); }
-  }, [range]);
+  }, [reportParams]);
 
   useEffect(() => {
     void load();
@@ -258,6 +270,13 @@ export default function StrategyLabReports() {
           <select value={range} onChange={(e) => setRange(e.target.value as RangeKey)} className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-semibold">
             {RANGE_OPTIONS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
           </select>
+          {range === 'custom' && (
+            <div className="flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50/50 px-2 py-1">
+              <input type="date" value={customFrom} max={customTo || undefined} onChange={(e) => setCustomFrom(e.target.value)} className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-xs font-semibold" />
+              <span className="text-xs font-bold text-slate-400">→</span>
+              <input type="date" value={customTo} min={customFrom || undefined} onChange={(e) => setCustomTo(e.target.value)} className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-xs font-semibold" />
+            </div>
+          )}
           <Link to="/strategy-lab" className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-bold text-slate-600 hover:bg-slate-50">Signals</Link>
           <button type="button" onClick={() => { void load(); void loadSignals(); }} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-bold text-white hover:bg-slate-700 disabled:opacity-50">
             {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
@@ -265,7 +284,7 @@ export default function StrategyLabReports() {
         </div>
       </div>
 
-      {tab === 'confluence' && <ConfluenceTab strategies={strategies} rangeParams={rangeToParams(range)} rangeLabel={perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label || ''} />}
+      {tab === 'confluence' && <ConfluenceTab strategies={strategies} rangeParams={reportParams} rangeLabel={perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label || ''} />}
 
       {tab !== 'confluence' && (<>
       {/* SEARCH — filters the strategy leaderboard, combos & per-session strategy lists */}
@@ -496,13 +515,13 @@ export default function StrategyLabReports() {
 // Global rank table (timeframe / symbol / session) — both win rates + signals, ranked.
 // ─── Confluence tab: do strategies AGREEING produce more accurate signals? ────
 function ConfluenceTab({ strategies, rangeParams, rangeLabel }: {
-  strategies: StrategyMeta[]; rangeParams: { days?: number; preset?: string }; rangeLabel: string;
+  strategies: StrategyMeta[]; rangeParams: ReportParams; rangeLabel: string;
 }) {
   const [data, setData] = useState<ConfluenceResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [combo, setCombo] = useState<string[]>([]);
   const [basis, setBasis] = useState<'ft' | 'at'>('ft');
-  const rp = `${rangeParams.preset || ''}|${rangeParams.days || ''}`;
+  const rp = `${rangeParams.preset || ''}|${rangeParams.days || ''}|${rangeParams.from || ''}|${rangeParams.to || ''}`;
   const cs = combo.join(',');
 
   useEffect(() => {

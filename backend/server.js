@@ -7270,6 +7270,12 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   strategyLabFttMinScore: 75,
   strategyLabFttMinGrade: 'ANY',   // ANY | B | A | A+
   strategyLabFttStrategies: {},    // { [strategyId]: boolean } — empty = all enabled
+  // Per-strategy EMAIL refinements — applies to BOTH the forex + fixed-time email gates. Lets you
+  // cut email NOISE per strategy (min score, specific symbols, direction) WITHOUT affecting signal
+  // generation / logging / popups / ranking (those are untouched). Overrides the global min for
+  // that strategy; symbols empty/absent = all symbols.
+  //   strategyLabRules: { [id]: { minScore?, minGrade?: ANY|B|A|A+, symbols?: string[], direction?: ANY|LONG|SHORT } }
+  strategyLabRules: {},
   // Strategy Controller (master per-strategy switch — gates EVERYTHING user-facing:
   // popups, emails, SSE, the recent-signals table and reports). Missing entry = fully
   // enabled. Optional per-strategy refinements gate DELIVERY (alerts): minScore, a
@@ -7343,6 +7349,32 @@ function saveEmailAlertSettings(nextSettings) {
     for (const [k, v] of Object.entries(nextSettings.strategyLabFttStrategies)) map[String(k)] = Boolean(v);
     sanitized.strategyLabFttStrategies = map;
   }
+  // Per-strategy EMAIL refinements (score / grade / symbols / direction). Replace the whole map
+  // on save (frontend sends the full object). DELIVERY-only — never touches generation/logging/ranking.
+  if (nextSettings && nextSettings.strategyLabRules && typeof nextSettings.strategyLabRules === 'object') {
+    const out = {};
+    for (const [id, rule] of Object.entries(nextSettings.strategyLabRules)) {
+      if (!rule || typeof rule !== 'object') continue;
+      const r = {};
+      if (rule.minScore !== undefined && rule.minScore !== null && rule.minScore !== '') {
+        const v = Number(rule.minScore);
+        if (Number.isFinite(v)) r.minScore = Math.max(40, Math.min(95, Math.round(v)));
+      }
+      if (rule.minGrade !== undefined) {
+        const g = String(rule.minGrade || 'ANY').toUpperCase();
+        if (['ANY', 'B', 'A', 'A+'].includes(g)) r.minGrade = g;
+      }
+      if (Array.isArray(rule.symbols)) {
+        r.symbols = [...new Set(rule.symbols.map((sym) => String(sym).toUpperCase()).filter(Boolean))];
+      }
+      if (rule.direction !== undefined) {
+        const d = String(rule.direction || 'ANY').toUpperCase();
+        if (['ANY', 'LONG', 'SHORT'].includes(d)) r.direction = d;
+      }
+      out[String(id)] = r;
+    }
+    sanitized.strategyLabRules = out;
+  }
   // Strategy Controller — replace the whole map on save (frontend sends the full object).
   if (nextSettings && nextSettings.strategyControls && typeof nextSettings.strategyControls === 'object') {
     const out = {};
@@ -7379,28 +7411,50 @@ function isEmailSystemEnabled(key) {
 // Strategy Lab EMAIL rule (frontend-controlled): master toggle + min score + min grade
 // + per-strategy enable. Popups are NOT gated by this — only emails.
 const STRATEGY_GRADE_RANK = { C: 0, B: 1, A: 2, 'A+': 3 };
-function strategyLabEmailAllowed(strategy, score, grade) {
+// Per-strategy EMAIL refinement (Settings → "Per-strategy email filters"). DELIVERY-only filter
+// layered on top of the strategy-lab email gates below — it never touches signal generation,
+// logging, popups, or ranking. The SAME rule applies to both the forex and fixed-time framings.
+// Returns false only on the HARD filters (symbol allow-list + direction); the min score / grade
+// OVERRIDES are resolved inline in each gate so they can fall back to the framing's global min.
+function strategyLabRulePassesSymbolDir(rule, symbol, direction) {
+  if (!rule) return true;
+  if (Array.isArray(rule.symbols) && rule.symbols.length) {
+    const want = String(symbol || '').toUpperCase();
+    if (!rule.symbols.some((s) => String(s).toUpperCase() === want)) return false;
+  }
+  const dir = String(rule.direction || 'ANY').toUpperCase();
+  if (dir === 'LONG' && direction !== 'BUY') return false;
+  if (dir === 'SHORT' && direction !== 'SELL') return false;
+  return true;
+}
+function strategyLabEmailAllowed(strategy, score, grade, symbol, direction) {
   const s = loadEmailAlertSettings();
   if (s.strategyLab === false) return false;
-  if ((Number(score) || 0) < Number(s.strategyLabMinScore ?? 75)) return false;
-  const minG = String(s.strategyLabMinGrade || 'ANY').toUpperCase();
+  const rule = (s.strategyLabRules || {})[strategy] || null;
+  const minScore = rule && Number.isFinite(Number(rule.minScore)) ? Number(rule.minScore) : Number(s.strategyLabMinScore ?? 75);
+  if ((Number(score) || 0) < minScore) return false;
+  const minG = String((rule && rule.minGrade) || s.strategyLabMinGrade || 'ANY').toUpperCase();
   if (minG !== 'ANY' && (STRATEGY_GRADE_RANK[String(grade || '').toUpperCase()] ?? 0) < (STRATEGY_GRADE_RANK[minG] ?? 0)) return false;
   const map = s.strategyLabStrategies || {};
   if (map[strategy] === false) return false;  // only an EXPLICIT opt-out blocks; missing = enabled (matches the UI's `?? true`)
+  if (!strategyLabRulePassesSymbolDir(rule, symbol, direction)) return false;
   return true;
 }
 
 // Strategy Lab FIXED-TIME EMAIL rule (frontend-controlled): master toggle + min score
 // + min grade + per-strategy enable. Independent of the forex rule above so the user can
 // receive one framing without the other. Popups are NOT gated by this — only emails.
-function strategyLabFttEmailAllowed(strategy, score, grade) {
+function strategyLabFttEmailAllowed(strategy, score, grade, symbol, direction) {
   const s = loadEmailAlertSettings();
   if (s.strategyLabFixedTime === false || s.strategyLabFixedTime === undefined) return false;
-  if ((Number(score) || 0) < Number(s.strategyLabFttMinScore ?? 75)) return false;
-  const minG = String(s.strategyLabFttMinGrade || 'ANY').toUpperCase();
+  const rule = (s.strategyLabRules || {})[strategy] || null;
+  const minScore = rule && Number.isFinite(Number(rule.minScore)) ? Number(rule.minScore) : Number(s.strategyLabFttMinScore ?? 75);
+  if ((Number(score) || 0) < minScore) return false;
+  const minG = String((rule && rule.minGrade) || s.strategyLabFttMinGrade || 'ANY').toUpperCase();
   if (minG !== 'ANY' && (STRATEGY_GRADE_RANK[String(grade || '').toUpperCase()] ?? 0) < (STRATEGY_GRADE_RANK[minG] ?? 0)) return false;
   const map = s.strategyLabFttStrategies || {};
   if (map[strategy] === false) return false;  // only an EXPLICIT opt-out blocks; missing = enabled (matches the UI's `?? true`)
+  if (!strategyLabRulePassesSymbolDir(rule, symbol, direction)) return false;
   return true;
 }
 
@@ -11507,8 +11561,8 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
   const kind = strategyNotifyDecide(strategy, symbol, tf, sig);
   if (!kind) return { popupSent: false, emailSent: false, kind: null };
   const wantPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
-  const wantEmail = strategyLabEmailAllowed(strategy, sig.score, sig.grade);
-  const wantFttEmail = strategyLabFttEmailAllowed(strategy, sig.score, sig.grade);
+  const wantEmail = strategyLabEmailAllowed(strategy, sig.score, sig.grade, symbol, sig.decision);
+  const wantFttEmail = strategyLabFttEmailAllowed(strategy, sig.score, sig.grade, symbol, sig.decision);
   const barMs = Date.parse(sig.barIso || '') || Date.now();
   const id = `${strategy}:${symbol}:${tf}:${barMs}`;
   if (wantPopup || wantEmail) {
@@ -11542,8 +11596,8 @@ async function processStrategyNotifyConfirms() {
       const sig = evaluateStrategy(st.strategy, ctx);
       if (!sig || sig.decision !== st.direction) continue; // didn't hold at the close
       const wantPopup = (st.firstScore ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
-      const wantEmail = strategyLabEmailAllowed(st.strategy, st.firstScore, st.firstGrade);
-      const wantFttEmail = strategyLabFttEmailAllowed(st.strategy, st.firstScore, st.firstGrade);
+      const wantEmail = strategyLabEmailAllowed(st.strategy, st.firstScore, st.firstGrade, st.symbol, st.direction);
+      const wantFttEmail = strategyLabFttEmailAllowed(st.strategy, st.firstScore, st.firstGrade, st.symbol, st.direction);
       if (!wantPopup && !wantEmail && !wantFttEmail) continue;
       const confirmSig = { ...sig, score: st.firstScore ?? sig.score, grade: st.firstGrade ?? sig.grade };
       const id = `${st.strategy}:${st.symbol}:${st.tf}:${st.createdBarMs}`;
@@ -11899,9 +11953,18 @@ function strategyLabFinalize(b) {
 // Report date window for the Strategy Lab reports. Supports rolling day-windows
 // (days=N) and calendar presets in Bangladesh time (UTC+6): today / yesterday / last7,
 // so "Today"/"Yesterday" align to BD calendar days (matching the BD session labels).
-function strategyLabReportWindow({ days = 90, preset = null } = {}) {
+function strategyLabReportWindow({ days = 90, preset = null, from = null, to = null } = {}) {
   const BD = 6 * 3600 * 1000;
   const nowMs = Date.now();
+  // Custom calendar range (from–to inclusive), interpreted in BD time so picking "1st–5th"
+  // matches the BD session labels. Takes precedence over preset/days when both dates are valid.
+  const parseDay = (v) => (v ? Date.parse(String(v).length <= 10 ? `${v}T00:00:00Z` : v) : NaN);
+  const fromD = parseDay(from), toD = parseDay(to);
+  if (Number.isFinite(fromD) && Number.isFinite(toD) && fromD <= toD) {
+    const fromMs = fromD - BD;                  // BD 00:00 of the from-day, in real UTC
+    const toMs = toD - BD + 86400000;           // end of the to-day (exclusive next BD midnight)
+    return { fromMs, toMs, preset: 'custom', days: null, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), label: `${String(from).slice(0, 10)} → ${String(to).slice(0, 10)} (BD)` };
+  }
   let fromMs;
   let toMs = nowMs;
   let label;
@@ -11920,9 +11983,9 @@ function strategyLabReportWindow({ days = 90, preset = null } = {}) {
   return { fromMs, toMs, preset: p, days, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), label };
 }
 
-async function buildStrategyLabPerformance({ days = 90, preset = null } = {}) {
+async function buildStrategyLabPerformance({ days = 90, preset = null, from = null, to = null } = {}) {
   const pool = await initializeDatabase();
-  const win = strategyLabReportWindow({ days, preset });
+  const win = strategyLabReportWindow({ days, preset, from, to });
   const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], sessionBreakdown: [], scoreRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
@@ -12053,9 +12116,9 @@ function confluenceAccumulate(b, m) {
   if (m.atOut === 'WIN') b.atW += 1; else if (m.atOut === 'LOSS') b.atL += 1; else if (m.atOut === 'DRAW') b.atD += 1;
 }
 
-async function buildStrategyLabConfluence({ days = 90, preset = null, timeframe = null, symbol = null, strategies = [] } = {}) {
+async function buildStrategyLabConfluence({ days = 90, preset = null, from = null, to = null, timeframe = null, symbol = null, strategies = [] } = {}) {
   const pool = await initializeDatabase();
-  const win = strategyLabReportWindow({ days, preset });
+  const win = strategyLabReportWindow({ days, preset, from, to });
   const minSample = 12; // confluence samples are sparser than single-signal → a lower bar
   const out = { ok: true, window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSample, agreementLadder: [], topPairs: [], combo: null, generatedAt: new Date().toISOString() };
   if (!pool) return out;
@@ -12146,10 +12209,12 @@ app.get('/api/strategy-lab/confluence', async (req, res) => {
   try {
     const days = Math.max(1, Math.min(Number(req.query.days) || 90, 365));
     const preset = req.query.preset ? String(req.query.preset) : null;
+    const from = req.query.from ? String(req.query.from) : null;
+    const to = req.query.to ? String(req.query.to) : null;
     const timeframe = req.query.timeframe ? String(req.query.timeframe) : null;
     const symbol = req.query.symbol ? String(req.query.symbol) : null;
     const strategies = req.query.strategies ? String(req.query.strategies).split(',').map((s) => s.trim()).filter(Boolean) : [];
-    res.json(await buildStrategyLabConfluence({ days, preset, timeframe, symbol, strategies }));
+    res.json(await buildStrategyLabConfluence({ days, preset, from, to, timeframe, symbol, strategies }));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -12159,7 +12224,10 @@ app.get('/api/strategy-lab/strategies', (req, res) => {
   // Attach each strategy's controller state (default = enabled) so the Settings page and
   // dashboard can render the on/off switch + refinements and grey muted strategies.
   const strategies = listStrategies().map((m) => ({ ...m, control: controls[m.id] || { enabled: true } }));
-  res.json({ ok: true, strategies, timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
+  // Curated symbol universe the lab scans — lets the Settings page build the per-strategy
+  // email symbol filter (empty selection = all symbols).
+  const symbols = getCuratedSymbols(getMt5Status().symbols);
+  res.json({ ok: true, strategies, symbols, timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
 });
 
 // GET /api/strategy-lab/live?strategy=&timeframe= — LIVE command per curated symbol on
@@ -12352,8 +12420,10 @@ app.get('/api/strategy-lab/performance', async (req, res) => {
   try {
     const days = req.query.days ? Number(req.query.days) : 90;
     const preset = req.query.preset ? String(req.query.preset) : null;
+    const from = req.query.from ? String(req.query.from) : null;
+    const to = req.query.to ? String(req.query.to) : null;
     const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
-    const perf = await buildStrategyLabPerformance({ days, preset });
+    const perf = await buildStrategyLabPerformance({ days, preset, from, to });
     if (!includeMuted) {
       const enabled = new Set(enabledStrategyIds());
       perf.strategies = (perf.strategies || []).filter((s) => enabled.has(s.id));

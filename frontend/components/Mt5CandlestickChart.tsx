@@ -28,6 +28,12 @@ interface Mt5CandlestickChartProps {
   timeframe: string;
   /** When provided, Entry / SL / TP horizontal lines are rendered. */
   levels?: TradeLevels | null;
+  /** In-chart symbol/timeframe switchers. The parent stays the data owner — these are
+   *  just controlled callbacks. Switchers render only when the matching callback is given. */
+  symbolOptions?: string[];
+  timeframeOptions?: string[];
+  onSymbolChange?: (symbol: string) => void;
+  onTimeframeChange?: (timeframe: string) => void;
 }
 
 type ChartCandle = { time: any; open: number; high: number; low: number; close: number; volume: number };
@@ -165,7 +171,203 @@ function detectCandlePatterns(data: ChartCandle[], lookback = 160): ChartMarker[
   return out;
 }
 
-export default function Mt5CandlestickChart({ candles, signals, symbol, timeframe, levels }: Mt5CandlestickChartProps) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Market-structure analytics (all client-side, computed from the candle array — the
+// same pattern as EMA/patterns above). Each is exposed as an optional chart overlay.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Pivot = { idx: number; time: any; price: number; kind: 'H' | 'L' };
+
+/** Fractal swing pivots: a high is a pivot when it's the strict max over ±span bars
+ *  (lows symmetric). Larger span = fewer, more significant swings. */
+function detectPivots(data: ChartCandle[], span = 3): Pivot[] {
+  const out: Pivot[] = [];
+  for (let i = span; i < data.length - span; i++) {
+    let isHigh = true;
+    let isLow = true;
+    for (let j = i - span; j <= i + span; j++) {
+      if (j === i) continue;
+      if (data[j].high >= data[i].high) isHigh = false;
+      if (data[j].low <= data[i].low) isLow = false;
+    }
+    if (isHigh) out.push({ idx: i, time: data[i].time, price: data[i].high, kind: 'H' });
+    if (isLow) out.push({ idx: i, time: data[i].time, price: data[i].low, kind: 'L' });
+  }
+  return out.sort((a, b) => a.idx - b.idx);
+}
+
+type ZigZagPoint = Pivot & { label: 'HH' | 'HL' | 'LH' | 'LL' };
+
+/** ZigZag: alternating swing sequence (collapse consecutive same-type pivots to the
+ *  most extreme one), each labelled HH / HL (bullish) or LH / LL (bearish) vs the
+ *  previous same-type pivot. This is the higher-high / higher-low structure read. */
+function computeZigZag(pivots: Pivot[]): ZigZagPoint[] {
+  const seq: Pivot[] = [];
+  for (const p of pivots) {
+    const last = seq[seq.length - 1];
+    if (!last) { seq.push(p); continue; }
+    if (last.kind === p.kind) {
+      const moreExtreme = p.kind === 'H' ? p.price > last.price : p.price < last.price;
+      if (moreExtreme) seq[seq.length - 1] = p;
+    } else {
+      seq.push(p);
+    }
+  }
+  return seq.map((p, i) => {
+    let label: ZigZagPoint['label'] = p.kind === 'H' ? 'HH' : 'LL';
+    for (let k = i - 1; k >= 0; k--) {
+      if (seq[k].kind !== p.kind) continue;
+      if (p.kind === 'H') label = p.price > seq[k].price ? 'HH' : 'LH';
+      else label = p.price < seq[k].price ? 'LL' : 'HL';
+      break;
+    }
+    return { ...p, label };
+  });
+}
+
+/** Read trend bias from the last few zigzag points: HH+HL = up, LH+LL = down. */
+function structureBias(zz: ZigZagPoint[]): 'UP' | 'DOWN' | 'RANGE' {
+  const recent = zz.slice(-4).map((p) => p.label);
+  const bull = recent.filter((l) => l === 'HH' || l === 'HL').length;
+  const bear = recent.filter((l) => l === 'LH' || l === 'LL').length;
+  if (bull >= bear + 2) return 'UP';
+  if (bear >= bull + 2) return 'DOWN';
+  return 'RANGE';
+}
+
+interface RegressionChannel {
+  slope: number;
+  mid: { time: any; value: number }[];
+  upper: { time: any; value: number }[];
+  lower: { time: any; value: number }[];
+  endValue: number;
+  projValue: number;     // regression extended `projBars` into the future
+  projBars: number;
+  changePct: number;     // % change across the window (slope strength)
+  trending: boolean;
+}
+
+/** Least-squares regression channel over the last `lookback` closes, with ±2σ bands
+ *  and a forward projection of the line (deterministic "where the trend points"). */
+function regressionChannel(data: ChartCandle[], lookback = 120, projBars = 12): RegressionChannel | null {
+  const n = Math.min(lookback, data.length);
+  if (n < 12) return null;
+  const slice = data.slice(data.length - n);
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  slice.forEach((d, i) => { sx += i; sy += d.close; sxx += i * i; sxy += i * d.close; });
+  const denom = n * sxx - sx * sx;
+  if (denom === 0) return null;
+  const slope = (n * sxy - sx * sy) / denom;
+  const intercept = (sy - slope * sx) / n;
+  let ss = 0;
+  slice.forEach((d, i) => { const yhat = intercept + slope * i; ss += (d.close - yhat) ** 2; });
+  const std = Math.sqrt(ss / n) || 0;
+  const at = (i: number) => intercept + slope * i;
+  const mid = slice.map((d, i) => ({ time: d.time, value: at(i) }));
+  const upper = slice.map((d, i) => ({ time: d.time, value: at(i) + 2 * std }));
+  const lower = slice.map((d, i) => ({ time: d.time, value: at(i) - 2 * std }));
+  const startValue = at(0);
+  const endValue = at(n - 1);
+  const projValue = at(n - 1 + projBars);
+  const changePct = startValue !== 0 ? ((endValue - startValue) / startValue) * 100 : 0;
+  // Trending when the regression's total rise/fall exceeds the noise band (±2σ).
+  const trending = Math.abs(endValue - startValue) > 2 * std;
+  return { slope, mid, upper, lower, endValue, projValue, projBars, changePct, trending };
+}
+
+/** Two most-recent swing lows → up-sloping support line; two highs → resistance line.
+ *  Each rendered as a 2-point segment (auto diagonal trend lines). */
+function autoTrendlines(pivots: Pivot[]) {
+  const highs = pivots.filter((p) => p.kind === 'H');
+  const lows = pivots.filter((p) => p.kind === 'L');
+  const seg = (a?: Pivot, b?: Pivot) => (a && b ? [{ time: a.time, value: a.price }, { time: b.time, value: b.price }] : null);
+  return {
+    support: seg(lows[lows.length - 2], lows[lows.length - 1]),
+    resistance: seg(highs[highs.length - 2], highs[highs.length - 1]),
+  };
+}
+
+interface VolumeProfile {
+  poc: number; vah: number; val: number;
+  buyVol: number; sellVol: number; buyPct: number;
+  pocDominant: 'BUY' | 'SELL';
+}
+
+/** Volume-by-price density split into buying (up-bars) vs selling (down-bars) volume.
+ *  Returns the Point of Control (most-traded price) + the 70% value area, and the
+ *  overall buy/sell balance — an honest density proxy (tick volume, not order flow). */
+function volumeProfile(data: ChartCandle[], bins = 24, lookback = 220): VolumeProfile | null {
+  const slice = data.slice(Math.max(0, data.length - lookback));
+  if (slice.length < 10) return null;
+  let lo = Infinity, hi = -Infinity;
+  for (const d of slice) { lo = Math.min(lo, d.low); hi = Math.max(hi, d.high); }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+  const step = (hi - lo) / bins;
+  const buy = new Array(bins).fill(0);
+  const sell = new Array(bins).fill(0);
+  for (const d of slice) {
+    const mid = (d.high + d.low) / 2;
+    let b = Math.floor((mid - lo) / step);
+    if (b < 0) b = 0; if (b >= bins) b = bins - 1;
+    const vol = d.volume || 1;
+    if (d.close >= d.open) buy[b] += vol; else sell[b] += vol;
+  }
+  const total = buy.map((v, i) => v + sell[i]);
+  let pocIdx = 0;
+  total.forEach((v, i) => { if (v > total[pocIdx]) pocIdx = i; });
+  const grand = total.reduce((a, b) => a + b, 0) || 1;
+  let included = total[pocIdx], loI = pocIdx, hiI = pocIdx;
+  while (included < grand * 0.7 && (loI > 0 || hiI < bins - 1)) {
+    const below = loI > 0 ? total[loI - 1] : -1;
+    const above = hiI < bins - 1 ? total[hiI + 1] : -1;
+    if (above >= below) { hiI += 1; included += total[hiI]; } else { loI -= 1; included += total[loI]; }
+  }
+  const buyVol = buy.reduce((a, b) => a + b, 0);
+  const sellVol = sell.reduce((a, b) => a + b, 0);
+  const tot = buyVol + sellVol || 1;
+  return {
+    poc: lo + (pocIdx + 0.5) * step,
+    vah: lo + (hiI + 1) * step,
+    val: lo + loI * step,
+    buyVol, sellVol,
+    buyPct: Math.round((buyVol / tot) * 100),
+    pocDominant: buy[pocIdx] >= sell[pocIdx] ? 'BUY' : 'SELL',
+  };
+}
+
+interface TradeZone { top: number; bottom: number; time: any }
+
+/** Nearest UNVIOLATED demand zone below price (buy area) and supply zone above price
+ *  (sell area), built from the freshest swing pivot whose origin candle hasn't been
+ *  closed through since. These are the "profitable area" bands + pip-target basis. */
+function tradeZones(data: ChartCandle[], pivots: Pivot[]): { demand: TradeZone | null; supply: TradeZone | null; price: number } {
+  const price = data[data.length - 1].close;
+  const lows = pivots.filter((p) => p.kind === 'L');
+  const highs = pivots.filter((p) => p.kind === 'H');
+  let demand: TradeZone | null = null;
+  for (let i = lows.length - 1; i >= 0; i--) {
+    const lv = lows[i];
+    if (lv.price >= price) continue;
+    const c = data[lv.idx];
+    const bottom = c.low, top = Math.max(c.open, c.close);
+    let violated = false;
+    for (let k = lv.idx + 1; k < data.length; k++) { if (data[k].close < bottom) { violated = true; break; } }
+    if (!violated) { demand = { top, bottom, time: c.time }; break; }
+  }
+  let supply: TradeZone | null = null;
+  for (let i = highs.length - 1; i >= 0; i--) {
+    const hv = highs[i];
+    if (hv.price <= price) continue;
+    const c = data[hv.idx];
+    const top = c.high, bottom = Math.min(c.open, c.close);
+    let violated = false;
+    for (let k = hv.idx + 1; k < data.length; k++) { if (data[k].close > top) { violated = true; break; } }
+    if (!violated) { supply = { top, bottom, time: c.time }; break; }
+  }
+  return { demand, supply, price };
+}
+
+export default function Mt5CandlestickChart({ candles, signals, symbol, timeframe, levels, symbolOptions, timeframeOptions, onSymbolChange, onTimeframeChange }: Mt5CandlestickChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLDivElement | null>(null);
 
@@ -176,6 +378,11 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const [showEma200, setShowEma200] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
   const [showPatterns, setShowPatterns] = useState(false);
+  const [showTrend, setShowTrend] = useState(false);
+  const [showTrendlines, setShowTrendlines] = useState(false);
+  const [showZigzag, setShowZigzag] = useState(false);
+  const [showDensity, setShowDensity] = useState(false);
+  const [showZones, setShowZones] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const chartRef = useRef<any>(null);
@@ -187,6 +394,16 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const ema200SeriesRef = useRef<any>(null);
   const markersApiRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
+  // Market-structure overlay series/lines (separate from trade-level price lines so
+  // toggling them never clears Entry/SL/TP).
+  const regMidRef = useRef<any>(null);
+  const regUpRef = useRef<any>(null);
+  const regLowRef = useRef<any>(null);
+  const trendlineSupRef = useRef<any>(null);
+  const trendlineResRef = useRef<any>(null);
+  const zigzagRef = useRef<any>(null);
+  const analysisLinesRef = useRef<any[]>([]);
+  const analysisBadgeRef = useRef<HTMLDivElement | null>(null);
   const lastLenRef = useRef(0);
   // Latest CLOSED bar (time in seconds + close), used to synthesize the live-forming bar.
   const lastClosedRef = useRef<{ time: number; close: number } | null>(null);
@@ -246,6 +463,13 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     ema200SeriesRef.current = null;
     markersApiRef.current = null;
     priceLinesRef.current = [];
+    regMidRef.current = null;
+    regUpRef.current = null;
+    regLowRef.current = null;
+    trendlineSupRef.current = null;
+    trendlineResRef.current = null;
+    zigzagRef.current = null;
+    analysisLinesRef.current = [];
 
     const renderLegend = (candle: any) => {
       const legendEl = legendRef.current;
@@ -297,6 +521,13 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
       ema200SeriesRef.current = null;
       markersApiRef.current = null;
       priceLinesRef.current = [];
+      regMidRef.current = null;
+      regUpRef.current = null;
+      regLowRef.current = null;
+      trendlineSupRef.current = null;
+      trendlineResRef.current = null;
+      zigzagRef.current = null;
+      analysisLinesRef.current = [];
     };
   }, [symbol, timeframe]);
 
@@ -411,6 +642,107 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     applyEma(ema50SeriesRef, showEma50, 50, '#f97316', 'EMA 50');
     applyEma(ema200SeriesRef, showEma200, 200, '#eab308', 'EMA 200');
 
+    // ── Market-structure overlays (trend / trendlines / zigzag / density / zones) ──
+    const aDigits = priceDigits(symbol, data[data.length - 1]?.close);
+    const fmt = (v: number) => v.toFixed(aDigits);
+    // Generic create/remove + setData for a 2+-point overlay line series.
+    const applyLine = (ref: React.MutableRefObject<any>, show: boolean, points: { time: any; value: number }[] | null | undefined, opts: any) => {
+      if (show && points && points.length >= 2) {
+        if (!ref.current) ref.current = chart.addSeries(LineSeries, opts);
+        ref.current.applyOptions(opts);
+        ref.current.setData(points);
+      } else if (ref.current) {
+        chart.removeSeries(ref.current);
+        ref.current = null;
+      }
+    };
+    // Rebuild the horizontal analysis price lines (density / zones / projection) fresh
+    // each pass. Kept separate from the Entry/SL/TP lines so the two never clash.
+    for (const l of analysisLinesRef.current) { try { series.removePriceLine(l); } catch { /* removed */ } }
+    analysisLinesRef.current = [];
+    const addAnalysisLine = (price: number | null | undefined, color: string, title: string, style = LineStyle.Solid) => {
+      if (price === null || price === undefined || !Number.isFinite(price)) return;
+      analysisLinesRef.current.push(series.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title }));
+    };
+
+    const needPivots = showTrendlines || showZigzag || showZones;
+    const pivots = needPivots ? detectPivots(data, 3) : [];
+    const analysisMarkers: ChartMarker[] = [];
+    const badgeChips: string[] = [];
+
+    // Trend: regression channel + forward projection + a direction chip.
+    const rc = showTrend ? regressionChannel(data) : null;
+    {
+      const up = (rc?.slope ?? 0) >= 0;
+      const trendCol = !rc ? '#64748b' : !rc.trending ? '#64748b' : up ? '#089981' : '#f23645';
+      applyLine(regMidRef, showTrend && !!rc, rc?.mid, { color: trendCol, lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Trend', lastValueVisible: false, priceLineVisible: false });
+      applyLine(regUpRef, showTrend && !!rc, rc?.upper, { color: trendCol, lineWidth: 1, lineStyle: LineStyle.Dashed, lastValueVisible: false, priceLineVisible: false });
+      applyLine(regLowRef, showTrend && !!rc, rc?.lower, { color: trendCol, lineWidth: 1, lineStyle: LineStyle.Dashed, lastValueVisible: false, priceLineVisible: false });
+      if (showTrend && rc) {
+        addAnalysisLine(rc.projValue, trendCol, `PROJ ${fmt(rc.projValue)}`, LineStyle.Dotted);
+        const dir = !rc.trending ? 'RANGE' : up ? 'UPTREND' : 'DOWNTREND';
+        const projPips = Math.abs(rc.projValue - rc.endValue) / (aDigits >= 4 ? 0.0001 : aDigits === 3 ? 0.01 : 0.1);
+        badgeChips.push(`<span class="font-black" style="color:${trendCol}">▲ ${dir}</span><span class="text-slate-400">·</span><span>${rc.changePct >= 0 ? '+' : ''}${rc.changePct.toFixed(2)}% · proj ${up ? '↑' : '↓'} ~${Math.round(projPips)}p</span>`);
+      }
+    }
+
+    // Auto diagonal trendlines (support / resistance) from the last two swing pivots.
+    const tl = showTrendlines ? autoTrendlines(pivots) : null;
+    applyLine(trendlineSupRef, showTrendlines && !!tl?.support, tl?.support, { color: '#10b981', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Support', lastValueVisible: false, priceLineVisible: false });
+    applyLine(trendlineResRef, showTrendlines && !!tl?.resistance, tl?.resistance, { color: '#ef4444', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Resistance', lastValueVisible: false, priceLineVisible: false });
+
+    // ZigZag structure + HH/HL/LH/LL labels.
+    if (showZigzag) {
+      const zz = computeZigZag(pivots);
+      applyLine(zigzagRef, true, zz.map((p) => ({ time: p.time, value: p.price })), { color: '#6366f1', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'ZigZag', lastValueVisible: false, priceLineVisible: false });
+      for (const p of zz) {
+        const bull = p.label === 'HH' || p.label === 'HL';
+        analysisMarkers.push({ time: p.time, position: p.kind === 'H' ? 'aboveBar' : 'belowBar', color: bull ? '#089981' : '#f23645', shape: 'circle', text: p.label });
+      }
+      const bias = structureBias(zz);
+      const biasCol = bias === 'UP' ? '#089981' : bias === 'DOWN' ? '#f23645' : '#64748b';
+      badgeChips.push(`<span class="font-black" style="color:${biasCol}">⟿ ${bias}</span><span class="text-slate-400">structure</span>`);
+    } else {
+      applyLine(zigzagRef, false, null, {});
+    }
+
+    // Density: volume-by-price (POC + value area) + buy/sell balance chip.
+    const vp = showDensity ? volumeProfile(data) : null;
+    if (showDensity && vp) {
+      addAnalysisLine(vp.poc, '#d97706', `POC ${fmt(vp.poc)}`, LineStyle.Solid);
+      addAnalysisLine(vp.vah, '#94a3b8', `VAH ${fmt(vp.vah)}`, LineStyle.Dashed);
+      addAnalysisLine(vp.val, '#94a3b8', `VAL ${fmt(vp.val)}`, LineStyle.Dashed);
+      const densCol = vp.buyPct >= 55 ? '#089981' : vp.buyPct <= 45 ? '#f23645' : '#64748b';
+      badgeChips.push(`<span class="font-black" style="color:${densCol}">◧ ${vp.buyPct}% buy</span><span class="text-slate-400">density · POC ${vp.pocDominant.toLowerCase()}</span>`);
+    }
+
+    // Profitable buy/sell areas: nearest unviolated demand & supply zone bands.
+    if (showZones) {
+      const tz = tradeZones(data, pivots);
+      if (tz.demand) {
+        addAnalysisLine(tz.demand.top, '#059669', `BUY ${fmt(tz.demand.top)}`, LineStyle.Solid);
+        addAnalysisLine(tz.demand.bottom, '#059669', `BUY ${fmt(tz.demand.bottom)}`, LineStyle.Dashed);
+        analysisMarkers.push({ time: tz.demand.time, position: 'belowBar', color: '#059669', shape: 'circle', text: 'BUY' });
+      }
+      if (tz.supply) {
+        addAnalysisLine(tz.supply.top, '#dc2626', `SELL ${fmt(tz.supply.top)}`, LineStyle.Dashed);
+        addAnalysisLine(tz.supply.bottom, '#dc2626', `SELL ${fmt(tz.supply.bottom)}`, LineStyle.Solid);
+        analysisMarkers.push({ time: tz.supply.time, position: 'aboveBar', color: '#dc2626', shape: 'circle', text: 'SELL' });
+      }
+      if (tz.demand && tz.supply) {
+        const reward = Math.abs(((tz.supply.top + tz.supply.bottom) / 2) - ((tz.demand.top + tz.demand.bottom) / 2));
+        const pips = reward / (aDigits >= 4 ? 0.0001 : aDigits === 3 ? 0.01 : 0.1);
+        badgeChips.push(`<span class="font-black text-slate-700">⤢ ~${Math.round(pips)}p</span><span class="text-slate-400">buy→sell range</span>`);
+      }
+    }
+
+    // Render / hide the structure summary badge.
+    const badgeEl = analysisBadgeRef.current;
+    if (badgeEl) {
+      badgeEl.innerHTML = badgeChips.map((c) => `<span class="inline-flex items-center gap-1 rounded bg-white/85 px-1.5 py-0.5">${c}</span>`).join('');
+      badgeEl.style.display = badgeChips.length ? 'flex' : 'none';
+    }
+
     // Markers: signals + (optional) candlestick patterns, merged & time-sorted.
     const candleTimes = data.map((d) => Number(d.time));
     const signalMarkers: ChartMarker[] = signals
@@ -427,7 +759,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         };
       });
     const patternMarkers = showPatterns ? detectCandlePatterns(data) : [];
-    const allMarkers = [...signalMarkers, ...patternMarkers].sort((a, b) => Number(a.time) - Number(b.time));
+    const allMarkers = [...signalMarkers, ...patternMarkers, ...analysisMarkers].sort((a, b) => Number(a.time) - Number(b.time));
     if (!markersApiRef.current) markersApiRef.current = createSeriesMarkers(series, []);
     markersApiRef.current.setMarkers(allMarkers as any);
 
@@ -481,7 +813,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         chart.timeScale().fitContent();
       }
     }
-  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, levels]);
+  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showTrend, showTrendlines, showZigzag, showDensity, showZones, levels]);
 
   // ─── Effect D: live forming bar + countdown (1s) ────────────────────────
   // The feed sends closed bars only, so without this the chart sits frozen between
@@ -568,13 +900,55 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     ? 'fixed inset-0 z-[60] bg-white p-3'
     : 'relative h-[clamp(420px,52vh,640px)] w-full overflow-hidden rounded-2xl border border-slate-100 bg-white';
 
+  // When the in-chart symbol/TF switcher is shown, push the legend + badge down so
+  // they don't sit under it.
+  const hasSwitcher = Boolean(onSymbolChange || onTimeframeChange);
+  const tfOpts = timeframeOptions?.length ? timeframeOptions : [timeframe];
+  const symOpts = symbolOptions?.length ? symbolOptions : [symbol];
+
   return (
     <div className={wrapperClass}>
       <div className="relative h-full w-full overflow-hidden rounded-2xl">
+        {/* In-chart symbol + timeframe switcher (controlled by the parent) */}
+        {hasSwitcher && (
+          <div className="absolute left-3 top-3 z-20 flex items-center gap-1 rounded-xl border border-slate-200/60 bg-white/85 p-1 shadow-sm backdrop-blur-md">
+            {onSymbolChange && (
+              <select
+                value={symbol}
+                onChange={(e) => onSymbolChange(e.target.value)}
+                className="rounded-lg border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] font-black text-slate-700 outline-none focus:border-indigo-400"
+                title="Symbol"
+              >
+                {symOpts.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            )}
+            {onTimeframeChange && (
+              <div className="flex overflow-hidden rounded-lg border border-slate-200">
+                {tfOpts.map((tf) => (
+                  <button
+                    key={tf}
+                    onClick={() => onTimeframeChange(tf)}
+                    className={`px-1.5 py-0.5 text-[10px] font-black transition-colors ${timeframe === tf ? 'bg-indigo-600 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}
+                  >
+                    {tf}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Hover legend */}
         <div
           ref={legendRef}
-          className="pointer-events-none absolute left-3 top-3 z-10 rounded-lg border border-slate-100/50 bg-white/75 px-2.5 py-1.5 shadow-sm backdrop-blur-[3px]"
+          className={`pointer-events-none absolute left-3 z-10 rounded-lg border border-slate-100/50 bg-white/75 px-2.5 py-1.5 shadow-sm backdrop-blur-[3px] ${hasSwitcher ? 'top-14' : 'top-3'}`}
+        />
+
+        {/* Market-structure summary badge (populated when Trend/ZigZag/Density/Zones are on) */}
+        <div
+          ref={analysisBadgeRef}
+          style={{ display: 'none' }}
+          className={`pointer-events-none absolute left-3 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-slate-100/60 bg-white/40 px-1.5 py-1 text-[10px] font-bold text-slate-600 shadow-sm backdrop-blur-[3px] ${hasSwitcher ? 'top-[5.5rem]' : 'top-12'}`}
         />
 
         {/* Live countdown to next bar close */}
@@ -592,6 +966,12 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
           {toggleBtn(showEma50, 'EMA 50', () => setShowEma50((v) => !v), 'bg-orange-50 text-orange-700 border-orange-200')}
           {toggleBtn(showEma200, 'EMA 200', () => setShowEma200((v) => !v), 'bg-amber-100 text-amber-800 border-amber-200')}
           {toggleBtn(showPatterns, 'Patterns', () => setShowPatterns((v) => !v), 'bg-violet-50 text-violet-700 border-violet-200')}
+          <span className="mx-0.5 h-4 w-px bg-slate-200" />
+          {toggleBtn(showTrend, 'Trend', () => setShowTrend((v) => !v), 'bg-teal-50 text-teal-700 border-teal-200')}
+          {toggleBtn(showTrendlines, 'Lines', () => setShowTrendlines((v) => !v), 'bg-rose-50 text-rose-700 border-rose-200')}
+          {toggleBtn(showZigzag, 'ZigZag', () => setShowZigzag((v) => !v), 'bg-indigo-50 text-indigo-700 border-indigo-200')}
+          {toggleBtn(showDensity, 'Density', () => setShowDensity((v) => !v), 'bg-amber-50 text-amber-700 border-amber-200')}
+          {toggleBtn(showZones, 'Zones', () => setShowZones((v) => !v), 'bg-emerald-50 text-emerald-700 border-emerald-200')}
           <span className="mx-0.5 h-4 w-px bg-slate-200" />
           <button
             onClick={() => {

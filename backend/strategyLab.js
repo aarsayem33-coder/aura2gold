@@ -10,7 +10,7 @@
 //              takeProfit3?, riskRewardRatio, reason, barIso, meta }
 // Pure: no I/O. New strategies = add one entry to STRATEGIES.
 
-import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep } from './liquidityEngine.js';
+import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels } from './liquidityEngine.js';
 import { buildBreakoutCandidate, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
@@ -1900,6 +1900,134 @@ function fixedTimeFusion(ctx) {
   };
 }
 
+// ─── Strategy confluence engine (shared by forex-confluence + fixed-time-confluence) ──
+// Diverse panel: ONE representative per logic family so agreement = independent confirmation,
+// not several SMC clones detecting the same setup. Each votes a direction; ≥2 agreeing fires,
+// graded up for 3/4/all + situational modifiers (HTF, session, location, key-level proximity).
+const CONFLUENCE_PANEL = [
+  ['ICT Breaker', ictBreaker],            // structure / ICT
+  ['Liquidity Trap', liquidityTrap],      // reversal / liquidity
+  ['Little Rizzy', littleRizzy],          // trend / continuation
+  ['Market Mechanics', marketMechanics3Step], // location / mechanics
+  ['SMC FVG', smcFvg],                    // SMC representative
+  ['Liquidity Sweep Pro', liquiditySweepPro], // graded sweep
+];
+
+// Run the panel; return the agreeing side (≥2, no tie) or null.
+function evalConfluencePanel(ctx) {
+  const votes = [];
+  for (const [name, fn] of CONFLUENCE_PANEL) {
+    let s = null;
+    try { s = fn({ ...ctx, config: {} }); } catch { s = null; }
+    if (s && (s.decision === 'BUY' || s.decision === 'SELL')) votes.push({ name, dir: s.decision, score: Number(s.score) || 60, sig: s });
+  }
+  const buy = votes.filter((v) => v.dir === 'BUY');
+  const sell = votes.filter((v) => v.dir === 'SELL');
+  const dir = buy.length > sell.length ? 'BUY' : sell.length > buy.length ? 'SELL' : null; // tie = conflicting = no confluence
+  if (!dir) return null;
+  const winners = dir === 'BUY' ? buy : sell;
+  if (winners.length < 2) return null;
+  const avgScore = winners.reduce((a, v) => a + v.score, 0) / winners.length;
+  return { dir, agree: winners.length, winners, avgScore, total: votes.length };
+}
+
+// Situational context for the agreeing direction: premium/discount location, session, HTF, key level.
+function confluenceSituation(ctx, dir) {
+  const candles = ctx.candles;
+  const last = candles[candles.length - 1];
+  const price = Number(last.close);
+  const win = candles.slice(-60);
+  const hi = Math.max(...win.map((c) => Number(c.high)).filter(Number.isFinite));
+  const lo = Math.min(...win.map((c) => Number(c.low)).filter(Number.isFinite));
+  const pct = hi > lo ? ((price - lo) / (hi - lo)) * 100 : 50;
+  const goodLocation = dir === 'BUY' ? pct < 45 : pct > 55;        // buy discount / sell premium
+  const h = new Date(last.time).getUTCHours();
+  const goodSession = Number.isFinite(h) && h >= 7 && h < 21;       // London+NY span (gold moves most)
+  const htfAligned = dir === 'BUY' ? (ctx.h4Trend === 'BULLISH' || ctx.h1Trend === 'BULLISH') : (ctx.h4Trend === 'BEARISH' || ctx.h1Trend === 'BEARISH');
+  const htfConflict = dir === 'BUY' ? ctx.h4Trend === 'BEARISH' : ctx.h4Trend === 'BULLISH';
+  let atKeyLevel = false;
+  try {
+    const { levels } = detectKeyLiquidityLevels(candles, { symbol: ctx.symbol });
+    const atr = atr14(candles) || 0;
+    atKeyLevel = atr > 0 && levels.some((l) => l.strength >= 3 && l.distanceAtr != null && l.distanceAtr <= 0.4);
+  } catch { /* key levels optional */ }
+  return { pct: Math.round(pct), goodLocation, goodSession, htfAligned, htfConflict, atKeyLevel };
+}
+
+// Grade 2/3/4+ agreement, modulated by component quality + situation. Gold rewarded for session.
+function gradeConfluence(agree, avgScore, sit, symbol) {
+  const gold = /XAU|GOLD/.test(String(symbol || '').toUpperCase());
+  let score = 50;
+  score += agree >= 5 ? 35 : agree === 4 ? 30 : agree === 3 ? 22 : 12; // agree >= 2
+  score += Math.max(0, Math.min(15, ((avgScore - 60) / 40) * 15));
+  if (sit.htfAligned) score += 6;
+  if (sit.goodSession) score += gold ? 6 : 5;
+  if (sit.goodLocation) score += 5;
+  if (sit.atKeyLevel) score += 6;
+  score = Math.min(98, Math.round(score));
+  const grade = score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C';
+  return { score, grade };
+}
+
+// FOREX confluence — gold-first. Anchors the TP/SL plan to the strongest agreeing component's
+// structure (no fuzzy blending); never fights a clear H4 trend.
+function forexConfluence(ctx) {
+  const cfg = ctx.config || {};
+  const c = evalConfluencePanel(ctx);
+  if (!c) return null;
+  const sit = confluenceSituation(ctx, c.dir);
+  if (sit.htfConflict) return null;
+  const { score, grade } = gradeConfluence(c.agree, c.avgScore, sit, ctx.symbol);
+  if (score < (cfg.minScore ?? 65)) return null;
+  const anchor = c.winners
+    .filter((v) => [v.sig.entry, v.sig.stopLoss, v.sig.takeProfit1].every((x) => Number.isFinite(x)))
+    .sort((a, b) => b.score - a.score)[0];
+  if (!anchor) return null;
+  const p = anchor.sig;
+  // Each agreeing component's OWN score is shown (e.g. "ICT Breaker 85, Liquidity Trap 78") — no
+  // floor gates them (every strategy already only fires on its own valid setup), but the scores
+  // are surfaced so the quality of the confluence is visible, and they feed the grade via avgScore.
+  const parts = c.winners.map((v) => `${v.name} ${Math.round(v.score)}`);
+  const components = c.winners.map((v) => ({ name: v.name, score: Math.round(v.score), grade: v.sig.grade ?? null }));
+  return {
+    decision: c.dir, score, grade,
+    entry: p.entry, stopLoss: p.stopLoss, takeProfit1: p.takeProfit1, takeProfit2: p.takeProfit2 ?? null, takeProfit3: p.takeProfit3 ?? null,
+    riskRewardRatio: p.riskRewardRatio ?? null,
+    reason: `Forex confluence: ${c.agree} agree ${c.dir} (${parts.join(', ')}); anchored to ${anchor.name}${sit.htfAligned ? ' · H4 aligned' : ''}${sit.goodLocation ? ` · ${c.dir === 'BUY' ? 'discount' : 'premium'}` : ''}${sit.atKeyLevel ? ' · at key level' : ''}`,
+    barIso: p.barIso || ctx.candles[ctx.candles.length - 1].time, // dedup on the anchor setup
+    meta: { agree: c.agree, components, avgComponentScore: Math.round(c.avgScore), situation: sit, anchor: anchor.name },
+  };
+}
+
+// FIXED-TIME confluence — next-candle direction by agreement count. Entry=close, ATR-framed plan.
+function fixedTimeConfluence(ctx) {
+  const cfg = ctx.config || {};
+  const c = evalConfluencePanel(ctx);
+  if (!c) return null;
+  const sit = confluenceSituation(ctx, c.dir);
+  if (sit.htfConflict) return null;
+  const { score, grade } = gradeConfluence(c.agree, c.avgScore, sit, ctx.symbol);
+  if (score < (cfg.minScore ?? 65)) return null;
+  const last = ctx.candles[ctx.candles.length - 1];
+  const close = Number(last.close);
+  const atr = atr14(ctx.candles) || 0;
+  if (!(close > 0) || !(atr > 0)) return null;
+  const slDist = atr, tpDist = atr * 1.5;
+  const parts = c.winners.map((v) => `${v.name} ${Math.round(v.score)}`);
+  const components = c.winners.map((v) => ({ name: v.name, score: Math.round(v.score), grade: v.sig.grade ?? null }));
+  return {
+    decision: c.dir, score, grade,
+    entry: close,
+    stopLoss: c.dir === 'BUY' ? close - slDist : close + slDist,
+    takeProfit1: c.dir === 'BUY' ? close + tpDist : close - tpDist,
+    takeProfit2: c.dir === 'BUY' ? close + tpDist * 1.5 : close - tpDist * 1.5,
+    takeProfit3: null, riskRewardRatio: 1.5,
+    reason: `Fixed-time confluence: ${c.agree} agree ${c.dir} (${parts.join(', ')})${sit.htfAligned ? ' · H4 aligned' : ''}${sit.goodSession ? ' · active session' : ''}`,
+    barIso: last.time, // fixed-time = per-bar
+    meta: { agree: c.agree, components, avgComponentScore: Math.round(c.avgScore), situation: sit },
+  };
+}
+
 // Liquidity Sweep Pro — thin wrapper over gradeSweep (the 5-component model). gradeSweep returns
 // a fully-formed lab signal (or null). No dailyCandles in the lab ctx, so PDH/PDL aren't in the
 // obvious-pool set here — session highs/lows, round numbers, and equal highs/lows are.
@@ -1917,6 +2045,24 @@ export const STRATEGIES = {
     timeframes: ['M5', 'M15', 'M30', 'H1'],
     config: { minRR: 1.8, minGrade: 'B' },
     evaluate: liquiditySweepPro,
+  },
+  'forex-confluence': {
+    id: 'forex-confluence',
+    name: 'Forex Confluence (Gold-first)',
+    source: 'Ensemble (meta) — fires when 2-4 DIVERSE strategies agree on direction; gold-optimised forex',
+    description: 'A gold-first FOREX confluence engine for the TP/SL side. Each bar it polls a DIVERSE panel — one representative per logic family (ICT structure, liquidity reversal, trend continuation, mechanics/location, SMC, graded sweep) so agreement is independent confirmation, not several SMC clones detecting the same setup. Fires only when ≥2 agree on the SAME direction (no tie), graded UP for 3/4/all-agree and modulated by situation: HTF (H4/H1) alignment, active session (London/NY — where gold moves most), premium/discount location, and proximity to a fresh KEY liquidity level (PDH/PDL, round number, session high/low). Never fights a clear H4 trend (hard veto). The TP/SL plan is ANCHORED to the strongest agreeing component\'s structure (no fuzzy blending) — its entry/stop/targets. Score 50 + agreement bonus (2→+12, 3→+22, 4→+30) + component quality + modifiers; grade B(≥65)/A(≥75)/A+(≥85). Isolated lab strategy; reads existing strategies, changes none. Best on gold then majors.',
+    timeframes: ['M5', 'M15', 'M30', 'H1', 'H4'],
+    config: { minScore: 65 },
+    evaluate: forexConfluence,
+  },
+  'fixed-time-confluence': {
+    id: 'fixed-time-confluence',
+    name: 'Fixed-Time Confluence',
+    source: 'Ensemble (meta) — next-candle direction by how many DIVERSE strategies agree',
+    description: 'A FIXED-TIME (next-candle) confluence engine, distinct from fixed-time-fusion (which weights live read + breakout). This one is the explicit AGREEMENT-COUNT model: it polls the same diverse panel (one per family — ICT, liquidity reversal, trend, mechanics, SMC, graded sweep) and fires an UP/DOWN call only when ≥2 agree on the SAME direction, graded UP for 3/4/all-agree. Score modulated by HTF alignment, active session, premium/discount location, and key-level proximity; never fires against a clear H4 trend. Entry at the close, ATR-framed for the forex measurement; the lab scores it BOTH ways (fixed-time direction win-rate + as-traded) so you can see whether more agreement = higher accuracy. Isolated; reads existing strategies, changes none.',
+    timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
+    config: { minScore: 65 },
+    evaluate: fixedTimeConfluence,
   },
   'fixed-time-fusion': {
     id: 'fixed-time-fusion',
