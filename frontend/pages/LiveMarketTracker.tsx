@@ -263,8 +263,18 @@ function ZoneMap({ t }: { t: LiveMarketTrackerResponse }) {
   );
 }
 
+// Merge fresh candles into the existing set, keyed by bar time (latest wins), sorted
+// ascending and capped. Lets the live SSE stream update the chart between REST polls.
+function mergeCandlesByTime(prev: Mt5Candle[], incoming: Mt5Candle[], cap = 600): Mt5Candle[] {
+  const map = new Map<string, Mt5Candle>();
+  for (const c of prev) map.set(c.time, c);
+  for (const c of incoming) map.set(c.time, c);
+  const merged = [...map.values()].sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+  return merged.length > cap ? merged.slice(merged.length - cap) : merged;
+}
+
 export default function LiveMarketTracker() {
-  const { status } = useMt5Stream();
+  const { status, candles: streamCandles } = useMt5Stream();
   const [symbol, setSymbol] = useState<string>('');
   const [timeframe, setTimeframe] = useState<string>('M5');
   const [data, setData] = useState<LiveMarketTrackerResponse | null>(null);
@@ -273,6 +283,11 @@ export default function LiveMarketTracker() {
   const [error, setError] = useState<string | null>(null);
   const symbolRef = useRef(symbol);
   symbolRef.current = symbol;
+  const inFlightRef = useRef(false);
+  // Which instrument the `candles` array currently holds. Used to REPLACE (not merge) on an
+  // instrument switch — so we never mix bars across symbols AND never empty the array (emptying
+  // would unmount the chart via the candles.length gate below, losing its fullscreen state).
+  const candlesKeyRef = useRef('');
 
   const symbolOptions = useMemo(() => {
     const fromStatus = status?.symbols || [];
@@ -286,6 +301,8 @@ export default function LiveMarketTracker() {
   }, [symbol, symbolOptions]);
 
   const load = useCallback(async (showSpinner = false) => {
+    if (inFlightRef.current) return; // don't let a slow request stack under the 3s poll
+    inFlightRef.current = true;
     if (showSpinner) setLoading(true);
     try {
       const t = await fetchLiveMarketTracker(symbolRef.current || undefined, timeframe);
@@ -293,23 +310,62 @@ export default function LiveMarketTracker() {
       setError(t.error || null);
       try {
         const c = await fetchMt5Candles(t.symbol, timeframe, 300);
-        setCandles(c.candles || []);
+        const key = `${(t.symbol || '').toUpperCase()}|${timeframe.toUpperCase()}`;
+        const fresh = c.candles || [];
+        // Same instrument → merge (keeps live SSE bars); switched instrument → replace wholesale
+        // (clears the old symbol's bars without ever emptying the array / unmounting the chart).
+        setCandles((prev) => (key === candlesKeyRef.current ? mergeCandlesByTime(prev, fresh) : fresh));
+        candlesKeyRef.current = key;
       } catch { /* chart is best-effort */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load tracker');
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   }, [timeframe]);
 
   useEffect(() => {
     load(true);
-    const id = setInterval(() => load(false), 8000);
+    // 3s poll for the analytics + banner (verdict / pressure / price). The chart itself
+    // updates faster via the live-stream merge below, so ticks land well under 3s.
+    const id = setInterval(() => load(false), 3000);
     return () => clearInterval(id);
   }, [load, symbol]);
 
+  // Live-stream fast path: merge SSE candle pushes for the active symbol/timeframe into the
+  // chart the instant they arrive (sub-second), instead of waiting for the next REST poll.
+  useEffect(() => {
+    const sym = (data?.symbol || '').toUpperCase();
+    const tf = timeframe.toUpperCase();
+    const key = `${sym}|${tf}`;
+    // Only merge once the REST load has this instrument in place — never merge across a switch.
+    if (!sym || !streamCandles?.length || key !== candlesKeyRef.current) return;
+    const relevant = streamCandles.filter((c) => (c.symbol || '').toUpperCase() === sym && (c.timeframe || '').toUpperCase() === tf);
+    if (relevant.length) setCandles((prev) => mergeCandlesByTime(prev, relevant));
+  }, [streamCandles, data?.symbol, timeframe]);
+
   const plan = data?.plan;
   const levels = plan ? { direction: data?.verdict.direction || undefined, entry: plan.entry, stopLoss: plan.sl, takeProfit1: plan.tp ?? undefined } : null;
+
+  // Small MT feed indicator (connected state + last-tick age) — shown only when the chart is
+  // expanded (the chart component renders it in fullscreen only).
+  const feedBadge = data ? (() => {
+    const fs = data.feedState;
+    const c = fs === 'LIVE'
+      ? { dot: 'bg-emerald-500 animate-pulse', wrap: 'border-emerald-200 bg-emerald-50/90 text-emerald-700', label: 'MT LIVE' }
+      : fs === 'STALE'
+        ? { dot: 'bg-amber-500', wrap: 'border-amber-200 bg-amber-50/90 text-amber-700', label: 'MT STALE' }
+        : { dot: 'bg-slate-400', wrap: 'border-slate-200 bg-slate-100/90 text-slate-500', label: 'MT OFFLINE' };
+    const age = data.staleSeconds == null ? null : data.staleSeconds < 60 ? `${data.staleSeconds}s` : `${Math.floor(data.staleSeconds / 60)}m`;
+    return (
+      <div className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-black shadow-sm backdrop-blur-[3px] ${c.wrap}`}>
+        <span className={`h-2 w-2 rounded-full ${c.dot}`} />
+        <span>{c.label}</span>
+        {fs !== 'MARKET_CLOSED' && age && <span className="font-semibold opacity-70">· tick {age} ago</span>}
+      </div>
+    );
+  })() : null;
 
   return (
     <div className="space-y-4">
@@ -357,6 +413,7 @@ export default function LiveMarketTracker() {
                     candles={candles} signals={[]} symbol={data.symbol} timeframe={timeframe} levels={levels}
                     symbolOptions={symbolOptions} timeframeOptions={TF_OPTIONS}
                     onSymbolChange={setSymbol} onTimeframeChange={setTimeframe}
+                    fullscreenBadge={feedBadge}
                   />
                 : <div className="flex h-72 items-center justify-center text-sm text-slate-400">No candle data for {data.symbol} {timeframe}.</div>}
             </div>

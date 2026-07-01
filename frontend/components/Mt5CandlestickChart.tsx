@@ -4,6 +4,7 @@ import {
   ColorType,
   createChart,
   createSeriesMarkers,
+  CrosshairMode,
   HistogramSeries,
   LineSeries,
   LineStyle,
@@ -34,6 +35,8 @@ interface Mt5CandlestickChartProps {
   timeframeOptions?: string[];
   onSymbolChange?: (symbol: string) => void;
   onTimeframeChange?: (timeframe: string) => void;
+  /** Small status node rendered top-center ONLY when the chart is expanded (fullscreen). */
+  fullscreenBadge?: React.ReactNode;
 }
 
 type ChartCandle = { time: any; open: number; high: number; low: number; close: number; volume: number };
@@ -64,7 +67,7 @@ function timeframeSeconds(tf: string): number {
  * making the chart visibly "live" without inventing price movement. Returns null
  * when real data already covers the current period (or the timeframe is unknown). */
 function formingBarFor(lastClosed: { time: number; close: number } | null, tfSec: number, nowMs = Date.now()) {
-  if (!lastClosed || tfSec <= 0 || !Number.isFinite(lastClosed.close)) return null;
+  if (!lastClosed || tfSec <= 0 || !Number.isFinite(lastClosed.close) || lastClosed.close <= 0) return null;
   const open = Math.floor(Math.floor(nowMs / 1000) / tfSec) * tfSec;
   if (lastClosed.time >= open) return null; // a real bar already occupies the current period
   return { time: open, open: lastClosed.close, high: lastClosed.close, low: lastClosed.close, close: lastClosed.close, volume: 0 };
@@ -206,6 +209,10 @@ function computeZigZag(pivots: Pivot[]): ZigZagPoint[] {
   for (const p of pivots) {
     const last = seq[seq.length - 1];
     if (!last) { seq.push(p); continue; }
+    // An "outside bar" can be flagged as BOTH a pivot high and low at the same index/time.
+    // Keep only the first so the zigzag never has two points on one timestamp (which the
+    // line series rejects — it requires strictly ascending, unique times).
+    if (p.idx === last.idx) continue;
     if (last.kind === p.kind) {
       const moreExtreme = p.kind === 'H' ? p.price > last.price : p.price < last.price;
       if (moreExtreme) seq[seq.length - 1] = p;
@@ -367,7 +374,7 @@ function tradeZones(data: ChartCandle[], pivots: Pivot[]): { demand: TradeZone |
   return { demand, supply, price };
 }
 
-export default function Mt5CandlestickChart({ candles, signals, symbol, timeframe, levels, symbolOptions, timeframeOptions, onSymbolChange, onTimeframeChange }: Mt5CandlestickChartProps) {
+export default function Mt5CandlestickChart({ candles, signals, symbol, timeframe, levels, symbolOptions, timeframeOptions, onSymbolChange, onTimeframeChange, fullscreenBadge }: Mt5CandlestickChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLDivElement | null>(null);
 
@@ -404,6 +411,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const zigzagRef = useRef<any>(null);
   const analysisLinesRef = useRef<any[]>([]);
   const analysisBadgeRef = useRef<HTMLDivElement | null>(null);
+  const resizeChartRef = useRef<(() => void) | null>(null);
   const lastLenRef = useRef(0);
   // Latest CLOSED bar (time in seconds + close), used to synthesize the live-forming bar.
   const lastClosedRef = useRef<{ time: number; close: number } | null>(null);
@@ -422,11 +430,16 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     lastLenRef.current = 0;
 
     const chart = createChart(container, {
-      autoSize: true,
+      // Explicit initial size + a ResizeObserver below (see resizeChart). autoSize is NOT used:
+      // its internal observer lags on the fullscreen transition, leaving the canvas at the old
+      // size so zoom rendered candles against wrong dimensions. Manual resize is reliable.
+      width: Math.max(1, container.clientWidth),
+      height: Math.max(1, container.clientHeight),
       layout: {
         background: { type: ColorType.Solid, color: '#ffffff' },
         textColor: '#64748b',
         fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        attributionLogo: false,
       },
       grid: {
         vertLines: { color: '#f1f5f9', style: LineStyle.Dashed, visible: true },
@@ -436,10 +449,15 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         borderColor: '#e2e8f0',
         scaleMargins: { top: 0.12, bottom: 0.22 },
       },
-      timeScale: { borderColor: '#e2e8f0', timeVisible: true, secondsVisible: false },
+      // rightOffset keeps the newest candle off the hard edge; barSpacing/minBarSpacing give a
+      // clean default candle width and let the user zoom in far without candles collapsing.
+      timeScale: { borderColor: '#e2e8f0', timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 8, minBarSpacing: 0.5 },
       crosshair: {
-        vertLine: { color: '#cbd5e1', width: 1, style: LineStyle.Dashed },
-        horzLine: { color: '#cbd5e1', width: 1, style: LineStyle.Dashed },
+        // Normal = the price (horizontal) line follows the mouse to ANY level, instead of
+        // Magnet mode's snapping to the nearest candle O/H/L/C — so you can measure freely.
+        mode: CrosshairMode.Normal,
+        vertLine: { color: '#f97316', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#ea580c' },
+        horzLine: { color: '#f97316', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#ea580c' },
       },
     });
 
@@ -470,6 +488,9 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     trendlineResRef.current = null;
     zigzagRef.current = null;
     analysisLinesRef.current = [];
+    // Drop the previous instrument's last-closed reference so Effect D can't paint a stale
+    // forming bar (old symbol's price) onto the fresh series before new data loads.
+    lastClosedRef.current = null;
 
     const renderLegend = (candle: any) => {
       const legendEl = legendRef.current;
@@ -510,7 +531,28 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
       renderLegend(candleData);
     });
 
+    // Reliable resize: observe the container box and resize the chart to match (rAF-batched so
+    // rapid changes — fullscreen enter/exit, window resize, layout shifts — repaint the canvas at
+    // the correct dimensions). Preserves the user's zoom. This is what fixes candles rendering
+    // wrong after zooming in fullscreen.
+    let rafId = 0;
+    const resizeChart = () => {
+      const w = Math.floor(container.clientWidth);
+      const h = Math.floor(container.clientHeight);
+      if (w > 0 && h > 0) { try { chart.resize(w, h); } catch { /* mid-teardown */ } }
+    };
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(resizeChart);
+    });
+    ro.observe(container);
+    resizeChartRef.current = resizeChart;
+    resizeChart(); // ensure correct size on first paint
+
     return () => {
+      cancelAnimationFrame(rafId);
+      ro.disconnect();
+      resizeChartRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -568,6 +610,10 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
       const l = candle.low as number;
       const c = candle.close as number;
       const v = (candle.volume as number) || 0;
+      // Data-sanity guard: a single garbage candle (0 / negative / non-finite / inverted) would
+      // drag the price-scale autoscale to ~0 and squash all real candles into a thin band at the
+      // top. Prices are always > 0 for these instruments, so drop anything invalid.
+      if (![o, h, l, c].every((x) => Number.isFinite(x) && x > 0) || h < l) continue;
       const prev = byBar.get(barTime);
       if (!prev) {
         byBar.set(barTime, { firstSec: sec, lastSec: sec, candle: { time: barTime, open: o, high: h, low: l, close: c, volume: v } });
@@ -586,7 +632,26 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         prev.lastSec = sec;
       }
     }
-    const data = [...byBar.values()].map((x) => x.candle).sort((a, b) => Number(a.time) - Number(b.time));
+    let data = [...byBar.values()].map((x) => x.candle).sort((a, b) => Number(a.time) - Number(b.time));
+    if (data.length === 0) return;
+
+    // Repair invalid OHLC bounds from the feed (e.g. close < low, which renders as a full-height
+    // spike): high must cover open/close, low must sit under them.
+    for (const d of data) {
+      d.high = Math.max(d.high, d.open, d.close);
+      d.low = Math.min(d.low, d.open, d.close);
+    }
+    // Drop gross outlier candles (feed glitches whose price is wildly off the dataset median) —
+    // one such bar drags the price-scale autoscale toward 0 and squashes every real candle. A 4×
+    // band never touches genuine volatility, so only true garbage is removed.
+    if (data.length >= 5) {
+      const closes = data.map((d) => d.close).sort((a, b) => a - b);
+      const med = closes[Math.floor(closes.length / 2)];
+      if (med > 0) {
+        const lo = med / 4, hi = med * 4;
+        data = data.filter((d) => d.low >= lo && d.high <= hi);
+      }
+    }
     if (data.length === 0) return;
 
     // Record the latest closed bar so the 1-second live effect can keep a forming
@@ -647,10 +712,14 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     const fmt = (v: number) => v.toFixed(aDigits);
     // Generic create/remove + setData for a 2+-point overlay line series.
     const applyLine = (ref: React.MutableRefObject<any>, show: boolean, points: { time: any; value: number }[] | null | undefined, opts: any) => {
-      if (show && points && points.length >= 2) {
+      // Enforce strictly-ascending, unique timestamps — lightweight-charts throws otherwise.
+      const clean = points
+        ? points.filter((p, i, arr) => Number.isFinite(p.value) && (i === 0 || Number(p.time) > Number(arr[i - 1].time)))
+        : null;
+      if (show && clean && clean.length >= 2) {
         if (!ref.current) ref.current = chart.addSeries(LineSeries, opts);
         ref.current.applyOptions(opts);
-        ref.current.setData(points);
+        ref.current.setData(clean);
       } else if (ref.current) {
         chart.removeSeries(ref.current);
         ref.current = null;
@@ -851,16 +920,21 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     return () => window.clearInterval(id);
   }, [symbol, timeframe]);
 
-  // Keep the chart sized correctly when toggling fullscreen.
+  // Keep the chart sized correctly when toggling fullscreen. Force an explicit resize across a
+  // couple of frames (the layout settles over 1–2 frames) — preserves zoom, unlike fitContent.
   useEffect(() => {
-    const id = window.setTimeout(() => {
-      try {
-        chartRef.current?.timeScale().fitContent();
-      } catch {
-        /* noop */
-      }
-    }, 60);
-    return () => window.clearTimeout(id);
+    let r1 = 0, r2 = 0;
+    r1 = window.requestAnimationFrame(() => {
+      resizeChartRef.current?.();
+      r2 = window.requestAnimationFrame(() => resizeChartRef.current?.());
+    });
+    // Lock body scroll while the chart is fullscreen so the page behind can't scroll under it.
+    if (isFullscreen) {
+      const prev = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      return () => { cancelAnimationFrame(r1); cancelAnimationFrame(r2); document.body.style.overflow = prev; };
+    }
+    return () => { cancelAnimationFrame(r1); cancelAnimationFrame(r2); };
   }, [isFullscreen]);
 
   // Close fullscreen on Escape.
@@ -872,17 +946,6 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [isFullscreen]);
-
-  if (!candles.length) {
-    return (
-      <div className="flex h-[440px] items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50/60 text-center">
-        <div>
-          <p className="font-bold text-slate-600">Waiting for MT5 candle data</p>
-          <p className="mt-1 text-sm text-slate-400">Post candles to /api/mt5/candles or /api/mt5/snapshot.</p>
-        </div>
-      </div>
-    );
-  }
 
   const toggleBtn = (active: boolean, label: string, onClick: () => void, activeClass = 'bg-amber-50 text-amber-700 border-amber-200') => (
     <button
@@ -909,6 +972,11 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   return (
     <div className={wrapperClass}>
       <div className="relative h-full w-full overflow-hidden rounded-2xl">
+        {/* Feed/status badge — only when expanded (fullscreen), top-center */}
+        {isFullscreen && fullscreenBadge && (
+          <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2">{fullscreenBadge}</div>
+        )}
+
         {/* In-chart symbol + timeframe switcher (controlled by the parent) */}
         {hasSwitcher && (
           <div className="absolute left-3 top-3 z-20 flex items-center gap-1 rounded-xl border border-slate-200/60 bg-white/85 p-1 shadow-sm backdrop-blur-md">
@@ -995,8 +1063,19 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
           </button>
         </div>
 
-        {/* Chart canvas */}
+        {/* Chart canvas — always mounted so the chart instance never loses its container
+            (prevents a blank chart if candles briefly empty then return). */}
         <div ref={containerRef} className="absolute inset-0" />
+
+        {/* Waiting overlay while there's no candle data (kept as an overlay, not a replacement). */}
+        {!candles.length && (
+          <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-50/70 text-center backdrop-blur-[1px]">
+            <div>
+              <p className="font-bold text-slate-600">Waiting for MT5 candle data…</p>
+              <p className="mt-1 text-sm text-slate-400">{symbol} · {timeframe}</p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

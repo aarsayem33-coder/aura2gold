@@ -829,25 +829,25 @@ export interface StrategyAtBucket {
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
 export interface StrategyTfRow {
-  timeframe: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  timeframe: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategySymbolRow {
-  symbol: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  symbol: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategySessionRow {
   session: string; sessionLabel: string; bdRange: string;
-  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategyComboRow {
   strategy: string; strategyName: string; symbol: string; timeframe: string;
-  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategySessionStrategyRow {
-  id: string; name: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  id: string; name: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategyScoreRow {
   band: string; label: string; range: string; order: number;
-  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket;
+  total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategySessionBreakdown {
   session: string; sessionLabel: string; bdRange: string;

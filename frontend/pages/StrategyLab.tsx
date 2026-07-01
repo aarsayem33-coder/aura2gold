@@ -25,6 +25,14 @@ function inScoreBucket(score: number | null | undefined, key: string): boolean {
   return v >= lo && v < hi;
 }
 const num = (v: number | null | undefined, d = 2) => (v === null || v === undefined ? '—' : Number(v).toFixed(d));
+// Full PRICE precision — every decimal as stored (e.g. 1.10952), no capping. toPrecision(12)
+// strips floating-point noise (1.1095200000000001) before String() drops trailing zeros. The
+// `symbol` arg is unused (kept for call-site stability / future per-symbol tweaks).
+const px = (v: number | null | undefined, _symbol?: string) => {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Number(n.toPrecision(12))) : '—';
+};
 
 type Tab = 'forex' | 'ftt';
 
@@ -447,9 +455,9 @@ export default function StrategyLab() {
                       <td className="px-3 py-2"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
                       <td className="px-3 py-2 text-right">{r.command === 'ENTRY' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
                       <td className="px-3 py-2 text-right font-mono text-[12px] font-black text-slate-900" title={r.command === 'ENTRY' && r.lossAtStop != null ? `Risk ${r.riskPercent ?? '?'}% · max loss $${r.lossAtStop} · ${r.stopPips ?? '?'} pip stop` : ''}>{r.command === 'ENTRY' && r.lots != null ? r.lots : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px]">{r.command === 'ENTRY' ? num(r.entry) : (r.price != null ? <span className="text-slate-400">{num(r.price)}</span> : '—')}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px] text-rose-600">{r.command === 'ENTRY' ? num(r.stopLoss) : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[11px] text-emerald-600">{r.command === 'ENTRY' ? <>{num(r.takeProfit1)} / {num(r.takeProfit2)} / {num(r.takeProfit3)}</> : '—'}</td>
+                      <td className="px-3 py-2 text-right font-mono text-[12px]">{r.command === 'ENTRY' ? px(r.entry, r.symbol) : (r.price != null ? <span className="text-slate-400">{px(r.price, r.symbol)}</span> : '—')}</td>
+                      <td className="px-3 py-2 text-right font-mono text-[12px] text-rose-600">{r.command === 'ENTRY' ? px(r.stopLoss, r.symbol) : '—'}</td>
+                      <td className="px-3 py-2 text-right font-mono text-[11px] text-emerald-600">{r.command === 'ENTRY' ? <>{px(r.takeProfit1, r.symbol)} / {px(r.takeProfit2, r.symbol)} / {px(r.takeProfit3, r.symbol)}</> : '—'}</td>
                       <td className="px-3 py-2 text-right font-mono">{r.command === 'ENTRY' && r.riskReward != null ? `1:${num(r.riskReward, 1)}` : '—'}</td>
                       <td className="px-3 py-2 text-[11px] text-slate-500 min-w-[220px] max-w-[360px] whitespace-normal break-words leading-snug align-top" title={r.reason || ''}>{r.command === 'ENTRY' ? r.reason : ''}</td>
                     </tr>
@@ -508,7 +516,7 @@ export default function StrategyLab() {
                       <td className="px-3 py-2">{/BUY/.test(s.direction) ? <span className="text-emerald-600 font-bold text-[12px]">BUY</span> : <span className="text-rose-600 font-bold text-[12px]">SELL</span>}</td>
                       <td className="px-3 py-2 text-right">{scoreBadge(s.score, s.grade)}</td>
                       <td className="px-3 py-2 text-right font-mono text-[12px] font-black text-slate-900" title={s.lossAtStop != null ? `max loss $${s.lossAtStop} · ${s.stopPips ?? '?'} pip stop` : ''}>{s.lots != null ? s.lots : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[11px] text-slate-500">{num(s.entryPrice)} / <span className="text-rose-500">{num(s.stopLoss)}</span> / <span className="text-emerald-600">{num(s.takeProfit1)} · {num(s.takeProfit2)} · {num(s.takeProfit3)}</span></td>
+                      <td className="px-3 py-2 text-right font-mono text-[11px] text-slate-500">{px(s.entryPrice, s.symbol)} / <span className="text-rose-500">{px(s.stopLoss, s.symbol)}</span> / <span className="text-emerald-600">{px(s.takeProfit1, s.symbol)} · {px(s.takeProfit2, s.symbol)} · {px(s.takeProfit3, s.symbol)}</span></td>
                       <td className="px-3 py-2 text-right font-mono">{s.riskReward === null ? '—' : `1:${num(s.riskReward, 1)}`}</td>
                       <td className="px-3 py-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
                       <td className="px-3 py-2 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>

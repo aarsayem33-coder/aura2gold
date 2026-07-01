@@ -10,7 +10,10 @@ import type {
 } from '../types';
 
 const REFRESH_MS = 60000;
-type Metric = 'forex' | 'ftt';
+type Metric = 'forex' | 'ftt' | 'at';
+const metricLabel = (m: Metric) => (m === 'ftt' ? 'fixed-time' : m === 'at' ? 'as-traded' : 'forex');
+// Empty bucket so ranking/render never crashes on rows missing an as-traded bucket (older data).
+const EMPTY_AT: StrategyAtBucket = { wins: 0, losses: 0, draws: 0, winLossSettled: 0, winRate: null, expectancyPips: null, confidence: 'weak' };
 type RangeKey = 'today' | 'yesterday' | 'last7' | 'd30' | 'd60' | 'd90' | 'd180' | 'custom';
 const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: 'today', label: 'Today' },
@@ -34,8 +37,9 @@ const confClass: Record<string, string> = {
   early: 'bg-amber-100 text-amber-700', weak: 'bg-slate-100 text-slate-500',
 };
 
-type AnyBucketRow = { forex: StrategyForexBucket; fixedTime: StrategyFtBucket };
-const pick = (row: AnyBucketRow, m: Metric): StrategyForexBucket | StrategyFtBucket => (m === 'ftt' ? row.fixedTime : row.forex);
+type AnyBucketRow = { forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket };
+const pick = (row: AnyBucketRow, m: Metric): StrategyForexBucket | StrategyFtBucket | StrategyAtBucket =>
+  (m === 'ftt' ? row.fixedTime : m === 'at' ? (row.asTraded ?? EMPTY_AT) : row.forex);
 
 function rankByMetric<T extends AnyBucketRow>(rows: T[], m: Metric, minSample: number): T[] {
   return [...rows].sort((a, b) => {
@@ -86,7 +90,7 @@ function WinCell({ b, minSample, bar = true }: { b: StrategyForexBucket | Strate
 // A compact "top pick" summary card.
 function PickCard({ icon, label, title, subtitle, b, minSample }: {
   icon: React.ReactNode; label: string; title: string; subtitle?: string | null;
-  b: (StrategyForexBucket | StrategyFtBucket) | null; minSample: number;
+  b: (StrategyForexBucket | StrategyFtBucket | StrategyAtBucket) | null; minSample: number;
 }) {
   const wr = b?.winRate ?? null;
   const settled = b?.winLossSettled ?? 0;
@@ -161,8 +165,8 @@ export default function StrategyLabReports() {
   const [range, setRange] = useState<RangeKey>('last7');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
-  const [tab, setTab] = useState<'forex' | 'ftt' | 'confluence'>('forex');
-  const metric: Metric = tab === 'ftt' ? 'ftt' : 'forex';
+  const [tab, setTab] = useState<'forex' | 'ftt' | 'at' | 'confluence'>('forex');
+  const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -250,6 +254,7 @@ export default function StrategyLabReports() {
     <div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-0.5">
       <button type="button" onClick={() => setTab('forex')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Forex</button>
       <button type="button" onClick={() => setTab('ftt')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Fixed-Time</button>
+      <button type="button" onClick={() => setTab('at')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'at' ? 'bg-teal-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`} title="As-traded: realistic result — entered at the live price when the signal fired, expiry at +duration.">As-traded</button>
       <button type="button" onClick={() => setTab('confluence')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'confluence' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}><Layers size={12} />Confluence</button>
     </div>
   );
@@ -303,19 +308,19 @@ export default function StrategyLabReports() {
       {/* TOP PICKS — best in each dimension, by the chosen metric */}
       <SectionLabel>Overview · best in each dimension</SectionLabel>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <PickCard icon={<Award size={12} />} label={`Best strategy · ${metric === 'ftt' ? 'fixed-time' : 'forex'}`} title={bestStrategy?.name || '—'} subtitle={`${bestStrategy?.total ?? 0} signals`} b={bestStrategy ? pick(bestStrategy, metric) : null} minSample={minSample} />
+        <PickCard icon={<Award size={12} />} label={`Best strategy · ${metricLabel(metric)}`} title={bestStrategy?.name || '—'} subtitle={`${bestStrategy?.total ?? 0} signals`} b={bestStrategy ? pick(bestStrategy, metric) : null} minSample={minSample} />
         <PickCard icon={<Clock size={12} />} label="Best timeframe" title={bestTf?.timeframe || '—'} subtitle={`${bestTf?.total ?? 0} signals (all strategies)`} b={bestTf ? pick(bestTf, metric) : null} minSample={minSample} />
         <PickCard icon={<Coins size={12} />} label="Best symbol" title={bestSymbol?.symbol || '—'} subtitle={`${bestSymbol?.total ?? 0} signals (all strategies)`} b={bestSymbol ? pick(bestSymbol, metric) : null} minSample={minSample} />
         <PickCard icon={<Globe size={12} />} label="Best session (BD time)" title={bestSession?.sessionLabel || '—'} subtitle={bestSession?.bdRange || 'all strategies'} b={bestSession ? pick(bestSession, metric) : null} minSample={minSample} />
       </div>
 
       {/* STRATEGY LEADERBOARD */}
-      <SectionLabel>Leaderboards · ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate</SectionLabel>
+      <SectionLabel>Leaderboards · ranked by {metricLabel(metric)} win rate</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
         <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
           <Trophy size={16} className="text-amber-500" />
           <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Strategy leaderboard · {perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label}</h3>
-          <span className="ml-1 text-[11px] font-semibold text-slate-400">ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate · trusted once ≥ {minSample} scored · {totalSignals} signals total{query ? ` · filtered: “${query}”` : ''}</span>
+          <span className="ml-1 text-[11px] font-semibold text-slate-400">ranked by {metricLabel(metric)} win rate · trusted once ≥ {minSample} scored · {totalSignals} signals total{query ? ` · filtered: “${query}”` : ''}</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[820px] text-left text-sm">
@@ -380,7 +385,7 @@ export default function StrategyLabReports() {
       </div>
 
       {/* SESSION-WISE TOP PERFORMERS — per session: top strategies / symbols / timeframes */}
-      <SectionLabel>Session-wise top performers · {metric === 'ftt' ? 'fixed-time' : 'forex'}</SectionLabel>
+      <SectionLabel>Session-wise top performers · {metricLabel(metric)}</SectionLabel>
       <SessionBreakdownSection data={sessionBreakdown} metric={metric} minSample={minSample} query={query} loading={loading} />
 
       {/* BEST COMBOS — strategy × symbol × timeframe */}
@@ -389,7 +394,7 @@ export default function StrategyLabReports() {
         <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
           <Target size={16} className="text-violet-500" />
           <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Best combos · strategy × symbol × timeframe</h3>
-          <span className="ml-1 text-[11px] font-semibold text-slate-400">the sharpest edges, ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win rate</span>
+          <span className="ml-1 text-[11px] font-semibold text-slate-400">the sharpest edges, ranked by {metricLabel(metric)} win rate</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[860px] text-left text-sm">
@@ -402,6 +407,7 @@ export default function StrategyLabReports() {
                 <th className="px-4 py-2 text-right">Forex win%</th>
                 <th className="px-4 py-2 text-right">Exp</th>
                 <th className="px-4 py-2 text-right">Fixed-time win%</th>
+                <th className="px-4 py-2 text-right">As-traded win%</th>
                 <th className="px-4 py-2 text-right">Signals</th>
               </tr>
             </thead>
@@ -415,10 +421,11 @@ export default function StrategyLabReports() {
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.forex} minSample={minSample} bar={false} /></div></td>
                   <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(c.forex)}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.fixedTime} minSample={minSample} bar={false} /></div></td>
+                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.asTraded} minSample={minSample} bar={false} /></div></td>
                   <td className="px-4 py-2 text-right font-mono font-bold">{c.total}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No combos match “${query}”.` : 'No combos settled yet.'}</td></tr>
+                <tr><td colSpan={9} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No combos match “${query}”.` : 'No combos settled yet.'}</td></tr>
               )}
             </tbody>
           </table>
@@ -674,7 +681,7 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
       <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3">
         {icon}
         <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">{title}</h3>
-        <span className="ml-1 text-[11px] font-semibold text-slate-400">{sub} · by {metric === 'ftt' ? 'fixed-time' : 'forex'} win%</span>
+        <span className="ml-1 text-[11px] font-semibold text-slate-400">{sub} · by {metricLabel(metric)} win%</span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
@@ -682,8 +689,9 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
             <tr>
               <th className="px-4 py-2 w-8">#</th>
               <th className="px-4 py-2">{colLabel}</th>
-              <th className="px-4 py-2 text-right">Forex</th>
-              <th className="px-4 py-2 text-right">Fixed-time</th>
+              <th className={`px-4 py-2 text-right ${metric === 'forex' ? 'text-slate-800' : ''}`}>Forex</th>
+              <th className={`px-4 py-2 text-right ${metric === 'ftt' ? 'text-violet-600' : ''}`}>Fixed-time</th>
+              <th className={`px-4 py-2 text-right ${metric === 'at' ? 'text-teal-600' : ''}`}>As-traded</th>
               <th className="px-4 py-2 text-right">Signals</th>
             </tr>
           </thead>
@@ -694,10 +702,11 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
                 <td className="px-4 py-2 font-black text-slate-800">{render(r)}</td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2 text-right font-mono font-bold">{r.total}</td>
               </tr>
             )) : (
-              <tr><td colSpan={5} className="px-4 py-8 text-center text-sm font-medium text-slate-400">No data yet.</td></tr>
+              <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">No data yet.</td></tr>
             )}
           </tbody>
         </table>
@@ -724,6 +733,7 @@ function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loadi
               <th className="px-4 py-2 text-right">Forex win%</th>
               <th className="px-4 py-2 text-right">Exp</th>
               <th className="px-4 py-2 text-right">Fixed-time</th>
+              <th className="px-4 py-2 text-right">As-traded</th>
               <th className="px-4 py-2 text-right">Signals</th>
             </tr>
           </thead>
@@ -734,10 +744,11 @@ function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loadi
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(r.forex)}</td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2 text-right font-mono font-bold">{r.total}</td>
               </tr>
             )) : (
-              <tr><td colSpan={5} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No settled signals for this strategy yet.'}</td></tr>
+              <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No settled signals for this strategy yet.'}</td></tr>
             )}
           </tbody>
         </table>
@@ -765,6 +776,7 @@ function MiniRank<T extends AnyBucketRow & { total: number }>({ title, icon, row
               <th className="px-3 py-2">{title.replace('Top ', '')}</th>
               <th className={`px-3 py-2 text-right ${metric === 'forex' ? 'text-slate-700' : ''}`}>Forex</th>
               <th className={`px-3 py-2 text-right ${metric === 'ftt' ? 'text-violet-600' : ''}`}>Fixed-time</th>
+              <th className={`px-3 py-2 text-right ${metric === 'at' ? 'text-teal-600' : ''}`}>As-traded</th>
               <th className="px-3 py-2 text-right">Sig</th>
             </tr>
           </thead>
@@ -775,10 +787,11 @@ function MiniRank<T extends AnyBucketRow & { total: number }>({ title, icon, row
                 <td className="px-3 py-2 font-bold text-slate-800">{render(r)}</td>
                 <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
+                <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
                 <td className="px-3 py-2 text-right font-mono font-bold">{r.total}</td>
               </tr>
             )) : (
-              <tr><td colSpan={5} className="px-3 py-6 text-center text-[12px] font-medium text-slate-400">{empty}</td></tr>
+              <tr><td colSpan={6} className="px-3 py-6 text-center text-[12px] font-medium text-slate-400">{empty}</td></tr>
             )}
           </tbody>
         </table>
@@ -819,7 +832,7 @@ function SessionBreakdownSection({ data, metric, minSample, query, loading }: {
             </button>
           );
         })}
-        <span className="ml-auto text-[11px] font-semibold text-slate-400">{active.bdRange} · ranked by {metric === 'ftt' ? 'fixed-time' : 'forex'} win%</span>
+        <span className="ml-auto text-[11px] font-semibold text-slate-400">{active.bdRange} · ranked by {metricLabel(metric)} win%</span>
       </div>
       <div className="grid grid-cols-1 gap-0 lg:grid-cols-3 lg:divide-x lg:divide-slate-100">
         <MiniRank<StrategySessionStrategyRow> title="Top strategies" icon={<Award size={13} className="text-amber-500" />} rows={strategyRows}
