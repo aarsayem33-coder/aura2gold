@@ -635,22 +635,23 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     let data = [...byBar.values()].map((x) => x.candle).sort((a, b) => Number(a.time) - Number(b.time));
     if (data.length === 0) return;
 
-    // Repair invalid OHLC bounds from the feed (e.g. close < low, which renders as a full-height
-    // spike): high must cover open/close, low must sit under them.
-    for (const d of data) {
-      d.high = Math.max(d.high, d.open, d.close);
-      d.low = Math.min(d.low, d.open, d.close);
-    }
-    // Drop gross outlier candles (feed glitches whose price is wildly off the dataset median) —
-    // one such bar drags the price-scale autoscale toward 0 and squashes every real candle. A 4×
-    // band never touches genuine volatility, so only true garbage is removed.
-    if (data.length >= 5) {
-      const closes = data.map((d) => d.close).sort((a, b) => a - b);
-      const med = closes[Math.floor(closes.length / 2)];
-      if (med > 0) {
-        const lo = med / 4, hi = med * 4;
-        data = data.filter((d) => d.low >= lo && d.high <= hi);
-      }
+    // Drop internally-inconsistent bars (open/close outside [low,high]) — corrupt feed data that
+    // otherwise renders as a full-height spike. (Dropped, not clamped: clamping would turn it into
+    // a giant fake candle that blows the vertical scale and squashes real candles when centered.)
+    data = data.filter((d) => d.low <= d.open && d.open <= d.high && d.low <= d.close && d.close <= d.high && d.high >= d.low);
+    // Drop isolated glitch spikes: a bar whose price sits far outside the LOCAL median of nearby
+    // bars (a lone candle jumping ~6%+ away from its neighbours and back — a stale/feed error). A
+    // local window tracks genuine trends, so trending bars are always kept; only isolated outliers
+    // are removed. Safety-capped (must keep ≥85%) so a real regime shift can never blank the chart.
+    if (data.length >= 7) {
+      const closes = data.map((d) => d.close);
+      const W = 7;
+      const kept = data.filter((d, i) => {
+        const win = closes.slice(Math.max(0, i - W), Math.min(closes.length, i + W + 1)).slice().sort((a, b) => a - b);
+        const med = win[Math.floor(win.length / 2)];
+        return !(med > 0) || (d.low >= med * 0.94 && d.high <= med * 1.06);
+      });
+      if (kept.length >= Math.floor(data.length * 0.85)) data = kept;
     }
     if (data.length === 0) return;
 
