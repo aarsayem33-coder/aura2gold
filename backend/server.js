@@ -6553,7 +6553,7 @@ function collapseCandlesToBars(candles, timeframe) {
   return [...byBar.entries()].sort((a, b) => a[0] - b[0]).map(([, c]) => c);
 }
 
-function evaluateForexReplay(report, candles, { horizonHours = 72 } = {}) {
+function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill = false } = {}) {
   const signalMs = Date.parse(report.signalTime || '');
   if (!Number.isFinite(signalMs)) return { outcome: 'PENDING', valid: false };
 
@@ -6583,6 +6583,27 @@ function evaluateForexReplay(report, candles, { horizonHours = 72 } = {}) {
     return { outcome: 'EXPIRED', valid: true, exitPrice: null, resolvedAt: null, barsToResolution: 0, tpHitLevel: 0, mfePips: 0, maePips: 0 };
   }
 
+  // FILL-GATED replay (limit-order strategies, e.g. special-forex-sniper): the signal's entry
+  // is a LIMIT the market must trade to. No fill within the horizon → EXPIRED (no trade
+  // happened — excluded from the win rate, never a phantom win). Filled → replay TP/SL from
+  // the fill bar onward; on the fill bar itself TPs count only off the CLOSE (the bar's
+  // extreme may predate the fill), while the SL still counts off the wick — conservative:
+  // may understate wins, can never overstate them.
+  let startIdx = 0;
+  let fillBarIdx = -1;
+  if (requiresFill) {
+    for (let i = 0; i < laterCandles.length; i++) {
+      const lo = Number(laterCandles[i].low);
+      const hi = Number(laterCandles[i].high);
+      if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
+      if (isBuy ? lo <= entry : hi >= entry) { fillBarIdx = i; break; }
+    }
+    if (fillBarIdx === -1) {
+      return { outcome: 'EXPIRED', valid: true, exitPrice: null, resolvedAt: null, barsToResolution: laterCandles.length, tpHitLevel: 0, mfePips: 0, maePips: 0 };
+    }
+    startIdx = fillBarIdx;
+  }
+
   const pip = pipSizeForSymbol(report.symbol);
   let bestRank = forexOutcomeRank(report.outcome);
   let outcome = forexOutcomeLabel(bestRank);
@@ -6593,20 +6614,26 @@ function evaluateForexReplay(report, candles, { horizonHours = 72 } = {}) {
   let maePips = 0;
   let tpHitLevel = bestRank;
 
-  for (const candle of laterCandles) {
+  for (let ci = startIdx; ci < laterCandles.length; ci++) {
+    const candle = laterCandles[ci];
+    const isFillBar = requiresFill && ci === fillBarIdx;
     barsToResolution += 1;
     const low = Number(candle.low);
     const high = Number(candle.high);
     if (!Number.isFinite(low) || !Number.isFinite(high)) continue;
+    const close = Number(candle.close);
+    // On the fill bar the favorable extreme may predate the fill — use the close instead.
+    const favHigh = isFillBar && Number.isFinite(close) ? close : high;
+    const favLow = isFillBar && Number.isFinite(close) ? close : low;
 
-    const favorable = isBuy ? (high - entry) / pip : (entry - low) / pip;
+    const favorable = isBuy ? (favHigh - entry) / pip : (entry - favLow) / pip;
     const adverse = isBuy ? (low - entry) / pip : (entry - high) / pip;
     mfePips = Math.max(mfePips, Math.round(favorable * 10) / 10);
     maePips = Math.min(maePips, Math.round(adverse * 10) / 10);
 
-    const hitTp1 = validTp(tp1) ? (isBuy ? high >= tp1 : low <= tp1) : false;
-    const hitTp2 = validTp(tp2) ? (isBuy ? high >= tp2 : low <= tp2) : false;
-    const hitTp3 = validTp(tp3) ? (isBuy ? high >= tp3 : low <= tp3) : false;
+    const hitTp1 = validTp(tp1) ? (isBuy ? favHigh >= tp1 : favLow <= tp1) : false;
+    const hitTp2 = validTp(tp2) ? (isBuy ? favHigh >= tp2 : favLow <= tp2) : false;
+    const hitTp3 = validTp(tp3) ? (isBuy ? favHigh >= tp3 : favLow <= tp3) : false;
     const hitAnyTarget = hitTp3 || hitTp2 || hitTp1;
     const hitLevel = hitTp3 ? 3 : hitTp2 ? 2 : hitTp1 ? 1 : 0;
     const hitSl = isBuy ? low <= sl : high >= sl;
@@ -11702,7 +11729,10 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
   // so the de-spam state isn't polluted (a later fresh re-detection still alerts as NEW).
   const barMs = Date.parse(sig.barIso || '') || Date.now();
   const tfMsNotify = Math.max(1, timeframeMinutes(tf)) * 60000;
-  if (Date.now() - (barMs + tfMsNotify) >= STRATEGY_LAB_STALE_SETUP_BARS * tfMsNotify) {
+  // PRE-ENTRY alerts (meta.preEntryAlert, e.g. special-forex-sniper) are exempt: their anchor
+  // bar is intentionally a few bars old — the setup waits for the pullback, and the engine's
+  // own 6–15-pip gap gate already guarantees the alert is price-fresh when it fires.
+  if (!sig?.meta?.preEntryAlert && Date.now() - (barMs + tfMsNotify) >= STRATEGY_LAB_STALE_SETUP_BARS * tfMsNotify) {
     return { popupSent: false, emailSent: false, kind: null, staleSetup: true };
   }
   const kind = strategyNotifyDecide(strategy, symbol, tf, sig);
@@ -11985,7 +12015,9 @@ async function processStrategyLabOutcomes() {
             payload: { takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3 },
             outcome: row.outcome, exitPrice: row.exit_price, resolvedAt: row.resolved_at,
           };
-          const replay = evaluateForexReplay(report, candles);
+          // special-forex-sniper logs LIMIT entries — resolve fill-gated so an unfilled
+          // limit can never produce a phantom win (see evaluateForexReplay).
+          const replay = evaluateForexReplay(report, candles, { requiresFill: String(row.strategy) === 'special-forex-sniper' });
           if (replay.valid && !['PENDING', 'EXPIRED'].includes(replay.outcome)) {
             if (replay.outcome === 'AMBIGUOUS') {
               await pool.execute("UPDATE mt5_strategy_signals SET outcome='AMBIGUOUS', resolved_at=? WHERE id=?", [toMysqlDate(replay.resolvedAt || new Date()), row.id]);

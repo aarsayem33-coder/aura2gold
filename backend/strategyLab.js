@@ -2150,7 +2150,184 @@ function xauSessionRaid(ctx) {
   };
 }
 
+// ─── Special Forex Sniper — composite institutional PRE-ENTRY engine ─────────
+// Forex-only. Hunts the highest-quality confluence of the lab's proven ingredients
+// (obvious-level sweep/reclaim OR breaker, displacement FVG, structure, premium/
+// discount, session, dual-HTF, second drive) and — the special part — ALERTS BEFORE
+// THE ENTRY: it fires while price is still ~6–15 pips (ideal 10–12) on the approach
+// side of the sniper limit, with momentum drifting toward it, so the trade can be
+// taken within ~5 minutes. Never chases: price ran past the entry = no signal.
+//
+// HONESTY: signals carry meta.requiresFill — the outcome resolver replays them as a
+// LIMIT order (no fill → EXPIRED, excluded from the win rate; fill → TP/SL replay
+// from the fill bar with conservative fill-bar handling). The win rate you see is
+// the win rate of trades you could actually have taken at the stated entry/RR.
+//
+// M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong
+// displacement, RR ≥2.5, London/NY, no HTF conflict, tight fast gap).
+function specialForexSniper(ctx) {
+  const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minScore = config.minScore ?? 75;
+  const minRR = config.minRR ?? 2.0;
+  const minPre = config.minPreEntryPips ?? 6;
+  const idealPre = config.idealPreEntryPips ?? 12;
+  const maxPre = config.maxPreEntryPips ?? 15;
+  const enterNowPips = config.enterNowPips ?? 3;
+  const minTargetPips = config.minTargetPips ?? 20;   // pips-VALUE floor: 2R on a tiny target is not profit
+  const maxChaseAtr = config.maxChaseAtr ?? 1.2;
+  const maxAgeBars = config.maxAgeBars ?? 5;
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const lastIdx = candles.length - 1;
+  const price = n(candles[lastIdx].close);
+  const tfU = String(timeframe).toUpperCase();
+
+  // Session quality (UTC): London 07–16 / NY 12–21, overlap 12–16 weighted highest.
+  const hour = new Date(candles[lastIdx].time).getUTCHours();
+  const inLondon = hour >= 7 && hour < 16;
+  const inNy = hour >= 12 && hour < 21;
+  const inOverlap = hour >= 12 && hour < 16;
+  const sessionScore = inOverlap ? 10 : (inLondon || inNy) ? 7 : 3;
+
+  // 1) Institutional trigger — an OBVIOUS-level sweep+reclaim (retail stops taken,
+  //    trap sprung) preferred; a fresh displaced breaker as the alternative.
+  const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 40 });
+  let keyLevels = [];
+  try { keyLevels = detectKeyLiquidityLevels(candles, { symbol }).levels || []; } catch { keyLevels = []; }
+  const raidLevel = sweep
+    ? keyLevels.filter((l) => l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= 0.35 * atr).sort((a, b) => b.strength - a.strength)[0] || null
+    : null;
+  const breaker = detectBreaker(candles, { maxAgeBars: 50 });
+  const freshBreaker = breaker && breaker.ageBars <= maxAgeBars && breaker.displacement?.present ? breaker : null;
+
+  let dir, trigger, levelStrength, triggerIso, disp, rawStop;
+  if (sweep && raidLevel && lastIdx - sweep.reclaimIdx <= maxAgeBars) {
+    dir = sweep.dir; trigger = 'sweep'; levelStrength = raidLevel.strength; triggerIso = sweep.reclaimIso;
+    disp = detectDisplacement(candles, sweep.reclaimIdx, dir, atr, { minAtr: config.dispMinAtr ?? 0.8 });
+    rawStop = sweep.extreme;
+  } else if (freshBreaker) {
+    dir = freshBreaker.type; trigger = 'breaker'; levelStrength = 3; triggerIso = freshBreaker.confirmedIso;
+    disp = freshBreaker.displacement;
+    rawStop = freshBreaker.stop;
+  } else return null;
+  if (!disp || !disp.present) return null;                       // displacement = institutional sponsorship, mandatory
+  const decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
+  if (h4Trend === 'BULLISH' && decision === 'SELL') return null; // never fight a clear H4
+  if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
+
+  // 2) Sniper entry = the 50% of the displacement FVG (limit fill, tight stop).
+  const gapLow = Math.min(disp.gapLow, disp.gapHigh);
+  const gapHigh = Math.max(disp.gapLow, disp.gapHigh);
+  const entry = (gapLow + gapHigh) / 2;
+  const stop = dir === 'BULLISH' ? Math.min(rawStop, gapLow) - 0.2 * atr : Math.max(rawStop, gapHigh) + 0.2 * atr;
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, { minStopAtr: config.minStopAtr ?? 0.35, minStopPips: config.minStopPips ?? 5 })) return null;
+
+  // 3) TP3 structural priority: opposing fresh liquidity → session H/L → PDH/PDL →
+  //    equal highs/lows → 3R fallback. Mid-range with no logical draw = handled by RR floor.
+  const pools = detectLiquidityPools(candles);
+  const opposing = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
+  const sideWanted = dir === 'BULLISH' ? 'above' : 'below';
+  const validTarget = (p) => Number.isFinite(p) && (dir === 'BULLISH' ? p > entry : p < entry);
+  const pickLevel = (match) => {
+    const c = keyLevels.filter((l) => l.side === sideWanted && l.fresh && match(l.type) && validTarget(l.price)).sort((a, b) => a.distance - b.distance)[0];
+    return c ? c.price : null;
+  };
+  let target = opposing && validTarget(opposing.price) ? opposing.price : null;
+  let targetType = target != null ? `${opposing.type}${opposing.equal ? ' (equal)' : ''}` : null;
+  if (target == null) { target = pickLevel((t) => /^(ASIAN|LONDON|NY)_/.test(t)); if (target != null) targetType = 'session level'; }
+  if (target == null) { target = pickLevel((t) => /^PD[HL]$/.test(t)); if (target != null) targetType = 'prev-day level'; }
+  if (target == null) { target = pickLevel((t) => /EQUAL/.test(t)); if (target != null) targetType = 'equal highs/lows'; }
+  if (target == null) { target = dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk; targetType = '3R'; }
+  const reward = Math.abs(target - entry);
+  const rr = Math.round((reward / risk) * 100) / 100;
+  if (rr < minRR) return null;                                   // RR floor
+  if (reward / pip < minTargetPips) return null;                 // pips-value floor
+
+  // 4) PRE-ENTRY timing gate — the special behavior. Alert while price is still on the
+  //    approach side, minPre–maxPre pips from the limit, drifting toward it (the "fillable
+  //    within ~5 minutes" proxy). Price ran past the entry = the snipe is gone, skip.
+  const gapPips = Math.abs(price - entry) / pip;
+  const approaching = dir === 'BULLISH' ? price > entry : price < entry;
+  let timingQuality, entryMode;
+  if (approaching) {
+    if (gapPips < minPre || gapPips > maxPre) return null;
+    if (Math.abs(price - entry) > maxChaseAtr * atr) return null;
+    const back = n(candles[Math.max(0, lastIdx - 3)].close);
+    const toward = dir === 'BULLISH' ? price < back : price > back; // last ~3 bars drifting into the level
+    if (!toward) return null;
+    timingQuality = Math.max(2, 10 - Math.round(Math.abs(gapPips - idealPre) / 2)); // 10 at the ideal 10–12p band
+    entryMode = `pre-entry ${Math.round(gapPips)}p out`;
+  } else {
+    if (gapPips > enterNowPips) return null;                     // beyond the entry = chased, gone
+    timingQuality = 8;
+    entryMode = 'enter-now zone';
+  }
+
+  // 5) Structure, location, second drive.
+  const { highs, lows } = fractalSwings(candles);
+  const upSwings = Math.min(risingTail(highs), risingTail(lows));
+  const downSwings = Math.min(fallingTail(highs), fallingTail(lows));
+  const structureOk = decision === 'BUY' ? upSwings >= 2 : downSwings >= 2;
+  const range = smcDealingRange(candles);
+  const pdOk = !!range && (decision === 'BUY' ? entry <= range.eq : entry >= range.eq);
+  const secondDrive = !!detectSecondDrive(candles, dir).isSecondDrive;
+  const htf4 = (decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH');
+  const htf1 = (decision === 'BUY' && h1Trend === 'BULLISH') || (decision === 'SELL' && h1Trend === 'BEARISH');
+
+  // 6) Deterministic 100-point budget: 20 liquidity · 15 displacement · 15 HTF ·
+  //    10 location · 10 session · 10 RR · 10 structure · 10 timing (+3 second drive).
+  let score = 0;
+  score += trigger === 'sweep' ? (levelStrength >= 5 ? 20 : levelStrength === 4 ? 17 : 14) : 14;
+  score += Math.min(15, Math.round((disp.atrMultiple ?? 1) * 10));
+  score += (htf4 ? 10 : 0) + (htf1 ? 5 : 0);
+  score += (pdOk ? 5 : 0) + (trigger === 'sweep' ? 5 : 3);
+  score += sessionScore;
+  score += Math.min(10, 4 + Math.round((rr - minRR) * 4));
+  score += structureOk ? 10 : 4;
+  score += timingQuality;
+  if (secondDrive) score += 3;
+  score = Math.max(40, Math.min(97, Math.round(score)));
+  if (score < minScore) return null;                             // elite-only: below 75 stays silent
+
+  // 7) M1 hard gate — exceptional setups only, otherwise M1 is ignored entirely.
+  if (tfU === 'M1') {
+    const exceptional = score >= (config.m1ExceptionalScore ?? 90)
+      && (disp.atrMultiple ?? 0) >= 1.2
+      && rr >= (config.m1MinRR ?? 2.5)
+      && (inLondon || inNy)
+      && gapPips <= idealPre;
+    if (!exceptional) return null;
+  }
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+    reason: `Sniper ${decision}: ${trigger === 'sweep' ? `swept ${raidLevel.label || raidLevel.type} ${r5(sweep.sweepLevel)} (str ${levelStrength}/5)` : `${dir.toLowerCase()} breaker reclaim`} + displacement ${disp.atrMultiple}× → LIMIT ${r5(entry)} (${entryMode}); stop ${r5(stop)}; draw ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''}${secondDrive ? ' · 2nd drive' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`,
+    barIso: triggerIso,                                          // dedup: ONE signal per raid/breaker
+    meta: {
+      v: 1, trigger, requiresFill: true, preEntryAlert: true,
+      limitEntry: r5(entry), preEntryPips: Math.round(gapPips * 10) / 10, entryMode,
+      raidedLevel: raidLevel ? { type: raidLevel.type, label: raidLevel.label, strength: raidLevel.strength } : null,
+      dispAtr: disp.atrMultiple, targetType, rrToTarget: rr,
+      session: inOverlap ? 'OVERLAP' : inLondon ? 'LONDON' : inNy ? 'NY' : 'OFF',
+      htf4, htf1, secondDrive, structure: decision === 'BUY' ? `${upSwings}-swing up` : `${downSwings}-swing down`,
+    },
+  };
+}
+
 export const STRATEGIES = {
+  'special-forex-sniper': {
+    id: 'special-forex-sniper',
+    name: 'Special Forex Sniper',
+    source: 'Composite institutional forex engine — liquidity, structure, displacement, RR, and PRE-ENTRY timing (alerts 10–12 pips before the entry)',
+    description: 'FOREX-ONLY sniper that alerts BEFORE the entry: it fires while price is still ~6–15 pips (ideal 10–12) on the approach side of the planned limit with momentum drifting toward it — so the trade can be taken within ~5 minutes; price that has run past the entry is never chased. Setup = an OBVIOUS-level liquidity sweep + reclaim (PDH/PDL, session highs/lows, round numbers, equal highs/lows, strength ≥3) or a fresh displaced breaker, confirmed by a displacement FVG (entry = its 50%), stop beyond the raid wick, structure (HH/HL·LH/LL), premium/discount location, second-drive preference and dual-HTF agreement (never fights a clear H4). Profit discipline: minimum 2R to a STRUCTURAL TP3 (opposing fresh liquidity → session H/L → prev-day H/L → equal extremes → 3R) AND a minimum 20-pip target — RR alone is not profit. Scored on a 100-point institutional checklist; below 75 stays silent. M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong displacement, RR ≥2.5, London/NY, tight fast gap). HONEST MEASUREMENT: signals are resolved as LIMIT orders — if price never fills the entry the signal EXPIRES and is excluded from the win rate, so the recorded performance is only of trades that could actually be taken.',
+    timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
+    config: { minScore: 75, minRR: 2.0, minPreEntryPips: 6, idealPreEntryPips: 12, maxPreEntryPips: 15, enterNowPips: 3, minTargetPips: 20, maxChaseAtr: 1.2, maxAgeBars: 5, minLevelStrength: 3, dispMinAtr: 0.8, minStopPips: 5, minStopAtr: 0.35, m1ExceptionalScore: 90, m1MinRR: 2.5, sweepLookback: 40 },
+    evaluate: specialForexSniper,
+  },
   'xau-session-raid': {
     id: 'xau-session-raid',
     name: 'Gold Desk — XAU Session Raid',
