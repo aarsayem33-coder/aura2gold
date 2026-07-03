@@ -417,7 +417,7 @@ export default function NotificationSettings() {
       </div>
 
       {/* Tab navigation */}
-      <div className="sticky top-0 z-20 -mx-1 overflow-x-auto bg-slate-50/95 px-1 py-1.5 backdrop-blur">
+      <div className="sticky top-0 z-20 -mx-1 overflow-x-auto bg-slate-50 px-1 py-1.5">
         <div className="flex w-max min-w-full gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
           {tabs.map((t) => (
             <button

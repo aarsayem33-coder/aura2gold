@@ -167,7 +167,9 @@ function TopbarMarketAlerts({ alerts }: { alerts: TopbarMarketAlert[] }) {
         {recentAlerts.length > 0 && <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-black text-white">{recentAlerts.length}</span>}
       </button>
       {(open || popupAlert) && displayAlert && (
-        <div className="absolute right-0 top-12 z-50 w-[360px] overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-900/15">
+        // Click-opened → dropdown anchored to the button (expected). AUTO-popup → docked to the
+        // bottom-right corner as a toast so a fresh alert never covers the tables being read.
+        <div className={`z-50 w-[360px] overflow-hidden rounded-2xl border border-amber-200 bg-white shadow-2xl shadow-slate-900/15 ${open ? 'absolute right-0 top-12' : 'fixed bottom-4 right-4 max-h-[72vh] overflow-y-auto'}`}>
           <div className="flex items-start justify-between gap-3 border-b border-amber-100 bg-gradient-to-r from-amber-50 to-white p-4">
             <div>
               <p className={`text-[10px] font-black uppercase tracking-[0.22em] ${displayAlert.alertKind === 'CLOSE' ? 'text-rose-600' : displayAlert.strategySource ? 'text-violet-600' : displayAlert.kind === 'BREAKOUT' ? (displayAlert.phase === 'PRE' ? 'text-amber-600' : 'text-emerald-600') : 'text-amber-600'}`}>{displayAlert.alertKind ? 'Trade management alert' : displayAlert.strategySource ? `Strategy Lab · ${displayAlert.strategySource}` : displayAlert.kind === 'BREAKOUT' ? (displayAlert.phase === 'PRE' ? 'Approaching breakout' : 'Breakout confirmed') : 'Live quality signal'}</p>
@@ -486,8 +488,11 @@ export default function Layout({ onLogout }: LayoutProps) {
         </header>
 
         {/* Page Content */}
-        <main className="flex-1 overflow-y-auto p-6 lg:p-10">
-          <div className={location.pathname === '/signals' ? 'flex min-h-full w-full max-w-none flex-col' : 'mx-auto max-w-7xl'}>
+        {/* Top padding lives on the INNER div, not the scroll container: a sticky child cannot
+            stick above a scroll container's own padding, which let content scroll through a
+            see-through strip above sticky toolbars. Visual spacing is identical. */}
+        <main className="flex-1 overflow-y-auto px-6 pb-6 lg:px-10 lg:pb-10">
+          <div className={location.pathname === '/signals' ? 'flex min-h-full w-full max-w-none flex-col pt-6 lg:pt-10' : 'mx-auto max-w-7xl pt-6 lg:pt-10'}>
             <Outlet />
           </div>
         </main>

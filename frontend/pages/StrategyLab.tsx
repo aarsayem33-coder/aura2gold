@@ -428,9 +428,11 @@ export default function StrategyLab() {
   );
 
   return (
-    <div className="space-y-3 p-1 pb-8">
-      {/* ── STICKY COMMAND BAR: tabs · filters · strategies · refresh — always reachable ── */}
-      <div className="sticky top-0 z-30 -mx-1 bg-slate-50/95 px-1 pb-1 pt-1 backdrop-blur">
+    <div className="space-y-3 pb-8">
+      {/* ── STICKY COMMAND BAR: tabs · filters · strategies · refresh — always reachable.
+           Negative margins consume <main>'s padding so the bar sits flush under the topbar
+           with a SOLID background: scrolling content can never peek through above it. ── */}
+      <div className="sticky top-0 z-30 -mx-6 bg-slate-50 px-6 pb-1.5 pt-1.5 shadow-[0_10px_14px_-14px_rgba(15,23,42,0.25)] lg:-mx-10 lg:px-10">
         <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-card">
           {/* Row 1 — identity, tabs, refresh */}
           <div className="flex flex-wrap items-center gap-2">
