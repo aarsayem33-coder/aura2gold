@@ -928,6 +928,13 @@ export interface StrategyLiveRow {
   lossAtStop?: number | null;
   riskPercent?: number | null;
   timing?: StrategyTiming;
+  // First-call enrichment from the DB (live evaluation = the CURRENT score; these are the
+  // original call time + frozen first score, for the signal-time / score-evolution display).
+  barIso?: string | null;
+  signalTime?: string | null;
+  firstScore?: number | null;
+  firstGrade?: string | null;
+  scoreUpdatedAt?: string | null;
 }
 export interface StrategyLiveResponse {
   ok: boolean; strategy: string; strategyName: string; timeframe: string; rows: StrategyLiveRow[]; generatedAt: string;
@@ -955,6 +962,12 @@ export interface StrategyFttLiveRow {
   tradeTimeLabel?: string | null;
   durationLabel?: string | null;
   reason?: string | null;
+  // First-call enrichment (see StrategyLiveRow).
+  barIso?: string | null;
+  signalTime?: string | null;
+  firstScore?: number | null;
+  firstGrade?: string | null;
+  scoreUpdatedAt?: string | null;
 }
 export interface StrategyFttLiveResponse {
   ok: boolean; strategy: string; strategyName: string; timeframe: string; expiryBars: number; rows: StrategyFttLiveRow[]; generatedAt: string;

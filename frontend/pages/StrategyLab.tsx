@@ -141,30 +141,35 @@ function scoreBadge(score: number | null | undefined, grade: string | null | und
 
 // Score EVOLUTION: the first-call score is the honest basis; when a later re-evaluation of the
 // same signal bar changed the quality, show first → latest with the drift direction coloured
-// (↗ improved, ↘ degraded). Unchanged signals render the plain badge.
-function ScoreEvolution({ s }: { s: StrategySignal }) {
-  const changed = s.latestScore != null && s.score != null && Math.round(s.latestScore) !== Math.round(s.score);
-  if (!changed) return scoreBadge(s.score, s.grade);
-  const up = (s.latestScore as number) > (s.score as number);
-  const updAt = s.scoreUpdatedAt ? new Date(s.scoreUpdatedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '—';
+// (↗ improved, ↘ degraded). Unchanged signals render the plain badge. Used by the recent
+// tables (first = frozen DB score, latest = latest_score) AND the live grids (first = DB
+// first-call score, latest = the live evaluation happening right now).
+function ScoreEvolution({ first, firstGrade, latest, latestGrade, updatedAt }: {
+  first: number | null | undefined; firstGrade?: string | null;
+  latest: number | null | undefined; latestGrade?: string | null; updatedAt?: string | null;
+}) {
+  const changed = first != null && latest != null && Math.round(first) !== Math.round(latest);
+  if (!changed) return scoreBadge(latest ?? first, latestGrade ?? firstGrade);
+  const up = (latest as number) > (first as number);
+  const updAt = updatedAt ? new Date(updatedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : 'now';
   return (
-    <span className="inline-flex items-center gap-0.5 whitespace-nowrap" title={`Called at ${Math.round(s.score as number)} (${s.grade || '—'}) → re-evaluated to ${Math.round(s.latestScore as number)} (${s.latestGrade || s.grade || '—'}) at ${updAt}`}>
-      <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-bold text-slate-400 line-through decoration-slate-400/70">{Math.round(s.score as number)}</span>
+    <span className="inline-flex items-center gap-0.5 whitespace-nowrap" title={`Called at ${Math.round(first as number)} (${firstGrade || '—'}) → re-evaluated to ${Math.round(latest as number)} (${latestGrade || firstGrade || '—'}) at ${updAt}`}>
+      <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-bold text-slate-400 line-through decoration-slate-400/70">{Math.round(first as number)}</span>
       <span className={`text-[11px] font-black ${up ? 'text-emerald-600' : 'text-rose-500'}`}>{up ? '↗' : '↘'}</span>
-      {scoreBadge(s.latestScore, s.latestGrade ?? s.grade)}
+      {scoreBadge(latest, latestGrade ?? firstGrade)}
     </span>
   );
 }
 
 // Signal-time cell: WHEN the signal was made, plus — only when the quality was re-evaluated
 // afterwards — when it was last updated. The freshness / quality-drift read at a glance.
-function SignalTimeCell({ s }: { s: StrategySignal }) {
+function SignalTimeCell({ signalTime, scoreUpdatedAt }: { signalTime?: string | null; scoreUpdatedAt?: string | null }) {
   return (
     <div className="whitespace-nowrap text-[11px] leading-tight">
-      <div className="text-slate-500" title="When the signal was first made">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</div>
-      {s.scoreUpdatedAt && (
-        <div className="font-bold text-amber-600" title={`Quality re-evaluated ${new Date(s.scoreUpdatedAt).toLocaleString()}`}>
-          ↻ upd {new Date(s.scoreUpdatedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
+      <div className="text-slate-500" title="When the signal was first made">{signalTime ? new Date(signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</div>
+      {scoreUpdatedAt && (
+        <div className="font-bold text-amber-600" title={`Quality re-evaluated ${new Date(scoreUpdatedAt).toLocaleString()}`}>
+          ↻ upd {new Date(scoreUpdatedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
         </div>
       )}
     </div>
@@ -555,6 +560,7 @@ export default function StrategyLab() {
                     <th className="px-3 py-1.5">Entry timing</th>
                     <th className="px-3 py-1.5">Symbol</th>
                     <th className="px-3 py-1.5 text-right">Score</th>
+                    <th className="px-3 py-1.5">Signal time</th>
                     <th className="px-3 py-1.5 text-right">Lots</th>
                     <th className="px-3 py-1.5 text-right">Entry / Stop</th>
                     <th className="px-3 py-1.5 text-right">TP1 / TP2 / TP3</th>
@@ -574,7 +580,8 @@ export default function StrategyLab() {
                         {multiStrategy && <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{r.strategyName || stratName(r.strategyId || '')}</td>}
                         <td className="px-3 py-1.5">{r.command === 'ENTRY' ? <TimingCell timing={r.timing} /> : <span className="text-slate-300">—</span>}</td>
                         <td className="px-3 py-1.5"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
-                        <td className="px-3 py-1.5 text-right">{r.command === 'ENTRY' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5 text-right">{r.command === 'ENTRY' ? <ScoreEvolution first={r.firstScore ?? r.score} firstGrade={r.firstGrade ?? r.grade} latest={r.score} latestGrade={r.grade} updatedAt={r.scoreUpdatedAt} /> : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5">{r.command === 'ENTRY' ? <SignalTimeCell signalTime={r.signalTime ?? r.barIso} scoreUpdatedAt={r.scoreUpdatedAt} /> : <span className="text-slate-300">—</span>}</td>
                         <td className="px-3 py-1.5 text-right font-mono text-[12px] font-black text-slate-900" title={r.command === 'ENTRY' && r.lossAtStop != null ? `Risk ${r.riskPercent ?? '?'}% · max loss $${r.lossAtStop} · ${r.stopPips ?? '?'} pip stop` : ''}>{r.command === 'ENTRY' && r.lots != null ? r.lots : '—'}</td>
                         <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight">
                           {r.command === 'ENTRY'
@@ -589,7 +596,7 @@ export default function StrategyLab() {
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={multiStrategy ? 10 : 9} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No setups match the current score / setup filter.' : 'No live setups right now — the grid fills the moment a strategy fires.'}</td></tr>
+                    <tr><td colSpan={multiStrategy ? 11 : 10} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No setups match the current score / setup filter.' : 'No live setups right now — the grid fills the moment a strategy fires.'}</td></tr>
                   )}
                 </tbody>
               </table>
@@ -631,7 +638,7 @@ export default function StrategyLab() {
                         <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{stratName(s.strategy)}</td>
                         <td className="px-3 py-1.5"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
                         <td className="px-3 py-1.5">{/BUY/.test(s.direction) ? <span className="text-[12px] font-bold text-emerald-600">BUY</span> : <span className="text-[12px] font-bold text-rose-600">SELL</span>}</td>
-                        <td className="px-3 py-1.5 text-right"><ScoreEvolution s={s} /></td>
+                        <td className="px-3 py-1.5 text-right"><ScoreEvolution first={s.score} firstGrade={s.grade} latest={s.latestScore ?? s.score} latestGrade={s.latestGrade ?? s.grade} updatedAt={s.scoreUpdatedAt} /></td>
                         <td className="px-3 py-1.5 text-right font-mono text-[12px] font-black text-slate-900" title={s.lossAtStop != null ? `max loss $${s.lossAtStop} · ${s.stopPips ?? '?'} pip stop` : ''}>{s.lots != null ? s.lots : '—'}</td>
                         <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight">
                           <div>{px(s.entryPrice, s.symbol)}</div>
@@ -645,7 +652,7 @@ export default function StrategyLab() {
                         <td className="px-3 py-1.5"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
                         <td className="px-3 py-1.5 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
                         <td className="px-3 py-1.5"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span></td>
-                        <td className="px-3 py-1.5"><SignalTimeCell s={s} /></td>
+                        <td className="px-3 py-1.5"><SignalTimeCell signalTime={s.signalTime} scoreUpdatedAt={s.scoreUpdatedAt} /></td>
                         <td className="px-3 py-1.5"><TimingCell timing={s.timing} /></td>
                       </tr>
                     );
@@ -676,6 +683,7 @@ export default function StrategyLab() {
                     {multiStrategy && <th className="px-3 py-1.5">Strategy</th>}
                     <th className="px-3 py-1.5">Symbol</th>
                     <th className="px-3 py-1.5 text-right">Score</th>
+                    <th className="px-3 py-1.5">Signal time</th>
                     <th className="px-3 py-1.5 text-right">Reference</th>
                     <th className="px-3 py-1.5">Trade time</th>
                     <th className="px-3 py-1.5">Entry read (last 5 candles)</th>
@@ -693,7 +701,8 @@ export default function StrategyLab() {
                         <td className="px-3 py-1.5"><FttCommandPill row={r} /></td>
                         {multiStrategy && <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{r.strategyName || stratName(r.strategyId || '')}</td>}
                         <td className="px-3 py-1.5"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
-                        <td className="px-3 py-1.5 text-right">{r.command === 'CALL' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5 text-right">{r.command === 'CALL' ? <ScoreEvolution first={r.firstScore ?? r.score} firstGrade={r.firstGrade ?? r.grade} latest={r.score} latestGrade={r.grade} updatedAt={r.scoreUpdatedAt} /> : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5">{r.command === 'CALL' ? <SignalTimeCell signalTime={r.signalTime ?? r.barIso} scoreUpdatedAt={r.scoreUpdatedAt} /> : <span className="text-slate-300">—</span>}</td>
                         <td className="px-3 py-1.5 text-right font-mono text-[12px]">{r.reference != null ? num(r.reference) : '—'}</td>
                         <td className="px-3 py-1.5">{r.command === 'CALL' ? <ExpiryCountdown iso={r.expiryIso} tradeTime={r.tradeTimeLabel} /> : <span className="text-slate-300">—</span>}</td>
                         <td className="px-3 py-1.5">{r.command === 'CALL' ? <CandleReadCell read={r.candleRead} /> : <span className="text-slate-300">—</span>}</td>
@@ -701,7 +710,7 @@ export default function StrategyLab() {
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={multiStrategy ? 8 : 7} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No calls match the current score / setup filter.' : 'No live calls right now — the grid fills the moment a strategy fires.'}</td></tr>
+                    <tr><td colSpan={multiStrategy ? 9 : 8} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No calls match the current score / setup filter.' : 'No live calls right now — the grid fills the moment a strategy fires.'}</td></tr>
                   )}
                 </tbody>
               </table>
@@ -746,10 +755,10 @@ export default function StrategyLab() {
                             : <span className="inline-flex items-center gap-1 rounded-md bg-rose-600/10 px-1.5 py-0.5 text-[11px] font-black text-rose-700"><TrendingDown size={12} /> DOWN</span>}
                         </td>
                         <td className="px-3 py-1.5"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
-                        <td className="px-3 py-1.5 text-right"><ScoreEvolution s={s} /></td>
+                        <td className="px-3 py-1.5 text-right"><ScoreEvolution first={s.score} firstGrade={s.grade} latest={s.latestScore ?? s.score} latestGrade={s.latestGrade ?? s.grade} updatedAt={s.scoreUpdatedAt} /></td>
                         <td className="px-3 py-1.5"><FtResultCell s={s} /></td>
                         <td className="px-3 py-1.5"><SourceChips popupSent={s.popupSent} emailSent={s.emailSent} /></td>
-                        <td className="px-3 py-1.5"><SignalTimeCell s={s} /></td>
+                        <td className="px-3 py-1.5"><SignalTimeCell signalTime={s.signalTime} scoreUpdatedAt={s.scoreUpdatedAt} /></td>
                       </tr>
                     );
                   }) : (

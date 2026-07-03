@@ -12388,7 +12388,34 @@ app.get('/api/strategy-lab/strategies', (req, res) => {
 
 // GET /api/strategy-lab/live?strategy=&timeframe= — LIVE command per curated symbol on
 // one timeframe (like the fixed-time scan): ENTRY (with plan) or HOLD / NO-DATA.
-app.get('/api/strategy-lab/live', (req, res) => {
+// Enrich live ENTRY/CALL rows with the FIRST-call info from the DB (when the signal was
+// originally made + the frozen first score) so the live grids can show the signal time and
+// the score evolution (first → current). Best-effort: rows render fine without it.
+async function enrichLiveRowsWithFirstCall(rows, strategy, commandKind) {
+  const targets = rows.filter((r) => r.command === commandKind && r.barIso);
+  if (!targets.length) return;
+  const idOf = (r) => `${strategy}:${r.symbol}:${r.timeframe}:${Date.parse(r.barIso)}`;
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const ids = targets.map(idOf);
+    const [dbRows] = await pool.query(
+      `SELECT id, signal_time, score, grade, score_updated_at FROM mt5_strategy_signals WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ids,
+    );
+    const byId = new Map(dbRows.map((d) => [d.id, d]));
+    for (const r of targets) {
+      const d = byId.get(idOf(r));
+      if (!d) continue;
+      r.signalTime = d.signal_time ? new Date(d.signal_time).toISOString() : null;
+      r.firstScore = d.score === null || d.score === undefined ? null : Number(d.score);
+      r.firstGrade = d.grade || null;
+      r.scoreUpdatedAt = d.score_updated_at ? new Date(d.score_updated_at).toISOString() : null;
+    }
+  } catch { /* enrichment only */ }
+}
+
+app.get('/api/strategy-lab/live', async (req, res) => {
   try {
     const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
     const strategy = req.query.strategy ? String(req.query.strategy) : (enabledStrategyIds()[0] || Object.keys(STRATEGY_LAB_REGISTRY)[0]);
@@ -12414,6 +12441,7 @@ app.get('/api/strategy-lab/live', (req, res) => {
           const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
           rows.push({
             symbol, timeframe: tf, command: 'ENTRY', direction: sig.decision,
+            barIso: sig.barIso ?? null,
             score: sig.score ?? null, grade: sig.grade ?? null, price,
             entry: sig.entry ?? null, stopLoss: sig.stopLoss ?? null,
             takeProfit1: sig.takeProfit1 ?? null, takeProfit2: sig.takeProfit2 ?? null, takeProfit3: sig.takeProfit3 ?? null,
@@ -12433,6 +12461,7 @@ app.get('/api/strategy-lab/live', (req, res) => {
       const rank = (r) => (r.command === 'ENTRY' ? 2 : r.command === 'HOLD' ? 1 : 0);
       return (rank(b) - rank(a)) || ((b.score || 0) - (a.score || 0));
     });
+    await enrichLiveRowsWithFirstCall(rows, strategy, 'ENTRY');
     res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, marketStatus: getForexMarketStatus(), rows, generatedAt: new Date().toISOString() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -12440,7 +12469,7 @@ app.get('/api/strategy-lab/live', (req, res) => {
 // GET /api/strategy-lab/live-ftt?strategy=&timeframe= — LIVE fixed-time framing of the
 // same strategy signals: UP/DOWN call with a next-candle expiry (instead of the forex
 // TP/SL plan). One row per curated symbol×timeframe: CALL (UP/DOWN) or HOLD / NO-DATA.
-app.get('/api/strategy-lab/live-ftt', (req, res) => {
+app.get('/api/strategy-lab/live-ftt', async (req, res) => {
   try {
     const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
     const strategy = req.query.strategy ? String(req.query.strategy) : (enabledStrategyIds()[0] || Object.keys(STRATEGY_LAB_REGISTRY)[0]);
@@ -12466,6 +12495,7 @@ app.get('/api/strategy-lab/live-ftt', (req, res) => {
           rows.push({
             symbol, timeframe: tf, command: 'CALL',
             direction: ftDir,
+            barIso: sig.barIso ?? null,
             score: sig.score ?? null, grade: sig.grade ?? null,
             reference: Number.isFinite(price) ? price : null,
             candleRead: fixedTimeCandleRead(ctx.candles, ftDir),
@@ -12484,6 +12514,7 @@ app.get('/api/strategy-lab/live-ftt', (req, res) => {
       const rank = (r) => (r.command === 'CALL' ? 2 : r.command === 'HOLD' ? 1 : 0);
       return (rank(b) - rank(a)) || ((b.score || 0) - (a.score || 0));
     });
+    await enrichLiveRowsWithFirstCall(rows, strategy, 'CALL');
     res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, marketStatus: getForexMarketStatus(), rows, generatedAt: new Date().toISOString() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
