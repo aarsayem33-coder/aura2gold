@@ -329,30 +329,49 @@ export default function StrategyLab() {
   // keeps the merged multi-strategy view readable); otherwise the grid shows every row.
   const [minScore, setMinScore] = useState(0);
   const [dirFilter, setDirFilter] = useState(''); // '' | 'LONG' | 'SHORT'
+  const [actionableView, setActionableView] = useState(true); // default: hide HOLD noise, signals only
   const liveFilterActive = minScore > 0 || dirFilter !== '';
-  const actionableOnly = liveFilterActive || multiStrategy;
+  const actionableOnly = actionableView || liveFilterActive || multiStrategy;
+  // Rank helpers — ENTER-NOW / tradable rows always surface FIRST, then waiting, then the rest.
+  const timingRank = (st?: string) => (st === 'TRADABLE' ? 0 : st === 'WAIT' ? 1 : 2);
+  const readRank = (v?: string) => (v === 'ENTER_NOW' ? 0 : v === 'WAIT_PULLBACK' ? 1 : 2);
   const forexRows = useMemo(() => {
-    const rows = live?.rows || [];
-    if (!actionableOnly) return rows;
-    return rows.filter((r) => r.command === 'ENTRY'
+    const rows = (live?.rows || []).filter((r) => !actionableOnly || (r.command === 'ENTRY'
       && (minScore === 0 || (r.score ?? 0) >= minScore)
-      && (!dirFilter || (dirFilter === 'LONG' ? /BUY/.test(r.direction || '') : /SELL/.test(r.direction || ''))));
+      && (!dirFilter || (dirFilter === 'LONG' ? /BUY/.test(r.direction || '') : /SELL/.test(r.direction || '')))));
+    return [...rows].sort((a, b) =>
+      (Number(b.command === 'ENTRY') - Number(a.command === 'ENTRY'))
+      || (timingRank(a.timing?.status) - timingRank(b.timing?.status))
+      || ((b.score ?? 0) - (a.score ?? 0)));
   }, [live, minScore, dirFilter, actionableOnly]);
   const ftRows = useMemo(() => {
-    const rows = ftLive?.rows || [];
-    if (!actionableOnly) return rows;
-    return rows.filter((r) => r.command === 'CALL'
+    const rows = (ftLive?.rows || []).filter((r) => !actionableOnly || (r.command === 'CALL'
       && (minScore === 0 || (r.score ?? 0) >= minScore)
-      && (!dirFilter || (dirFilter === 'LONG' ? r.direction === 'UP' : r.direction === 'DOWN')));
+      && (!dirFilter || (dirFilter === 'LONG' ? r.direction === 'UP' : r.direction === 'DOWN'))));
+    return [...rows].sort((a, b) =>
+      (Number(b.command === 'CALL') - Number(a.command === 'CALL'))
+      || (readRank(a.candleRead?.verdict) - readRank(b.candleRead?.verdict))
+      || ((b.score ?? 0) - (a.score ?? 0)));
   }, [ftLive, minScore, dirFilter, actionableOnly]);
   const entries = forexRows.filter((r) => r.command === 'ENTRY');
   const calls = ftRows.filter((r) => r.command === 'CALL');
+  const tradableNow = entries.filter((r) => r.timing?.status === 'TRADABLE').length;
+  const enterNowCalls = calls.filter((r) => r.candleRead?.verdict === 'ENTER_NOW').length;
+  const holdCount = tab === 'ftt'
+    ? (ftLive?.rows.length || 0) - (ftLive?.rows || []).filter((r) => r.command === 'CALL').length
+    : (live?.rows.length || 0) - (live?.rows || []).filter((r) => r.command === 'ENTRY').length;
   // Recent-table filters: symbol + score bucket (applied to BOTH recent tables).
   const histSymbolOptions = useMemo(() => Array.from(new Set(signals.map((s) => s.symbol))).sort(), [signals]);
   const filteredSignals = useMemo(
     () => signals.filter((s) => (!symbolFilter || s.symbol === symbolFilter) && inScoreBucket(s.score, scoreBucket)),
     [signals, symbolFilter, scoreBucket],
   );
+  // Recent tables: actionable-NOW first (forex TRADABLE limit / fixed-time LIVE open call),
+  // then newest signal first.
+  const sortedSignals = useMemo(() => [...filteredSignals].sort((a, b) => {
+    const act = (s: StrategySignal) => (tab === 'ftt' ? Number(Boolean(s.live)) : Number(s.timing?.status === 'TRADABLE'));
+    return (act(b) - act(a)) || (new Date(b.signalTime || 0).getTime() - new Date(a.signalTime || 0).getTime());
+  }), [filteredSignals, tab]);
   // Fired fixed-time calls that are STILL within their expiry window — surfaced from the
   // logged-signal feed (all strategies/TFs, DB-backed → reload-safe) so every call that
   // fired a browser alert is visible in the signal portion, independent of the
@@ -380,152 +399,192 @@ export default function StrategyLab() {
   }, [signals]);
 
   return (
-    <div className="space-y-5 p-1">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div className="rounded-xl bg-violet-100 p-2"><FlaskConical className="text-violet-600" size={22} /></div>
-          <div>
-            <h1 className="text-xl font-black text-slate-900">Strategy Lab — Signals</h1>
-            <p className="text-xs font-medium text-slate-400">Live single-strategy signals (isolated engine), framed two ways: Forex (TP/SL plan) and Fixed-Time (direction at next-candle expiry).</p>
+    <div className="space-y-3 p-1 pb-8">
+      {/* ── STICKY COMMAND BAR: tabs · filters · strategies · refresh — always reachable ── */}
+      <div className="sticky top-0 z-30 -mx-1 bg-slate-50/95 px-1 pb-1 pt-1 backdrop-blur">
+        <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-card">
+          {/* Row 1 — identity, tabs, refresh */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-2">
+              <FlaskConical className="text-violet-600" size={18} />
+              <h1 className="text-sm font-black text-slate-900">Strategy Lab</h1>
+            </div>
+            <div className="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+              <button type="button" onClick={() => setTab('forex')} className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-bold transition ${tab === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-white'}`}>
+                <TrendingUp size={12} /> Forex
+              </button>
+              <button type="button" onClick={() => setTab('ftt')} className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-bold transition ${tab === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-white'}`}>
+                <Timer size={12} /> Fixed-Time
+              </button>
+            </div>
+            {/* Actionable summary — the numbers that matter, always visible */}
+            {tab === 'forex' ? (
+              <div className="flex items-center gap-1.5 text-[10px] font-black">
+                <span className={`rounded-md px-2 py-1 ${tradableNow ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-400'}`}>{tradableNow} ENTER NOW</span>
+                <span className="rounded-md bg-amber-50 px-2 py-1 text-amber-600">{entries.length - tradableNow} WAIT</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 text-[10px] font-black">
+                <span className={`rounded-md px-2 py-1 ${enterNowCalls ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-400'}`}>{enterNowCalls} ENTER NOW</span>
+                <span className="rounded-md bg-amber-50 px-2 py-1 text-amber-600">{calls.length - enterNowCalls} WAIT</span>
+              </div>
+            )}
+            <div className="ml-auto flex items-center gap-1.5">
+              <Link to="/strategy-lab/reports" className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-50"><BarChart3 size={13} /> Reports</Link>
+              <button type="button" onClick={() => void loadData()} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-bold text-white hover:bg-slate-700 disabled:opacity-50">
+                {loading ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} Refresh
+              </button>
+            </div>
+          </div>
+          {/* Row 2 — live-grid + history filters (shared) */}
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-1.5">
+            <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="Live grid timeframe">
+              <option value="ALL">All TFs (live)</option>
+              {timeframes.map((t) => <option key={t} value={t}>{t} live</option>)}
+            </select>
+            <GridFilters minScore={minScore} setMinScore={setMinScore} dir={dirFilter} setDir={setDirFilter} mode={tab} />
+            <button type="button" onClick={() => setActionableView((v) => !v)} title="Hide/show HOLD rows in the live grid"
+              className={`rounded-lg border px-2 py-1 text-xs font-bold transition ${actionableView ? 'border-emerald-300 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>
+              {actionableView ? '● Signals only' : `○ All rows (+${holdCount} hold)`}
+            </button>
+            <span className="mx-0.5 hidden h-4 w-px bg-slate-200 sm:block" />
+            <select value={histStrategy} onChange={(e) => setHistStrategy(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="History: strategy">
+              <option value="">History: all strategies</option>
+              {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="History: timeframe">
+              <option value="">All TFs</option>
+              {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <select value={scoreBucket} onChange={(e) => setScoreBucket(e.target.value)} title="History: score range" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+              {SCORE_BUCKETS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+            </select>
+            <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)} title="History: symbol" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+              <option value="">All symbols</option>
+              {histSymbolOptions.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
+            </select>
+            <button type="button" onClick={() => setShowMuted((v) => !v)} title="Muted strategies are hidden by default — toggle to include strategies switched off in the Strategy Controller" className={`rounded-lg border px-2 py-1 text-xs font-bold transition-colors ${showMuted ? 'border-gold-500 bg-gold-50 text-gold-700' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>{showMuted ? 'Incl. muted' : 'Active only'}</button>
+          </div>
+          {/* Row 3 — strategy chips */}
+          <div className="mt-1.5 border-t border-slate-100 pt-1.5">
+            <StrategyChips list={strategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Link to="/strategy-lab/reports" className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-bold text-slate-600 hover:bg-slate-50"><BarChart3 size={14} /> Reports</Link>
-          <button type="button" onClick={() => void loadData()} disabled={loading} className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-bold text-white hover:bg-slate-700 disabled:opacity-50">
-            {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} Refresh
-          </button>
-        </div>
       </div>
 
-      {/* Tabs */}
-      <div className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-card w-fit">
-        <button type="button" onClick={() => setTab('forex')} className={`inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-sm font-bold transition ${tab === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>
-          <TrendingUp size={14} /> Forex (TP/SL)
-        </button>
-        <button type="button" onClick={() => setTab('ftt')} className={`inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-sm font-bold transition ${tab === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>
-          <Timer size={14} /> Fixed-Time
-        </button>
-      </div>
-
-      {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</div>}
+      {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-700">{error}</div>}
 
       {/* ───────────────────────── FOREX TAB ───────────────────────── */}
       {tab === 'forex' && (
         <>
-          {/* LIVE COMMAND GRID — top, dashboard-style */}
-          <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
-            <div className="flex flex-col gap-2 border-b border-slate-100 px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Live signals · {liveTitle} · {liveTf}</h3>
-                <div className="flex flex-wrap items-center gap-2">
-                  <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="Live grid timeframe">
-                    <option value="ALL">All timeframes</option>
-                    {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-                  </select>
-                  <GridFilters minScore={minScore} setMinScore={setMinScore} dir={dirFilter} setDir={setDirFilter} mode="forex" />
-                  <span className="text-[11px] font-bold text-slate-400">{entries.length} ENTRY{actionableOnly ? ' (filtered)' : ` · ${(live?.rows.length || 0) - entries.length} HOLD`} · auto-refresh 30s</span>
-                </div>
-              </div>
-              <StrategyChips list={strategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
+          {/* LIVE COMMAND GRID — ENTER NOW first, then WAIT, then expired */}
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
+              <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Live signals · {liveTitle} · {liveTf}</h3>
+              <span className="text-[11px] font-bold text-slate-400">{entries.length} signal{entries.length === 1 ? '' : 's'}{actionableOnly ? '' : ` · ${holdCount} hold`} · sorted: tradable first · auto-refresh 30s</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[920px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
-                    <th className="px-3 py-2">Command</th>
-                    {multiStrategy && <th className="px-3 py-2">Strategy</th>}
-                    <th className="px-3 py-2">Entry timing</th>
-                    <th className="px-3 py-2">Symbol</th>
-                    <th className="px-3 py-2 text-right">Score</th>
-                    <th className="px-3 py-2 text-right">Lots</th>
-                    <th className="px-3 py-2 text-right">Entry</th>
-                    <th className="px-3 py-2 text-right">Stop</th>
-                    <th className="px-3 py-2 text-right">TP1 / TP2 / TP3</th>
-                    <th className="px-3 py-2 text-right">RR</th>
-                    <th className="px-3 py-2">Why</th>
+                    <th className="px-3 py-1.5">Command</th>
+                    {multiStrategy && <th className="px-3 py-1.5">Strategy</th>}
+                    <th className="px-3 py-1.5">Entry timing</th>
+                    <th className="px-3 py-1.5">Symbol</th>
+                    <th className="px-3 py-1.5 text-right">Score</th>
+                    <th className="px-3 py-1.5 text-right">Lots</th>
+                    <th className="px-3 py-1.5 text-right">Entry / Stop</th>
+                    <th className="px-3 py-1.5 text-right">TP1 / TP2 / TP3</th>
+                    <th className="px-3 py-1.5 text-right">RR</th>
+                    <th className="px-3 py-1.5">Why</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {forexRows.length ? forexRows.map((r) => (
-                    <tr key={`${r.strategyId || ''}-${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${r.command === 'ENTRY' ? (/BUY/.test(r.direction || '') ? 'bg-emerald-50/30' : 'bg-rose-50/30') : ''}`}>
-                      <td className="px-3 py-2"><CommandPill row={r} /></td>
-                      {multiStrategy && <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{r.strategyName || stratName(r.strategyId || '')}</td>}
-                      <td className="px-3 py-2">{r.command === 'ENTRY' ? <TimingCell timing={r.timing} /> : <span className="text-slate-300">—</span>}</td>
-                      <td className="px-3 py-2"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
-                      <td className="px-3 py-2 text-right">{r.command === 'ENTRY' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px] font-black text-slate-900" title={r.command === 'ENTRY' && r.lossAtStop != null ? `Risk ${r.riskPercent ?? '?'}% · max loss $${r.lossAtStop} · ${r.stopPips ?? '?'} pip stop` : ''}>{r.command === 'ENTRY' && r.lots != null ? r.lots : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px]">{r.command === 'ENTRY' ? px(r.entry, r.symbol) : (r.price != null ? <span className="text-slate-400">{px(r.price, r.symbol)}</span> : '—')}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px] text-rose-600">{r.command === 'ENTRY' ? px(r.stopLoss, r.symbol) : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[11px] text-emerald-600">{r.command === 'ENTRY' ? <>{px(r.takeProfit1, r.symbol)} / {px(r.takeProfit2, r.symbol)} / {px(r.takeProfit3, r.symbol)}</> : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono">{r.command === 'ENTRY' && r.riskReward != null ? `1:${num(r.riskReward, 1)}` : '—'}</td>
-                      <td className="px-3 py-2 text-[11px] text-slate-500 min-w-[220px] max-w-[360px] whitespace-normal break-words leading-snug align-top" title={r.reason || ''}>{r.command === 'ENTRY' ? r.reason : ''}</td>
-                    </tr>
-                  )) : (
-                    <tr><td colSpan={multiStrategy ? 11 : 10} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No setups match the current score / setup filter.' : multiStrategy ? 'No live setups across the selected strategies right now.' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
+                  {forexRows.length ? forexRows.map((r) => {
+                    const tradable = r.command === 'ENTRY' && r.timing?.status === 'TRADABLE';
+                    const rowTint = tradable
+                      ? 'bg-emerald-50/70 shadow-[inset_3px_0_0_#059669]'
+                      : r.command === 'ENTRY' ? (/BUY/.test(r.direction || '') ? 'bg-emerald-50/25' : 'bg-rose-50/25') : '';
+                    return (
+                      <tr key={`${r.strategyId || ''}-${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${rowTint}`}>
+                        <td className="px-3 py-1.5"><CommandPill row={r} /></td>
+                        {multiStrategy && <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{r.strategyName || stratName(r.strategyId || '')}</td>}
+                        <td className="px-3 py-1.5">{r.command === 'ENTRY' ? <TimingCell timing={r.timing} /> : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
+                        <td className="px-3 py-1.5 text-right">{r.command === 'ENTRY' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5 text-right font-mono text-[12px] font-black text-slate-900" title={r.command === 'ENTRY' && r.lossAtStop != null ? `Risk ${r.riskPercent ?? '?'}% · max loss $${r.lossAtStop} · ${r.stopPips ?? '?'} pip stop` : ''}>{r.command === 'ENTRY' && r.lots != null ? r.lots : '—'}</td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight">
+                          {r.command === 'ENTRY'
+                            ? <><div>{px(r.entry, r.symbol)}</div><div className="text-rose-600">{px(r.stopLoss, r.symbol)}</div></>
+                            : (r.price != null ? <span className="text-slate-400">{px(r.price, r.symbol)}</span> : '—')}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight text-emerald-600">
+                          {r.command === 'ENTRY' ? <><div>{px(r.takeProfit1, r.symbol)} / {px(r.takeProfit2, r.symbol)}</div><div>{px(r.takeProfit3, r.symbol)}</div></> : '—'}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono">{r.command === 'ENTRY' && r.riskReward != null ? `1:${num(r.riskReward, 1)}` : '—'}</td>
+                        <td className="min-w-[200px] max-w-[340px] whitespace-normal break-words px-3 py-1.5 align-top text-[11px] leading-snug text-slate-500" title={r.reason || ''}>{r.command === 'ENTRY' ? r.reason : ''}</td>
+                      </tr>
+                    );
+                  }) : (
+                    <tr><td colSpan={multiStrategy ? 10 : 9} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No setups match the current score / setup filter.' : 'No live setups right now — the grid fills the moment a strategy fires.'}</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <div className="border-t border-slate-100 px-4 py-2 text-[11px] font-medium text-slate-400">
-              ENTRY = a fresh {selectedMetas.length === 1 ? selectedMetas[0].name : 'strategy'} setup right now · HOLD = no setup on this bar · isolated lab engine, not the main system.
+            <div className="border-t border-slate-100 px-4 py-1.5 text-[11px] font-medium text-slate-400">
+              <span className="font-bold text-emerald-600">Green-edged row</span> = tradable at the entry right now · ENTRY = a fresh {selectedMetas.length === 1 ? selectedMetas[0].name : 'strategy'} setup · isolated lab engine, not the main system.
             </div>
           </div>
 
-          {/* RECENT SIGNALS (history with outcomes) */}
-          <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
-              <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Recent signals & outcomes <span className="text-[11px] font-bold text-slate-400">· {showMuted ? 'incl. muted' : 'active only'}</span></h3>
-              <div className="flex items-center gap-2">
-                <button type="button" onClick={() => setShowMuted((v) => !v)} title="Muted strategies are hidden by default — toggle to include strategies switched off in the Strategy Controller" className={`rounded-lg border px-2 py-1 text-xs font-bold transition-colors ${showMuted ? 'border-gold-500 bg-gold-50 text-gold-700' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>{showMuted ? 'Showing muted' : 'Include muted'}</button>
-                <select value={histStrategy} onChange={(e) => setHistStrategy(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  <option value="">All strategies</option>
-                  {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </select>
-                <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  <option value="">All TFs</option>
-                  {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-                </select>
-                <select value={scoreBucket} onChange={(e) => setScoreBucket(e.target.value)} title="Filter by score range" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  {SCORE_BUCKETS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
-                </select>
-                <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)} title="Filter by symbol" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  <option value="">All symbols</option>
-                  {histSymbolOptions.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
-                </select>
-              </div>
+          {/* RECENT SIGNALS — tradable-now pinned on top, then newest first */}
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
+              <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent signals &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· {showMuted ? 'incl. muted' : 'active only'} · tradable pinned first</span></h3>
+              <span className="text-[11px] font-bold text-slate-400">{sortedSignals.length} shown</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1000px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
-                    <th className="px-3 py-2">Strategy</th>
-                    <th className="px-3 py-2">Symbol</th><th className="px-3 py-2">Dir</th>
-                    <th className="px-3 py-2 text-right">Score</th><th className="px-3 py-2 text-right">Lots</th>
-                    <th className="px-3 py-2 text-right">Entry / SL / TP1·2·3</th><th className="px-3 py-2 text-right">RR</th>
-                    <th className="px-3 py-2">Forex</th><th className="px-3 py-2 text-right">Pips</th>
-                    <th className="px-3 py-2">Fixed-time</th><th className="px-3 py-2">Signal made</th>
-                    <th className="px-3 py-2">Entry timing</th>
+                    <th className="px-3 py-1.5">Strategy</th>
+                    <th className="px-3 py-1.5">Symbol</th><th className="px-3 py-1.5">Dir</th>
+                    <th className="px-3 py-1.5 text-right">Score</th><th className="px-3 py-1.5 text-right">Lots</th>
+                    <th className="px-3 py-1.5 text-right">Entry / SL</th>
+                    <th className="px-3 py-1.5 text-right">TP1 · TP2 · TP3</th>
+                    <th className="px-3 py-1.5 text-right">RR</th>
+                    <th className="px-3 py-1.5">Forex</th><th className="px-3 py-1.5 text-right">Pips</th>
+                    <th className="px-3 py-1.5">Fixed-time</th><th className="px-3 py-1.5">Made</th>
+                    <th className="px-3 py-1.5">Entry timing</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {filteredSignals.length ? filteredSignals.map((s) => (
-                    <tr key={s.id} className="hover:bg-slate-50/70">
-                      <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{stratName(s.strategy)}</td>
-                      <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
-                      <td className="px-3 py-2">{/BUY/.test(s.direction) ? <span className="text-emerald-600 font-bold text-[12px]">BUY</span> : <span className="text-rose-600 font-bold text-[12px]">SELL</span>}</td>
-                      <td className="px-3 py-2 text-right">{scoreBadge(s.score, s.grade)}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px] font-black text-slate-900" title={s.lossAtStop != null ? `max loss $${s.lossAtStop} · ${s.stopPips ?? '?'} pip stop` : ''}>{s.lots != null ? s.lots : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[11px] text-slate-500">{px(s.entryPrice, s.symbol)} / <span className="text-rose-500">{px(s.stopLoss, s.symbol)}</span> / <span className="text-emerald-600">{px(s.takeProfit1, s.symbol)} · {px(s.takeProfit2, s.symbol)} · {px(s.takeProfit3, s.symbol)}</span></td>
-                      <td className="px-3 py-2 text-right font-mono">{s.riskReward === null ? '—' : `1:${num(s.riskReward, 1)}`}</td>
-                      <td className="px-3 py-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
-                      <td className="px-3 py-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span></td>
-                      <td className="px-3 py-2 text-[11px] text-slate-400">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
-                      <td className="px-3 py-2"><TimingCell timing={s.timing} /></td>
-                    </tr>
-                  )) : (
-                    <tr><td colSpan={12} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No signals match the score / symbol filter.' : 'No signals logged yet for this strategy.')}</td></tr>
+                  {sortedSignals.length ? sortedSignals.map((s) => {
+                    const tradable = s.timing?.status === 'TRADABLE';
+                    return (
+                      <tr key={s.id} className={`hover:bg-slate-50/70 ${tradable ? 'bg-emerald-50/60 shadow-[inset_3px_0_0_#059669]' : ''}`}>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{stratName(s.strategy)}</td>
+                        <td className="px-3 py-1.5"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
+                        <td className="px-3 py-1.5">{/BUY/.test(s.direction) ? <span className="text-[12px] font-bold text-emerald-600">BUY</span> : <span className="text-[12px] font-bold text-rose-600">SELL</span>}</td>
+                        <td className="px-3 py-1.5 text-right">{scoreBadge(s.score, s.grade)}</td>
+                        <td className="px-3 py-1.5 text-right font-mono text-[12px] font-black text-slate-900" title={s.lossAtStop != null ? `max loss $${s.lossAtStop} · ${s.stopPips ?? '?'} pip stop` : ''}>{s.lots != null ? s.lots : '—'}</td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight">
+                          <div>{px(s.entryPrice, s.symbol)}</div>
+                          <div className="text-rose-500">{px(s.stopLoss, s.symbol)}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight text-emerald-600">
+                          <div>{px(s.takeProfit1, s.symbol)} · {px(s.takeProfit2, s.symbol)}</div>
+                          <div>{px(s.takeProfit3, s.symbol)}</div>
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono">{s.riskReward === null ? '—' : `1:${num(s.riskReward, 1)}`}</td>
+                        <td className="px-3 py-1.5"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
+                        <td className="px-3 py-1.5 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
+                        <td className="px-3 py-1.5"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span></td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-[11px] text-slate-400">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                        <td className="px-3 py-1.5"><TimingCell timing={s.timing} /></td>
+                      </tr>
+                    );
+                  }) : (
+                    <tr><td colSpan={13} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No signals match the score / symbol filter.' : 'No signals logged yet for this strategy.')}</td></tr>
                   )}
                 </tbody>
               </table>
@@ -537,131 +596,106 @@ export default function StrategyLab() {
       {/* ──────────────────────── FIXED-TIME TAB ──────────────────────── */}
       {tab === 'ftt' && (
         <>
-          {/* LIVE FIXED-TIME CALL GRID */}
-          <div className="rounded-2xl border border-violet-200 bg-white shadow-card overflow-hidden">
-            <div className="flex flex-col gap-2 border-b border-violet-100 bg-violet-50/40 px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h3 className="text-sm font-black uppercase tracking-wider text-violet-700">Live fixed-time calls · {liveTitle} · {liveTf}</h3>
-                <div className="flex flex-wrap items-center gap-2">
-                  <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="Live grid timeframe">
-                    <option value="ALL">All timeframes</option>
-                    {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-                  </select>
-                  <GridFilters minScore={minScore} setMinScore={setMinScore} dir={dirFilter} setDir={setDirFilter} mode="ftt" />
-                  <span className="text-[11px] font-bold text-slate-400">{calls.length} CALL{actionableOnly ? ' (filtered)' : ` · ${(ftLive?.rows.length || 0) - calls.length} HOLD`} · expiry {ftLive?.expiryBars === 1 ? 'next candle' : `${ftLive?.expiryBars} candles`} · auto-refresh {liveTf === 'M1' || liveTf === 'M5' ? '10s' : '30s'}</span>
-                </div>
-              </div>
-              <StrategyChips list={strategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
+          {/* LIVE FIXED-TIME CALL GRID — ENTER NOW first */}
+          <div className="overflow-hidden rounded-2xl border border-violet-200 bg-white shadow-card">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-violet-100 bg-violet-50/40 px-4 py-2">
+              <h3 className="text-xs font-black uppercase tracking-wider text-violet-700">Live fixed-time calls · {liveTitle} · {liveTf}</h3>
+              <span className="text-[11px] font-bold text-slate-400">{calls.length} call{calls.length === 1 ? '' : 's'} · sorted: enter-now first · expiry {ftLive?.expiryBars === 1 ? 'next candle' : `${ftLive?.expiryBars} candles`} · auto-refresh {liveTf === 'M1' || liveTf === 'M5' ? '10s' : '30s'}</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1000px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
-                    <th className="px-3 py-2">Call</th>
-                    {multiStrategy && <th className="px-3 py-2">Strategy</th>}
-                    <th className="px-3 py-2">Symbol</th>
-                    <th className="px-3 py-2 text-right">Score</th>
-                    <th className="px-3 py-2 text-right">Reference</th>
-                    <th className="px-3 py-2">Trade time</th>
-                    <th className="px-3 py-2">Entry read (last 5 candles)</th>
-                    <th className="px-3 py-2">Why</th>
+                    <th className="px-3 py-1.5">Call</th>
+                    {multiStrategy && <th className="px-3 py-1.5">Strategy</th>}
+                    <th className="px-3 py-1.5">Symbol</th>
+                    <th className="px-3 py-1.5 text-right">Score</th>
+                    <th className="px-3 py-1.5 text-right">Reference</th>
+                    <th className="px-3 py-1.5">Trade time</th>
+                    <th className="px-3 py-1.5">Entry read (last 5 candles)</th>
+                    <th className="px-3 py-1.5">Why</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {ftRows.length ? ftRows.map((r) => (
-                    <tr key={`${r.strategyId || ''}-${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${r.command === 'CALL' ? (r.direction === 'UP' ? 'bg-emerald-50/30' : 'bg-rose-50/30') : ''}`}>
-                      <td className="px-3 py-2"><FttCommandPill row={r} /></td>
-                      {multiStrategy && <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{r.strategyName || stratName(r.strategyId || '')}</td>}
-                      <td className="px-3 py-2"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
-                      <td className="px-3 py-2 text-right">{r.command === 'CALL' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
-                      <td className="px-3 py-2 text-right font-mono text-[12px]">{r.reference != null ? num(r.reference) : '—'}</td>
-                      <td className="px-3 py-2">{r.command === 'CALL' ? <ExpiryCountdown iso={r.expiryIso} tradeTime={r.tradeTimeLabel} /> : <span className="text-slate-300">—</span>}</td>
-                      <td className="px-3 py-2">{r.command === 'CALL' ? <CandleReadCell read={r.candleRead} /> : <span className="text-slate-300">—</span>}</td>
-                      <td className="px-3 py-2 text-[11px] text-slate-500 min-w-[220px] max-w-[360px] whitespace-normal break-words leading-snug align-top" title={r.reason || ''}>{r.command === 'CALL' ? r.reason : ''}</td>
-                    </tr>
-                  )) : (
-                    <tr><td colSpan={multiStrategy ? 8 : 7} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No calls match the current score / setup filter.' : multiStrategy ? 'No live calls across the selected strategies right now.' : 'No data — make sure the MT5 feed is live for this timeframe.'}</td></tr>
+                  {ftRows.length ? ftRows.map((r) => {
+                    const enterNow = r.command === 'CALL' && r.candleRead?.verdict === 'ENTER_NOW';
+                    const rowTint = enterNow
+                      ? 'bg-emerald-50/70 shadow-[inset_3px_0_0_#059669]'
+                      : r.command === 'CALL' ? (r.direction === 'UP' ? 'bg-emerald-50/25' : 'bg-rose-50/25') : '';
+                    return (
+                      <tr key={`${r.strategyId || ''}-${r.symbol}-${r.timeframe}`} className={`hover:bg-slate-50/70 ${rowTint}`}>
+                        <td className="px-3 py-1.5"><FttCommandPill row={r} /></td>
+                        {multiStrategy && <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{r.strategyName || stratName(r.strategyId || '')}</td>}
+                        <td className="px-3 py-1.5"><span className="font-black text-slate-900">{r.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{r.timeframe}</span></td>
+                        <td className="px-3 py-1.5 text-right">{r.command === 'CALL' ? scoreBadge(r.score, r.grade) : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5 text-right font-mono text-[12px]">{r.reference != null ? num(r.reference) : '—'}</td>
+                        <td className="px-3 py-1.5">{r.command === 'CALL' ? <ExpiryCountdown iso={r.expiryIso} tradeTime={r.tradeTimeLabel} /> : <span className="text-slate-300">—</span>}</td>
+                        <td className="px-3 py-1.5">{r.command === 'CALL' ? <CandleReadCell read={r.candleRead} /> : <span className="text-slate-300">—</span>}</td>
+                        <td className="min-w-[200px] max-w-[340px] whitespace-normal break-words px-3 py-1.5 align-top text-[11px] leading-snug text-slate-500" title={r.reason || ''}>{r.command === 'CALL' ? r.reason : ''}</td>
+                      </tr>
+                    );
+                  }) : (
+                    <tr><td colSpan={multiStrategy ? 8 : 7} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : liveFilterActive ? 'No calls match the current score / setup filter.' : 'No live calls right now — the grid fills the moment a strategy fires.'}</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <div className="border-t border-slate-100 px-4 py-2 text-[11px] font-medium text-slate-400">
-              <span className="font-bold text-violet-700">Trade time</span> = the expiry to set on your fixed-time / binary platform (one {liveTf} candle{ftLive && ftLive.expiryBars > 1 ? ` × ${ftLive.expiryBars}` : ''}). Best practice: enter as a new candle opens and set that duration, so the expiry lines up with the candle close the call is judged against. If you enter mid-bar, set the “left in bar” time instead. · CALL UP / DOWN = predict price will be higher / lower than the reference at the {ftLive?.expiryBars === 1 ? 'next-candle' : 'expiry'} close · Entry read scans the last 5 candles (momentum · reversal/indecision pattern · at local high/low): ✅ ENTER NOW = action confirms the call · ⏳ WAIT FOR PULLBACK = stretched or indecisive · ✖ NO ENTRY = reversing against the call · HOLD = no call this bar · isolated lab engine, not the main FTT engine.
+            <div className="border-t border-slate-100 px-4 py-1.5 text-[11px] font-medium text-slate-400">
+              <span className="font-bold text-emerald-600">Green-edged row</span> = entry read confirms ENTER NOW · <span className="font-bold text-violet-700">Trade time</span> = the expiry to set on your platform (enter as a new candle opens so expiry lines up with the close; entering mid-bar → set the "left in bar" time) · CALL UP / DOWN = price higher / lower than the reference at expiry close · isolated lab engine.
             </div>
           </div>
 
-          {/* RECENT FIXED-TIME OUTCOMES — every call tracked (system + email), live P/L */}
-          <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
-              <div className="flex items-center gap-2">
-                <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Recent fixed-time calls & outcomes</h3>
-                <span className="hidden sm:inline text-[11px] font-bold text-slate-400">every signal tracked · live position</span>
-              </div>
-              <div className="flex items-center gap-2">
-                {/* Live + settled summary chips */}
-                <div className="hidden items-center gap-1.5 md:flex">
-                  <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-black text-emerald-700"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" /> {ftStats.liveWin} live win</span>
-                  <span className="inline-flex items-center gap-1 rounded-md bg-rose-50 px-2 py-0.5 text-[10px] font-black text-rose-700"><span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse" /> {ftStats.liveLoss} live loss</span>
-                  <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-500">{ftStats.win}W / {ftStats.loss}L settled</span>
-                </div>
-                <select value={histStrategy} onChange={(e) => setHistStrategy(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  <option value="">All strategies</option>
-                  {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </select>
-                <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  <option value="">All TFs</option>
-                  {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-                </select>
-                <select value={scoreBucket} onChange={(e) => setScoreBucket(e.target.value)} title="Filter by score range" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  {SCORE_BUCKETS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
-                </select>
-                <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)} title="Filter by symbol" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-                  <option value="">All symbols</option>
-                  {histSymbolOptions.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
-                </select>
+          {/* RECENT FIXED-TIME OUTCOMES — live calls pinned first, then newest */}
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
+              <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent fixed-time calls &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· live pinned first</span></h3>
+              <div className="hidden items-center gap-1.5 md:flex">
+                <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-black text-emerald-700"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> {ftStats.liveWin} live win</span>
+                <span className="inline-flex items-center gap-1 rounded-md bg-rose-50 px-2 py-0.5 text-[10px] font-black text-rose-700"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-500" /> {ftStats.liveLoss} live loss</span>
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-500">{ftStats.win}W / {ftStats.loss}L settled · {ftStats.pending} pending</span>
               </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[820px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
-                    <th className="px-3 py-2">Strategy</th>
-                    <th className="px-3 py-2">Call</th>
-                    <th className="px-3 py-2">Symbol</th>
-                    <th className="px-3 py-2 text-right">Score</th>
-                    <th className="px-3 py-2">Live / Result</th>
-                    <th className="px-3 py-2">Track</th>
-                    <th className="px-3 py-2">Signal made</th>
+                    <th className="px-3 py-1.5">Strategy</th>
+                    <th className="px-3 py-1.5">Call</th>
+                    <th className="px-3 py-1.5">Symbol</th>
+                    <th className="px-3 py-1.5 text-right">Score</th>
+                    <th className="px-3 py-1.5">Live / Result</th>
+                    <th className="px-3 py-1.5">Track</th>
+                    <th className="px-3 py-1.5">Made</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {filteredSignals.length ? filteredSignals.map((s) => {
+                  {sortedSignals.length ? sortedSignals.map((s) => {
                     const up = /BUY/.test(s.direction);
-                    const liveTint = s.live ? (s.live.status === 'WINNING' ? 'bg-emerald-50/40' : s.live.status === 'LOSING' ? 'bg-rose-50/40' : '') : '';
+                    const liveTint = s.live ? (s.live.status === 'WINNING' ? 'bg-emerald-50/50 shadow-[inset_3px_0_0_#059669]' : s.live.status === 'LOSING' ? 'bg-rose-50/50 shadow-[inset_3px_0_0_#e11d48]' : 'bg-slate-50/60') : '';
                     return (
                       <tr key={s.id} className={`hover:bg-slate-50/70 ${liveTint}`}>
-                        <td className="px-3 py-2 text-[11px] font-bold text-violet-700 whitespace-nowrap">{stratName(s.strategy)}</td>
-                        <td className="px-3 py-2">
+                        <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{stratName(s.strategy)}</td>
+                        <td className="px-3 py-1.5">
                           {up
                             ? <span className="inline-flex items-center gap-1 rounded-md bg-emerald-600/10 px-1.5 py-0.5 text-[11px] font-black text-emerald-700"><TrendingUp size={12} /> UP</span>
                             : <span className="inline-flex items-center gap-1 rounded-md bg-rose-600/10 px-1.5 py-0.5 text-[11px] font-black text-rose-700"><TrendingDown size={12} /> DOWN</span>}
                         </td>
-                        <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
-                        <td className="px-3 py-2 text-right">{scoreBadge(s.score, s.grade)}</td>
-                        <td className="px-3 py-2"><FtResultCell s={s} /></td>
-                        <td className="px-3 py-2"><SourceChips popupSent={s.popupSent} emailSent={s.emailSent} /></td>
-                        <td className="px-3 py-2 text-[11px] text-slate-400 whitespace-nowrap">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                        <td className="px-3 py-1.5"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
+                        <td className="px-3 py-1.5 text-right">{scoreBadge(s.score, s.grade)}</td>
+                        <td className="px-3 py-1.5"><FtResultCell s={s} /></td>
+                        <td className="px-3 py-1.5"><SourceChips popupSent={s.popupSent} emailSent={s.emailSent} /></td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-[11px] text-slate-400">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={7} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No calls match the score / symbol filter.' : 'No fixed-time calls logged yet for this strategy.')}</td></tr>
+                    <tr><td colSpan={7} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No calls match the score / symbol filter.' : 'No fixed-time calls logged yet for this strategy.')}</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <div className="border-t border-slate-100 px-4 py-2 text-[11px] font-medium text-slate-400">
-              <span className="font-bold text-emerald-600">LIVE</span> = open call, coloured by current position · <span className="font-black text-slate-500">Ideal</span> = signal-bar close → next-bar close (strategy edge) · <span className="font-black text-violet-500">Real</span> = as-traded (entered at the live price when the signal fired, expired after the set duration); <span className="font-bold">Δ</span> = pips the signal→entry delay cost ·
-              <span className="font-bold"> SYS</span>/<span className="font-bold">MAIL</span> = tracked by system popup / sent by email · see <Link to="/strategy-lab/reports" className="font-bold text-violet-600 hover:underline">Reports</Link> for win rates.
+            <div className="border-t border-slate-100 px-4 py-1.5 text-[11px] font-medium text-slate-400">
+              <span className="font-bold text-emerald-600">LIVE</span> = open call, coloured by current position · <span className="font-black text-slate-500">Ideal</span> = signal-bar close → next-bar close (strategy edge) · <span className="font-black text-violet-500">Real</span> = as-traded (live price at signal, set duration); <span className="font-bold">Δ</span> = pips the signal→entry delay cost ·
+              <span className="font-bold"> SYS</span>/<span className="font-bold">MAIL</span> = system popup / email · see <Link to="/strategy-lab/reports" className="font-bold text-violet-600 hover:underline">Reports</Link> for win rates.
             </div>
           </div>
         </>
