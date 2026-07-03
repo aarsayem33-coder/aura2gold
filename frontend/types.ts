@@ -814,6 +814,8 @@ export interface StrategyForexBucket {
   wins: number; losses: number; expired: number; pending: number;
   winLossSettled: number; winRate: number | null;
   expectancyPips: number | null; expectancyR: number | null;
+  // Average signal R:R offered by this bucket's forex plans (TP3 vs SL at signal time).
+  avgRR?: number | null;
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
 export interface StrategyFtBucket {

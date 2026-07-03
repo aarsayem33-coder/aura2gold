@@ -10,7 +10,7 @@
 //              takeProfit3?, riskRewardRatio, reason, barIso, meta }
 // Pure: no I/O. New strategies = add one entry to STRATEGIES.
 
-import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels } from './liquidityEngine.js';
+import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels, detectDisplacement } from './liquidityEngine.js';
 import { buildBreakoutCandidate, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
@@ -2033,10 +2033,133 @@ function fixedTimeConfluence(ctx) {
 // obvious-pool set here — session highs/lows, round numbers, and equal highs/lows are.
 function liquiditySweepPro(ctx) {
   const cfg = ctx.config || {};
-  return gradeSweep(ctx.candles, { symbol: ctx.symbol, h4Trend: ctx.h4Trend, h1Trend: ctx.h1Trend, minRR: cfg.minRR ?? 1.8, minGrade: cfg.minGrade ?? 'B' });
+  const sig = gradeSweep(ctx.candles, { symbol: ctx.symbol, h4Trend: ctx.h4Trend, h1Trend: ctx.h1Trend, minRR: cfg.minRR ?? 1.8, minGrade: cfg.minGrade ?? 'B' });
+  if (!sig) return null;
+  // gradeSweep doesn't enforce the lab's minimum-stop rule, so M1 sweeps could emit sub-spread
+  // stops (e.g. a 0.3-pip stop → RR 100+, inflated score, absurd lot size — untradeable). Apply
+  // the SAME stopTooTight guard every other engine uses; rejects only the broken setups.
+  const risk = Math.abs(Number(sig.entry) - Number(sig.stopLoss));
+  if (stopTooTight(risk, atr14(ctx.candles), ctx.pip, cfg)) return null;
+  return sig;
+}
+
+// ─── Gold Desk — XAU Session Raid (DEDICATED XAUUSD forex engine) ────────────
+// Gold-only. Encodes the psychology that makes gold different from FX majors:
+//   • Gold is the retail magnet — stop clusters are denser and MORE obvious (round
+//     dollars, session extremes), so the raid → reclaim → displacement sequence is
+//     cleaner than anywhere else (the user's two best engines — ict-breaker 81% and
+//     liquidity-sweep-pro 80% — are both sweep models; this specializes that edge).
+//   • Session AMD (Power of 3): Asia ACCUMULATES the range, London MANIPULATES (the
+//     Judas swing that raids the obvious level), London/NY DISTRIBUTE the true move.
+//     Signals fire only in London/NY (Asia = accumulation, not a TP/SL trade).
+//   • Gold's wicks are violent: stop buffer is wider (0.3×ATR) and the minimum stop
+//     floor is $0.80 (8 gold-pips) so no sub-spread stop can ever pass.
+// Sequence (all closed-bar confirmed): sweep of an OBVIOUS key level (round number /
+// session high-low / equal highs-lows, strength ≥3) → close back inside (the trap) →
+// DISPLACEMENT away (institutional sponsorship, FVG) → enter the FVG 50% pullback
+// (sniper) or the reclaim close while fresh; stop beyond the raid wick; TP1/TP2 =
+// 1R/2R, TP3 = the opposing resting liquidity (the draw). Min 2R. Forex (TP/SL)
+// framing ONLY by design — this is not a next-candle call. Pure; isolated.
+function xauSessionRaid(ctx) {
+  const { candles, symbol = '', h4Trend = null, h1Trend = null, config = {}, pip = 0.1 } = ctx;
+  if (!/XAU|GOLD/.test(String(symbol).toUpperCase())) return null;   // dedicated: gold only
+  const minRR = config.minRR ?? 2;
+  const maxAgeBars = config.maxAgeBars ?? 5;                          // raid must be fresh
+  const levelTolAtr = config.levelTolAtr ?? 0.3;                      // sweep must hit a KEY level
+  const chaseAtr = config.chaseAtr ?? 1.2;                            // never chase gold
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const lastIdx = candles.length - 1;
+  const price = n(candles[lastIdx].close);
+
+  // Session gate (UTC): London 07–16 / NY 12–21; the 12–16 overlap is gold's engine room.
+  const hour = new Date(candles[lastIdx].time).getUTCHours();
+  const inLondon = hour >= 7 && hour < 16;
+  const inNy = hour >= 12 && hour < 21;
+  if ((config.sessionsOnly ?? true) && !inLondon && !inNy) return null;
+  const inOverlap = hour >= 12 && hour < 16;
+
+  // 1) The raid: most recent sweep + reclaim (close back inside).
+  const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 40 });
+  if (!sweep) return null;
+  if (lastIdx - sweep.reclaimIdx > maxAgeBars) return null;           // stale raid = no trade
+  const dir = sweep.dir, decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
+  if (h4Trend === 'BULLISH' && decision === 'SELL') return null;      // never fight a clear H4
+  if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
+
+  // 2) The raided level must be OBVIOUS — where gold's retail stops actually rest.
+  //    Round dollars / session extremes / equal highs-lows, strength ≥ 3.
+  let raidLevel = null;
+  try {
+    const { levels } = detectKeyLiquidityLevels(candles, { symbol });
+    raidLevel = (levels || [])
+      .filter((l) => l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= levelTolAtr * atr)
+      .sort((a, b) => b.strength - a.strength)[0] || null;
+  } catch { raidLevel = null; }
+  if (!raidLevel) return null;                                        // random swing raid = noise, skip
+
+  // 3) Displacement AFTER the reclaim — the institutional footprint (FVG).
+  const disp = detectDisplacement(candles, sweep.reclaimIdx, dir, atr, { minAtr: config.dispMinAtr ?? 0.8 });
+  if (!disp.present) return null;
+
+  // 4) Entry: the FVG 50% (sniper pullback) when price has displaced beyond it;
+  //    else the reclaim close while the raid is fresh (≤1 bar old).
+  let entry, entryMode;
+  const gapMid = (disp.gapLow + disp.gapHigh) / 2;
+  if (dir === 'BULLISH' ? price > gapMid : price < gapMid) { entry = gapMid; entryMode = 'FVG 50% pullback'; }
+  else if (lastIdx - sweep.reclaimIdx <= 1) { entry = n(candles[sweep.reclaimIdx].close); entryMode = 'reclaim close'; }
+  else return null;                                                   // neither sniper nor fresh = chase, skip
+  if (Math.abs(price - entry) > chaseAtr * atr) return null;          // anti-chase guard
+
+  // 5) Stop beyond the raid wick with gold's wider buffer; hard $ floor via stopTooTight.
+  const stop = dir === 'BULLISH' ? sweep.extreme - 0.3 * atr : sweep.extreme + 0.3 * atr;
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, { minStopAtr: config.minStopAtr ?? 0.4, minStopPips: config.minStopPips ?? 8 })) return null;
+
+  // 6) Target = the opposing resting liquidity (the draw). Min 2R to it.
+  const pools = detectLiquidityPools(candles);
+  const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
+  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk);
+  const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
+  if (!(rr >= minRR)) return null;
+
+  // 7) Deterministic score — the gold-desk checklist.
+  let score = 50;
+  score += Math.min(16, Math.round(disp.atrMultiple * 10));           // displacement strength
+  score += Math.min(12, Math.round((rr - minRR) * 4));                // RR above the 2R floor
+  score += raidLevel.strength >= 5 ? 10 : raidLevel.strength === 4 ? 8 : 6; // level obviousness
+  score += inOverlap ? 8 : 5;                                         // session quality
+  if ((decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH')) score += 8;
+  if ((decision === 'BUY' && h1Trend === 'BULLISH') || (decision === 'SELL' && h1Trend === 'BEARISH')) score += 4;
+  if (lastIdx - sweep.reclaimIdx <= 1) score += 5;                    // freshest raid
+  if (tgt && tgt.equal) score += 4;                                   // draw = stacked equal highs/lows
+  score = Math.max(40, Math.min(95, score));
+
+  const ladder = tpLadder(decision, entry, risk, target);
+  return {
+    decision, score, grade: smcGrade(score),
+    entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+    reason: `Gold raid ${decision}: swept ${raidLevel.label || raidLevel.type} ${r5(sweep.sweepLevel)} (str ${raidLevel.strength}/5) → reclaim + displacement ${disp.atrMultiple}× → ${entryMode} @ ${r5(entry)}; draw ${tgt ? `${tgt.type} ${tgt.price}` : '3R'} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : 'New York'}`,
+    barIso: sweep.reclaimIso,                                          // dedup: one signal per raid
+    meta: {
+      raidedLevel: { type: raidLevel.type, label: raidLevel.label, price: raidLevel.price, strength: raidLevel.strength },
+      sweepLevel: sweep.sweepLevel, sweepExtreme: sweep.extreme, dispAtr: disp.atrMultiple,
+      entryMode, session: inOverlap ? 'OVERLAP' : inLondon ? 'LONDON' : 'NY', h4Trend, h1Trend,
+    },
+  };
 }
 
 export const STRATEGIES = {
+  'xau-session-raid': {
+    id: 'xau-session-raid',
+    name: 'Gold Desk — XAU Session Raid',
+    source: 'Dedicated XAUUSD engine — session AMD (Power of 3) + obvious-level raid, distilled from the lab\'s two best sweep models',
+    description: 'GOLD ONLY (returns nothing on any other symbol) and FOREX (TP/SL) framing only by design. Encodes gold\'s crowd psychology: gold is the retail magnet, so stops cluster at OBVIOUS levels (round dollars, session highs/lows, equal highs/lows) and the market is structured around raiding them — Asia accumulates the range, London manipulates it (the Judas swing), London/NY distribute the true move. The engine fires only in London/NY when: an obvious key level (strength ≥3) is SWEPT then RECLAIMED (the trap), followed by DISPLACEMENT (FVG — institutional sponsorship). Entry at the FVG 50% pullback (sniper) or the fresh reclaim close; stop beyond the raid wick + 0.3×ATR (gold-wide buffer, hard $0.80 minimum stop); TP1/TP2 = 1R/2R, TP3 = the opposing resting liquidity. Never fights a clear H4 trend; never chases (>1.2×ATR from entry = skip). Min 2R. Scored on the gold-desk checklist: displacement strength, level obviousness, session (overlap best), dual-HTF alignment, raid freshness, equal-highs/lows draw.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: { minRR: 2, maxAgeBars: 5, levelTolAtr: 0.3, chaseAtr: 1.2, minLevelStrength: 3, dispMinAtr: 0.8, minStopAtr: 0.4, minStopPips: 8, sessionsOnly: true, sweepLookback: 40 },
+    evaluate: xauSessionRaid,
+  },
   'liquidity-sweep-pro': {
     id: 'liquidity-sweep-pro',
     name: 'Liquidity Sweep Pro',

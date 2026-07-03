@@ -116,6 +116,9 @@ const expLabel = (b: StrategyForexBucket) =>
   b.expectancyPips === null ? '—'
     : `${b.expectancyPips > 0 ? '+' : ''}${b.expectancyPips}p${b.expectancyR !== null ? ` · ${b.expectancyR > 0 ? '+' : ''}${b.expectancyR}R` : ''}`;
 
+// Average signal R:R the bucket's forex plans offered (TP3 vs SL at signal time).
+const rrLabel = (b: StrategyForexBucket) => (b.avgRR == null ? '—' : `1:${b.avgRR}`);
+
 function outcomeChip(o: string) {
   const s = (o || '').toUpperCase();
   if (s.endsWith('_WIN') || s === 'WIN') return 'bg-emerald-50 text-emerald-700';
@@ -330,6 +333,7 @@ export default function StrategyLabReports() {
                 <th className="px-4 py-2">Strategy</th>
                 <th className="px-4 py-2 text-right">Forex win%</th>
                 <th className="px-4 py-2 text-right">Expectancy</th>
+                <th className="px-4 py-2 text-right" title="Average signal risk-to-reward the strategy's forex plans offered (TP3 vs SL at signal time).">Avg RR</th>
                 <th className="px-4 py-2 text-right" title="Idealized: signal-bar close → next-bar close.">Fixed-time win%</th>
                 <th className="px-4 py-2 text-right" title="As-traded: live entry when the signal fired, expiry at +duration. The realistic number.">As-traded win%</th>
                 <th className="px-4 py-2 text-right">Signals</th>
@@ -342,12 +346,13 @@ export default function StrategyLabReports() {
                   <td className="px-4 py-2"><span className="font-bold text-slate-800">{s.name}</span>{s.source && <span className="block text-[10px] font-semibold text-slate-400 max-w-[260px] truncate" title={s.source}>{s.source}</span>}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.forex} minSample={minSample} /></div></td>
                   <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(s.forex)}</td>
+                  <td className="px-4 py-2 text-right font-mono text-xs font-bold text-slate-700">{rrLabel(s.forex)}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.fixedTime} minSample={minSample} /></div></td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.asTraded} minSample={minSample} /></div></td>
                   <td className="px-4 py-2 text-right font-mono font-bold">{s.total}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No strategies match “${query}”.` : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
+                <tr><td colSpan={8} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No strategies match “${query}”.` : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
               )}
             </tbody>
           </table>
@@ -406,6 +411,7 @@ export default function StrategyLabReports() {
                 <th className="px-4 py-2">TF</th>
                 <th className="px-4 py-2 text-right">Forex win%</th>
                 <th className="px-4 py-2 text-right">Exp</th>
+                <th className="px-4 py-2 text-right" title="Average signal risk-to-reward of this combo's forex plans.">RR</th>
                 <th className="px-4 py-2 text-right">Fixed-time win%</th>
                 <th className="px-4 py-2 text-right">As-traded win%</th>
                 <th className="px-4 py-2 text-right">Signals</th>
@@ -420,12 +426,13 @@ export default function StrategyLabReports() {
                   <td className="px-4 py-2 font-bold text-slate-500">{c.timeframe}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.forex} minSample={minSample} bar={false} /></div></td>
                   <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(c.forex)}</td>
+                  <td className="px-4 py-2 text-right font-mono text-xs font-bold text-slate-700">{rrLabel(c.forex)}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.fixedTime} minSample={minSample} bar={false} /></div></td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.asTraded} minSample={minSample} bar={false} /></div></td>
                   <td className="px-4 py-2 text-right font-mono font-bold">{c.total}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={9} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No combos match “${query}”.` : 'No combos settled yet.'}</td></tr>
+                <tr><td colSpan={10} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No combos match “${query}”.` : 'No combos settled yet.'}</td></tr>
               )}
             </tbody>
           </table>
@@ -475,6 +482,7 @@ export default function StrategyLabReports() {
                 <th className="px-3 py-2">Dir</th>
                 <th className="px-3 py-2">Symbol</th>
                 <th className="px-3 py-2 text-right">Score</th>
+                <th className="px-3 py-2 text-right" title="Signal risk-to-reward of the forex plan (TP3 vs SL at signal time).">RR</th>
                 <th className="px-3 py-2">Forex result</th>
                 <th className="px-3 py-2 text-right">Pips</th>
                 <th className="px-3 py-2">Fixed-time (live/result)</th>
@@ -495,6 +503,7 @@ export default function StrategyLabReports() {
                     </td>
                     <td className="px-3 py-2"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
                     <td className="px-3 py-2 text-right">{s.score === null ? <span className="text-slate-300">—</span> : <span className="font-black text-slate-700">{Math.round(s.score)}{s.grade ? ` ${s.grade}` : ''}</span>}</td>
+                    <td className="px-3 py-2 text-right font-mono text-xs font-bold text-slate-700">{s.riskReward == null ? <span className="text-slate-300">—</span> : `1:${s.riskReward}`}</td>
                     <td className="px-3 py-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
                     <td className="px-3 py-2 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
                     <td className="px-3 py-2"><FtResultCell s={s} /></td>
@@ -503,7 +512,7 @@ export default function StrategyLabReports() {
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={8} className="px-3 py-8 text-center text-sm font-medium text-slate-400">No signals logged yet for this strategy.</td></tr>
+                <tr><td colSpan={9} className="px-3 py-8 text-center text-sm font-medium text-slate-400">No signals logged yet for this strategy.</td></tr>
               )}
             </tbody>
           </table>
@@ -732,6 +741,7 @@ function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loadi
               <th className="px-4 py-2">{colLabel}</th>
               <th className="px-4 py-2 text-right">Forex win%</th>
               <th className="px-4 py-2 text-right">Exp</th>
+              <th className="px-4 py-2 text-right" title="Average signal risk-to-reward of the forex plans in this bucket.">RR</th>
               <th className="px-4 py-2 text-right">Fixed-time</th>
               <th className="px-4 py-2 text-right">As-traded</th>
               <th className="px-4 py-2 text-right">Signals</th>
@@ -743,12 +753,13 @@ function BreakdownTable({ title, colLabel, rows, keyOf, render, minSample, loadi
                 <td className="px-4 py-2 font-bold">{render(r)}</td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(r.forex)}</td>
+                <td className="px-4 py-2 text-right font-mono text-xs font-bold text-slate-700">{rrLabel(r.forex)}</td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2 text-right font-mono font-bold">{r.total}</td>
               </tr>
             )) : (
-              <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No settled signals for this strategy yet.'}</td></tr>
+              <tr><td colSpan={7} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No settled signals for this strategy yet.'}</td></tr>
             )}
           </tbody>
         </table>

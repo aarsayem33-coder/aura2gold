@@ -70,20 +70,30 @@ if (!PROXY_HEADER) {
   process.exit(1);
 }
 
+// Cached, pooled transporter: creating one per email forced a full TCP+TLS+AUTH handshake
+// (~1-3s) on EVERY send, and the notify pass awaits sends serially — on a busy bar close the
+// last signal's email could lag many seconds. Pooling reuses warm connections, cutting the
+// signal→email latency to the SMTP submit time. Delivery-only; no effect on signal logic.
+let emailTransporterCache = null;
 function getEmailTransporter() {
   const user = process?.env?.SMTP_USER;
   const pass = process?.env?.SMTP_PASS;
   if (!user || !pass) {
     throw new Error('SMTP_USER and SMTP_PASS must be set to send email notifications.');
   }
+  if (emailTransporterCache) return emailTransporterCache;
 
   const port = Number(process?.env?.SMTP_PORT || 587);
-  return nodemailer.createTransport({
+  emailTransporterCache = nodemailer.createTransport({
     host: process?.env?.SMTP_HOST || 'smtp.gmail.com',
     port,
     secure: process?.env?.SMTP_SECURE === 'true' || port === 465,
     auth: { user, pass },
+    pool: true,
+    maxConnections: 3,
+    maxMessages: 200,
   });
+  return emailTransporterCache;
 }
 
 const DB_HOST = process?.env?.DB_HOST;
@@ -2085,12 +2095,14 @@ function noteCandleForNotify(candle) {
     // A bar newer than we'd seen → the prior candle just closed → check this series now.
     strategyNotifyPendingPairs.add(`${candle.symbol}|${tf}`);
     if (!strategyNotifyDebounce) {
+      // 1s debounce: long enough to batch the burst of candles the EA posts together on a bar
+      // close, short enough to keep the bar-close → alert path tight (was 2.5s).
       strategyNotifyDebounce = setTimeout(() => {
         strategyNotifyDebounce = null;
         const pairs = [...strategyNotifyPendingPairs];
         strategyNotifyPendingPairs.clear();
         if (pairs.length) void runStrategyNotifyPass(pairs);
-      }, 2500);
+      }, 1000);
       if (typeof strategyNotifyDebounce.unref === 'function') strategyNotifyDebounce.unref();
     }
   }
@@ -10974,6 +10986,9 @@ const STRATEGY_LAB_SCAN_MS = Math.max(60000, Number(process.env.STRATEGY_LAB_SCA
 const STRATEGY_LAB_RETENTION_DAYS = Math.max(7, Number(process.env.STRATEGY_LAB_RETENTION_DAYS || 45));
 const STRATEGY_LAB_FT_EXPIRY_BARS = Math.max(1, Number(process.env.STRATEGY_LAB_FT_EXPIRY_BARS || 1));
 const STRATEGY_LAB_ALERT_MIN_SCORE = Math.max(50, Number(process.env.STRATEGY_LAB_ALERT_MIN_SCORE || 75));
+// Delivery-only entry-gap guard: don't alert a setup whose signal bar closed this many (or
+// more) bars ago — price has drifted off the planned entry. Logging/ranking never gated.
+const STRATEGY_LAB_STALE_SETUP_BARS = Math.max(1, Number(process.env.STRATEGY_LAB_STALE_SETUP_BARS || 2));
 let strategyLabScanRunning = false;
 
 // Trading session for a Strategy Lab signal, in Bangladesh time (BDT = UTC+6). Pure
@@ -11226,6 +11241,112 @@ function strategySignalTiming(sig, timeframe, madeMs = Date.now(), sentMs = Date
     signalToEmail: s2eSec == null ? 'n/a' : (s2eSec < 60 ? `${s2eSec}s` : `${Math.round(s2eSec / 60)} min`),
   };
 }
+// ── Gold Desk (xau-session-raid) dedicated email ─────────────────────────────
+// Purpose-designed layout for the gold engine: subject `GOLD | <score> <grade> SETUP |
+// <direction>`, an ENTER NOW / WAIT (pips-to-entry) action box, the full trade plan
+// (entry/SL/TP1-3 with pips + $ at the suggested lots), the raid PSYCHOLOGY (which obvious
+// level was swept, displacement, session narrative), and a numbered execution playbook.
+// Display-only: changes nothing about scoring, gating, or delivery rules.
+function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing }) {
+  const m = sig.meta || {};
+  const buy = /BUY/.test(String(sig.decision));
+  const pip = pipSizeForSymbol(symbol) || 0.1;
+  const pips = (a, b) => (Number.isFinite(Number(a)) && Number.isFinite(Number(b)) ? Math.round((Math.abs(Number(a) - Number(b)) / pip) * 10) / 10 : null);
+  const usd = (p) => (p != null ? `$${(p * pip).toFixed(2)}` : null); // gold: pips → dollars-of-price
+
+  // Live entry timing: at entry now, or how many pips away.
+  let live = NaN;
+  try { const c = getRecentCandles(symbol, timeframe, 2); if (c && c.length) live = Number(c[c.length - 1].close); } catch { /* best effort */ }
+  const t = strategyLabLiveTiming(symbol, sig.decision, live, sig.entry, sig.stopLoss);
+  const distPips = Number.isFinite(live) ? pips(live, sig.entry) : null;
+  const action = t.status === 'TRADABLE'
+    ? { label: 'ENTER NOW', detail: `Market is at the entry (${px(sig.entry, symbol)}). Execute at market with the stop already set.`, color: '#047857' }
+    : t.status === 'EXPIRED'
+      ? { label: 'SKIP', detail: 'Price already touched the stop side — this raid is gone. The next scan brings the next setup. Never revenge-chase gold.', color: '#b91c1c' }
+      : { label: `WAIT — ${distPips != null ? `${distPips} pips (${usd(distPips)})` : 'pullback'} to entry`, detail: `Place a LIMIT ${sig.decision} at ${px(sig.entry, symbol)}. If price runs away without tagging it, let it go — chasing gold is how raids claim their second victim.`, color: '#b45309' };
+
+  const raided = m.raidedLevel || {};
+  const sessionLabel = m.session === 'OVERLAP' ? 'London–NY overlap (gold\'s prime window)' : m.session === 'LONDON' ? 'London session' : m.session === 'NY' ? 'New York session' : 'Active session';
+  const htfLine = (buy && m.h4Trend === 'BULLISH') || (!buy && m.h4Trend === 'BEARISH')
+    ? `H4 trend aligned (${m.h4Trend})` : 'H4 neutral — raid quality carries the setup';
+  const slPips = sizing?.stopPips ?? pips(sig.entry, sig.stopLoss);
+  const tp1Pips = pips(sig.takeProfit1, sig.entry), tp2Pips = pips(sig.takeProfit2, sig.entry), tp3Pips = pips(sig.takeProfit3, sig.entry);
+
+  const kindTag = kind && kind !== 'NEW' ? ` · ${kind}` : '';
+  const subject = `GOLD | ${Math.round(sig.score)} ${sig.grade} SETUP | ${sig.decision} ${timeframe}${kindTag}`.slice(0, 180);
+
+  const psychology = [
+    `The raid: gold is the retail magnet — stops cluster at OBVIOUS levels. ${raided.label || raided.type || 'A key level'} (${raided.strength ?? '?'}/5 obviousness) was swept, trapping breakout traders, then price closed back inside. That trap is the trade.`,
+    `The footprint: displacement of ${m.dispAtr ?? '?'}×ATR after the reclaim printed a fair value gap — institutional sponsorship, not drift. Entry is the ${m.entryMode || 'reclaim'}.`,
+    `The clock: ${sessionLabel}. Asia accumulates, London manipulates, New York distributes — this raid fired in the distribution window.`,
+    `The bias: ${htfLine}.`,
+  ];
+  const playbook = [
+    t.status === 'TRADABLE' ? `Enter ${sig.decision} at market (~${px(live, symbol)}).` : `Set a LIMIT ${sig.decision} @ ${px(sig.entry, symbol)}${distPips != null ? ` — ${distPips} pips away` : ''}. Cancel if the stop side is touched first.`,
+    `Hard stop ${px(sig.stopLoss, symbol)} (${slPips} pips${sizing?.lossAtStop != null ? ` = max loss ${px2(sizing.lossAtStop)}` : ''}). Never widen a gold stop — the wick you fear is the raid you just traded.`,
+    `TP1 ${px(sig.takeProfit1, symbol)} (+${tp1Pips} pips, 1R): close 50% and move the stop to breakeven — the trade is now free.`,
+    `TP2 ${px(sig.takeProfit2, symbol)} (+${tp2Pips} pips, 2R): close another 25%.`,
+    `TP3 ${px(sig.takeProfit3, symbol)} (+${tp3Pips} pips — the opposing liquidity draw): let the runner work. No re-entry after TP3.`,
+    lots != null ? `Size: ${lots} lots = ${sizing.riskPercent}% risk (${px2(sizing.riskAmount)}) on ${px2(sizing.equity)} equity.` : 'Size to a fixed % risk of equity on the shown stop.',
+  ];
+
+  const text = [
+    `AURA GOLD DESK — XAU SESSION RAID${kindTag}`,
+    `${sig.decision} ${symbol} ${timeframe} | score ${Math.round(sig.score)}/100 (${sig.grade}) | RR 1:${sig.riskRewardRatio ?? 'n/a'}`,
+    '',
+    `>> ${action.label}`,
+    `   ${action.detail}`,
+    '',
+    'TRADE PLAN',
+    `  Entry ${px(sig.entry, symbol)}   SL ${px(sig.stopLoss, symbol)} (${slPips}p)`,
+    `  TP1 ${px(sig.takeProfit1, symbol)} (+${tp1Pips}p · 1R)   TP2 ${px(sig.takeProfit2, symbol)} (+${tp2Pips}p · 2R)   TP3 ${px(sig.takeProfit3, symbol)} (+${tp3Pips}p · draw)`,
+    lots != null ? `  Volume ${lots} lots (${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})` : '',
+    '',
+    'WHY THIS TRADE (the psychology)',
+    ...psychology.map((p) => `  • ${p}`),
+    '',
+    'EXECUTION PLAYBOOK',
+    ...playbook.map((p, i) => `  ${i + 1}. ${p}`),
+    '',
+    `Candle formed ${timing.formed} · signal ${timing.made} (${timing.candleToSignal}) · emailed ${timing.sent} (${timing.signalToEmail})`,
+    'Gold Desk — dedicated XAUUSD forex engine. Isolated lab signal. Advisory — not financial advice.',
+  ].filter(Boolean).join('\n');
+
+  const dirColor = buy ? '#047857' : '#b91c1c';
+  const row = (k, v) => `<tr><td style="padding:3px 12px 3px 0;color:#78716c;white-space:nowrap">${k}</td><td style="font-weight:700;color:#1c1917">${v}</td></tr>`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:640px;border:1px solid #e7e5e4;border-radius:10px;overflow:hidden">
+    <div style="background:linear-gradient(135deg,#1c1917,#292524);padding:14px 18px">
+      <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:.18em;color:#f59e0b;text-transform:uppercase">Aura Gold Desk · XAU Session Raid${kindTag}</p>
+      <h2 style="margin:6px 0 0;color:#fff;font-size:22px">${sig.decision} ${symbol} <span style="color:#a8a29e;font-size:14px">${timeframe}</span>
+        <span style="float:right;background:#f59e0b;color:#1c1917;border-radius:6px;padding:2px 10px;font-size:14px">${Math.round(sig.score)} · ${sig.grade}</span></h2>
+    </div>
+    <div style="padding:14px 18px">
+      <div style="padding:10px 12px;border-left:4px solid ${action.color};background:#fafaf9;border-radius:4px;margin-bottom:12px">
+        <p style="margin:0;font-size:15px;font-weight:800;color:${action.color}">▶ ${action.label}</p>
+        <p style="margin:4px 0 0;font-size:12px;color:#44403c">${action.detail}</p>
+      </div>
+      <table style="font-size:13px;border-collapse:collapse;width:100%">
+        ${row('Entry', `${px(sig.entry, symbol)} <span style="color:#a8a29e">(${m.entryMode || 'raid entry'})</span>`)}
+        ${row('Stop loss', `<span style="color:#b91c1c">${px(sig.stopLoss, symbol)}</span> <span style="color:#a8a29e">${slPips} pips${sizing?.lossAtStop != null ? ` · max loss ${px2(sizing.lossAtStop)}` : ''}</span>`)}
+        ${row('TP1 · 1R', `<span style="color:#047857">${px(sig.takeProfit1, symbol)}</span> <span style="color:#a8a29e">+${tp1Pips} pips${sizing?.profitAtTp1 != null ? ` · ${px2(sizing.profitAtTp1)}` : ''} — close 50%, SL → breakeven</span>`)}
+        ${row('TP2 · 2R', `<span style="color:#047857">${px(sig.takeProfit2, symbol)}</span> <span style="color:#a8a29e">+${tp2Pips} pips${sizing?.profitAtTp2 != null ? ` · ${px2(sizing.profitAtTp2)}` : ''} — close 25%</span>`)}
+        ${row('TP3 · draw', `<span style="color:#047857">${px(sig.takeProfit3, symbol)}</span> <span style="color:#a8a29e">+${tp3Pips} pips${sizing?.profitAtTp3 != null ? ` · ${px2(sizing.profitAtTp3)}` : ''} — runner to the opposing liquidity</span>`)}
+        ${row('R : R', `1 : ${sig.riskRewardRatio ?? 'n/a'}`)}
+        ${lots != null ? row('Volume', `${lots} lots <span style="color:#a8a29e">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)} on ${px2(sizing.equity)})</span>`) : ''}
+      </table>
+      <div style="margin-top:12px;padding:10px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px">
+        <p style="margin:0 0 6px;font-size:10px;font-weight:800;letter-spacing:.14em;color:#b45309;text-transform:uppercase">Why this trade — the psychology</p>
+        <ul style="margin:0;padding-left:16px;font-size:12px;color:#44403c">${psychology.map((p) => `<li style="margin:3px 0">${p}</li>`).join('')}</ul>
+      </div>
+      <div style="margin-top:10px;padding:10px 12px;background:#fafaf9;border:1px solid #e7e5e4;border-radius:6px">
+        <p style="margin:0 0 6px;font-size:10px;font-weight:800;letter-spacing:.14em;color:#57534e;text-transform:uppercase">Execution playbook</p>
+        <ol style="margin:0;padding-left:18px;font-size:12px;color:#44403c">${playbook.map((p) => `<li style="margin:3px 0">${p}</li>`).join('')}</ol>
+      </div>
+      <p style="font-size:11px;color:#a8a29e;margin:10px 0 0">Candle formed ${timing.formed} · signal ${timing.made} <b>(${timing.candleToSignal})</b> · emailed ${timing.sent} <b>(${timing.signalToEmail})</b><br/>Gold Desk — dedicated XAUUSD forex engine · isolated lab signal · advisory, not financial advice.</p>
+    </div></div>`;
+  return { subject, text, html };
+}
+
 async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, popup = true, email = false, kind = 'NEW', madeMs = Date.now() }) {  const sizing = strategyLabSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
   const lots = sizing?.suggestedLots ?? null;
   const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
@@ -11242,8 +11363,17 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
   }
   if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
   const timing = strategySignalTiming(sig, timeframe, madeMs, Date.now());
+  // Gold Desk gets its purpose-designed email (GOLD | score grade SETUP | direction).
+  if (strategy === 'xau-session-raid') {
+    const g = buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing });
+    try {
+      await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject: g.subject, text: g.text, html: g.html, signalId: `stratlab:${id}` });
+      console.log(`[GoldDesk] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`);
+    } catch (e) { console.error('[GoldDesk] email failed:', e.message); }
+    return;
+  }
   const advisory = strategyForexAdvisory(symbol, timeframe, sig);
-  const subject = `[STRATEGY ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`.slice(0, 180);
+  const subject = `[STRATEGY ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)}${sig.riskRewardRatio != null ? ` · RR 1:${sig.riskRewardRatio}` : ''})`.slice(0, 180);
   const lotLine = lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a';
   const text = [
     `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})${kind !== 'NEW' ? ` — ${kind}` : ''}`,
@@ -11558,21 +11688,34 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
   if (!isCandleCurrent(lastCandle, tf) || !liveSignalsAllowed()) {
     return { popupSent: false, emailSent: false, kind: null, stale: true };
   }
+  // STALE-SETUP gate: some strategies anchor a signal to a bar that qualified several bars
+  // ago (lookback re-detection). By alert time price has drifted off the planned entry
+  // (measured p90 ≈ 11.6 pips) — alerting now invites a bad fill. Skip DELIVERY when the
+  // setup bar closed ≥ STRATEGY_LAB_STALE_SETUP_BARS bars ago; DB logging (caller) is
+  // untouched so the ranking keeps measuring every detection. Before strategyNotifyDecide
+  // so the de-spam state isn't polluted (a later fresh re-detection still alerts as NEW).
+  const barMs = Date.parse(sig.barIso || '') || Date.now();
+  const tfMsNotify = Math.max(1, timeframeMinutes(tf)) * 60000;
+  if (Date.now() - (barMs + tfMsNotify) >= STRATEGY_LAB_STALE_SETUP_BARS * tfMsNotify) {
+    return { popupSent: false, emailSent: false, kind: null, staleSetup: true };
+  }
   const kind = strategyNotifyDecide(strategy, symbol, tf, sig);
   if (!kind) return { popupSent: false, emailSent: false, kind: null };
   const wantPopup = (sig.score ?? 0) >= STRATEGY_LAB_ALERT_MIN_SCORE;
   const wantEmail = strategyLabEmailAllowed(strategy, sig.score, sig.grade, symbol, sig.decision);
   const wantFttEmail = strategyLabFttEmailAllowed(strategy, sig.score, sig.grade, symbol, sig.decision);
-  const barMs = Date.parse(sig.barIso || '') || Date.now();
   const id = `${strategy}:${symbol}:${tf}:${barMs}`;
+  // Emits are fire-and-forget: the popup (SSE) is synchronous inside, and the email path
+  // catches its own errors. Not awaiting means one slow SMTP round-trip can't delay the
+  // NEXT symbol/strategy's alert in the same notify pass.
   if (wantPopup || wantEmail) {
-    await emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: wantPopup, email: wantEmail, kind, madeMs });
+    void emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: wantPopup, email: wantEmail, kind, madeMs });
   }
   // Fixed-time notification only when the call is still tradable (expiry candle open) —
   // never alert a next-candle bet whose candle has already closed (stale-on-arrival).
   if (strategyFtActionable(barMs, tf) && (wantPopup || wantFttEmail)) {
     const refClose = ctx ? Number(ctx.candles[ctx.candles.length - 1].close) : null;
-    await emitStrategyLabFttSignal({ id, strategy, symbol, timeframe: tf, sig, refClose, popup: wantPopup, email: wantFttEmail, kind, madeMs });
+    void emitStrategyLabFttSignal({ id, strategy, symbol, timeframe: tf, sig, refClose, popup: wantPopup, email: wantFttEmail, kind, madeMs });
   }
   return { popupSent: wantPopup, emailSent: wantEmail || wantFttEmail, kind };
 }
@@ -11601,8 +11744,8 @@ async function processStrategyNotifyConfirms() {
       if (!wantPopup && !wantEmail && !wantFttEmail) continue;
       const confirmSig = { ...sig, score: st.firstScore ?? sig.score, grade: st.firstGrade ?? sig.grade };
       const id = `${st.strategy}:${st.symbol}:${st.tf}:${st.createdBarMs}`;
-      if (wantPopup || wantEmail) await emitStrategyLabSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, popup: wantPopup, email: wantEmail, kind: 'CONFIRMED' });
-      if (strategyFtActionable(st.createdBarMs, st.tf) && (wantPopup || wantFttEmail)) { const refClose = Number(ctx.candles[ctx.candles.length - 1].close); await emitStrategyLabFttSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, refClose, popup: wantPopup, email: wantFttEmail, kind: 'CONFIRMED' }); }
+      if (wantPopup || wantEmail) void emitStrategyLabSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, popup: wantPopup, email: wantEmail, kind: 'CONFIRMED' });
+      if (strategyFtActionable(st.createdBarMs, st.tf) && (wantPopup || wantFttEmail)) { const refClose = Number(ctx.candles[ctx.candles.length - 1].close); void emitStrategyLabFttSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, refClose, popup: wantPopup, email: wantFttEmail, kind: 'CONFIRMED' }); }
     } catch { /* confirm is best-effort */ }
   }
 }
@@ -11894,6 +12037,9 @@ function strategyLabAccumulate(b, row) {
   else if (fo === 'LOSS') { b.fxLosses += 1; }
   else if (fo === 'EXPIRED') b.fxExpired += 1; else if (fo === 'PENDING') b.fxPending += 1;
   if (Number.isFinite(row.profit_loss_pips)) { b.fxNetPips += Number(row.profit_loss_pips); b.fxPipsN += 1; }
+  // Signal R:R is a property of the plan (TP3 vs SL at signal time), so every signal that
+  // carries one counts — not just settled rows. Answers "what RR does this bucket offer?".
+  if (Number.isFinite(Number(row.risk_reward)) && Number(row.risk_reward) > 0) { b.fxRRSum += Number(row.risk_reward); b.fxRRCount += 1; }
   if (fo.endsWith('_WIN') || fo === 'WIN' || fo === 'LOSS') {
     const rm = rMultiple(row.symbol, row.entry_price, row.stop_loss, row.profit_loss_pips);
     if (rm !== null) { b.fxNetR += rm; b.fxRN += 1; }
@@ -11914,7 +12060,7 @@ function strategyLabAccumulate(b, row) {
   if (Number.isFinite(Number(row.at_pips)) && (ato === 'WIN' || ato === 'LOSS')) { b.atNetPips += Number(row.at_pips); b.atPipsN += 1; }
 }
 function strategyLabBucket() {
-  return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0, atWins: 0, atLosses: 0, atDraws: 0, atNetPips: 0, atPipsN: 0 };
+  return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, fxRRSum: 0, fxRRCount: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0, atWins: 0, atLosses: 0, atDraws: 0, atNetPips: 0, atPipsN: 0 };
 }
 function strategyLabFinalize(b) {
   const fxScored = b.fxWins + b.fxLosses;
@@ -11927,6 +12073,7 @@ function strategyLabFinalize(b) {
       winRate: fxScored ? Math.round((b.fxWins / fxScored) * 1000) / 10 : null,
       expectancyPips: b.fxPipsN ? Math.round((b.fxNetPips / b.fxPipsN) * 10) / 10 : null,
       expectancyR: b.fxRN ? Math.round((b.fxNetR / b.fxRN) * 100) / 100 : null,
+      avgRR: b.fxRRCount ? Math.round((b.fxRRSum / b.fxRRCount) * 100) / 100 : null,
       confidence: sampleConfidence(fxScored),
     },
     fixedTime: {
@@ -11989,7 +12136,7 @@ async function buildStrategyLabPerformance({ days = 90, preset = null, from = nu
   const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], sessionBreakdown: [], scoreRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
-    "SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
+    "SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
     [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
   );
   const byStrat = new Map();
@@ -12577,26 +12724,51 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
 app.post('/api/strategy-lab/test-email', async (req, res) => {
   try {
     const strategy = req.query.strategy ? String(req.query.strategy) : 'little-rizzy';
-    const symbol = (req.query.symbol ? String(req.query.symbol) : 'EURUSDM').toUpperCase();
-    const tf = (req.query.timeframe ? String(req.query.timeframe) : 'M30').toUpperCase();
-    const buy = String(req.query.dir || 'SELL').toUpperCase() === 'BUY';
-    // Realistic forex sample (EURUSD-style numbers): measured-move continuation.
-    const entry = 1.08500;
-    const stop = buy ? 1.08320 : 1.08680;
-    const tp1 = buy ? 1.08680 : 1.08320;
-    const tp2 = buy ? 1.08860 : 1.08140;
-    const tp3 = buy ? 1.09800 : 1.07200;
-    const sig = {
-      decision: buy ? 'BUY' : 'SELL', score: 88, grade: 'A+',
-      entry, stopLoss: stop, takeProfit1: tp1, takeProfit2: tp2, takeProfit3: tp3,
-      riskRewardRatio: Math.round((Math.abs(entry - tp3) / Math.abs(stop - entry)) * 100) / 100,
-      reason: 'TEST sample — pullback to a lower/higher extreme after an impulse; measured-move continuation',
-      barIso: new Date().toISOString(),
-      meta: { measuredMove: Math.abs(entry - tp3), bbMid: 1.0855, bbUpper: 1.0875, bbLower: 1.0835, legAgeBars: 1 },
-    };
+    const isGoldDesk = strategy === 'xau-session-raid';
+    const symbol = (req.query.symbol ? String(req.query.symbol) : (isGoldDesk ? 'XAUUSDM' : 'EURUSDM')).toUpperCase();
+    const tf = (req.query.timeframe ? String(req.query.timeframe) : (isGoldDesk ? 'M15' : 'M30')).toUpperCase();
+    const buy = String(req.query.dir || (isGoldDesk ? 'BUY' : 'SELL')).toUpperCase() === 'BUY';
+    let sig;
+    if (isGoldDesk) {
+      // Gold-realistic sample: round-number raid, reclaimed, displacement, FVG pullback entry.
+      const entry = buy ? 4002.80 : 4047.20;
+      const stop = buy ? 3996.40 : 4053.60;
+      const risk = Math.abs(entry - stop);
+      const tp1 = buy ? entry + risk : entry - risk;
+      const tp2 = buy ? entry + 2 * risk : entry - 2 * risk;
+      const tp3 = buy ? 4031.50 : 4018.50;
+      sig = {
+        decision: buy ? 'BUY' : 'SELL', score: 87, grade: 'A+',
+        entry, stopLoss: stop, takeProfit1: tp1, takeProfit2: tp2, takeProfit3: tp3,
+        riskRewardRatio: Math.round((Math.abs(entry - tp3) / risk) * 100) / 100,
+        reason: 'TEST sample — Gold Desk raid preview',
+        barIso: new Date().toISOString(),
+        meta: {
+          raidedLevel: { type: 'ROUND_NUMBER', label: buy ? 'Round 4000' : 'Round 4050', price: buy ? 4000 : 4050, strength: 5 },
+          sweepLevel: buy ? 4000 : 4050, sweepExtreme: buy ? 3997.6 : 4052.4, dispAtr: 1.4,
+          entryMode: 'FVG 50% pullback', session: 'OVERLAP', h4Trend: buy ? 'BULLISH' : 'BEARISH', h1Trend: buy ? 'BULLISH' : 'BEARISH',
+        },
+      };
+    } else {
+      // Realistic forex sample (EURUSD-style numbers): measured-move continuation.
+      const entry = 1.08500;
+      const stop = buy ? 1.08320 : 1.08680;
+      const tp1 = buy ? 1.08680 : 1.08320;
+      const tp2 = buy ? 1.08860 : 1.08140;
+      const tp3 = buy ? 1.09800 : 1.07200;
+      sig = {
+        decision: buy ? 'BUY' : 'SELL', score: 88, grade: 'A+',
+        entry, stopLoss: stop, takeProfit1: tp1, takeProfit2: tp2, takeProfit3: tp3,
+        riskRewardRatio: Math.round((Math.abs(entry - tp3) / Math.abs(stop - entry)) * 100) / 100,
+        reason: 'TEST sample — pullback to a lower/higher extreme after an impulse; measured-move continuation',
+        barIso: new Date().toISOString(),
+        meta: { measuredMove: Math.abs(entry - tp3), bbMid: 1.0855, bbUpper: 1.0875, bbLower: 1.0835, legAgeBars: 1 },
+      };
+    }
     const id = `test:${Date.now()}`;
     await emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: false, email: true, kind: 'NEW' });
-    await emitStrategyLabFttSignal({ id: `${id}:ftt`, strategy, symbol, timeframe: tf, sig, refClose: entry, popup: false, email: true, kind: 'NEW' });
+    // Gold Desk is forex-only by design — no fixed-time preview for it.
+    if (!isGoldDesk) await emitStrategyLabFttSignal({ id: `${id}:ftt`, strategy, symbol, timeframe: tf, sig, refClose: sig.entry, popup: false, email: true, kind: 'NEW' });
     res.json({ ok: true, sentTo: SIGNAL_ALERT_EMAIL_TO, alertsEnabled: SIGNAL_ALERTS_ENABLED, strategy, symbol, timeframe: tf, dir: buy ? 'BUY' : 'SELL' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
