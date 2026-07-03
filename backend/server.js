@@ -807,6 +807,12 @@ async function initializeDatabase() {
       // signal fired (at_ref_price), expiry = signal_time + one TF candle. Settled close-to-the-
       // expiry-instant. Distinct from the idealized ft_outcome (signal-bar close → next-bar close).
       // at_ref_price NULL = logged before this feature → never settled (no sub-bar history).
+      // Score evolution tracking (display-only): `score`/`grade` stay FROZEN at first
+      // detection (the honest ranking basis); when a later re-detection of the same signal
+      // bar computes a different score, the latest value + when it changed are stored here.
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'latest_score', 'DECIMAL(5,1) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'latest_grade', 'VARCHAR(8) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'score_updated_at', 'DATETIME(3) NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_ref_price', 'DOUBLE NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_outcome', 'VARCHAR(16) NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_exit_price', 'DOUBLE NULL');
@@ -11800,7 +11806,10 @@ async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, n
         risk_reward, reason, outcome, ft_outcome, at_ref_price, created_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?,?)
      ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade)),
-       at_ref_price = COALESCE(at_ref_price, VALUES(at_ref_price))`,
+       at_ref_price = COALESCE(at_ref_price, VALUES(at_ref_price)),
+       score_updated_at = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(signal_time), score_updated_at),
+       latest_grade    = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(grade), COALESCE(latest_grade, grade)),
+       latest_score    = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(score), COALESCE(latest_score, score))`,
     [id, stratId, symbol, tf, toMysqlDate(new Date(barMs)), toMysqlDate(nowDate), sig.decision, sig.score ?? null, sig.grade ?? null,
      sig.entry ?? null, sig.stopLoss ?? null, sig.takeProfit1 ?? null, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
      sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), atRef, toMysqlDate(nowDate)],
@@ -12535,6 +12544,11 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
           id: r.id, strategy: r.strategy, symbol: r.symbol, timeframe: r.timeframe,
           signalTime: r.signal_time ? new Date(r.signal_time).toISOString() : null,
           direction: r.direction, score: num(r.score), grade: r.grade || null,
+          // Score evolution: latest re-detected score/grade + when it last changed. Null until
+          // a later scan computes a different score for the same signal bar (score/grade above
+          // stay frozen at the first call — the honest basis).
+          latestScore: num(r.latest_score), latestGrade: r.latest_grade || null,
+          scoreUpdatedAt: r.score_updated_at ? new Date(r.score_updated_at).toISOString() : null,
           entryPrice: num(r.entry_price), stopLoss: num(r.stop_loss),
           takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
           riskReward: num(r.risk_reward), reason: r.reason,

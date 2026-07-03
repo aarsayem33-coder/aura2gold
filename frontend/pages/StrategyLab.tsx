@@ -139,6 +139,38 @@ function scoreBadge(score: number | null | undefined, grade: string | null | und
   return <span className={`inline-block rounded px-1.5 py-0.5 text-[11px] font-black ${cls}`}>{Math.round(score)}{grade ? ` ${grade}` : ''}</span>;
 }
 
+// Score EVOLUTION: the first-call score is the honest basis; when a later re-evaluation of the
+// same signal bar changed the quality, show first → latest with the drift direction coloured
+// (↗ improved, ↘ degraded). Unchanged signals render the plain badge.
+function ScoreEvolution({ s }: { s: StrategySignal }) {
+  const changed = s.latestScore != null && s.score != null && Math.round(s.latestScore) !== Math.round(s.score);
+  if (!changed) return scoreBadge(s.score, s.grade);
+  const up = (s.latestScore as number) > (s.score as number);
+  const updAt = s.scoreUpdatedAt ? new Date(s.scoreUpdatedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '—';
+  return (
+    <span className="inline-flex items-center gap-0.5 whitespace-nowrap" title={`Called at ${Math.round(s.score as number)} (${s.grade || '—'}) → re-evaluated to ${Math.round(s.latestScore as number)} (${s.latestGrade || s.grade || '—'}) at ${updAt}`}>
+      <span className="rounded bg-slate-100 px-1 py-0.5 text-[10px] font-bold text-slate-400 line-through decoration-slate-400/70">{Math.round(s.score as number)}</span>
+      <span className={`text-[11px] font-black ${up ? 'text-emerald-600' : 'text-rose-500'}`}>{up ? '↗' : '↘'}</span>
+      {scoreBadge(s.latestScore, s.latestGrade ?? s.grade)}
+    </span>
+  );
+}
+
+// Signal-time cell: WHEN the signal was made, plus — only when the quality was re-evaluated
+// afterwards — when it was last updated. The freshness / quality-drift read at a glance.
+function SignalTimeCell({ s }: { s: StrategySignal }) {
+  return (
+    <div className="whitespace-nowrap text-[11px] leading-tight">
+      <div className="text-slate-500" title="When the signal was first made">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</div>
+      {s.scoreUpdatedAt && (
+        <div className="font-bold text-amber-600" title={`Quality re-evaluated ${new Date(s.scoreUpdatedAt).toLocaleString()}`}>
+          ↻ upd {new Date(s.scoreUpdatedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Tracking chips — was the call surfaced by the system (popup) and/or sent by email.
 function SourceChips({ popupSent, emailSent }: { popupSent?: boolean | null; emailSent?: boolean | null }) {
   if (popupSent == null && emailSent == null) return <span className="text-[10px] text-slate-300">—</span>;
@@ -587,7 +619,7 @@ export default function StrategyLab() {
                     <th className="px-3 py-1.5 text-right">TP1 · TP2 · TP3</th>
                     <th className="px-3 py-1.5 text-right">RR</th>
                     <th className="px-3 py-1.5">Forex</th><th className="px-3 py-1.5 text-right">Pips</th>
-                    <th className="px-3 py-1.5">Fixed-time</th><th className="px-3 py-1.5">Made</th>
+                    <th className="px-3 py-1.5">Fixed-time</th><th className="px-3 py-1.5">Signal time</th>
                     <th className="px-3 py-1.5">Entry timing</th>
                   </tr>
                 </thead>
@@ -599,7 +631,7 @@ export default function StrategyLab() {
                         <td className="whitespace-nowrap px-3 py-1.5 text-[11px] font-bold text-violet-700">{stratName(s.strategy)}</td>
                         <td className="px-3 py-1.5"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
                         <td className="px-3 py-1.5">{/BUY/.test(s.direction) ? <span className="text-[12px] font-bold text-emerald-600">BUY</span> : <span className="text-[12px] font-bold text-rose-600">SELL</span>}</td>
-                        <td className="px-3 py-1.5 text-right">{scoreBadge(s.score, s.grade)}</td>
+                        <td className="px-3 py-1.5 text-right"><ScoreEvolution s={s} /></td>
                         <td className="px-3 py-1.5 text-right font-mono text-[12px] font-black text-slate-900" title={s.lossAtStop != null ? `max loss $${s.lossAtStop} · ${s.stopPips ?? '?'} pip stop` : ''}>{s.lots != null ? s.lots : '—'}</td>
                         <td className="whitespace-nowrap px-3 py-1.5 text-right font-mono text-[11px] leading-tight">
                           <div>{px(s.entryPrice, s.symbol)}</div>
@@ -613,7 +645,7 @@ export default function StrategyLab() {
                         <td className="px-3 py-1.5"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
                         <td className="px-3 py-1.5 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
                         <td className="px-3 py-1.5"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.ftOutcome)}`}>{s.ftOutcome}</span></td>
-                        <td className="whitespace-nowrap px-3 py-1.5 text-[11px] text-slate-400">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                        <td className="px-3 py-1.5"><SignalTimeCell s={s} /></td>
                         <td className="px-3 py-1.5"><TimingCell timing={s.timing} /></td>
                       </tr>
                     );
@@ -698,7 +730,7 @@ export default function StrategyLab() {
                     <th className="px-3 py-1.5 text-right">Score</th>
                     <th className="px-3 py-1.5">Live / Result</th>
                     <th className="px-3 py-1.5">Track</th>
-                    <th className="px-3 py-1.5">Made</th>
+                    <th className="px-3 py-1.5">Signal time</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-700">
@@ -714,10 +746,10 @@ export default function StrategyLab() {
                             : <span className="inline-flex items-center gap-1 rounded-md bg-rose-600/10 px-1.5 py-0.5 text-[11px] font-black text-rose-700"><TrendingDown size={12} /> DOWN</span>}
                         </td>
                         <td className="px-3 py-1.5"><span className="font-black text-slate-900">{s.symbol}</span> <span className="text-[10px] font-bold text-slate-400">{s.timeframe}</span></td>
-                        <td className="px-3 py-1.5 text-right">{scoreBadge(s.score, s.grade)}</td>
+                        <td className="px-3 py-1.5 text-right"><ScoreEvolution s={s} /></td>
                         <td className="px-3 py-1.5"><FtResultCell s={s} /></td>
                         <td className="px-3 py-1.5"><SourceChips popupSent={s.popupSent} emailSent={s.emailSent} /></td>
-                        <td className="whitespace-nowrap px-3 py-1.5 text-[11px] text-slate-400">{s.signalTime ? new Date(s.signalTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                        <td className="px-3 py-1.5"><SignalTimeCell s={s} /></td>
                       </tr>
                     );
                   }) : (

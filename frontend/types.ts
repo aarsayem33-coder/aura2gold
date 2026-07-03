@@ -779,6 +779,11 @@ export interface StrategySignal {
   direction: string;
   score: number | null;
   grade: string | null;
+  // Score evolution — latest re-detected score/grade + when it last changed (null = unchanged
+  // since the first call). score/grade above stay frozen at first detection.
+  latestScore?: number | null;
+  latestGrade?: string | null;
+  scoreUpdatedAt?: string | null;
   entryPrice: number | null;
   stopLoss: number | null;
   takeProfit1: number | null;
