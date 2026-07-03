@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Smartphone, Mail, MessageSquare, Send, CheckCircle2, XCircle, Bell, Volume2 } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Mail, Send, CheckCircle2, XCircle, Bell, Volume2, Route, SlidersHorizontal, FlaskConical, Filter, ScrollText, MonitorSmartphone, ChevronDown } from 'lucide-react';
 import { fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, useMt5Stream } from '../mt5Api';
 import { formatBdDateTime } from '../utils/time';
 import { playAlertSound, requestNotificationPermission, showBrowserNotification } from '../utils/notifications';
@@ -82,10 +82,14 @@ const breakoutGradeOptions = [
 
 export default function NotificationSettings() {
   const { logs, refresh } = useMt5Stream();
-  const [mqId, setMqId] = useState('12345678');
   const [email, setEmail] = useState('aarsayem002@gmail.com');
-  const [whatsapp, setWhatsapp] = useState('+1234567890');
   const [testStatus, setTestStatus] = useState<string | null>(null);
+  // ── Redesigned UI state: tab navigation, per-strategy filter accordion, dirty tracking ──
+  const [activeTab, setActiveTab] = useState<'routing' | 'strategies' | 'lab' | 'filters' | 'device' | 'log'>('routing');
+  const [expandedFilter, setExpandedFilter] = useState<string | null>(null);
+  // Snapshot of the last LOADED/SAVED settings — the single sticky Save bar appears only
+  // when the current settings differ (all sections save through the same endpoint).
+  const savedSnapshotRef = useRef<string>(JSON.stringify(defaultEmailAlertSettings));
   const [testing, setTesting] = useState(false);
   const [emailSettings, setEmailSettings] = useState<EmailAlertSettings>(defaultEmailAlertSettings);
   const [emailSettingsStatus, setEmailSettingsStatus] = useState<string | null>(null);
@@ -122,7 +126,9 @@ export default function NotificationSettings() {
     fetchEmailAlertSettings()
       .then((payload) => {
         if (cancelled) return;
-        setEmailSettings({ ...defaultEmailAlertSettings, ...payload.settings });
+        const merged = { ...defaultEmailAlertSettings, ...payload.settings };
+        setEmailSettings(merged);
+        savedSnapshotRef.current = JSON.stringify(merged);
         setEmailSettingsMeta({ emailTo: payload.email_to, newsEmailTo: payload.news_email_to, smtpConfigured: payload.smtpConfigured });
       })
       .catch((error) => {
@@ -291,8 +297,10 @@ export default function NotificationSettings() {
     setEmailSettingsStatus(null);
     try {
       const payload = await saveEmailAlertSettings(emailSettings);
-      setEmailSettings({ ...defaultEmailAlertSettings, ...payload.settings });
-      setEmailSettingsStatus('Email routing settings saved.');
+      const merged = { ...defaultEmailAlertSettings, ...payload.settings };
+      setEmailSettings(merged);
+      savedSnapshotRef.current = JSON.stringify(merged);
+      setEmailSettingsStatus('Settings saved.');
     } catch (error) {
       setEmailSettingsStatus(error instanceof Error ? error.message : 'Failed to save email routing settings');
     } finally {
@@ -337,543 +345,500 @@ export default function NotificationSettings() {
     }
   };
 
+  // ── Derived values for the redesigned UI ──────────────────────────────────
+  const dirty = JSON.stringify(emailSettings) !== savedSnapshotRef.current;
+  const routesOn = emailSignalOptions.filter((o) => emailSettings[o.key]).length;
+  const strategiesOn = labStrategies.filter((s) => ctrlOf(s.id).enabled !== false).length;
+  const filteredCount = labStrategies.filter((s) => {
+    const r = ruleOf(s.id);
+    return r.minScore !== undefined || (r.minGrade && r.minGrade !== 'ANY') || (r.symbols || []).length > 0 || (r.direction && r.direction !== 'ANY');
+  }).length;
+
+  // Routing groups — related toggles together so the list scans in seconds.
+  const routeGroups: { label: string; keys: EmailRouteKey[] }[] = [
+    { label: 'Core signals', keys: ['forexScanner', 'fixedTime'] },
+    { label: 'News', keys: ['postNewsForex', 'postNewsFixed', 'highImpactNews'] },
+    { label: 'Advisory & tracking', keys: ['aiTracked', 'forecast', 'signalTracker', 'breakout'] },
+    { label: 'Strategy Lab', keys: ['strategyLab', 'strategyLabFixedTime'] },
+  ];
+
+  // Compact primitives (kept inside the component — they close over nothing).
+  const Toggle = ({ checked, onChange }: { checked: boolean; onChange: () => void }) => (
+    <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+      <input type="checkbox" checked={checked} onChange={onChange} className="peer sr-only" />
+      <div className="h-5 w-9 rounded-full bg-slate-200 transition-colors after:absolute after:left-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-white after:shadow-sm after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-4"></div>
+    </label>
+  );
+  const gradeSelect = (value: string, onChange: (v: string) => void) => (
+    <select value={value} onChange={(e) => onChange(e.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-semibold text-slate-700 outline-none focus:border-gold-500">
+      <option value="ANY">Any grade</option>
+      <option value="B">B and above</option>
+      <option value="A">A and above</option>
+      <option value="A+">A+ only</option>
+    </select>
+  );
+  const thresholdSelect = (label: string, value: string, key: EmailSelectKey, options: readonly { value: string; label: string }[]) => (
+    <label className="flex min-w-0 flex-col gap-1">
+      <span className="text-[11px] font-semibold text-slate-500">{label}</span>
+      <select value={value} onChange={(e) => handleEmailSettingSelect(key, e.target.value)} className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 outline-none focus:border-gold-500">
+        {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </label>
+  );
+
+  const tabs: { key: typeof activeTab; label: string; icon: React.ReactNode; badge?: string }[] = [
+    { key: 'routing', label: 'Routing', icon: <Route size={14} />, badge: `${routesOn} on` },
+    { key: 'strategies', label: 'Strategies', icon: <SlidersHorizontal size={14} />, badge: labStrategies.length ? `${strategiesOn}/${labStrategies.length}` : undefined },
+    { key: 'lab', label: 'Lab Rules', icon: <FlaskConical size={14} /> },
+    { key: 'filters', label: 'Filters', icon: <Filter size={14} />, badge: filteredCount ? `${filteredCount}` : undefined },
+    { key: 'device', label: 'Device & Test', icon: <MonitorSmartphone size={14} /> },
+    { key: 'log', label: 'Delivery Log', icon: <ScrollText size={14} />, badge: logs.length ? `${logs.length}` : undefined },
+  ];
+
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Notification Settings</h2>
-        <p className="text-slate-500 text-sm mt-1 font-medium">Configure where real MT5 alerts are sent</p>
+    <div className="mx-auto max-w-5xl space-y-4 pb-24">
+      {/* Header — title + live delivery status at a glance */}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-bold tracking-tight text-slate-900">Notifications</h2>
+          <p className="mt-0.5 text-sm font-medium text-slate-500">Which signals reach you, and where.</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold">
+          <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${emailSettingsMeta.smtpConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
+            <Mail size={11} /> {emailSettingsMeta.smtpConfigured ? emailSettingsMeta.emailTo || 'Email ready' : 'SMTP not configured'}
+          </span>
+          <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${notificationPermission === 'granted' && browserNotifications ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-500'}`}>
+            <Bell size={11} /> Popups {notificationPermission === 'granted' && browserNotifications ? 'on' : 'off'}
+          </span>
+          <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${soundAlerts ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-500'}`}>
+            <Volume2 size={11} /> Sound {soundAlerts ? 'on' : 'off'}
+          </span>
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="space-y-6">
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
-            <h3 className="text-lg font-bold text-slate-900 mb-6 border-b border-slate-100 pb-3">Channel Configuration</h3>
-            <div className="space-y-6">
-              <div>
-                <label className="flex items-center gap-2 text-sm font-bold text-slate-700 mb-2">
-                  <Smartphone size={18} className="text-blue-500" /> MetaQuotes ID (MT5 App)
-                </label>
-                <div className="flex gap-3">
-                  <input
-                    type="text"
-                    value={mqId}
-                    onChange={(event) => setMqId(event.target.value)}
-                    className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-gold-500/20 focus:border-gold-500 focus:bg-white transition-all"
-                    placeholder="Enter ID from MT5 Mobile App"
-                  />
-                  <button className="px-5 py-2.5 bg-white border border-slate-200 text-slate-400 rounded-xl text-sm font-bold shadow-sm cursor-not-allowed" disabled>
-                    Coming Soon
-                  </button>
-                </div>
-                <p className="text-xs text-slate-500 mt-2 font-medium">Find this in MT5 Mobile App {'->'} Settings {'->'} Messages</p>
-              </div>
+      {/* Tab navigation */}
+      <div className="sticky top-0 z-20 -mx-1 overflow-x-auto bg-slate-50/95 px-1 py-1.5 backdrop-blur">
+        <div className="flex w-max min-w-full gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => setActiveTab(t.key)}
+              className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-bold transition-colors ${activeTab === t.key ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100'}`}
+            >
+              {t.icon}{t.label}
+              {t.badge && <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${activeTab === t.key ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'}`}>{t.badge}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
 
-              <div>
-                <label className="flex items-center gap-2 text-sm font-bold text-slate-700 mb-2">
-                  <Mail size={18} className="text-red-500" /> Email Address
-                </label>
-                <div className="flex gap-3">
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-gold-500/20 focus:border-gold-500 focus:bg-white transition-all"
-                  />
-                  <button onClick={sendTestEmail} disabled={testing} className="px-5 py-2.5 bg-white border border-slate-200 hover:bg-slate-50 hover:border-slate-300 text-slate-700 rounded-xl text-sm font-bold transition-all shadow-sm disabled:opacity-60">
-                    {testing ? 'Sending...' : 'Test'}
-                  </button>
-                </div>
-                {testStatus && <p className="text-xs text-slate-500 mt-2 font-semibold">{testStatus}</p>}
-              </div>
-
-              <div>
-                <label className="flex items-center gap-2 text-sm font-bold text-slate-700 mb-2">
-                  <MessageSquare size={18} className="text-emerald-500" /> WhatsApp Number
-                </label>
-                <div className="flex gap-3">
-                  <input
-                    type="text"
-                    value={whatsapp}
-                    onChange={(event) => setWhatsapp(event.target.value)}
-                    className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-gold-500/20 focus:border-gold-500 focus:bg-white transition-all"
-                    placeholder="+1234567890"
-                  />
-                  <button className="px-5 py-2.5 bg-white border border-slate-200 text-slate-400 rounded-xl text-sm font-bold shadow-sm cursor-not-allowed" disabled>
-                    Coming Soon
-                  </button>
-                </div>
-                <p className="text-xs text-slate-500 mt-2 font-medium">WhatsApp delivery is not implemented yet. Email delivery is live.</p>
-              </div>
-
-              <div className="pt-6 border-t border-slate-100">
-                <button className="w-full flex items-center justify-center gap-2 bg-gold-500 text-white font-bold py-3.5 px-4 rounded-xl shadow-sm opacity-70 cursor-not-allowed" disabled>
-                  <Send size={18} /> Saved in Backend Env for Now
-                </button>
-              </div>
+      {/* ── ROUTING ── */}
+      {activeTab === 'routing' && (
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="border-b border-slate-100 px-5 py-3">
+              <h3 className="text-sm font-bold text-slate-900">Signal email routing</h3>
+              <p className="text-xs font-medium text-slate-500">Which signal systems may email you. Popups are separate and stay on.</p>
             </div>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
-            <h3 className="text-lg font-bold text-slate-900 mb-6 border-b border-slate-100 pb-3">Browser & Local Alerts</h3>
-            <div className="space-y-6">
-              <div className="flex items-center justify-between p-4 rounded-xl bg-slate-50 border border-slate-200">
-                <div className="flex items-start gap-3">
-                  <Bell size={20} className="text-blue-500 mt-0.5" />
-                  <div>
-                    <h4 className="text-sm font-bold text-slate-800">Browser Notifications</h4>
-                    <p className="text-xs text-slate-500 mt-0.5 font-medium">Show desktop popups for Forex & FTT signals</p>
-                    <p className="text-[10px] text-slate-400 mt-1 font-semibold uppercase">
-                      Status: {notificationPermission === 'granted' ? 'Active' : notificationPermission === 'denied' ? 'Blocked' : 'Click Switch to Enable'}
-                    </p>
-                  </div>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={browserNotifications && notificationPermission === 'granted'}
-                    onChange={handleNotificationToggle}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-gold-500"></div>
-                </label>
-              </div>
-
-              <div className="flex items-center justify-between p-4 rounded-xl bg-slate-50 border border-slate-200">
-                <div className="flex items-start gap-3">
-                  <Volume2 size={20} className="text-emerald-500 mt-0.5" />
-                  <div>
-                    <h4 className="text-sm font-bold text-slate-800">Sound Alerts</h4>
-                    <p className="text-xs text-slate-500 mt-0.5 font-medium">Play a premium chime sound for incoming alerts</p>
-                  </div>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={soundAlerts}
-                    onChange={handleSoundToggle}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-gold-500"></div>
-                </label>
-              </div>
-
-              <div className="flex gap-3 pt-2">
-                <button
-                  onClick={triggerTestNotification}
-                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-bold shadow-sm transition-all border border-slate-200"
-                >
-                  Test Notification
-                </button>
-                <button
-                  onClick={playAlertSound}
-                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-bold shadow-sm transition-all border border-slate-200"
-                >
-                  Test Chime
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
-            <div className="mb-6 border-b border-slate-100 pb-3">
-              <h3 className="text-lg font-bold text-slate-900">Signal Email Routing</h3>
-              <p className="mt-1 text-xs font-semibold text-slate-500">Choose which signal systems are allowed to send email alerts.</p>
-            </div>
-            <div className="space-y-3">
-              {emailSignalOptions.map((option) => (
-                <div key={option.key} className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
-                  <div>
-                    <h4 className="text-sm font-bold text-slate-800">{option.title}</h4>
-                    <p className="mt-0.5 text-xs font-medium text-slate-500">{option.description}</p>
-                    <p className="mt-1 text-[10px] font-black uppercase tracking-wider text-amber-600">{option.note}</p>
-                  </div>
-                  <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                    <input
-                      type="checkbox"
-                      checked={emailSettings[option.key]}
-                      onChange={() => handleEmailSettingToggle(option.key)}
-                      className="sr-only peer"
-                    />
-                    <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
-                  </label>
-                </div>
-              ))}
-            </div>
-            <div className="mt-5 grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:grid-cols-2">
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Forex Minimum Setup</label>
-                <select
-                  value={emailSettings.forexMinGrade}
-                  onChange={(event) => handleEmailSettingSelect('forexMinGrade', event.target.value)}
-                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
-                >
-                  {forexGradeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Forex Minimum Signal</label>
-                <select
-                  value={emailSettings.forexMinQuality}
-                  onChange={(event) => handleEmailSettingSelect('forexMinQuality', event.target.value)}
-                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
-                >
-                  {forexQualityOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Fixed-Time Minimum</label>
-                <select
-                  value={emailSettings.fixedTimeMinTier}
-                  onChange={(event) => handleEmailSettingSelect('fixedTimeMinTier', event.target.value)}
-                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
-                >
-                  {fttTierOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Post-News Forex Minimum</label>
-                <select
-                  value={emailSettings.postNewsForexMinGrade}
-                  onChange={(event) => handleEmailSettingSelect('postNewsForexMinGrade', event.target.value)}
-                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
-                >
-                  {newsGradeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Post-News Fixed Minimum</label>
-                <select
-                  value={emailSettings.postNewsFixedMinTier}
-                  onChange={(event) => handleEmailSettingSelect('postNewsFixedMinTier', event.target.value)}
-                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
-                >
-                  {fttTierOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Breakout Email Minimum Grade</label>
-                <select
-                  value={emailSettings.breakoutEmailMinGrade}
-                  onChange={(event) => handleEmailSettingSelect('breakoutEmailMinGrade', event.target.value)}
-                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500"
-                >
-                  {breakoutGradeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="mt-5 rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800">
-              WATCH_ONLY and NO_TRADE are never emailed. Fixed-time filters only choose between QUALITY_SIGNAL-only and TRADE_SIGNAL-or-better.
-            </div>
-            <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="text-xs font-semibold text-slate-500">
-                <p>Trade emails: {emailSettingsMeta.emailTo || 'not configured'}</p>
-                <p>News emails: {emailSettingsMeta.newsEmailTo || emailSettingsMeta.emailTo || 'not configured'} · SMTP {emailSettingsMeta.smtpConfigured ? 'configured' : 'not configured'}</p>
-              </div>
-              <button
-                onClick={handleSaveEmailSettings}
-                disabled={savingEmailSettings}
-                className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60"
-              >
-                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Email Routing'}
-              </button>
-            </div>
-            {emailSettingsStatus && <p className="mt-3 text-xs font-bold text-slate-500">{emailSettingsStatus}</p>}
-          </div>
-
-          {/* Strategy Controller — master per-strategy switch (gates EVERYTHING) */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
-            <div className="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="text-lg font-bold text-slate-900">Strategy Controller</h3>
-                <p className="mt-1 text-xs font-semibold text-slate-500">Master on/off per strategy. <b>Off</b> = no signals anywhere — dashboard tables, reports, browser popups and emails all go silent for that strategy. It keeps being measured in the background, so its win-rate ranking still accumulates (turn it back on anytime). Optional per-strategy <b>min score / setup / timeframes</b> further filter which signals actually alert.</p>
-              </div>
-              <div className="flex shrink-0 gap-2">
-                <button type="button" onClick={() => setAllStrategiesEnabled(true)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-bold text-slate-600 hover:bg-slate-50">All on</button>
-                <button type="button" onClick={() => setAllStrategiesEnabled(false)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-bold text-slate-600 hover:bg-slate-50">All off</button>
-              </div>
-            </div>
-
-            <div className="space-y-2.5">
-              {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
-              {labStrategies.map((s) => {
-                const c = ctrlOf(s.id);
-                const on = c.enabled !== false;
-                const tfs = c.timeframes || [];
-                return (
-                  <div key={s.id} className={`rounded-xl border p-3.5 transition-colors ${on ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50'}`}>
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <h4 className={`truncate text-sm font-bold ${on ? 'text-slate-800' : 'text-slate-400'}`}>{s.name}</h4>
-                          {s.id === 'ict-breaker' && <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-700">LIVE WINNER</span>}
-                          {!on && <span className="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">MUTED</span>}
+            {routeGroups.map((group) => (
+              <div key={group.label}>
+                <p className="bg-slate-50/70 px-5 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">{group.label}</p>
+                <div className="divide-y divide-slate-100">
+                  {group.keys.map((key) => {
+                    const option = emailSignalOptions.find((o) => o.key === key)!;
+                    return (
+                      <div key={key} className="flex items-center justify-between gap-4 px-5 py-2.5 transition-colors hover:bg-slate-50/60">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h4 className="text-[13px] font-bold text-slate-800">{option.title}</h4>
+                            <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-600">{option.note}</span>
+                          </div>
+                          <p className="mt-0.5 truncate text-[11px] font-medium text-slate-400" title={option.description}>{option.description}</p>
                         </div>
-                        <p className="mt-0.5 truncate text-[11px] font-medium text-slate-400">{s.id} · {s.timeframes.join(' / ')}</p>
+                        <Toggle checked={emailSettings[key]} onChange={() => handleEmailSettingToggle(key)} />
                       </div>
-                      <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                        <input type="checkbox" checked={on} onChange={() => handleStrategyEnabledToggle(s.id)} className="sr-only peer" />
-                        <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
-                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
+            <h3 className="text-sm font-bold text-slate-900">Minimum thresholds</h3>
+            <p className="mb-3 text-xs font-medium text-slate-500">Below these, a signal is not emailed. WATCH_ONLY and NO_TRADE are never emailed.</p>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {thresholdSelect('Forex minimum setup', emailSettings.forexMinGrade, 'forexMinGrade', forexGradeOptions)}
+              {thresholdSelect('Forex minimum signal', emailSettings.forexMinQuality, 'forexMinQuality', forexQualityOptions)}
+              {thresholdSelect('Fixed-time minimum', emailSettings.fixedTimeMinTier, 'fixedTimeMinTier', fttTierOptions)}
+              {thresholdSelect('Post-news forex minimum', emailSettings.postNewsForexMinGrade, 'postNewsForexMinGrade', newsGradeOptions)}
+              {thresholdSelect('Post-news fixed minimum', emailSettings.postNewsFixedMinTier, 'postNewsFixedMinTier', fttTierOptions)}
+              {thresholdSelect('Breakout minimum grade', emailSettings.breakoutEmailMinGrade, 'breakoutEmailMinGrade', breakoutGradeOptions)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── STRATEGIES (Controller) ── */}
+      {activeTab === 'strategies' && (
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-5 py-3">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Strategy controller</h3>
+              <p className="text-xs font-medium text-slate-500">Off = silent everywhere (still measured for ranking). Refinements filter which signals alert.</p>
+            </div>
+            <div className="flex gap-1.5">
+              <button type="button" onClick={() => setAllStrategiesEnabled(true)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-600 hover:bg-slate-50">All on</button>
+              <button type="button" onClick={() => setAllStrategiesEnabled(false)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-600 hover:bg-slate-50">All off</button>
+            </div>
+          </div>
+          <div className="divide-y divide-slate-100">
+            {!labStrategies.length && <p className="px-5 py-6 text-center text-xs font-medium text-slate-400">No strategies loaded — check the backend connection.</p>}
+            {labStrategies.map((s) => {
+              const c = ctrlOf(s.id);
+              const on = c.enabled !== false;
+              const tfs = c.timeframes || [];
+              return (
+                <div key={s.id} className={`px-5 py-2.5 transition-colors ${on ? 'hover:bg-slate-50/60' : 'bg-slate-50/50'}`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <h4 className={`truncate text-[13px] font-bold ${on ? 'text-slate-800' : 'text-slate-400'}`}>{s.name}</h4>
+                        {s.id === 'ict-breaker' && <span className="shrink-0 rounded bg-emerald-100 px-1.5 py-0.5 text-[9px] font-bold text-emerald-700">LIVE WINNER</span>}
+                        {s.id === 'xau-session-raid' && <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-700">GOLD ONLY</span>}
+                        {!on && <span className="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[9px] font-bold text-slate-500">MUTED</span>}
+                      </div>
+                      <p className="mt-0.5 truncate text-[11px] font-medium text-slate-400">{s.timeframes.join(' · ')}</p>
                     </div>
-                    {on && (
-                      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-100 pt-3">
-                        <label className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500">Min score
-                          <select value={c.minScore ?? ''} onChange={(e) => handleStrategyMinScore(s.id, e.target.value)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-xs font-semibold text-slate-700">
-                            <option value="">Any</option>
+                    <div className="flex shrink-0 items-center gap-3">
+                      {on && (
+                        <div className="hidden items-center gap-2 sm:flex">
+                          <select value={c.minScore ?? ''} onChange={(e) => handleStrategyMinScore(s.id, e.target.value)} title="Minimum score to alert" className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px] font-semibold text-slate-600">
+                            <option value="">Any score</option>
                             {[65, 70, 75, 80, 85, 90].map((v) => <option key={v} value={v}>≥ {v}</option>)}
                           </select>
-                        </label>
-                        <label className="flex items-center gap-1.5 text-[11px] font-bold text-slate-500">Setup
-                          <select value={c.direction ?? 'ANY'} onChange={(e) => handleStrategyDirection(s.id, e.target.value)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-xs font-semibold text-slate-700">
+                          <select value={c.direction ?? 'ANY'} onChange={(e) => handleStrategyDirection(s.id, e.target.value)} title="Setup direction" className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px] font-semibold text-slate-600">
                             <option value="ANY">Both</option>
                             <option value="LONG">Long only</option>
                             <option value="SHORT">Short only</option>
                           </select>
-                        </label>
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[11px] font-bold text-slate-500">Timeframes</span>
-                          {s.timeframes.map((tf) => {
-                            const active = tfs.length === 0 || tfs.includes(tf);
-                            return (
-                              <button key={tf} type="button" onClick={() => handleStrategyTimeframe(s.id, tf)}
-                                className={`rounded-md px-1.5 py-1 text-[11px] font-bold transition-colors ${active ? 'bg-gold-500 text-white' : 'bg-slate-100 text-slate-400'}`}>{tf}</button>
-                            );
-                          })}
-                          {tfs.length === 0 && <span className="text-[10px] font-medium text-slate-400">(all)</span>}
+                          <div className="flex items-center gap-1">
+                            {s.timeframes.map((tf) => {
+                              const active = tfs.length === 0 || tfs.includes(tf);
+                              return (
+                                <button key={tf} type="button" onClick={() => handleStrategyTimeframe(s.id, tf)} title={active ? `${tf} alerts on` : `${tf} alerts off`}
+                                  className={`rounded px-1.5 py-0.5 text-[10px] font-bold transition-colors ${active ? 'bg-gold-500 text-white' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}>{tf}</button>
+                              );
+                            })}
+                          </div>
                         </div>
-                      </div>
-                    )}
+                      )}
+                      <Toggle checked={on} onChange={() => handleStrategyEnabledToggle(s.id)} />
+                    </div>
                   </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Strategy Lab email rules — which strategies / score / grade send email */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card">
-            <div className="mb-5 border-b border-slate-100 pb-3">
-              <h3 className="text-lg font-bold text-slate-900">Strategy Lab Email Rules</h3>
-              <p className="mt-1 text-xs font-semibold text-slate-500">Choose which strategies email, the minimum score, and the minimum grade. Popups still fire for every score ≥ {STRATEGY_LAB_POPUP_GATE}; these rules only filter <b>emails</b>.</p>
-            </div>
-
-            <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
-              <div>
-                <h4 className="text-sm font-bold text-slate-800">Strategy Lab emails</h4>
-                <p className="mt-0.5 text-xs font-medium text-slate-500">Master switch — turn on to email high-score strategy signals.</p>
-              </div>
-              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                <input type="checkbox" checked={emailSettings.strategyLab} onChange={() => handleEmailSettingToggle('strategyLab')} className="sr-only peer" />
-                <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
-              </label>
-            </div>
-
-            <div className={`mt-4 grid gap-4 sm:grid-cols-2 ${emailSettings.strategyLab ? '' : 'opacity-50 pointer-events-none'}`}>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum score: <span className="text-gold-600">{emailSettings.strategyLabMinScore}</span></label>
-                <input type="range" min={40} max={95} step={1} value={emailSettings.strategyLabMinScore} onChange={(e) => handleLabMinScore(Number(e.target.value))} className="mt-3 w-full accent-gold-500" />
-                <div className="flex justify-between text-[10px] font-bold text-slate-400"><span>40</span><span>95</span></div>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum grade</label>
-                <select value={emailSettings.strategyLabMinGrade} onChange={(e) => handleLabMinGrade(e.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500">
-                  <option value="ANY">Any grade</option>
-                  <option value="B">B and above</option>
-                  <option value="A">A and above</option>
-                  <option value="A+">A+ only</option>
-                </select>
-              </div>
-            </div>
-
-            <div className={`mt-4 ${emailSettings.strategyLab ? '' : 'opacity-50 pointer-events-none'}`}>
-              <p className="text-xs font-black uppercase tracking-wider text-slate-500 mb-2">Strategies that email</p>
-              <div className="space-y-2">
-                {labStrategies.map((s) => {
-                  const map = emailSettings.strategyLabStrategies || {};
-                  const enabled = Object.keys(map).length === 0 ? true : (map[s.id] ?? true);
-                  return (
-                    <div key={s.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                      <div>
-                        <h5 className="text-sm font-bold text-slate-800">{s.name}</h5>
-                        {s.source && <p className="text-[10px] font-semibold text-slate-400">{s.source}</p>}
-                      </div>
-                      <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                        <input type="checkbox" checked={enabled} onChange={() => handleLabStrategyToggle(s.id)} className="sr-only peer" />
-                        <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
-                      </label>
-                    </div>
-                  );
-                })}
-                {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
-              </div>
-            </div>
-
-            <div className="mt-5 flex justify-end">
-              <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
-                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Strategy Lab Rules'}
-              </button>
-            </div>
-          </div>
-
-          {/* Strategy Lab FIXED-TIME email rules — independent UP/DOWN call emails */}
-          <div className="bg-white rounded-2xl border border-violet-200 p-6 sm:p-8 shadow-card">
-            <div className="mb-5 border-b border-slate-100 pb-3">
-              <h3 className="text-lg font-bold text-slate-900">Strategy Lab — Fixed-Time Email Rules</h3>
-              <p className="mt-1 text-xs font-semibold text-slate-500">Independent rules for the <b>fixed-time (UP/DOWN at next-candle expiry)</b> framing of strategy-lab signals. Choose which strategies email, the minimum score, and the minimum grade. Separate from the Forex strategy-lab emails above.</p>
-            </div>
-
-            <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
-              <div>
-                <h4 className="text-sm font-bold text-slate-800">Strategy Lab fixed-time emails</h4>
-                <p className="mt-0.5 text-xs font-medium text-slate-500">Master switch — turn on to email high-score fixed-time calls.</p>
-              </div>
-              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                <input type="checkbox" checked={emailSettings.strategyLabFixedTime} onChange={() => handleEmailSettingToggle('strategyLabFixedTime')} className="sr-only peer" />
-                <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
-              </label>
-            </div>
-
-            <div className={`mt-4 grid gap-4 sm:grid-cols-2 ${emailSettings.strategyLabFixedTime ? '' : 'opacity-50 pointer-events-none'}`}>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum score: <span className="text-gold-600">{emailSettings.strategyLabFttMinScore}</span></label>
-                <input type="range" min={40} max={95} step={1} value={emailSettings.strategyLabFttMinScore} onChange={(e) => handleLabFttMinScore(Number(e.target.value))} className="mt-3 w-full accent-gold-500" />
-                <div className="flex justify-between text-[10px] font-bold text-slate-400"><span>40</span><span>95</span></div>
-              </div>
-              <div>
-                <label className="text-xs font-black uppercase tracking-wider text-slate-500">Minimum grade</label>
-                <select value={emailSettings.strategyLabFttMinGrade} onChange={(e) => handleLabFttMinGrade(e.target.value)} className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-gold-500">
-                  <option value="ANY">Any grade</option>
-                  <option value="B">B and above</option>
-                  <option value="A">A and above</option>
-                  <option value="A+">A+ only</option>
-                </select>
-              </div>
-            </div>
-
-            <div className={`mt-4 ${emailSettings.strategyLabFixedTime ? '' : 'opacity-50 pointer-events-none'}`}>
-              <p className="text-xs font-black uppercase tracking-wider text-slate-500 mb-2">Strategies that email fixed-time calls</p>
-              <div className="space-y-2">
-                {labStrategies.map((s) => {
-                  const map = emailSettings.strategyLabFttStrategies || {};
-                  const enabled = Object.keys(map).length === 0 ? true : (map[s.id] ?? true);
-                  return (
-                    <div key={s.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                      <div>
-                        <h5 className="text-sm font-bold text-slate-800">{s.name}</h5>
-                        {s.source && <p className="text-[10px] font-semibold text-slate-400">{s.source}</p>}
-                      </div>
-                      <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                        <input type="checkbox" checked={enabled} onChange={() => handleLabFttStrategyToggle(s.id)} className="sr-only peer" />
-                        <div className="h-6 w-11 rounded-full bg-slate-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-slate-300 after:bg-white after:transition-all after:content-[''] peer-checked:bg-gold-500 peer-checked:after:translate-x-full peer-checked:after:border-white"></div>
-                      </label>
-                    </div>
-                  );
-                })}
-                {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
-              </div>
-            </div>
-
-            <div className="mt-5 flex justify-end">
-              <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
-                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Fixed-Time Rules'}
-              </button>
-            </div>
-          </div>
-
-          {/* Per-strategy EMAIL filters — score / symbols / setup, to cut email noise per strategy */}
-          <div className="bg-white rounded-2xl border border-emerald-200 p-6 sm:p-8 shadow-card">
-            <div className="mb-5 border-b border-slate-100 pb-3">
-              <h3 className="text-lg font-bold text-slate-900">Per-Strategy Email Filters</h3>
-              <p className="mt-1 text-xs font-semibold text-slate-500">Fine-tune <b>which symbols and setups each strategy emails</b> to cut noise. Applies to <b>both</b> the Forex and Fixed-Time strategy-lab emails above. A strategy with no filter set behaves exactly as before. <span className="font-bold text-emerald-700">Delivery-only</span> — signal generation, logging, popups, and win-rate ranking are never affected, so signal quality and count are untouched.</p>
-            </div>
-
-            <div className="space-y-3">
-              {labStrategies.map((s) => {
-                const rule = ruleOf(s.id);
-                const selectedSymbols = (rule.symbols || []).map((x) => x.toUpperCase());
-                const active = Boolean(rule.minScore !== undefined || (rule.minGrade && rule.minGrade !== 'ANY') || selectedSymbols.length || (rule.direction && rule.direction !== 'ANY'));
-                return (
-                  <div key={s.id} className={`rounded-xl border p-4 ${active ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200 bg-slate-50'}`}>
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <h5 className="text-sm font-bold text-slate-800">{s.name}{active && <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-black uppercase tracking-wider text-emerald-700">Filtered</span>}</h5>
-                        {s.source && <p className="text-[10px] font-semibold text-slate-400">{s.source}</p>}
-                      </div>
-                      {active && <button onClick={() => clearLabRule(s.id)} className="shrink-0 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-500 transition hover:border-red-200 hover:text-red-600">Reset</button>}
-                    </div>
-
-                    <div className="mt-3 grid gap-3 sm:grid-cols-3">
-                      <div>
-                        <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Min score</label>
-                        <input type="number" min={40} max={95} step={1} value={rule.minScore ?? ''} placeholder="default" onChange={(e) => handleLabRuleMinScore(s.id, e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500" />
-                      </div>
-                      <div>
-                        <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Min grade</label>
-                        <select value={rule.minGrade || 'ANY'} onChange={(e) => handleLabRuleMinGrade(s.id, e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500">
-                          <option value="ANY">Any grade</option>
-                          <option value="B">B and above</option>
-                          <option value="A">A and above</option>
-                          <option value="A+">A+ only</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Setup (direction)</label>
-                        <select value={rule.direction || 'ANY'} onChange={(e) => handleLabRuleDirection(s.id, e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500">
-                          <option value="ANY">Both (long &amp; short)</option>
-                          <option value="LONG">Long only (BUY)</option>
-                          <option value="SHORT">Short only (SELL)</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="mt-3">
-                      <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">Symbols {selectedSymbols.length ? <span className="text-emerald-700">({selectedSymbols.length} selected)</span> : <span className="text-slate-400">(none = all symbols)</span>}</label>
-                      <div className="mt-1.5 flex flex-wrap gap-1.5">
-                        {labSymbols.map((sym) => {
-                          const on = selectedSymbols.includes(sym.toUpperCase());
+                  {on && (
+                    <div className="mt-2 flex items-center gap-2 sm:hidden">
+                      <select value={c.minScore ?? ''} onChange={(e) => handleStrategyMinScore(s.id, e.target.value)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px] font-semibold text-slate-600">
+                        <option value="">Any score</option>
+                        {[65, 70, 75, 80, 85, 90].map((v) => <option key={v} value={v}>≥ {v}</option>)}
+                      </select>
+                      <select value={c.direction ?? 'ANY'} onChange={(e) => handleStrategyDirection(s.id, e.target.value)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px] font-semibold text-slate-600">
+                        <option value="ANY">Both</option>
+                        <option value="LONG">Long</option>
+                        <option value="SHORT">Short</option>
+                      </select>
+                      <div className="flex items-center gap-1">
+                        {s.timeframes.map((tf) => {
+                          const active = tfs.length === 0 || tfs.includes(tf);
                           return (
-                            <button key={sym} onClick={() => handleLabRuleSymbol(s.id, sym)} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{sym}</button>
+                            <button key={tf} type="button" onClick={() => handleStrategyTimeframe(s.id, tf)}
+                              className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${active ? 'bg-gold-500 text-white' : 'bg-slate-100 text-slate-400'}`}>{tf}</button>
                           );
                         })}
-                        {!labSymbols.length && <p className="text-xs font-medium text-slate-400">No symbols available (MT5 feed offline) — leave empty to email all symbols.</p>}
                       </div>
                     </div>
-                  </div>
-                );
-              })}
-              {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies registered yet.</p>}
-            </div>
-
-            <div className="mt-5 flex justify-end">
-              <button onClick={handleSaveEmailSettings} disabled={savingEmailSettings} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gold-500 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-gold-600 disabled:opacity-60">
-                <Send size={16} /> {savingEmailSettings ? 'Saving...' : 'Save Per-Strategy Filters'}
-              </button>
-            </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
+      )}
 
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-card flex flex-col">
-          <h3 className="text-lg font-bold text-slate-900 mb-6 border-b border-slate-100 pb-3">Recent Delivery Logs</h3>
-          <div className="flex-1 overflow-y-auto pr-2 space-y-3">
-            {logs.map((log) => (
-              <div key={log.id} className="p-4 rounded-xl bg-slate-50 border border-slate-100 flex items-start justify-between hover:border-slate-200 transition-colors">
-                <div>
-                  <div className="flex items-center gap-2 mb-1.5">
-                    <span className="text-sm font-bold text-slate-800">{log.channel}</span>
-                    <span className="text-xs font-medium text-slate-400">{formatBdDateTime(log.timestamp)}</span>
-                  </div>
-                  <p className="text-xs text-slate-600 font-mono bg-white px-2 py-1 rounded border border-slate-100 inline-block">{log.recipient}</p>
-                  {log.signalId && <p className="text-xs font-medium text-slate-400 mt-2">Signal: {log.signalId}</p>}
-                  {log.error && <p className="text-xs font-semibold text-red-500 mt-2">Error: {log.error}</p>}
-                </div>
-                <div className="mt-1">
-                  {log.status === 'Success' ? <CheckCircle2 size={22} className="text-emerald-500" /> : <XCircle size={22} className="text-red-500" />}
+      {/* ── LAB RULES (Forex + Fixed-Time, side by side) ── */}
+      {activeTab === 'lab' && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          {/* Forex framing */}
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Forex lab emails</h3>
+                <p className="text-xs font-medium text-slate-500">TP/SL framing. Popups fire from score ≥ {STRATEGY_LAB_POPUP_GATE} regardless.</p>
+              </div>
+              <Toggle checked={emailSettings.strategyLab} onChange={() => handleEmailSettingToggle('strategyLab')} />
+            </div>
+            <div className={`space-y-4 p-5 ${emailSettings.strategyLab ? '' : 'pointer-events-none opacity-45'}`}>
+              <div className="flex items-center gap-4">
+                <label className="flex-1">
+                  <span className="text-[11px] font-semibold text-slate-500">Min score <b className="text-gold-600">{emailSettings.strategyLabMinScore}</b></span>
+                  <input type="range" min={40} max={95} step={1} value={emailSettings.strategyLabMinScore} onChange={(e) => handleLabMinScore(Number(e.target.value))} className="mt-1 w-full accent-gold-500" />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-[11px] font-semibold text-slate-500">Min grade</span>
+                  {gradeSelect(emailSettings.strategyLabMinGrade, handleLabMinGrade)}
+                </label>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">Strategies that email</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {labStrategies.map((s) => {
+                    const map = emailSettings.strategyLabStrategies || {};
+                    const enabled = Object.keys(map).length === 0 ? true : (map[s.id] ?? true);
+                    return (
+                      <button key={s.id} type="button" onClick={() => handleLabStrategyToggle(s.id)} title={s.source || s.id}
+                        className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${enabled ? 'border-gold-400 bg-gold-50 text-gold-700' : 'border-slate-200 bg-white text-slate-400 hover:border-slate-300'}`}>
+                        {enabled ? '✓ ' : ''}{s.name}
+                      </button>
+                    );
+                  })}
+                  {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies loaded.</p>}
                 </div>
               </div>
-            ))}
-            {!logs.length && <p className="text-sm font-medium text-slate-400">No email delivery logs yet.</p>}
+            </div>
+          </div>
+
+          {/* Fixed-time framing */}
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Fixed-time lab emails</h3>
+                <p className="text-xs font-medium text-slate-500">UP/DOWN at next-candle expiry. Independent of the forex rules.</p>
+              </div>
+              <Toggle checked={emailSettings.strategyLabFixedTime} onChange={() => handleEmailSettingToggle('strategyLabFixedTime')} />
+            </div>
+            <div className={`space-y-4 p-5 ${emailSettings.strategyLabFixedTime ? '' : 'pointer-events-none opacity-45'}`}>
+              <div className="flex items-center gap-4">
+                <label className="flex-1">
+                  <span className="text-[11px] font-semibold text-slate-500">Min score <b className="text-gold-600">{emailSettings.strategyLabFttMinScore}</b></span>
+                  <input type="range" min={40} max={95} step={1} value={emailSettings.strategyLabFttMinScore} onChange={(e) => handleLabFttMinScore(Number(e.target.value))} className="mt-1 w-full accent-gold-500" />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-[11px] font-semibold text-slate-500">Min grade</span>
+                  {gradeSelect(emailSettings.strategyLabFttMinGrade, handleLabFttMinGrade)}
+                </label>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">Strategies that email fixed-time calls</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {labStrategies.map((s) => {
+                    const map = emailSettings.strategyLabFttStrategies || {};
+                    const enabled = Object.keys(map).length === 0 ? true : (map[s.id] ?? true);
+                    return (
+                      <button key={s.id} type="button" onClick={() => handleLabFttStrategyToggle(s.id)} title={s.source || s.id}
+                        className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${enabled ? 'border-violet-400 bg-violet-50 text-violet-700' : 'border-slate-200 bg-white text-slate-400 hover:border-slate-300'}`}>
+                        {enabled ? '✓ ' : ''}{s.name}
+                      </button>
+                    );
+                  })}
+                  {!labStrategies.length && <p className="text-xs font-medium text-slate-400">No strategies loaded.</p>}
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
+      )}
+
+      {/* ── PER-STRATEGY FILTERS (accordion) ── */}
+      {activeTab === 'filters' && (
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+          <div className="border-b border-slate-100 px-5 py-3">
+            <h3 className="text-sm font-bold text-slate-900">Per-strategy email filters</h3>
+            <p className="text-xs font-medium text-slate-500">Which symbols and setups each strategy emails. Delivery-only — signal quality, logging and rankings are untouched.</p>
+          </div>
+          <div className="divide-y divide-slate-100">
+            {!labStrategies.length && <p className="px-5 py-6 text-center text-xs font-medium text-slate-400">No strategies loaded — check the backend connection.</p>}
+            {labStrategies.map((s) => {
+              const rule = ruleOf(s.id);
+              const selectedSymbols = (rule.symbols || []).map((x) => x.toUpperCase());
+              const active = Boolean(rule.minScore !== undefined || (rule.minGrade && rule.minGrade !== 'ANY') || selectedSymbols.length || (rule.direction && rule.direction !== 'ANY'));
+              const open = expandedFilter === s.id;
+              const summary = [
+                rule.minScore !== undefined ? `score ≥ ${rule.minScore}` : null,
+                rule.minGrade && rule.minGrade !== 'ANY' ? `${rule.minGrade}+` : null,
+                rule.direction && rule.direction !== 'ANY' ? (rule.direction === 'LONG' ? 'long only' : 'short only') : null,
+                selectedSymbols.length ? `${selectedSymbols.length} symbol${selectedSymbols.length > 1 ? 's' : ''}` : null,
+              ].filter(Boolean).join(' · ');
+              return (
+                <div key={s.id}>
+                  <button type="button" onClick={() => setExpandedFilter(open ? null : s.id)} className="flex w-full items-center justify-between gap-3 px-5 py-2.5 text-left transition-colors hover:bg-slate-50/60">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <h4 className="truncate text-[13px] font-bold text-slate-800">{s.name}</h4>
+                      {active && <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-700">Filtered</span>}
+                      {summary && <span className="hidden truncate text-[11px] font-medium text-slate-400 sm:inline">{summary}</span>}
+                    </div>
+                    <ChevronDown size={15} className={`shrink-0 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+                  </button>
+                  {open && (
+                    <div className="space-y-3 border-t border-slate-100 bg-slate-50/50 px-5 py-3.5">
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[11px] font-semibold text-slate-500">Min score (blank = default)</span>
+                          <input type="number" min={40} max={95} step={1} value={rule.minScore ?? ''} placeholder="default" onChange={(e) => handleLabRuleMinScore(s.id, e.target.value)} className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-bold text-slate-800 outline-none focus:border-emerald-500" />
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[11px] font-semibold text-slate-500">Min grade</span>
+                          {gradeSelect(rule.minGrade || 'ANY', (v) => handleLabRuleMinGrade(s.id, v))}
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[11px] font-semibold text-slate-500">Setup (direction)</span>
+                          <select value={rule.direction || 'ANY'} onChange={(e) => handleLabRuleDirection(s.id, e.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500">
+                            <option value="ANY">Both (long &amp; short)</option>
+                            <option value="LONG">Long only (BUY)</option>
+                            <option value="SHORT">Short only (SELL)</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div>
+                        <p className="mb-1.5 text-[11px] font-semibold text-slate-500">
+                          Symbols {selectedSymbols.length ? <span className="text-emerald-600">— {selectedSymbols.length} selected</span> : <span className="text-slate-400">— none selected = all symbols email</span>}
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {labSymbols.map((sym) => {
+                            const on = selectedSymbols.includes(sym.toUpperCase());
+                            return (
+                              <button key={sym} type="button" onClick={() => handleLabRuleSymbol(s.id, sym)} className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{sym}</button>
+                            );
+                          })}
+                          {!labSymbols.length && <p className="text-xs font-medium text-slate-400">No symbols available (MT5 feed offline) — leave empty to email all symbols.</p>}
+                        </div>
+                      </div>
+                      {active && (
+                        <button type="button" onClick={() => clearLabRule(s.id)} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-500 transition-colors hover:border-red-200 hover:text-red-600">Reset filter</button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── DEVICE & TEST ── */}
+      {activeTab === 'device' && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="border-b border-slate-100 px-5 py-3">
+              <h3 className="text-sm font-bold text-slate-900">This device</h3>
+              <p className="text-xs font-medium text-slate-500">Browser popups and sound for incoming signals.</p>
+            </div>
+            <div className="divide-y divide-slate-100">
+              <div className="flex items-center justify-between gap-4 px-5 py-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <Bell size={16} className="shrink-0 text-slate-400" />
+                  <div className="min-w-0">
+                    <h4 className="text-[13px] font-bold text-slate-800">Browser notifications</h4>
+                    <p className="text-[11px] font-medium text-slate-400">
+                      {notificationPermission === 'granted' ? 'Permission granted' : notificationPermission === 'denied' ? 'Blocked in browser settings' : 'Toggle to request permission'}
+                    </p>
+                  </div>
+                </div>
+                <Toggle checked={browserNotifications && notificationPermission === 'granted'} onChange={handleNotificationToggle} />
+              </div>
+              <div className="flex items-center justify-between gap-4 px-5 py-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <Volume2 size={16} className="shrink-0 text-slate-400" />
+                  <div className="min-w-0">
+                    <h4 className="text-[13px] font-bold text-slate-800">Sound alerts</h4>
+                    <p className="text-[11px] font-medium text-slate-400">Chime on incoming alerts</p>
+                  </div>
+                </div>
+                <Toggle checked={soundAlerts} onChange={handleSoundToggle} />
+              </div>
+              <div className="flex gap-2 px-5 py-3">
+                <button onClick={triggerTestNotification} className="flex-1 rounded-lg border border-slate-200 bg-slate-50 py-2 text-xs font-bold text-slate-600 transition-colors hover:bg-slate-100">Test popup</button>
+                <button onClick={playAlertSound} className="flex-1 rounded-lg border border-slate-200 bg-slate-50 py-2 text-xs font-bold text-slate-600 transition-colors hover:bg-slate-100">Test chime</button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="border-b border-slate-100 px-5 py-3">
+              <h3 className="text-sm font-bold text-slate-900">Email channel</h3>
+              <p className="text-xs font-medium text-slate-500">Recipient is configured in the backend env; send a test any time.</p>
+            </div>
+            <div className="space-y-3 p-5">
+              <div className="flex gap-2">
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-900 outline-none transition-colors focus:border-gold-500 focus:bg-white"
+                />
+                <button onClick={sendTestEmail} disabled={testing} className="shrink-0 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:opacity-60">
+                  {testing ? 'Sending…' : 'Send test'}
+                </button>
+              </div>
+              {testStatus && <p className="text-[11px] font-semibold text-slate-500">{testStatus}</p>}
+              <div className="rounded-lg bg-slate-50 px-3 py-2 text-[11px] font-medium text-slate-500">
+                <p>Trade emails → <b className="text-slate-700">{emailSettingsMeta.emailTo || 'not configured'}</b></p>
+                <p>News emails → <b className="text-slate-700">{emailSettingsMeta.newsEmailTo || emailSettingsMeta.emailTo || 'not configured'}</b> · SMTP {emailSettingsMeta.smtpConfigured ? 'ok' : 'missing'}</p>
+              </div>
+              <p className="text-[11px] font-medium text-slate-400">MT5 push (MetaQuotes ID) and WhatsApp delivery — coming soon. Email is the live channel.</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── DELIVERY LOG ── */}
+      {activeTab === 'log' && (
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+          <div className="border-b border-slate-100 px-5 py-3">
+            <h3 className="text-sm font-bold text-slate-900">Recent delivery log</h3>
+            <p className="text-xs font-medium text-slate-500">Every email attempt, newest first.</p>
+          </div>
+          <div className="max-h-[560px] divide-y divide-slate-100 overflow-y-auto">
+            {logs.map((log) => (
+              <div key={log.id} className="flex items-center gap-3 px-5 py-2 transition-colors hover:bg-slate-50/60">
+                {log.status === 'Success' ? <CheckCircle2 size={15} className="shrink-0 text-emerald-500" /> : <XCircle size={15} className="shrink-0 text-red-500" />}
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-mono text-[11px] font-semibold text-slate-600">{log.signalId || log.recipient}</p>
+                  {log.error && <p className="truncate text-[11px] font-semibold text-red-500">{log.error}</p>}
+                </div>
+                <span className="shrink-0 text-[11px] font-medium text-slate-400">{formatBdDateTime(log.timestamp)}</span>
+              </div>
+            ))}
+            {!logs.length && <p className="px-5 py-8 text-center text-xs font-medium text-slate-400">No email delivery logs yet.</p>}
+          </div>
+        </div>
+      )}
+
+      {/* ── Sticky save bar (appears only with unsaved changes) ── */}
+      {(dirty || emailSettingsStatus) && (
+        <div className="fixed inset-x-0 bottom-4 z-30 flex justify-center px-4">
+          <div className="flex w-full max-w-xl items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/95 py-2 pl-4 pr-2 shadow-lg backdrop-blur">
+            {dirty ? (
+              <span className="flex items-center gap-2 text-xs font-bold text-slate-700">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />Unsaved changes
+              </span>
+            ) : (
+              <span className="flex items-center gap-2 text-xs font-bold text-emerald-600">
+                <CheckCircle2 size={14} />{emailSettingsStatus}
+              </span>
+            )}
+            {dirty && (
+              <button
+                onClick={handleSaveEmailSettings}
+                disabled={savingEmailSettings}
+                className="inline-flex items-center gap-2 rounded-xl bg-gold-500 px-5 py-2 text-sm font-bold text-white shadow-sm transition-colors hover:bg-gold-600 disabled:opacity-60"
+              >
+                <Send size={14} /> {savingEmailSettings ? 'Saving…' : 'Save all changes'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
