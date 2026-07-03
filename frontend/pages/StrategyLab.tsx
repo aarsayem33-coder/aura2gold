@@ -388,15 +388,44 @@ export default function StrategyLab() {
       && ['A', 'A+'].includes((s.grade || '').toUpperCase()))
     .sort((a, b) => new Date(a.ftExpiryIso || 0).getTime() - new Date(b.ftExpiryIso || 0).getTime()),
   [signals, nowTick]);
-  const ftStats = useMemo(() => {
-    let liveWin = 0, liveLoss = 0, win = 0, loss = 0, pending = 0;
-    for (const s of signals) {
-      if (s.live) { if (s.live.status === 'WINNING') liveWin += 1; else if (s.live.status === 'LOSING') liveLoss += 1; }
-      const o = (s.ftOutcome || '').toUpperCase();
-      if (o === 'WIN') win += 1; else if (o === 'LOSS') loss += 1; else if (o === 'PENDING') pending += 1;
+  // FILTER-AWARE header stats for the recent tables: computed from the rows currently
+  // shown (strategy/TF/score/symbol filters applied), so the W/L and win% always describe
+  // exactly what you're looking at. Four framings: forex settled (TP/SL), fixed-time ideal,
+  // as-traded REAL, and live open positions.
+  const tableStats = useMemo(() => {
+    let fxW = 0, fxL = 0, ftW = 0, ftL = 0, atW = 0, atL = 0, liveW = 0, liveL = 0, pending = 0;
+    for (const s of filteredSignals) {
+      const fo = (s.outcome || '').toUpperCase();
+      if (fo.endsWith('_WIN') || fo === 'WIN') fxW += 1; else if (fo === 'LOSS') fxL += 1;
+      const ft = (s.ftOutcome || '').toUpperCase();
+      if (ft === 'WIN') ftW += 1; else if (ft === 'LOSS') ftL += 1; else if (ft === 'PENDING') pending += 1;
+      const at = (s.atOutcome || '').toUpperCase();
+      if (at === 'WIN') atW += 1; else if (at === 'LOSS') atL += 1;
+      if (s.live) { if (s.live.status === 'WINNING') liveW += 1; else if (s.live.status === 'LOSING') liveL += 1; }
     }
-    return { liveWin, liveLoss, win, loss, pending };
-  }, [signals]);
+    const pct = (w: number, l: number) => (w + l > 0 ? Math.round((w / (w + l)) * 100) : null);
+    return { fxW, fxL, fxPct: pct(fxW, fxL), ftW, ftL, ftPct: pct(ftW, ftL), atW, atL, atPct: pct(atW, atL), liveW, liveL, pending };
+  }, [filteredSignals]);
+  // Compact stat chip: label + W/L + win% — tone follows the win rate.
+  const statChip = (label: string, w: number, l: number, pctv: number | null, title: string) => (
+    <span title={title} className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-black ${pctv === null ? 'bg-slate-100 text-slate-400' : pctv >= 55 ? 'bg-emerald-50 text-emerald-700' : pctv >= 45 ? 'bg-blue-50 text-blue-600' : 'bg-rose-50 text-rose-600'}`}>
+      <span className="font-bold uppercase tracking-wide opacity-70">{label}</span>
+      <span className="text-emerald-600">{w}W</span>/<span className="text-rose-500">{l}L</span>
+      {pctv !== null && <span>· {pctv}%</span>}
+    </span>
+  );
+  const headerStatChips = (
+    <div className="flex flex-wrap items-center gap-1">
+      {statChip('Forex', tableStats.fxW, tableStats.fxL, tableStats.fxPct, 'Forex settled (TP hit vs SL) in the filtered rows')}
+      {statChip('Fixed', tableStats.ftW, tableStats.ftL, tableStats.ftPct, 'Fixed-time IDEAL outcome (signal-bar close → next-bar close) in the filtered rows')}
+      {statChip('Real', tableStats.atW, tableStats.atL, tableStats.atPct, 'As-traded / REAL outcome (live entry at signal time, set duration) in the filtered rows')}
+      {(tableStats.liveW > 0 || tableStats.liveL > 0) && (
+        <span className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-1.5 py-0.5 text-[10px] font-black text-white" title="Open fixed-time calls right now: currently winning / losing">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" /> LIVE {tableStats.liveW}▲ {tableStats.liveL}▼
+        </span>
+      )}
+    </div>
+  );
 
   return (
     <div className="space-y-3 p-1 pb-8">
@@ -540,7 +569,10 @@ export default function StrategyLab() {
           <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
               <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent signals &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· {showMuted ? 'incl. muted' : 'active only'} · tradable pinned first</span></h3>
-              <span className="text-[11px] font-bold text-slate-400">{sortedSignals.length} shown</span>
+              <div className="flex flex-wrap items-center gap-2">
+                {headerStatChips}
+                <span className="text-[11px] font-bold text-slate-400">{sortedSignals.length} shown</span>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1000px] text-left text-sm">
@@ -649,10 +681,9 @@ export default function StrategyLab() {
           <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
               <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent fixed-time calls &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· live pinned first</span></h3>
-              <div className="hidden items-center gap-1.5 md:flex">
-                <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-black text-emerald-700"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" /> {ftStats.liveWin} live win</span>
-                <span className="inline-flex items-center gap-1 rounded-md bg-rose-50 px-2 py-0.5 text-[10px] font-black text-rose-700"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-500" /> {ftStats.liveLoss} live loss</span>
-                <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-500">{ftStats.win}W / {ftStats.loss}L settled · {ftStats.pending} pending</span>
+              <div className="flex flex-wrap items-center gap-2">
+                {headerStatChips}
+                <span className="text-[11px] font-bold text-slate-400">{tableStats.pending} pending · {sortedSignals.length} shown</span>
               </div>
             </div>
             <div className="overflow-x-auto">
