@@ -2169,13 +2169,13 @@ function specialForexSniper(ctx) {
   const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
   const minScore = config.minScore ?? 75;
   const minRR = config.minRR ?? 2.0;
-  const minPre = config.minPreEntryPips ?? 6;
+  const minPre = config.minPreEntryPips ?? 4;
   const idealPre = config.idealPreEntryPips ?? 12;
-  const maxPre = config.maxPreEntryPips ?? 15;
+  const maxPre = config.maxPreEntryPips ?? 18;
   const enterNowPips = config.enterNowPips ?? 3;
   const minTargetPips = config.minTargetPips ?? 20;   // pips-VALUE floor: 2R on a tiny target is not profit
   const maxChaseAtr = config.maxChaseAtr ?? 1.2;
-  const maxAgeBars = config.maxAgeBars ?? 5;
+  const maxAgeBars = config.maxAgeBars ?? 12;         // the pullback into the FVG takes bars — the pip-gap gate keeps alerts price-fresh
   if (!Array.isArray(candles) || candles.length < 80) return null;
   const atr = atr14(candles);
   if (!(atr > 0)) return null;
@@ -2195,16 +2195,20 @@ function specialForexSniper(ctx) {
   const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 40 });
   let keyLevels = [];
   try { keyLevels = detectKeyLiquidityLevels(candles, { symbol }).levels || []; } catch { keyLevels = []; }
+  // Obvious-level match is a QUALITY BONUS, not a hard requirement: a sweep+reclaim with
+  // displacement is institutionally meaningful on its own (the proven lsp edge) — an obvious
+  // raided level (session H/L, round number, equal H/L) scores it higher, its absence scores
+  // it lower. Gate-bisection showed the hard requirement starved the trigger to near-zero.
   const raidLevel = sweep
-    ? keyLevels.filter((l) => l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= 0.35 * atr).sort((a, b) => b.strength - a.strength)[0] || null
+    ? keyLevels.filter((l) => l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= (config.levelTolAtr ?? 0.6) * atr).sort((a, b) => b.strength - a.strength)[0] || null
     : null;
   const breaker = detectBreaker(candles, { maxAgeBars: 50 });
   const freshBreaker = breaker && breaker.ageBars <= maxAgeBars && breaker.displacement?.present ? breaker : null;
 
   let dir, trigger, levelStrength, triggerIso, disp, rawStop;
-  if (sweep && raidLevel && lastIdx - sweep.reclaimIdx <= maxAgeBars) {
-    dir = sweep.dir; trigger = 'sweep'; levelStrength = raidLevel.strength; triggerIso = sweep.reclaimIso;
-    disp = detectDisplacement(candles, sweep.reclaimIdx, dir, atr, { minAtr: config.dispMinAtr ?? 0.8 });
+  if (sweep && lastIdx - sweep.reclaimIdx <= maxAgeBars) {
+    dir = sweep.dir; trigger = 'sweep'; levelStrength = raidLevel ? raidLevel.strength : 0; triggerIso = sweep.reclaimIso;
+    disp = detectDisplacement(candles, sweep.reclaimIdx, dir, atr, { minAtr: config.dispMinAtr ?? 0.6 });
     rawStop = sweep.extreme;
   } else if (freshBreaker) {
     dir = freshBreaker.type; trigger = 'breaker'; levelStrength = 3; triggerIso = freshBreaker.confirmedIso;
@@ -2254,10 +2258,11 @@ function specialForexSniper(ctx) {
   if (approaching) {
     if (gapPips < minPre || gapPips > maxPre) return null;
     if (Math.abs(price - entry) > maxChaseAtr * atr) return null;
+    // Drift toward the entry over the last ~3 bars = timing BONUS (not a hard gate — one
+    // counter-candle mid-pullback would otherwise randomly veto perfectly good approaches).
     const back = n(candles[Math.max(0, lastIdx - 3)].close);
-    const toward = dir === 'BULLISH' ? price < back : price > back; // last ~3 bars drifting into the level
-    if (!toward) return null;
-    timingQuality = Math.max(2, 10 - Math.round(Math.abs(gapPips - idealPre) / 2)); // 10 at the ideal 10–12p band
+    const toward = dir === 'BULLISH' ? price < back : price > back;
+    timingQuality = Math.max(2, 8 - Math.round(Math.abs(gapPips - idealPre) / 3)) + (toward ? 2 : 0); // ≈10 at the ideal 10–12p band
     entryMode = `pre-entry ${Math.round(gapPips)}p out`;
   } else {
     if (gapPips > enterNowPips) return null;                     // beyond the entry = chased, gone
@@ -2279,13 +2284,20 @@ function specialForexSniper(ctx) {
   // 6) Deterministic 100-point budget: 20 liquidity · 15 displacement · 15 HTF ·
   //    10 location · 10 session · 10 RR · 10 structure · 10 timing (+3 second drive).
   let score = 0;
-  score += trigger === 'sweep' ? (levelStrength >= 5 ? 20 : levelStrength === 4 ? 17 : 14) : 14;
+  // Liquidity trigger: obvious raided level scores highest; a plain sweep+displacement (the
+  // proven lsp edge) still earns a solid base; breaker reclaim in between.
+  score += trigger === 'sweep' ? (levelStrength >= 5 ? 20 : levelStrength === 4 ? 17 : levelStrength === 3 ? 15 : 12) : 14;
   score += Math.min(15, Math.round((disp.atrMultiple ?? 1) * 10));
-  score += (htf4 ? 10 : 0) + (htf1 ? 5 : 0);
-  score += (pdOk ? 5 : 0) + (trigger === 'sweep' ? 5 : 3);
+  // HTF: aligned scores full; NEUTRAL (no clear trend — the usual state) is not a defect and
+  // earns the midpoint; hard opposition was already vetoed above.
+  score += htf4 ? 10 : (h4Trend === null ? 5 : 2);
+  score += htf1 ? 5 : 2;
+  score += (pdOk ? 5 : 0) + (raidLevel ? 5 : 2);
   score += sessionScore;
   score += Math.min(10, 4 + Math.round((rr - minRR) * 4));
-  score += structureOk ? 10 : 4;
+  // Structure: a sweep REVERSAL rarely shows trend structure at the trigger — that's the
+  // nature of the setup, not a flaw; aligned trend structure is the bonus case.
+  score += structureOk ? 10 : 6;
   score += timingQuality;
   if (secondDrive) score += 3;
   score = Math.max(40, Math.min(97, Math.round(score)));
@@ -2305,7 +2317,7 @@ function specialForexSniper(ctx) {
   return {
     decision, score, grade: smcGrade(score),
     entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
-    reason: `Sniper ${decision}: ${trigger === 'sweep' ? `swept ${raidLevel.label || raidLevel.type} ${r5(sweep.sweepLevel)} (str ${levelStrength}/5)` : `${dir.toLowerCase()} breaker reclaim`} + displacement ${disp.atrMultiple}× → LIMIT ${r5(entry)} (${entryMode}); stop ${r5(stop)}; draw ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''}${secondDrive ? ' · 2nd drive' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`,
+    reason: `Sniper ${decision}: ${trigger === 'sweep' ? `swept ${raidLevel ? `${raidLevel.label || raidLevel.type} ` : ''}${r5(sweep.sweepLevel)}${raidLevel ? ` (str ${levelStrength}/5)` : ''}` : `${dir.toLowerCase()} breaker reclaim`} + displacement ${disp.atrMultiple}× → LIMIT ${r5(entry)} (${entryMode}); stop ${r5(stop)}; draw ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''}${secondDrive ? ' · 2nd drive' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`,
     barIso: triggerIso,                                          // dedup: ONE signal per raid/breaker
     meta: {
       v: 1, trigger, requiresFill: true, preEntryAlert: true,
@@ -2325,7 +2337,7 @@ export const STRATEGIES = {
     source: 'Composite institutional forex engine — liquidity, structure, displacement, RR, and PRE-ENTRY timing (alerts 10–12 pips before the entry)',
     description: 'FOREX-ONLY sniper that alerts BEFORE the entry: it fires while price is still ~6–15 pips (ideal 10–12) on the approach side of the planned limit with momentum drifting toward it — so the trade can be taken within ~5 minutes; price that has run past the entry is never chased. Setup = an OBVIOUS-level liquidity sweep + reclaim (PDH/PDL, session highs/lows, round numbers, equal highs/lows, strength ≥3) or a fresh displaced breaker, confirmed by a displacement FVG (entry = its 50%), stop beyond the raid wick, structure (HH/HL·LH/LL), premium/discount location, second-drive preference and dual-HTF agreement (never fights a clear H4). Profit discipline: minimum 2R to a STRUCTURAL TP3 (opposing fresh liquidity → session H/L → prev-day H/L → equal extremes → 3R) AND a minimum 20-pip target — RR alone is not profit. Scored on a 100-point institutional checklist; below 75 stays silent. M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong displacement, RR ≥2.5, London/NY, tight fast gap). HONEST MEASUREMENT: signals are resolved as LIMIT orders — if price never fills the entry the signal EXPIRES and is excluded from the win rate, so the recorded performance is only of trades that could actually be taken.',
     timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
-    config: { minScore: 75, minRR: 2.0, minPreEntryPips: 6, idealPreEntryPips: 12, maxPreEntryPips: 15, enterNowPips: 3, minTargetPips: 20, maxChaseAtr: 1.2, maxAgeBars: 5, minLevelStrength: 3, dispMinAtr: 0.8, minStopPips: 5, minStopAtr: 0.35, m1ExceptionalScore: 90, m1MinRR: 2.5, sweepLookback: 40 },
+    config: { minScore: 75, minRR: 2.0, minPreEntryPips: 4, idealPreEntryPips: 12, maxPreEntryPips: 18, enterNowPips: 3, minTargetPips: 20, maxChaseAtr: 1.2, maxAgeBars: 12, minLevelStrength: 3, levelTolAtr: 0.6, dispMinAtr: 0.6, minStopPips: 5, minStopAtr: 0.35, m1ExceptionalScore: 90, m1MinRR: 2.5, sweepLookback: 40 },
     evaluate: specialForexSniper,
   },
   'xau-session-raid': {
