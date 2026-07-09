@@ -5069,7 +5069,7 @@ app.get('/api/notifications/email-settings', (req, res) => {
   res.json({
     ok: true,
     settings: loadEmailAlertSettings(),
-    email_to: SIGNAL_ALERT_EMAIL_TO,
+    email_to: signalEmailTo(),
     news_email_to: NEWS_ALERT_EMAIL_TO,
     smtpConfigured: Boolean(process?.env?.SMTP_USER && process?.env?.SMTP_PASS),
   });
@@ -5642,7 +5642,18 @@ const SCANNER_INTERVAL_MS = Math.max(30000, Number(process.env.SCANNER_INTERVAL_
 const SCAN_TIMEFRAMES = String(process.env.SCANNER_TIMEFRAMES || 'M5,M15').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 const FTT_EXPIRIES = String(process.env.SCANNER_FTT_EXPIRIES || '2m,3m,5m,15m,30m,1h').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 const SIGNAL_ALERTS_ENABLED = (process.env.SIGNAL_ALERTS_ENABLED ?? 'true') !== 'false';
-const SIGNAL_ALERT_EMAIL_TO = process.env.SIGNAL_ALERT_EMAIL_TO || process.env.EMAIL_TO;
+const SIGNAL_ALERT_EMAIL_TO_ENV = process.env.SIGNAL_ALERT_EMAIL_TO || process.env.EMAIL_TO;
+// Effective SIGNAL recipient(s), resolved at SEND time: the user-managed recipient list from
+// the Notification Settings store (multiple addresses → one comma-joined nodemailer `to`),
+// falling back to the single env address when the list is empty. Lets the user add/remove
+// recipients from the UI with no env edit or restart. News reminders keep NEWS_ALERT_EMAIL_TO.
+function signalEmailTo() {
+  try {
+    const list = (loadEmailAlertSettings().emailRecipients || []).filter(Boolean);
+    if (list.length) return list.join(', ');
+  } catch { /* settings store not ready (boot) — fall through to env */ }
+  return SIGNAL_ALERT_EMAIL_TO_ENV || null;
+}
 const SIGNAL_ALERT_MIN_GAP_MS = Math.max(0, Number(process.env.SIGNAL_ALERT_MIN_GAP_MIN || 30)) * 60 * 1000;
 const FOREX_M5_MAX_EMAIL_AGE_MS = Math.max(0, Number(process.env.FOREX_M5_MAX_EMAIL_AGE_SEC || 180)) * 1000;
 const FOREX_M15_MAX_EMAIL_AGE_MS = Math.max(0, Number(process.env.FOREX_M15_MAX_EMAIL_AGE_SEC || 300)) * 1000;
@@ -6053,7 +6064,7 @@ function recordSkippedAlert({ type, symbol, timeframe, expiry, reason, ageMs, ma
   alertDiagnostics.lastSkippedStale = { ...detail, at: new Date().toISOString() };
   addDeliveryLog({
     channel: 'Email',
-    recipient: SIGNAL_ALERT_EMAIL_TO || null,
+    recipient: signalEmailTo() || null,
     signalId: signalId || null,
     status: `Skipped ${reason}`,
     error: `${type} ${symbol}${timeframe ? ` ${timeframe}` : ''}${expiry ? ` ${expiry}` : ''}: ${reason}${detail.ageSeconds !== null ? ` (${detail.ageSeconds}s > ${detail.maxAgeSeconds}s)` : ''}`,
@@ -6080,7 +6091,7 @@ function recordWouldSuppress({ type, symbol, timeframe = null, expiry = null, re
   const key = `${type}|${symbol}`;
   wouldSuppressCounts.set(key, (wouldSuppressCounts.get(key) || 0) + 1);
   addDeliveryLog({
-    channel: 'Email', recipient: SIGNAL_ALERT_EMAIL_TO || null, signalId: null,
+    channel: 'Email', recipient: signalEmailTo() || null, signalId: null,
     status: 'Would-suppress (shadow)',
     error: `${type} ${symbol}${timeframe ? ` ${timeframe}` : ''}${expiry ? ` ${expiry}` : ''}: ${reason}`,
   });
@@ -7253,7 +7264,7 @@ async function persistEmailedForexReport(result) {
     trade_time: signalTime,
     resolved_at: null,
     email_sent_at: now,
-    email_to: SIGNAL_ALERT_EMAIL_TO,
+    email_to: signalEmailTo(),
     candle_bias_tf: result.timeframe,
     candle_trend_tf: null,
     candle_entry_tf: result.timeframe,
@@ -7321,6 +7332,9 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   // that strategy; symbols empty/absent = all symbols.
   //   strategyLabRules: { [id]: { minScore?, minGrade?: ANY|B|A|A+, symbols?: string[], direction?: ANY|LONG|SHORT } }
   strategyLabRules: {},
+  // SIGNAL email recipients (user-managed, up to 10). Empty = fall back to the single
+  // SIGNAL_ALERT_EMAIL_TO / EMAIL_TO env address. All signal emails go to every address.
+  emailRecipients: [],
   // Strategy Controller (master per-strategy switch — gates EVERYTHING user-facing:
   // popups, emails, SSE, the recent-signals table and reports). Missing entry = fully
   // enabled. Optional per-strategy refinements gate DELIVERY (alerts): minScore, a
@@ -7419,6 +7433,15 @@ function saveEmailAlertSettings(nextSettings) {
       out[String(id)] = r;
     }
     sanitized.strategyLabRules = out;
+  }
+  // Signal email recipients — replace the whole list on save; basic shape validation,
+  // lowercase + dedup, capped at 10 addresses.
+  if (Array.isArray(nextSettings?.emailRecipients)) {
+    const seen = new Set();
+    sanitized.emailRecipients = nextSettings.emailRecipients
+      .map((e) => String(e || '').trim().toLowerCase())
+      .filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && !seen.has(e) && seen.add(e))
+      .slice(0, 10);
   }
   // Strategy Controller — replace the whole map on save (frontend sends the full object).
   if (nextSettings && nextSettings.strategyControls && typeof nextSettings.strategyControls === 'object') {
@@ -7561,7 +7584,7 @@ async function persistEmailedPostNewsForexReport(sig, referenceId) {
     trade_time: tradeTime,
     resolved_at: null,
     email_sent_at: now,
-    email_to: SIGNAL_ALERT_EMAIL_TO,
+    email_to: signalEmailTo(),
     candle_bias_tf: 'H4',
     candle_trend_tf: 'H1',
     candle_entry_tf: 'M5',
@@ -7606,7 +7629,7 @@ async function persistEmailedFixedReport(prediction) {
     trade_time: prediction.entryTime ? new Date(prediction.entryTime) : now,
     resolved_at: null,
     email_sent_at: now,
-    email_to: SIGNAL_ALERT_EMAIL_TO,
+    email_to: signalEmailTo(),
     candle_bias_tf: tfMap.bias,
     candle_trend_tf: tfMap.trend,
     candle_entry_tf: tfMap.entry,
@@ -7958,7 +7981,7 @@ app.post('/api/signal-tracker/:id/done', async (req, res) => {
 });
 
 async function sendSignalTrackerEmail(item) {
-  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('signalTracker')) return;
+  if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo() || !isEmailSystemEnabled('signalTracker')) return;
   const sym = item.symbol;
   const close = item.severity >= 3;
   const tag = close ? 'CLOSE TRADE' : 'MANAGE TRADE';
@@ -7987,7 +8010,7 @@ async function sendSignalTrackerEmail(item) {
     <p style="font-size:13px;color:#0f172a;margin:8px 0 0">Action: <b>${item.suggestedAction}</b></p>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory early warning — not a guarantee, not financial advice. — Aura Gold Signal Tracker</p></div>`;
   try {
-    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `tracker:${item.id}:${item.alertType}` });
+    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `tracker:${item.id}:${item.alertType}` });
     console.log(`[SignalTracker] Emailed ${tag} ${item.direction} ${sym} (${item.warningReason})`);
   } catch (e) { console.error('[SignalTracker] email failed:', e.message); }
 }
@@ -8562,7 +8585,7 @@ async function runSlTpCalibration({ days = 90, symbol = null, minSample = 8 } = 
 }
 
 async function sendForexAlert(result) {
-  if (!SIGNAL_ALERT_EMAIL_TO) return false;
+  if (!signalEmailTo()) return false;
   if (!isEmailSystemEnabled('forexScanner')) return false;
   const stale = shouldSkipStaleForexAlert(result);
   if (stale) {
@@ -8669,7 +8692,7 @@ async function sendForexAlert(result) {
       <p style="font-size:12px;color:#64748b">Confluences: ${conf.map((c) => `${c.name} +${c.points}`).join(', ') || 'none'}</p>
       <p style="font-size:11px;color:#94a3b8;margin-top:10px">Advisory only — not financial advice. — Aura Gold Scanner</p>
     </div>`;
-  await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `forex:${result.symbol}:${result.timeframe}:${result.bar}` });
+  await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `forex:${result.symbol}:${result.timeframe}:${result.bar}` });
   try {
     await persistEmailedForexReport(result);
   } catch (err) {
@@ -8692,7 +8715,7 @@ function recordForexDailyBestCandidate(result) {
 }
 
 async function maybeSendForexDailyBestEmail(now = new Date()) {
-  if (!FOREX_DAILY_BEST_EMAIL_ENABLED || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forexScanner')) return false;
+  if (!FOREX_DAILY_BEST_EMAIL_ENABLED || !SIGNAL_ALERTS_ENABLED || !signalEmailTo() || !isEmailSystemEnabled('forexScanner')) return false;
   const day = now.toISOString().slice(0, 10);
   if (lastForexDailyBestEmailDate === day) return false;
   if (now.getUTCHours() < FOREX_DAILY_BEST_EMAIL_UTC_HOUR) return false;
@@ -8728,7 +8751,7 @@ async function maybeSendForexDailyBestEmail(now = new Date()) {
     return `<tr><td style="padding:8px;border-bottom:1px solid #e2e8f0">${index + 1}</td><td style="padding:8px;border-bottom:1px solid #e2e8f0"><b style="color:${color}">${sd.decision.replace('_', ' ')}</b><br>${item.symbol} ${item.timeframe}<br><span style="font-size:11px;color:#b45309">${sd.signalQuality || setupLabel(sd.grade)}</span></td><td style="padding:8px;border-bottom:1px solid #e2e8f0">Score ${Math.round(sd.confidence)}/100<br>DAT ${sd.datFramework?.score ?? 'n/a'}/3<br>RR ${sd.riskRewardRatio ?? 'n/a'}</td><td style="padding:8px;border-bottom:1px solid #e2e8f0">Entry <b>${px(sd.entryPrice, item.symbol)}</b><br>SL <span style="color:#b91c1c">${px(sd.stopLoss, item.symbol)}</span><br>TP1/2/3 <span style="color:#047857">${px(sd.takeProfit1, item.symbol)} / ${px(sd.takeProfit2, item.symbol)} / ${px(sd.takeProfit3, item.symbol)}</span></td><td style="padding:8px;border-bottom:1px solid #e2e8f0">Lot ${risk?.suggestedLotSize ?? 'n/a'}<br>Multiplier ${risk?.multiplier || `${risk?.leverage || 'n/a'}x`}<br>Risk ${money(risk?.amountToRisk ?? risk?.riskAmount)}<br>SL loss ${money(risk?.lossAtStop ?? risk?.maxLoss)}<br>TP1/2/3 ${money(risk?.profitAtTp1)} / ${money(risk?.profitAtTp2)} / ${money(risk?.profitAtTp3)}</td></tr>`;
   }).join('');
   const html = `<div style="font-family:Arial,sans-serif;max-width:900px"><p style="margin:0 0 8px;font-size:11px;font-weight:700;letter-spacing:.12em;color:#b45309;text-transform:uppercase">Best Forex Signals Of The Day</p><h2 style="margin:0 0 8px;color:#0f172a">Top ${candidates.length} Scanner Setup(s) - ${day} UTC</h2><p style="font-size:12px;color:#64748b">Ranked by signal quality, confidence, DAT score, and RR. Advisory only - verify chart context before trading.</p><table style="width:100%;font-size:12px;border-collapse:collapse"><thead><tr style="text-align:left;background:#f8fafc"><th style="padding:8px">#</th><th style="padding:8px">Signal</th><th style="padding:8px">Quality</th><th style="padding:8px">Levels</th><th style="padding:8px">Risk Plan</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-  await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject: `[BEST FOREX SIGNALS | ${day}] Top ${candidates.length} scanner setups`, text: lines.join('\n'), html, signalId });
+  await sendNotificationEmail({ to: signalEmailTo(), subject: `[BEST FOREX SIGNALS | ${day}] Top ${candidates.length} scanner setups`, text: lines.join('\n'), html, signalId });
   recordAlert(signalId, day);
   lastForexDailyBestEmailDate = day;
   console.log(`[Scanner] Emailed daily best forex summary (${candidates.length} setup(s)).`);
@@ -8736,7 +8759,7 @@ async function maybeSendForexDailyBestEmail(now = new Date()) {
 }
 
 async function sendFttAlert(prediction) {
-  if (!SIGNAL_ALERT_EMAIL_TO) return false;
+  if (!signalEmailTo()) return false;
   const isPostNewsFixed = prediction?.source === 'news';
   if (!isEmailSystemEnabled(isPostNewsFixed ? 'postNewsFixed' : 'fixedTime')) return false;
   if (!fttEmailAllowed(prediction)) return false;
@@ -8827,7 +8850,7 @@ async function sendFttAlert(prediction) {
       <p style="font-size:12px;color:#334155">${prediction.reasoning || ''}</p>
       <p style="font-size:11px;color:#94a3b8;margin-top:10px">Advisory only — not financial advice. — Aura Gold Future Predictions</p>
     </div>`;
-  await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: prediction.id });
+  await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: prediction.id });
   try {
     await persistEmailedFixedReport(prediction);
   } catch (err) {
@@ -8992,12 +9015,12 @@ async function onActualReleased(event) {
   const affected = affectedSymbols(event.currency, curated);
 
   // Instant email, once per event.
-  if (SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && isEmailSystemEnabled('highImpactNews')) {
+  if (SIGNAL_ALERTS_ENABLED && signalEmailTo() && isEmailSystemEnabled('highImpactNews')) {
     const key = `actual:${event.id}`;
     if (canAlert(key, event.id, { minGapMs: 0 })) {
       const { subject, text, html } = buildActualReleasedEmail(event, surprise, affected);
       try {
-        await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: key });
+        await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: key });
         recordAlert(key, event.id);
         console.log(`[News:Delta] Emailed ACTUAL RELEASED for ${event.currency} ${event.title} = ${event.actual}`);
       } catch (e) { console.warn('[News:Delta] actual email failed:', e.message); }
@@ -9026,7 +9049,7 @@ function refreshPostNewsSignals(now = Date.now()) {
       // Email + SSE once when it becomes ACTIVE with a real direction.
       if (forexSig.status === 'ACTIVE' && forexSig.direction !== 'NEUTRAL') {
         const key = `postnews:${eventId}:${symbol}`;
-        if (SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && isEmailSystemEnabled('postNewsForex') && postNewsForexEmailAllowed(forexSig) && canAlert(key, eventId, { minGapMs: 0 })) {
+        if (SIGNAL_ALERTS_ENABLED && signalEmailTo() && isEmailSystemEnabled('postNewsForex') && postNewsForexEmailAllowed(forexSig) && canAlert(key, eventId, { minGapMs: 0 })) {
           const subject = `[POST-NEWS FOREX | ${forexSig.grade}] ${forexSig.directionLabel} ${symbol} — ${event.currency} ${event.title} (${Math.round(forexSig.confidence)}%)`;
           const text = [
             `POST-NEWS FOREX ENTRY SIGNAL (blackout cleared)`,
@@ -9043,7 +9066,7 @@ function refreshPostNewsSignals(now = Date.now()) {
             <p style="font-size:13px">Entry <b>${px(forexSig.price, symbol)}</b> · SL ${px(forexSig.stopLoss, symbol)} · TP1 ${px(forexSig.takeProfit1, symbol)} · TP2 ${px(forexSig.takeProfit2, symbol)}</p>
             <p style="font-size:12px;color:#475569">Rule: wait for release, market reaction, blackout, and confirmation. No blind news prediction.</p>
             <p style="font-size:11px;color:#94a3b8">Advisory only — not financial advice. — Aura Gold Post-News Engine</p></div>`;
-          sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: key })
+          sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: key })
             .then(async (info) => {
               if (!info) return;
               recordAlert(key, eventId);
@@ -9057,7 +9080,7 @@ function refreshPostNewsSignals(now = Date.now()) {
         const fixedSig = buildTradeNewsFixedSignal(forexSig, TRADE_NEWS_FIXED_EXPIRY, now);
         if (fttTierAllowed(fixedSig.qualityTier, 'postNewsFixedMinTier') && isEmailSystemEnabled('postNewsFixed')) {
           const fixedKey = `postnewsftt:${eventId}:${symbol}:${fixedSig.expiry}`;
-          if (SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && canAlert(fixedKey, eventId, { minGapMs: 0 })) {
+          if (SIGNAL_ALERTS_ENABLED && signalEmailTo() && canAlert(fixedKey, eventId, { minGapMs: 0 })) {
             const prediction = buildTradeNewsFixedPrediction(fixedSig);
             persistFttPrediction(prediction)
               .then(async () => {
@@ -9276,7 +9299,7 @@ async function routeBreakout(cand) {
   }
 
   // ── Tier 2: Email (strict, anti-flood) ──
-  if (!(SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && isEmailSystemEnabled('breakout'))) return;
+  if (!(SIGNAL_ALERTS_ENABLED && signalEmailTo() && isEmailSystemEnabled('breakout'))) return;
 
   // Asymmetric bar: PRE (a prediction) requires at least A; CONFIRMED uses the
   // configured minimum (default B). Both respect the user's configured floor.
@@ -9297,7 +9320,7 @@ async function routeBreakout(cand) {
 
   const { subject, text, html } = buildBreakoutEmail(cand);
   try {
-    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: key });
+    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: key });
     recordAlert(key, cand.bar);
     void persistBreakoutAlert(cand, 'EMAIL');
     console.log(`[Breakout] Emailed ${cand.phase} ${cand.grade} ${cand.direction} ${cand.symbol} ${cand.timeframe} @ ${cand.level}`);
@@ -9388,7 +9411,7 @@ async function runScanCycle() {
               await persistFttPrediction(prediction);
               fttPredictions.unshift(prediction);
               sendStreamEvent('ftt_prediction', prediction);
-              if (SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO) {
+              if (SIGNAL_ALERTS_ENABLED && signalEmailTo()) {
                 const key = `ftt:${symbol}:${expiry}`;
                 if (canAlert(key, bar, { minGapMs: SIGNAL_ALERT_MIN_GAP_MS })) {
                   const sent = await sendFttAlert(prediction);
@@ -9428,7 +9451,7 @@ async function runScanCycle() {
           if (marketOpen && !r.outdated && forexScannerEmailAllowed(sd)) {
             recordForexDailyBestCandidate(r);
             // Email (dedup: once per symbol/bar + min gap).
-            if (SIGNAL_ALERTS_ENABLED && SIGNAL_ALERT_EMAIL_TO && isEmailSystemEnabled('forexScanner')) {
+            if (SIGNAL_ALERTS_ENABLED && signalEmailTo() && isEmailSystemEnabled('forexScanner')) {
               const key = `forex:${symbol}:${tf}`;
               if (canAlert(key, r.bar, { minGapMs: SIGNAL_ALERT_MIN_GAP_MS })) {
                 const sent = await sendForexAlert(r);
@@ -9465,7 +9488,7 @@ function startBackgroundScanner() {
   if (typeof timer.unref === 'function') timer.unref();
   // First cycle shortly after boot (let the cache warm + EA push a snapshot).
   setTimeout(() => void runScanCycle(), 8000);
-  console.log(`[Scanner] Background scanner started. TFs=${SCAN_TIMEFRAMES.join(',')} expiries=${FTT_EXPIRIES.join(',')} every ${SCANNER_INTERVAL_MS / 1000}s. AI on >=${process.env.SIGNAL_ALERT_MIN_GRADE || 'B Setup'}. Alerts->${SIGNAL_ALERT_EMAIL_TO || 'disabled'}`);
+  console.log(`[Scanner] Background scanner started. TFs=${SCAN_TIMEFRAMES.join(',')} expiries=${FTT_EXPIRIES.join(',')} every ${SCANNER_INTERVAL_MS / 1000}s. AI on >=${process.env.SIGNAL_ALERT_MIN_GRADE || 'B Setup'}. Alerts->${signalEmailTo() || 'disabled'}`);
 }
 startBackgroundScanner();
 
@@ -9749,7 +9772,7 @@ async function reforecastActiveForecasts() {
 const NEWS_REACTION_TF = (process.env.NEWS_REACTION_TF || 'M5').toUpperCase();
 
 async function sendNewsReactionEmail(fc, event, reaction, levels) {
-  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forecast')) return;
+  if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo() || !isEmailSystemEnabled('forecast')) return;
   const sym = fc.symbol;
   const tierLabel = reaction.tier === 'B' ? 'CONFIRMED REACTION' : 'SPIKE (aggressive)';
   const dirColor = fc.decision === 'BUY' ? '#047857' : '#b91c1c';
@@ -9778,7 +9801,7 @@ async function sendNewsReactionEmail(fc, event, reaction, levels) {
     <p style="font-size:12px;color:#475569;margin:4px 0 0">Direction is from the <b>actual price reaction</b>, not a pre-release guess. ATR-scaled levels.</p>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory only — not financial advice. — Aura Gold News Reaction</p></div>`;
   try {
-    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `newsreact:${event.id}:${sym}:${reaction.tier}` });
+    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `newsreact:${event.id}:${sym}:${reaction.tier}` });
     console.log(`[Forecast] Emailed NEWS ${tierLabel} ${fc.decision} ${sym} (${event.title})`);
   } catch (e) {
     console.error('[Forecast] News reaction email failed:', e.message);
@@ -9845,7 +9868,7 @@ async function scanNewsReactions() {
 
 // ── Forecast email workflow (Phase 3) ───────────────────────────────────────
 // Four one-shot stages per forecast row: Created, T-10m, T-5m, at-ETA. Reuses
-// sendNotificationEmail, the 'forecast' email-system toggle, SIGNAL_ALERT_EMAIL_TO,
+// sendNotificationEmail, the 'forecast' email-system toggle, signalEmailTo(),
 // and natural dedup via the email_* boolean flags on the row.
 const FORECAST_EMAIL_MIN_SCORE = Number(process.env.FORECAST_EMAIL_MIN_SCORE || 75);
 // The "now executable" READY email fires at the executable threshold — a setup
@@ -9946,11 +9969,11 @@ function buildForecastReadyEmail(symbol, timeframe, sd) {
 }
 
 async function sendForecastReadyEmail(pool, id, symbol, timeframe, sd) {
-  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forecast')) return;
+  if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo() || !isEmailSystemEnabled('forecast')) return;
   if ((Number(sd?.confidence) || 0) < FORECAST_READY_EMAIL_MIN_SCORE) return;
   try {
     const { subject, text, html } = buildForecastReadyEmail(symbol, timeframe, sd);
-    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `forecast:${id}:ready` });
+    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `forecast:${id}:ready` });
     if (pool) await pool.execute('UPDATE mt5_execution_forecasts SET email_execution = 1, updated_at = ? WHERE id = ?', [toMysqlDate(new Date()), id]);
     console.log(`[Forecast] Emailed READY (full detail) ${symbol} ${timeframe} score ${Math.round(sd.confidence)}`);
   } catch (e) {
@@ -9961,7 +9984,7 @@ async function sendForecastReadyEmail(pool, id, symbol, timeframe, sd) {
 let forecastEmailRunning = false;
 async function processForecastEmails() {
   if (!FORECAST_ENABLED || forecastEmailRunning) return;
-  if (!SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO || !isEmailSystemEnabled('forecast')) return;
+  if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo() || !isEmailSystemEnabled('forecast')) return;
   forecastEmailRunning = true;
   try {
     const pool = await initializeDatabase();
@@ -9995,7 +10018,7 @@ async function processForecastEmails() {
       for (const stage of stages) {
         try {
           const { subject, text, html } = buildForecastEmail(row, stage, etaMs);
-          await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `forecast:${row.id}:${stage}` });
+          await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `forecast:${row.id}:${stage}` });
           const col = { reminder1: 'email_reminder1', reminder2: 'email_reminder2' }[stage];
           await pool.execute(`UPDATE mt5_execution_forecasts SET ${col} = 1, updated_at = ? WHERE id = ?`, [toMysqlDate(new Date()), row.id]);
           // keep the in-memory copy in sync so the next cycle doesn't re-pick the stage
@@ -11394,13 +11417,13 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
       riskReward: sig.riskRewardRatio ?? null, reason: sig.reason || null, kind, at,
     });
   }
-  if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
+  if (!email || !SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
   const timing = strategySignalTiming(sig, timeframe, madeMs, Date.now());
   // Gold Desk gets its purpose-designed email (GOLD | score grade SETUP | direction).
   if (strategy === 'xau-session-raid') {
     const g = buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing });
     try {
-      await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject: g.subject, text: g.text, html: g.html, signalId: `stratlab:${id}` });
+      await sendNotificationEmail({ to: signalEmailTo(), subject: g.subject, text: g.text, html: g.html, signalId: `stratlab:${id}` });
       console.log(`[GoldDesk] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`);
     } catch (e) { console.error('[GoldDesk] email failed:', e.message); }
     return;
@@ -11448,7 +11471,7 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
     </div>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Volume sized at ${sizing?.riskPercent ?? '?'}% risk on ${px2(sizing?.equity || 0)} equity, scaled to the ${timeframe} stop. Isolated strategy-lab signal — not the main system. Advisory only. — Aura Gold Strategy Lab</p></div>`;
   try {
-    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `stratlab:${id}` });
+    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `stratlab:${id}` });
     console.log(`[StrategyLab] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (${strategyName}, score ${Math.round(sig.score)})`);
   } catch (e) { console.error('[StrategyLab] email failed:', e.message); }
 }
@@ -11571,7 +11594,7 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
       durationLabel: expiry?.durationLabel ?? null, reason: sig.reason || null, kind, at,
     });
   }
-  if (!email || !SIGNAL_ALERTS_ENABLED || !SIGNAL_ALERT_EMAIL_TO) return;
+  if (!email || !SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
   const expiryUtc = expiry?.expiryIso
     ? new Date(expiry.expiryIso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC'
     : 'next candle';
@@ -11618,7 +11641,7 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
     </div>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Fixed-time call (direction at next-candle expiry). Isolated strategy-lab signal — not the main system or FTT engine. Advisory only. — Aura Gold Strategy Lab</p></div>`;
   try {
-    await sendNotificationEmail({ to: SIGNAL_ALERT_EMAIL_TO, subject, text, html, signalId: `stratlabftt:${id}` });
+    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `stratlabftt:${id}` });
     console.log(`[StrategyLab] Emailed FIXED-TIME ${sig.grade} ${ftDir} ${symbol} ${timeframe} (${strategyName}, score ${Math.round(sig.score)})`);
   } catch (e) { console.error('[StrategyLab] FTT email failed:', e.message); }
 }
@@ -12846,7 +12869,7 @@ app.post('/api/strategy-lab/test-email', async (req, res) => {
     await emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: false, email: true, kind: 'NEW' });
     // Gold Desk is forex-only by design — no fixed-time preview for it.
     if (!isGoldDesk) await emitStrategyLabFttSignal({ id: `${id}:ftt`, strategy, symbol, timeframe: tf, sig, refClose: sig.entry, popup: false, email: true, kind: 'NEW' });
-    res.json({ ok: true, sentTo: SIGNAL_ALERT_EMAIL_TO, alertsEnabled: SIGNAL_ALERTS_ENABLED, strategy, symbol, timeframe: tf, dir: buy ? 'BUY' : 'SELL' });
+    res.json({ ok: true, sentTo: signalEmailTo(), alertsEnabled: SIGNAL_ALERTS_ENABLED, strategy, symbol, timeframe: tf, dir: buy ? 'BUY' : 'SELL' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

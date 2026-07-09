@@ -403,6 +403,8 @@ export interface EmailAlertSettings {
   // Strategy Controller — master per-strategy switch (gates table, reports, popups, emails,
   // SSE). Missing entry = enabled. Optional refinements gate alert delivery.
   strategyControls?: Record<string, StrategyControl>;
+  // Signal email recipients (user-managed, up to 10). Empty = backend env default address.
+  emailRecipients?: string[];
   // Per-strategy EMAIL refinements (score / grade / symbols / direction). DELIVERY-only — cuts
   // email noise per strategy without touching signal generation, logging, popups, or ranking.
   // Applies to BOTH the forex and fixed-time strategy-lab email framings. symbols empty/absent =

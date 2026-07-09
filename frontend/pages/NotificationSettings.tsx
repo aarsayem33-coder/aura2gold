@@ -27,6 +27,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   strategyLabFttMinGrade: 'ANY',
   strategyLabFttStrategies: {},
   strategyLabRules: {},
+  emailRecipients: [],
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
@@ -83,6 +84,7 @@ const breakoutGradeOptions = [
 export default function NotificationSettings() {
   const { logs, refresh } = useMt5Stream();
   const [email, setEmail] = useState('aarsayem002@gmail.com');
+  const [newRecipient, setNewRecipient] = useState(''); // input for the signal-recipients list
   const [testStatus, setTestStatus] = useState<string | null>(null);
   // ── Redesigned UI state: tab navigation, per-strategy filter accordion, dirty tracking ──
   const [activeTab, setActiveTab] = useState<'routing' | 'strategies' | 'lab' | 'filters' | 'device' | 'log'>('routing');
@@ -289,6 +291,23 @@ export default function NotificationSettings() {
       for (const s of labStrategies) controls[s.id] = { ...(controls[s.id] || {}), enabled: on };
       return { ...current, strategyControls: controls };
     });
+    setEmailSettingsStatus(null);
+  };
+
+  // ── Signal email recipients (multiple) — saved through the same settings store ──
+  const addRecipient = () => {
+    const e = newRecipient.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) { setEmailSettingsStatus('Enter a valid email address.'); return; }
+    setEmailSettings((current) => {
+      const list = current.emailRecipients || [];
+      if (list.includes(e) || list.length >= 10) return current;
+      return { ...current, emailRecipients: [...list, e] };
+    });
+    setNewRecipient('');
+    setEmailSettingsStatus(null);
+  };
+  const removeRecipient = (e: string) => {
+    setEmailSettings((current) => ({ ...current, emailRecipients: (current.emailRecipients || []).filter((x) => x !== e) }));
     setEmailSettingsStatus(null);
   };
 
@@ -781,6 +800,34 @@ export default function NotificationSettings() {
                 </button>
               </div>
               {testStatus && <p className="text-[11px] font-semibold text-slate-500">{testStatus}</p>}
+              {/* Signal recipients — every signal email goes to ALL of these (max 10). */}
+              <div>
+                <p className="text-[11px] font-semibold text-slate-500">
+                  Signal recipients {(emailSettings.emailRecipients?.length ?? 0) > 0
+                    ? <span className="text-emerald-600">— {emailSettings.emailRecipients!.length} address{emailSettings.emailRecipients!.length > 1 ? 'es' : ''}</span>
+                    : <span className="text-slate-400">— none set = backend default is used</span>}
+                </p>
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {(emailSettings.emailRecipients || []).map((r) => (
+                    <span key={r} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-bold text-emerald-700">
+                      {r}
+                      <button type="button" onClick={() => removeRecipient(r)} title="Remove recipient" className="rounded-full text-emerald-500 transition-colors hover:text-red-600">✕</button>
+                    </span>
+                  ))}
+                </div>
+                <div className="mt-1.5 flex gap-2">
+                  <input
+                    type="email"
+                    value={newRecipient}
+                    onChange={(e) => setNewRecipient(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addRecipient(); } }}
+                    placeholder="add.recipient@email.com"
+                    className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-900 outline-none transition-colors focus:border-emerald-500 focus:bg-white"
+                  />
+                  <button type="button" onClick={addRecipient} className="shrink-0 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700 transition-colors hover:bg-emerald-100">+ Add</button>
+                </div>
+                <p className="mt-1 text-[10px] font-medium text-slate-400">Remember to Save — the list applies instantly to all signal emails (forex, fixed-time, lab, breakout, tracker, forecast, news reminders).</p>
+              </div>
               <div className="rounded-lg bg-slate-50 px-3 py-2 text-[11px] font-medium text-slate-500">
                 <p>Trade emails → <b className="text-slate-700">{emailSettingsMeta.emailTo || 'not configured'}</b></p>
                 <p>News emails → <b className="text-slate-700">{emailSettingsMeta.newsEmailTo || emailSettingsMeta.emailTo || 'not configured'}</b> · SMTP {emailSettingsMeta.smtpConfigured ? 'ok' : 'missing'}</p>
