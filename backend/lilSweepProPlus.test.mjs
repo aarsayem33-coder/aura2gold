@@ -31,13 +31,13 @@ function flatCandles(nBars = 120, base = 1.1) {
   return mkCandles(rows);
 }
 
-// Synthetic Plan A: a rising market prints a clean PDH-style high zone with EQUAL
-// highs at `lvl`, then a sweep candle wicks through it, closes back below, the next
-// candle drives down, and price holds below into the last bar.
+// Synthetic Plan A: a rising market stalls under the 5-dot round number `lvl`
+// (with equal highs AT it), then a sweep candle wicks through, closes back below,
+// the next candle drives down, and price holds below into the last bar.
 function sweepRejectCandles() {
   const rows = [];
-  const lvl = 1.10500;
-  let p = 1.09600;
+  const lvl = 1.11000; // full-grid round number → strength 5, qualifies under the 5-dot rule
+  let p = 1.10100;
   for (let i = 0; i < 70; i++) { const o = p; p += 0.00012; rows.push([o, Math.max(o, p) + 0.0002, Math.min(o, p) - 0.0002, p]); }
   // Two equal highs AT the level (visible stop cluster), pull back between them.
   rows.push([p, lvl, p - 0.0004, lvl - 0.0012]);

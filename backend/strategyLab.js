@@ -2385,11 +2385,17 @@ function lilSweepProPlus(ctx) {
 
   let keyLevels = [];
   try { keyLevels = detectKeyLiquidityLevels(candles, { symbol }).levels || []; } catch { keyLevels = []; }
-  const watch = keyLevels.filter((l) => l.strength >= minStrength && Number.isFinite(n(l.price)));
+  // Level-rank rule: EVERY level must be 5 dots — except PDH/PDL and session
+  // highs/lows, which qualify at 4 (what every desk watches regardless); strength
+  // still feeds the score either way.
+  const isPd = (t) => /^PD[HL]$/.test(t);
+  const isSession = (t) => /^(ASIAN|LONDON|NY)_/.test(t);
+  const watch = keyLevels.filter((l) => Number.isFinite(n(l.price))
+    && (l.strength >= 5 || (l.strength >= minStrength && (isPd(l.type) || isSession(l.type)))));
   if (!watch.length) return null;
-  // Label importance: PDH/PDL and session H/L are what every desk watches; equal
-  // highs/lows are the visible stop cluster; round numbers the retail magnet.
-  const labelBonus = (t) => (/^PD[HL]$/.test(t) || /^(ASIAN|LONDON|NY)_/.test(t) ? 5 : /EQUAL/.test(t) ? 4 : /ROUND/.test(t) ? 3 : 1);
+  // Label importance ranking: PDH/PDL (1) > session H/L (2) > equal highs/lows (3,
+  // the visible stop cluster) > round numbers (4, the retail magnet) > plain swings.
+  const labelBonus = (t) => (isPd(t) ? 5 : isSession(t) ? 4 : /EQUAL/.test(t) ? 4 : /ROUND/.test(t) ? 3 : 1);
 
   const candidates = [];
   for (const lvl of watch) {
@@ -2610,7 +2616,7 @@ export const STRATEGIES = {
     id: 'lil-sweep-pro-plus',
     name: 'LIL SWEEP-PRO+',
     source: 'Key Liquidity Levels playbook — Plan A sweep-rejection / Plan B break-and-hold on the strongest (●●●●–●●●●●) map levels',
-    description: 'FOREX-ONLY engine that trades the key liquidity map itself — only levels with strength ≥4 dots (PDH/PDL, session highs/lows, equal highs/lows, round numbers). PLAN A (sweep-rejection): fires only after the full 4-condition checklist prints — (1) wick trades THROUGH the level, (2) candle CLOSES back on the original side, (3) the next candle follows through away from the level, (4) price FAILS TO HOLD beyond (no re-close through it). Entry = break of the rejection candle\'s extreme (alerted while the trigger is pending or just broke — never chased), stop beyond the sweep wick, target the nearest opposing liquidity (swing pool → round → equal → session/PD). PLAN B (break-and-hold continuation): a strong BODY close through the level (not a wick), then a retest that tags it and HOLDS with a rejection candle — enter the continuation, stop beyond the retest, target the next fresh liquidity ahead. "SWEPT = do not enter late" is a hard rule: the rejection must be recent (≤8 bars). Never fights a clear H4. Min 1.8R and a 12-pip minimum target. HONEST MEASUREMENT: resolved as trigger orders (meta.requiresFill) — if the break never comes the signal EXPIRES and is excluded from the win rate.',
+    description: 'FOREX-ONLY engine that trades the key liquidity map itself — every level must be FULL 5 dots, except PDH/PDL and session highs/lows which qualify at 4 (level rank: PDH/PDL > session H/L > equal highs/lows > round numbers > swings; strength always feeds the score). PLAN A (sweep-rejection): fires only after the full 4-condition checklist prints — (1) wick trades THROUGH the level, (2) candle CLOSES back on the original side, (3) the next candle follows through away from the level, (4) price FAILS TO HOLD beyond (no re-close through it). Entry = break of the rejection candle\'s extreme (alerted while the trigger is pending or just broke — never chased), stop beyond the sweep wick, target the nearest opposing liquidity (swing pool → round → equal → session/PD). PLAN B (break-and-hold continuation): a strong BODY close through the level (not a wick), then a retest that tags it and HOLDS with a rejection candle — enter the continuation, stop beyond the retest, target the next fresh liquidity ahead. "SWEPT = do not enter late" is a hard rule: the rejection must be recent (≤8 bars). Never fights a clear H4. Min 1.8R and a 12-pip minimum target. HONEST MEASUREMENT: resolved as trigger orders (meta.requiresFill) — if the break never comes the signal EXPIRES and is excluded from the win rate.',
     timeframes: ['M5', 'M15', 'M30', 'H1'],
     config: { minScore: 72, minRR: 1.8, minLevelStrength: 4, maxAgeBars: 8, sweepMinAtr: 0.12, minSweepPips: 2, breakCloseAtr: 0.25, minBreakPips: 2, retestTolAtr: 0.35, retestWindowBars: 14, maxWaitAtr: 1.0, enterNowAtr: 0.3, minTargetPips: 12, maxTargetAtr: 6, minStopPips: 4, minStopAtr: 0.3 },
     evaluate: lilSweepProPlus,
