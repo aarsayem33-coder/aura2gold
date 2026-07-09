@@ -342,6 +342,98 @@ function volumeProfile(data: ChartCandle[], bins = 24, lookback = 220): VolumePr
   };
 }
 
+// ── Ichimoku Kinko Hyo (classic 9 / 26 / 52, displacement 26) ────────────────
+// Proper text-book calculation: Tenkan = (9-bar high+low)/2, Kijun = (26-bar high+low)/2,
+// Senkou Span A = (Tenkan+Kijun)/2 plotted 26 bars AHEAD, Span B = (52-bar high+low)/2
+// plotted 26 ahead (future timestamps synthesized from the timeframe), Chikou = close
+// plotted 26 bars BACK. Returns line arrays + matched Span A/B pairs for the Kumo fill.
+function ichimokuData(data: ChartCandle[], tfSec: number, { conversion = 9, base = 26, spanBP = 52, displacement = 26 } = {}) {
+  const n = data.length;
+  if (n < spanBP + 2) return null;
+  const hh = (i: number, p: number) => { let h = -Infinity; for (let k = i - p + 1; k <= i; k++) h = Math.max(h, data[k].high); return h; };
+  const ll = (i: number, p: number) => { let l = Infinity; for (let k = i - p + 1; k <= i; k++) l = Math.min(l, data[k].low); return l; };
+  const futureTime = (i: number): number | null => {
+    const j = i + displacement;
+    if (j < n) return Number(data[j].time);
+    return tfSec > 0 ? Number(data[n - 1].time) + (j - (n - 1)) * tfSec : null;
+  };
+  const tenkan: { time: any; value: number }[] = [];
+  const kijun: { time: any; value: number }[] = [];
+  const chikou: { time: any; value: number }[] = [];
+  const aPts: { time: any; value: number }[] = [];
+  const bPts: { time: any; value: number }[] = [];
+  const bByTime = new Map<number, number>();
+  for (let i = 0; i < n; i++) {
+    let t: number | null = null;
+    let k: number | null = null;
+    if (i >= conversion - 1) { t = (hh(i, conversion) + ll(i, conversion)) / 2; tenkan.push({ time: data[i].time, value: t }); }
+    if (i >= base - 1) { k = (hh(i, base) + ll(i, base)) / 2; kijun.push({ time: data[i].time, value: k }); }
+    const ft = futureTime(i);
+    if (ft !== null) {
+      if (t !== null && k !== null) aPts.push({ time: ft, value: (t + k) / 2 });
+      if (i >= spanBP - 1) { const v = (hh(i, spanBP) + ll(i, spanBP)) / 2; bPts.push({ time: ft, value: v }); bByTime.set(ft, v); }
+    }
+    if (i >= displacement) chikou.push({ time: data[i - displacement].time, value: data[i].close });
+  }
+  // Matched pairs (same displaced timestamp) for the Kumo fill + the cloud AT each time.
+  const pairs = aPts.filter((p) => bByTime.has(Number(p.time))).map((p) => ({ time: Number(p.time), a: p.value, b: bByTime.get(Number(p.time)) as number }));
+  return { tenkan, kijun, chikou, aPts, bPts, pairs };
+}
+
+// Kumo (cloud) fill — a lightweight-charts series primitive that paints the polygon between
+// Span A and Span B (green where A ≥ B, red where B > A), behind the candles. lightweight-charts
+// has no native fill-between-two-lines series, so this draws it directly on the pane canvas
+// using the chart's own coordinate conversions (stays correct under zoom/pan/resize).
+class KumoCloudPrimitive {
+  _chart: any = null;
+  _series: any = null;
+  _pairs: { time: number; a: number; b: number }[] = [];
+  setData(pairs: { time: number; a: number; b: number }[]) { this._pairs = pairs; }
+  attached({ chart, series }: any) { this._chart = chart; this._series = series; }
+  detached() { this._chart = null; this._series = null; }
+  updateAllViews() { /* stateless — recomputed every draw */ }
+  paneViews() {
+    return [{
+      zOrder: () => 'bottom' as const,
+      renderer: () => ({
+        draw: (target: any) => {
+          const chart = this._chart, series = this._series, pairs = this._pairs;
+          if (!chart || !series || pairs.length < 2) return;
+          target.useMediaCoordinateSpace((scope: any) => {
+            const ctx = scope.context;
+            const ts = chart.timeScale();
+            let seg: { x: number; ya: number; yb: number }[] = [];
+            let segBull: boolean | null = null;
+            const flush = () => {
+              if (seg.length > 1 && segBull !== null) {
+                ctx.beginPath();
+                ctx.moveTo(seg[0].x, seg[0].ya);
+                for (let i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, seg[i].ya);
+                for (let i = seg.length - 1; i >= 0; i--) ctx.lineTo(seg[i].x, seg[i].yb);
+                ctx.closePath();
+                ctx.fillStyle = segBull ? 'rgba(8, 153, 129, 0.14)' : 'rgba(242, 54, 69, 0.12)';
+                ctx.fill();
+              }
+              seg = [];
+            };
+            for (const p of pairs) {
+              const x = ts.timeToCoordinate(p.time);
+              const ya = series.priceToCoordinate(p.a);
+              const yb = series.priceToCoordinate(p.b);
+              if (x === null || ya === null || yb === null) { flush(); segBull = null; continue; }
+              const bull = p.a >= p.b;
+              if (segBull === null) segBull = bull;
+              else if (bull !== segBull) { seg.push({ x, ya, yb }); flush(); segBull = bull; }
+              seg.push({ x, ya, yb });
+            }
+            flush();
+          });
+        },
+      }),
+    }];
+  }
+}
+
 interface TradeZone { top: number; bottom: number; time: any }
 
 /** Nearest UNVIOLATED demand zone below price (buy area) and supply zone above price
@@ -385,6 +477,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const [showEma200, setShowEma200] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
   const [showPatterns, setShowPatterns] = useState(false);
+  const [showIchimoku, setShowIchimoku] = useState(false);
   const [showTrend, setShowTrend] = useState(false);
   const [showTrendlines, setShowTrendlines] = useState(false);
   const [showZigzag, setShowZigzag] = useState(false);
@@ -409,6 +502,13 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const trendlineSupRef = useRef<any>(null);
   const trendlineResRef = useRef<any>(null);
   const zigzagRef = useRef<any>(null);
+  // Ichimoku overlay series + the Kumo cloud-fill primitive (attached to the Span A series).
+  const ichiTenkanRef = useRef<any>(null);
+  const ichiKijunRef = useRef<any>(null);
+  const ichiChikouRef = useRef<any>(null);
+  const ichiSpanARef = useRef<any>(null);
+  const ichiSpanBRef = useRef<any>(null);
+  const kumoRef = useRef<KumoCloudPrimitive | null>(null);
   const analysisLinesRef = useRef<any[]>([]);
   const analysisBadgeRef = useRef<HTMLDivElement | null>(null);
   const resizeChartRef = useRef<(() => void) | null>(null);
@@ -487,6 +587,12 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     trendlineSupRef.current = null;
     trendlineResRef.current = null;
     zigzagRef.current = null;
+    ichiTenkanRef.current = null;
+    ichiKijunRef.current = null;
+    ichiChikouRef.current = null;
+    ichiSpanARef.current = null;
+    ichiSpanBRef.current = null;
+    kumoRef.current = null;
     analysisLinesRef.current = [];
     // Drop the previous instrument's last-closed reference so Effect D can't paint a stale
     // forming bar (old symbol's price) onto the fresh series before new data loads.
@@ -756,6 +862,43 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
       }
     }
 
+    // Ichimoku Kinko Hyo (9/26/52, displacement 26): Tenkan + Kijun + Chikou lines and the
+    // Kumo — Span A/B projected 26 bars into the FUTURE with a true cloud fill painted by
+    // KumoCloudPrimitive (green where A ≥ B, red where B > A), behind the candles.
+    const ichi = showIchimoku && tfSec > 0 ? ichimokuData(data, tfSec) : null;
+    if ((!showIchimoku || !ichi) && kumoRef.current && ichiSpanARef.current) {
+      try { ichiSpanARef.current.detachPrimitive(kumoRef.current); } catch { /* series may be gone */ }
+      kumoRef.current = null;
+    }
+    applyLine(ichiTenkanRef, !!ichi, ichi?.tenkan, { color: '#2962ff', lineWidth: 1, title: 'Tenkan 9', lastValueVisible: false, priceLineVisible: false });
+    applyLine(ichiKijunRef, !!ichi, ichi?.kijun, { color: '#b71c1c', lineWidth: 1, title: 'Kijun 26', lastValueVisible: false, priceLineVisible: false });
+    applyLine(ichiChikouRef, !!ichi, ichi?.chikou, { color: '#43a047', lineWidth: 1, lineStyle: LineStyle.Dotted, title: 'Chikou', lastValueVisible: false, priceLineVisible: false });
+    applyLine(ichiSpanARef, !!ichi, ichi?.aPts, { color: 'rgba(8, 153, 129, 0.65)', lineWidth: 1, title: 'Span A', lastValueVisible: false, priceLineVisible: false });
+    applyLine(ichiSpanBRef, !!ichi, ichi?.bPts, { color: 'rgba(242, 54, 69, 0.65)', lineWidth: 1, title: 'Span B', lastValueVisible: false, priceLineVisible: false });
+    if (ichi && ichiSpanARef.current) {
+      if (!kumoRef.current) {
+        kumoRef.current = new KumoCloudPrimitive();
+        try { ichiSpanARef.current.attachPrimitive(kumoRef.current); } catch { kumoRef.current = null; }
+      }
+      kumoRef.current?.setData(ichi.pairs);
+      // Badge: where price sits vs the CURRENT cloud (the pair displaced onto the last bar)
+      // plus the Tenkan/Kijun relation — the classic Ichimoku read at a glance.
+      const nowT = Number(data[data.length - 1].time);
+      const pairNow = ichi.pairs.find((p) => p.time === nowT) || null;
+      const lastClose = data[data.length - 1].close;
+      const tkLast = ichi.tenkan[ichi.tenkan.length - 1]?.value;
+      const kjLast = ichi.kijun[ichi.kijun.length - 1]?.value;
+      if (pairNow) {
+        const cloudTop = Math.max(pairNow.a, pairNow.b);
+        const cloudBot = Math.min(pairNow.a, pairNow.b);
+        const pos = lastClose > cloudTop ? 'ABOVE' : lastClose < cloudBot ? 'BELOW' : 'INSIDE';
+        const col = pos === 'ABOVE' ? '#089981' : pos === 'BELOW' ? '#f23645' : '#64748b';
+        const tk = Number.isFinite(tkLast) && Number.isFinite(kjLast)
+          ? (tkLast > kjLast ? 'TK>KJ' : tkLast < kjLast ? 'TK<KJ' : 'TK=KJ') : '';
+        badgeChips.push(`<span class="font-black" style="color:${col}">☁ ${pos} KUMO</span><span class="text-slate-400">${tk}${pairNow.a >= pairNow.b ? ' · cloud bullish' : ' · cloud bearish'}</span>`);
+      }
+    }
+
     // Auto diagonal trendlines (support / resistance) from the last two swing pivots.
     const tl = showTrendlines ? autoTrendlines(pivots) : null;
     applyLine(trendlineSupRef, showTrendlines && !!tl?.support, tl?.support, { color: '#10b981', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Support', lastValueVisible: false, priceLineVisible: false });
@@ -883,7 +1026,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         chart.timeScale().fitContent();
       }
     }
-  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showTrend, showTrendlines, showZigzag, showDensity, showZones, levels]);
+  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showIchimoku, showTrend, showTrendlines, showZigzag, showDensity, showZones, levels]);
 
   // ─── Effect D: live forming bar + countdown (1s) ────────────────────────
   // The feed sends closed bars only, so without this the chart sits frozen between
@@ -1034,6 +1177,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
           {toggleBtn(showEma21, 'EMA 21', () => setShowEma21((v) => !v), 'bg-purple-50 text-purple-700 border-purple-200')}
           {toggleBtn(showEma50, 'EMA 50', () => setShowEma50((v) => !v), 'bg-orange-50 text-orange-700 border-orange-200')}
           {toggleBtn(showEma200, 'EMA 200', () => setShowEma200((v) => !v), 'bg-amber-100 text-amber-800 border-amber-200')}
+          {toggleBtn(showIchimoku, 'Ichimoku', () => setShowIchimoku((v) => !v), 'bg-cyan-50 text-cyan-700 border-cyan-200')}
           {toggleBtn(showPatterns, 'Patterns', () => setShowPatterns((v) => !v), 'bg-violet-50 text-violet-700 border-violet-200')}
           <span className="mx-0.5 h-4 w-px bg-slate-200" />
           {toggleBtn(showTrend, 'Trend', () => setShowTrend((v) => !v), 'bg-teal-50 text-teal-700 border-teal-200')}
