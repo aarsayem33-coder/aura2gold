@@ -2330,6 +2330,254 @@ function specialForexSniper(ctx) {
   };
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// LIL SWEEP-PRO+ — trades the KEY LIQUIDITY MAP itself: only the strongest fresh
+// levels (●●●● / ●●●●● — PDH/PDL, session highs/lows, equal highs/lows, round
+// numbers) via the two-plan playbook:
+//
+//   PLAN A — SWEEP-REJECTION (reversal). All FOUR checklist conditions must print:
+//     (1) wick trades THROUGH the level (a real sweep, ≥ sweepMinAtr×ATR beyond),
+//     (2) the candle CLOSES back on the original side of the level,
+//     (3) the NEXT candle moves away from the level (follow-through),
+//     (4) price FAILS TO HOLD beyond — no re-close through the level since.
+//     Entry = break of the rejection candle's extreme (stop-style trigger); the
+//     alert fires while the trigger is still pending (or just broke) — never after
+//     price has run away. Stop beyond the sweep wick. Target = nearest opposing
+//     liquidity (swing pool → round → equal → session/PD level).
+//
+//   PLAN B — BREAK-AND-HOLD (continuation). Strong BODY close through the level
+//     (not a wick), then a retest that tags it and HOLDS (no strong close back
+//     through), with a rejection candle at the retest = enter with the break.
+//     Stop beyond the retest extreme/level; target the next fresh liquidity ahead.
+//
+// "SWEPT = don't enter late" is enforced by recency (the rejection must be within
+// maxAgeBars) — a 5-dot level that was raided long ago is dead, not a setup.
+// HONESTY: meta.requiresFill — Plan A resolves as a trigger order (no break = no
+// trade = EXPIRED, excluded from the win rate). Never fights a clear H4 trend.
+function lilSweepProPlus(ctx) {
+  const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minScore = config.minScore ?? 72;
+  const minRR = config.minRR ?? 1.8;
+  const minStrength = config.minLevelStrength ?? 4;
+  const maxAgeBars = config.maxAgeBars ?? 8;          // sweep-rejection recency — "SWEPT long ago = do not enter late"
+  const sweepMinAtr = config.sweepMinAtr ?? 0.12;     // the wick must trade meaningfully THROUGH the level
+  const minSweepPips = config.minSweepPips ?? 2;      // ...and by an absolute floor: a sub-2-pip poke in dead chop is noise, not a raid
+  const breakCloseAtr = config.breakCloseAtr ?? 0.25; // Plan B: BODY close beyond, "not just wick"
+  const minBreakPips = config.minBreakPips ?? 2;      // same absolute floor for the break
+  const maxTargetAtr = config.maxTargetAtr ?? 6;      // a structural draw >6×ATR away is not a realistic magnet for THIS timeframe
+  const retestTolAtr = config.retestTolAtr ?? 0.35;   // Plan B: how close the pullback must tag the broken level
+  const retestWindowBars = config.retestWindowBars ?? 14;
+  const maxWaitAtr = config.maxWaitAtr ?? 1.0;        // Plan A pending trigger can't sit absurdly far from price
+  const enterNowAtr = config.enterNowAtr ?? 0.3;      // trigger already broke: only this far past = still takeable
+  const minTargetPips = config.minTargetPips ?? 12;   // pips-value floor — RR on a micro target is not profit
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const lastIdx = candles.length - 1;
+  const last = candles[lastIdx];
+  const price = n(last.close);
+
+  const hour = new Date(last.time).getUTCHours();
+  const inLondon = hour >= 7 && hour < 16;
+  const inNy = hour >= 12 && hour < 21;
+  const inOverlap = hour >= 12 && hour < 16;
+  const sessionScore = inOverlap ? 10 : (inLondon || inNy) ? 7 : 3;
+
+  let keyLevels = [];
+  try { keyLevels = detectKeyLiquidityLevels(candles, { symbol }).levels || []; } catch { keyLevels = []; }
+  const watch = keyLevels.filter((l) => l.strength >= minStrength && Number.isFinite(n(l.price)));
+  if (!watch.length) return null;
+  // Label importance: PDH/PDL and session H/L are what every desk watches; equal
+  // highs/lows are the visible stop cluster; round numbers the retail magnet.
+  const labelBonus = (t) => (/^PD[HL]$/.test(t) || /^(ASIAN|LONDON|NY)_/.test(t) ? 5 : /EQUAL/.test(t) ? 4 : /ROUND/.test(t) ? 3 : 1);
+
+  const candidates = [];
+  for (const lvl of watch) {
+    const L = n(lvl.price);
+
+    // ── PLAN A: sweep + rejection, scanned in BOTH directions ────────────────
+    for (let i = Math.max(2, lastIdx - maxAgeBars); i < lastIdx; i++) {
+      const c = candles[i];
+      const upWick = n(c.high) - L;   // buy-side sweep depth (→ SELL)
+      const dnWick = L - n(c.low);    // sell-side sweep depth (→ BUY)
+      const sweepFloor = Math.max(sweepMinAtr * atr, minSweepPips * pip);
+      if (upWick >= sweepFloor && n(c.close) < L) {
+        const next = candles[i + 1];
+        if (!(n(next.close) < n(c.close) || n(next.close) < n(next.open))) continue; // (3) next candle moves down
+        let held = true, wickExtreme = n(c.high);
+        for (let j = i + 1; j <= lastIdx; j++) {
+          if (n(candles[j].close) > L) { held = false; break; }                      // (4) fails to hold above
+          wickExtreme = Math.max(wickExtreme, n(candles[j].high));
+        }
+        if (!held) continue;
+        candidates.push({
+          plan: 'SWEEP-REJECT', decision: 'SELL', lvl, evIdx: i, excursion: upWick,
+          trigger: n(c.low), wickExtreme, closeBack: L - n(c.close),
+          followStrong: n(next.close) < n(next.open) && n(next.close) < n(c.low),
+        });
+      }
+      if (dnWick >= sweepFloor && n(c.close) > L) {
+        const next = candles[i + 1];
+        if (!(n(next.close) > n(c.close) || n(next.close) > n(next.open))) continue;
+        let held = true, wickExtreme = n(c.low);
+        for (let j = i + 1; j <= lastIdx; j++) {
+          if (n(candles[j].close) < L) { held = false; break; }
+          wickExtreme = Math.min(wickExtreme, n(candles[j].low));
+        }
+        if (!held) continue;
+        candidates.push({
+          plan: 'SWEEP-REJECT', decision: 'BUY', lvl, evIdx: i, excursion: dnWick,
+          trigger: n(c.high), wickExtreme, closeBack: n(c.close) - L,
+          followStrong: n(next.close) > n(next.open) && n(next.close) > n(c.high),
+        });
+      }
+    }
+
+    // ── PLAN B: break + strong close + retest hold, both directions ──────────
+    // The LAST closed bar must BE the retest rejection — Plan B is entered at the
+    // retest, not chased bars later.
+    for (const dir of ['BUY', 'SELL']) {
+      const up = dir === 'BUY';
+      const beyond = (v) => (up ? v - L : L - v);
+      // Retest rejection on the last bar: tags the level, closes back on the trade side.
+      const tag = up ? L + retestTolAtr * atr : L - retestTolAtr * atr;
+      const tagged = up ? n(last.low) <= tag && n(last.close) > L : n(last.high) >= tag && n(last.close) < L;
+      if (!tagged) continue;
+      const range = Math.max(n(last.high) - n(last.low), 1e-12);
+      const rejWick = up ? (Math.min(n(last.close), n(last.open)) - n(last.low)) / range : (n(last.high) - Math.max(n(last.close), n(last.open))) / range;
+      const bullishRejection = (up ? n(last.close) > n(last.open) : n(last.close) < n(last.open)) || rejWick >= 0.4;
+      if (!bullishRejection) continue;
+      // Find the break bar: a BODY close beyond the level, coming FROM the other side.
+      let breakIdx = -1;
+      for (let b = lastIdx - 1; b >= Math.max(2, lastIdx - retestWindowBars); b--) {
+        const cb = candles[b];
+        const bodyBeyond = beyond(n(cb.close));
+        const wasOtherSide = beyond(n(candles[b - 1].close)) < 0;
+        if (bodyBeyond >= Math.max(breakCloseAtr * atr, minBreakPips * pip) && (up ? n(cb.close) > n(cb.open) : n(cb.close) < n(cb.open)) && wasOtherSide) { breakIdx = b; break; }
+      }
+      if (breakIdx < 0) continue;
+      // Holds: no strong close back through the level since the break.
+      let holds = true;
+      for (let j = breakIdx + 1; j <= lastIdx; j++) {
+        if (beyond(n(candles[j].close)) < -0.1 * atr) { holds = false; break; }
+      }
+      if (!holds) continue;
+      const retestExtreme = up ? Math.min(n(last.low), L) : Math.max(n(last.high), L);
+      candidates.push({
+        plan: 'BREAK-HOLD', decision: dir, lvl, evIdx: breakIdx, retestIdx: lastIdx,
+        trigger: price, wickExtreme: retestExtreme,
+        bodyBeyond: beyond(n(candles[breakIdx].close)), rejWick,
+      });
+    }
+  }
+  if (!candidates.length) return null;
+
+  const pools = detectLiquidityPools(candles);
+  const pickLevel = (sideWanted, match, validTarget) => {
+    const c = keyLevels.filter((l) => l.side === sideWanted && l.fresh && match(l.type) && validTarget(n(l.price))).sort((a, b) => a.distance - b.distance)[0];
+    return c ? n(c.price) : null;
+  };
+
+  let best = null;
+  for (const cand of candidates) {
+    const { plan, decision, lvl } = cand;
+    const buy = decision === 'BUY';
+    if (h4Trend === 'BULLISH' && !buy) continue;   // never fight a clear H4
+    if (h4Trend === 'BEARISH' && buy) continue;
+    const planA = plan === 'SWEEP-REJECT';
+
+    // Entry mechanics. Plan A = trigger order at the rejection candle's extreme:
+    // alert while pending (price hasn't broken it) or just after the break — a
+    // trigger that price has already run past is a chased trade, skipped.
+    let entry, entryMode, timingScore;
+    if (planA) {
+      entry = cand.trigger;
+      const distToTrigger = buy ? entry - price : price - entry;
+      if (distToTrigger > 0) {                               // trigger still pending
+        if (distToTrigger > maxWaitAtr * atr) continue;
+        const p = Math.round((distToTrigger / pip) * 10) / 10;
+        entryMode = `awaiting break — trigger ${p}p away`;
+        timingScore = distToTrigger <= 0.5 * atr ? 10 : 7;
+      } else {                                               // broke already
+        if (-distToTrigger > enterNowAtr * atr) continue;    // ran off = gone
+        entryMode = 'ENTER NOW — trigger just broke';
+        timingScore = 8;
+      }
+    } else {
+      entry = price;                                         // Plan B enters at the retest rejection close
+      entryMode = 'ENTER NOW — retest held';
+      timingScore = 9;
+    }
+    const stop = buy ? Math.min(cand.wickExtreme, entry) - 0.2 * atr : Math.max(cand.wickExtreme, entry) + 0.2 * atr;
+    const risk = Math.abs(entry - stop);
+    if (stopTooTight(risk, atr, pip, { minStopAtr: config.minStopAtr ?? 0.3, minStopPips: config.minStopPips ?? 4 })) continue;
+
+    // Target = the user's ladder: nearest opposing swing pool → round → equal →
+    // session/PD level → 2.5R fallback.
+    const sideWanted = buy ? 'above' : 'below';
+    const validTarget = (p) => Number.isFinite(p) && (buy ? p > entry + risk : p < entry - risk);
+    const opposing = buy ? pools.targetAbove : pools.targetBelow;
+    let target = opposing && validTarget(n(opposing.price)) ? n(opposing.price) : null;
+    let targetType = target != null ? `${opposing.type}${opposing.equal ? ' (equal)' : ''}` : null;
+    if (target == null) { target = pickLevel(sideWanted, (t) => /ROUND/.test(t), validTarget); if (target != null) targetType = 'round number'; }
+    if (target == null) { target = pickLevel(sideWanted, (t) => /EQUAL/.test(t), validTarget); if (target != null) targetType = 'equal highs/lows'; }
+    if (target == null) { target = pickLevel(sideWanted, (t) => /^(ASIAN|LONDON|NY)_/.test(t) || /^PD[HL]$/.test(t), validTarget); if (target != null) targetType = 'session/prev-day level'; }
+    if (target == null) { target = buy ? entry + 2.5 * risk : entry - 2.5 * risk; targetType = '2.5R'; }
+    // Realism clamp: a structural level many ATRs away isn't this timeframe's draw —
+    // fall back to a bounded 2.5R rather than advertise a fantasy RR.
+    if (Math.abs(target - entry) > maxTargetAtr * atr) { target = buy ? entry + 2.5 * risk : entry - 2.5 * risk; targetType = '2.5R'; }
+    const reward = Math.abs(target - entry);
+    const rr = Math.round((reward / risk) * 100) / 100;
+    if (rr < minRR) continue;
+    if (reward / pip < minTargetPips) continue;
+
+    // 100-point budget: 25 level quality · 20 event quality · 8 hold · 15 HTF ·
+    // 10 session · 10 RR · 10 timing (+2 overlap-fresh bonus headroom).
+    const htf4 = (buy && h4Trend === 'BULLISH') || (!buy && h4Trend === 'BEARISH');
+    const htf1 = (buy && h1Trend === 'BULLISH') || (!buy && h1Trend === 'BEARISH');
+    let score = 0;
+    score += (lvl.strength >= 5 ? 20 : 15) + labelBonus(lvl.type);
+    if (planA) {
+      score += Math.min(10, Math.round((cand.excursion / atr) * 12));      // real sweep depth
+      score += cand.closeBack >= 0.15 * atr ? 5 : 3;                       // decisive close back inside
+      score += cand.followStrong ? 5 : 3;                                  // conviction follow-through
+    } else {
+      score += cand.bodyBeyond >= 0.4 * atr ? 10 : 8;                      // strong body break
+      score += 5;                                                          // held the retest (gated above)
+      score += cand.rejWick >= 0.4 ? 5 : 3;                                // rejection quality at the retest
+    }
+    const ageBars = lastIdx - cand.evIdx;
+    score += ageBars <= 3 ? 8 : ageBars <= 6 ? 6 : 4;
+    score += htf4 ? 10 : (h4Trend === null ? 5 : 2);
+    score += htf1 ? 5 : 2;
+    score += sessionScore;
+    score += Math.min(10, 4 + Math.round((rr - minRR) * 4));
+    score += timingScore;
+    score = Math.max(40, Math.min(97, Math.round(score)));
+    if (score < minScore) continue;
+
+    const ladder = tpLadder(decision, entry, risk, target);
+    const dots = '●'.repeat(Math.max(1, Math.min(5, lvl.strength)));
+    const sig = {
+      decision, score, grade: smcGrade(score),
+      entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
+      reason: planA
+        ? `SWEEP-REJECT ${decision}: ${lvl.label || lvl.type} ${r5(n(lvl.price))} ${dots} swept (${Math.round((cand.excursion / pip) * 10) / 10}p through), closed back ${buy ? 'above' : 'below'}, follow-through, no re-close — ${decision} on break of ${r5(entry)} (${entryMode}); stop beyond sweep wick ${r5(stop)}; target ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`
+        : `BREAK-HOLD ${decision}: ${lvl.label || lvl.type} ${r5(n(lvl.price))} ${dots} broken by BODY close, retested and HELD with rejection — ${decision} ${r5(entry)} (${entryMode}); stop ${r5(stop)}; target ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`,
+      barIso: candles[cand.evIdx].time,                    // dedup: ONE signal per sweep/break event
+      meta: {
+        v: 1, plan, requiresFill: true, forexOnly: true, preEntryAlert: planA,
+        level: { type: lvl.type, label: lvl.label, price: r5(n(lvl.price)), strength: lvl.strength },
+        triggerPrice: r5(entry), entryMode, targetType, rrToTarget: rr,
+        session: inOverlap ? 'OVERLAP' : inLondon ? 'LONDON' : inNy ? 'NY' : 'OFF',
+        htf4, htf1, ageBars,
+      },
+    };
+    if (!best || sig.score > best.score) best = sig;
+  }
+  return best;
+}
+
 export const STRATEGIES = {
   'special-forex-sniper': {
     id: 'special-forex-sniper',
@@ -2357,6 +2605,15 @@ export const STRATEGIES = {
     timeframes: ['M5', 'M15', 'M30', 'H1'],
     config: { minRR: 1.8, minGrade: 'B' },
     evaluate: liquiditySweepPro,
+  },
+  'lil-sweep-pro-plus': {
+    id: 'lil-sweep-pro-plus',
+    name: 'LIL SWEEP-PRO+',
+    source: 'Key Liquidity Levels playbook — Plan A sweep-rejection / Plan B break-and-hold on the strongest (●●●●–●●●●●) map levels',
+    description: 'FOREX-ONLY engine that trades the key liquidity map itself — only levels with strength ≥4 dots (PDH/PDL, session highs/lows, equal highs/lows, round numbers). PLAN A (sweep-rejection): fires only after the full 4-condition checklist prints — (1) wick trades THROUGH the level, (2) candle CLOSES back on the original side, (3) the next candle follows through away from the level, (4) price FAILS TO HOLD beyond (no re-close through it). Entry = break of the rejection candle\'s extreme (alerted while the trigger is pending or just broke — never chased), stop beyond the sweep wick, target the nearest opposing liquidity (swing pool → round → equal → session/PD). PLAN B (break-and-hold continuation): a strong BODY close through the level (not a wick), then a retest that tags it and HOLDS with a rejection candle — enter the continuation, stop beyond the retest, target the next fresh liquidity ahead. "SWEPT = do not enter late" is a hard rule: the rejection must be recent (≤8 bars). Never fights a clear H4. Min 1.8R and a 12-pip minimum target. HONEST MEASUREMENT: resolved as trigger orders (meta.requiresFill) — if the break never comes the signal EXPIRES and is excluded from the win rate.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: { minScore: 72, minRR: 1.8, minLevelStrength: 4, maxAgeBars: 8, sweepMinAtr: 0.12, minSweepPips: 2, breakCloseAtr: 0.25, minBreakPips: 2, retestTolAtr: 0.35, retestWindowBars: 14, maxWaitAtr: 1.0, enterNowAtr: 0.3, minTargetPips: 12, maxTargetAtr: 6, minStopPips: 4, minStopAtr: 0.3 },
+    evaluate: lilSweepProPlus,
   },
   'forex-confluence': {
     id: 'forex-confluence',

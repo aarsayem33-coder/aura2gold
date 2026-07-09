@@ -11253,6 +11253,17 @@ function strategyAdvisoryNotes(strategy, sig, { symbol, timeframe, fixedTime = f
     notes.push('Confirm first: only valid once a candle CLOSES the move — a quick wick touching the level is not enough.');
   } else if (strategy === 'market-mechanics-3step') {
     notes.push('Only valid with the bigger (H4) trend and at a good price zone — no location, no trade.');
+  } else if (strategy === 'lil-sweep-pro-plus') {
+    const m = sig.meta || {};
+    const lv = m.level || {};
+    const dots = '●'.repeat(Math.max(1, Math.min(5, Number(lv.strength) || 4)));
+    if (m.plan === 'SWEEP-REJECT') {
+      notes.push(`Plan A — sweep-rejection at ${lv.label || lv.type || 'a key level'} ${dots}: the level was swept, price closed back ${buy ? 'above' : 'below'} and failed to hold. ${buy ? 'BUY' : 'SELL'} only when price BREAKS ${px(entry, symbol)} (the rejection candle's ${buy ? 'high' : 'low'}) — if the break never comes, there is no trade.`);
+      notes.push('Do not enter early at the level itself — the break of the rejection candle is the confirmation. The stop sits beyond the sweep wick; never widen it.');
+    } else {
+      notes.push(`Plan B — break-and-hold at ${lv.label || lv.type || 'a key level'} ${dots}: a strong BODY close broke the level and the retest just HELD with a rejection candle. Enter the continuation now at ${px(entry, symbol)}; invalid if price closes strongly back ${buy ? 'below' : 'above'} the level.`);
+    }
+    notes.push('This level was chosen from the key liquidity map (strength ≥4 dots). A level already swept bars ago is dead — this alert is only valid while fresh; skip it if you see it late.');
   }
 
   // Don't-chase, measured against the live price when available.
@@ -11429,7 +11440,10 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
     return;
   }
   const advisory = strategyForexAdvisory(symbol, timeframe, sig);
-  const subject = `[STRATEGY ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)}${sig.riskRewardRatio != null ? ` · RR 1:${sig.riskRewardRatio}` : ''})`.slice(0, 180);
+  // LIL SWEEP-PRO+ gets its named subject: `LIL SWEEP-PRO+ | <score> <grade> <PLAN> | <dir> <symbol> <tf>`.
+  const subject = (strategy === 'lil-sweep-pro-plus'
+    ? `LIL SWEEP-PRO+ | ${Math.round(sig.score)} ${sig.grade || ''} ${sig.meta?.plan || 'SWEEP'} | ${sig.decision} ${symbol} ${timeframe}${kind && kind !== 'NEW' ? ` · ${kind}` : ''}`
+    : `[STRATEGY ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)}${sig.riskRewardRatio != null ? ` · RR 1:${sig.riskRewardRatio}` : ''})`).slice(0, 180);
   const lotLine = lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a';
   const text = [
     `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})${kind !== 'NEW' ? ` — ${kind}` : ''}`,
@@ -11772,7 +11786,8 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
   }
   // Fixed-time notification only when the call is still tradable (expiry candle open) —
   // never alert a next-candle bet whose candle has already closed (stale-on-arrival).
-  if (strategyFtActionable(barMs, tf) && (wantPopup || wantFttEmail)) {
+  // meta.forexOnly (e.g. lil-sweep-pro-plus trigger entries) = TP/SL framing only, no FTT alert.
+  if (!sig?.meta?.forexOnly && strategyFtActionable(barMs, tf) && (wantPopup || wantFttEmail)) {
     const refClose = ctx ? Number(ctx.candles[ctx.candles.length - 1].close) : null;
     void emitStrategyLabFttSignal({ id, strategy, symbol, timeframe: tf, sig, refClose, popup: wantPopup, email: wantFttEmail, kind, madeMs });
   }
@@ -11804,7 +11819,7 @@ async function processStrategyNotifyConfirms() {
       const confirmSig = { ...sig, score: st.firstScore ?? sig.score, grade: st.firstGrade ?? sig.grade };
       const id = `${st.strategy}:${st.symbol}:${st.tf}:${st.createdBarMs}`;
       if (wantPopup || wantEmail) void emitStrategyLabSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, popup: wantPopup, email: wantEmail, kind: 'CONFIRMED' });
-      if (strategyFtActionable(st.createdBarMs, st.tf) && (wantPopup || wantFttEmail)) { const refClose = Number(ctx.candles[ctx.candles.length - 1].close); void emitStrategyLabFttSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, refClose, popup: wantPopup, email: wantFttEmail, kind: 'CONFIRMED' }); }
+      if (!sig?.meta?.forexOnly && strategyFtActionable(st.createdBarMs, st.tf) && (wantPopup || wantFttEmail)) { const refClose = Number(ctx.candles[ctx.candles.length - 1].close); void emitStrategyLabFttSignal({ id, strategy: st.strategy, symbol: st.symbol, timeframe: st.tf, sig: confirmSig, refClose, popup: wantPopup, email: wantFttEmail, kind: 'CONFIRMED' }); }
     } catch { /* confirm is best-effort */ }
   }
 }
@@ -12038,9 +12053,10 @@ async function processStrategyLabOutcomes() {
             payload: { takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3 },
             outcome: row.outcome, exitPrice: row.exit_price, resolvedAt: row.resolved_at,
           };
-          // special-forex-sniper logs LIMIT entries — resolve fill-gated so an unfilled
+          // special-forex-sniper (limit) and lil-sweep-pro-plus (break trigger) log
+          // pending entries — resolve fill-gated so an unfilled
           // limit can never produce a phantom win (see evaluateForexReplay).
-          const replay = evaluateForexReplay(report, candles, { requiresFill: String(row.strategy) === 'special-forex-sniper' });
+          const replay = evaluateForexReplay(report, candles, { requiresFill: ['special-forex-sniper', 'lil-sweep-pro-plus'].includes(String(row.strategy)) });
           if (replay.valid && !['PENDING', 'EXPIRED'].includes(replay.outcome)) {
             if (replay.outcome === 'AMBIGUOUS') {
               await pool.execute("UPDATE mt5_strategy_signals SET outcome='AMBIGUOUS', resolved_at=? WHERE id=?", [toMysqlDate(replay.resolvedAt || new Date()), row.id]);
