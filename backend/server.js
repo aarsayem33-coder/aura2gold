@@ -5654,6 +5654,31 @@ function signalEmailTo() {
   } catch { /* settings store not ready (boot) — fall through to env */ }
   return SIGNAL_ALERT_EMAIL_TO_ENV || null;
 }
+// Per-recipient routing: like signalEmailTo(), but each recipient can restrict which
+// SYMBOLS and TIMEFRAMES they receive (emailRecipientRules, keyed by address; empty
+// list = everything). Returns only the recipients whose filters match this signal —
+// or null when nobody wants it (the send is skipped). Sends without a symbol/tf
+// context (tests, daily digests, health) keep using signalEmailTo() = everyone.
+function signalEmailToFor(symbol = null, timeframe = null) {
+  try {
+    const s = loadEmailAlertSettings();
+    const list = (s.emailRecipients || []).filter(Boolean);
+    if (list.length) {
+      const rules = s.emailRecipientRules || {};
+      const sym = symbol ? String(symbol).toUpperCase() : null;
+      const tf = timeframe ? String(timeframe).toUpperCase() : null;
+      const matched = list.filter((e) => {
+        const r = rules[String(e).toLowerCase()];
+        if (!r) return true;
+        if (sym && Array.isArray(r.symbols) && r.symbols.length && !r.symbols.includes(sym)) return false;
+        if (tf && Array.isArray(r.timeframes) && r.timeframes.length && !r.timeframes.includes(tf)) return false;
+        return true;
+      });
+      return matched.length ? matched.join(', ') : null;
+    }
+  } catch { /* settings store not ready (boot) — fall through to env */ }
+  return SIGNAL_ALERT_EMAIL_TO_ENV || null;
+}
 const SIGNAL_ALERT_MIN_GAP_MS = Math.max(0, Number(process.env.SIGNAL_ALERT_MIN_GAP_MIN || 30)) * 60 * 1000;
 const FOREX_M5_MAX_EMAIL_AGE_MS = Math.max(0, Number(process.env.FOREX_M5_MAX_EMAIL_AGE_SEC || 180)) * 1000;
 const FOREX_M15_MAX_EMAIL_AGE_MS = Math.max(0, Number(process.env.FOREX_M15_MAX_EMAIL_AGE_SEC || 300)) * 1000;
@@ -7335,6 +7360,10 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   // SIGNAL email recipients (user-managed, up to 10). Empty = fall back to the single
   // SIGNAL_ALERT_EMAIL_TO / EMAIL_TO env address. All signal emails go to every address.
   emailRecipients: [],
+  // Per-recipient routing (optional, keyed by address): which symbols/timeframes THAT
+  // address receives. Missing entry / empty lists = everything. Delivery-only.
+  //   emailRecipientRules: { [email]: { symbols?: string[], timeframes?: string[] } }
+  emailRecipientRules: {},
   // Strategy Controller (master per-strategy switch — gates EVERYTHING user-facing:
   // popups, emails, SSE, the recent-signals table and reports). Missing entry = fully
   // enabled. Optional per-strategy refinements gate DELIVERY (alerts): minScore, a
@@ -7442,6 +7471,25 @@ function saveEmailAlertSettings(nextSettings) {
       .map((e) => String(e || '').trim().toLowerCase())
       .filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && !seen.has(e) && seen.add(e))
       .slice(0, 10);
+  }
+  // Per-recipient symbol/timeframe routing — replace the whole map on save. Keys must be
+  // valid addresses; symbols uppercased (max 30), timeframes restricted to known TFs.
+  if (nextSettings && nextSettings.emailRecipientRules && typeof nextSettings.emailRecipientRules === 'object') {
+    const KNOWN_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+    const out = {};
+    for (const [email, rule] of Object.entries(nextSettings.emailRecipientRules)) {
+      const key = String(email || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(key) || !rule || typeof rule !== 'object') continue;
+      const r = {};
+      if (Array.isArray(rule.symbols)) {
+        r.symbols = [...new Set(rule.symbols.map((x) => String(x || '').trim().toUpperCase()).filter((x) => /^[A-Z0-9._#-]{2,20}$/.test(x)))].slice(0, 30);
+      }
+      if (Array.isArray(rule.timeframes)) {
+        r.timeframes = [...new Set(rule.timeframes.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_TFS.includes(x));
+      }
+      if ((r.symbols || []).length || (r.timeframes || []).length) out[key] = r; // all-empty rule = no rule
+    }
+    sanitized.emailRecipientRules = out;
   }
   // Strategy Controller — replace the whole map on save (frontend sends the full object).
   if (nextSettings && nextSettings.strategyControls && typeof nextSettings.strategyControls === 'object') {
@@ -8010,7 +8058,9 @@ async function sendSignalTrackerEmail(item) {
     <p style="font-size:13px;color:#0f172a;margin:8px 0 0">Action: <b>${item.suggestedAction}</b></p>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory early warning — not a guarantee, not financial advice. — Aura Gold Signal Tracker</p></div>`;
   try {
-    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `tracker:${item.id}:${item.alertType}` });
+    const trackerTo = signalEmailToFor(item.symbol, item.timeframe);
+    if (!trackerTo) return;
+    await sendNotificationEmail({ to: trackerTo, subject, text, html, signalId: `tracker:${item.id}:${item.alertType}` });
     console.log(`[SignalTracker] Emailed ${tag} ${item.direction} ${sym} (${item.warningReason})`);
   } catch (e) { console.error('[SignalTracker] email failed:', e.message); }
 }
@@ -8692,7 +8742,9 @@ async function sendForexAlert(result) {
       <p style="font-size:12px;color:#64748b">Confluences: ${conf.map((c) => `${c.name} +${c.points}`).join(', ') || 'none'}</p>
       <p style="font-size:11px;color:#94a3b8;margin-top:10px">Advisory only — not financial advice. — Aura Gold Scanner</p>
     </div>`;
-  await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `forex:${result.symbol}:${result.timeframe}:${result.bar}` });
+  const forexTo = signalEmailToFor(result.symbol, result.timeframe);
+  if (!forexTo) return false;
+  await sendNotificationEmail({ to: forexTo, subject, text, html, signalId: `forex:${result.symbol}:${result.timeframe}:${result.bar}` });
   try {
     await persistEmailedForexReport(result);
   } catch (err) {
@@ -8850,7 +8902,9 @@ async function sendFttAlert(prediction) {
       <p style="font-size:12px;color:#334155">${prediction.reasoning || ''}</p>
       <p style="font-size:11px;color:#94a3b8;margin-top:10px">Advisory only — not financial advice. — Aura Gold Future Predictions</p>
     </div>`;
-  await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: prediction.id });
+  const fttTo = signalEmailToFor(sym, prediction.timeframe || null);
+  if (!fttTo) return false;
+  await sendNotificationEmail({ to: fttTo, subject, text, html, signalId: prediction.id });
   try {
     await persistEmailedFixedReport(prediction);
   } catch (err) {
@@ -9066,7 +9120,8 @@ function refreshPostNewsSignals(now = Date.now()) {
             <p style="font-size:13px">Entry <b>${px(forexSig.price, symbol)}</b> · SL ${px(forexSig.stopLoss, symbol)} · TP1 ${px(forexSig.takeProfit1, symbol)} · TP2 ${px(forexSig.takeProfit2, symbol)}</p>
             <p style="font-size:12px;color:#475569">Rule: wait for release, market reaction, blackout, and confirmation. No blind news prediction.</p>
             <p style="font-size:11px;color:#94a3b8">Advisory only — not financial advice. — Aura Gold Post-News Engine</p></div>`;
-          sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: key })
+          const postNewsTo = signalEmailToFor(symbol, null);
+          if (postNewsTo) sendNotificationEmail({ to: postNewsTo, subject, text, html, signalId: key })
             .then(async (info) => {
               if (!info) return;
               recordAlert(key, eventId);
@@ -9319,8 +9374,10 @@ async function routeBreakout(cand) {
   }
 
   const { subject, text, html } = buildBreakoutEmail(cand);
+  const breakoutTo = signalEmailToFor(cand.symbol, cand.timeframe);
+  if (!breakoutTo) { refundBreakoutEmailBudget(); return false; }
   try {
-    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: key });
+    await sendNotificationEmail({ to: breakoutTo, subject, text, html, signalId: key });
     recordAlert(key, cand.bar);
     void persistBreakoutAlert(cand, 'EMAIL');
     console.log(`[Breakout] Emailed ${cand.phase} ${cand.grade} ${cand.direction} ${cand.symbol} ${cand.timeframe} @ ${cand.level}`);
@@ -9800,8 +9857,10 @@ async function sendNewsReactionEmail(fc, event, reaction, levels) {
     <p style="font-size:12px;color:#b45309;margin:8px 0 0">${warn}</p>
     <p style="font-size:12px;color:#475569;margin:4px 0 0">Direction is from the <b>actual price reaction</b>, not a pre-release guess. ATR-scaled levels.</p>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Advisory only — not financial advice. — Aura Gold News Reaction</p></div>`;
+  const newsTo = signalEmailToFor(sym, null);
+  if (!newsTo) return;
   try {
-    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `newsreact:${event.id}:${sym}:${reaction.tier}` });
+    await sendNotificationEmail({ to: newsTo, subject, text, html, signalId: `newsreact:${event.id}:${sym}:${reaction.tier}` });
     console.log(`[Forecast] Emailed NEWS ${tierLabel} ${fc.decision} ${sym} (${event.title})`);
   } catch (e) {
     console.error('[Forecast] News reaction email failed:', e.message);
@@ -9973,7 +10032,9 @@ async function sendForecastReadyEmail(pool, id, symbol, timeframe, sd) {
   if ((Number(sd?.confidence) || 0) < FORECAST_READY_EMAIL_MIN_SCORE) return;
   try {
     const { subject, text, html } = buildForecastReadyEmail(symbol, timeframe, sd);
-    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `forecast:${id}:ready` });
+    const forecastTo = signalEmailToFor(symbol, timeframe);
+    if (!forecastTo) return;
+    await sendNotificationEmail({ to: forecastTo, subject, text, html, signalId: `forecast:${id}:ready` });
     if (pool) await pool.execute('UPDATE mt5_execution_forecasts SET email_execution = 1, updated_at = ? WHERE id = ?', [toMysqlDate(new Date()), id]);
     console.log(`[Forecast] Emailed READY (full detail) ${symbol} ${timeframe} score ${Math.round(sd.confidence)}`);
   } catch (e) {
@@ -10018,7 +10079,9 @@ async function processForecastEmails() {
       for (const stage of stages) {
         try {
           const { subject, text, html } = buildForecastEmail(row, stage, etaMs);
-          await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `forecast:${row.id}:${stage}` });
+          const reminderTo = signalEmailToFor(row.symbol, row.timeframe);
+          if (!reminderTo) continue;
+          await sendNotificationEmail({ to: reminderTo, subject, text, html, signalId: `forecast:${row.id}:${stage}` });
           const col = { reminder1: 'email_reminder1', reminder2: 'email_reminder2' }[stage];
           await pool.execute(`UPDATE mt5_execution_forecasts SET ${col} = 1, updated_at = ? WHERE id = ?`, [toMysqlDate(new Date()), row.id]);
           // keep the in-memory copy in sync so the next cycle doesn't re-pick the stage
@@ -11429,12 +11492,16 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
     });
   }
   if (!email || !SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+  // Per-recipient symbol/timeframe routing — only the recipients who asked for this
+  // symbol+TF receive it; nobody matching = skip the send entirely.
+  const labTo = signalEmailToFor(symbol, timeframe);
+  if (!labTo) return;
   const timing = strategySignalTiming(sig, timeframe, madeMs, Date.now());
   // Gold Desk gets its purpose-designed email (GOLD | score grade SETUP | direction).
   if (strategy === 'xau-session-raid') {
     const g = buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing });
     try {
-      await sendNotificationEmail({ to: signalEmailTo(), subject: g.subject, text: g.text, html: g.html, signalId: `stratlab:${id}` });
+      await sendNotificationEmail({ to: labTo, subject: g.subject, text: g.text, html: g.html, signalId: `stratlab:${id}` });
       console.log(`[GoldDesk] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`);
     } catch (e) { console.error('[GoldDesk] email failed:', e.message); }
     return;
@@ -11485,7 +11552,7 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
     </div>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Volume sized at ${sizing?.riskPercent ?? '?'}% risk on ${px2(sizing?.equity || 0)} equity, scaled to the ${timeframe} stop. Isolated strategy-lab signal — not the main system. Advisory only. — Aura Gold Strategy Lab</p></div>`;
   try {
-    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `stratlab:${id}` });
+    await sendNotificationEmail({ to: labTo, subject, text, html, signalId: `stratlab:${id}` });
     console.log(`[StrategyLab] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (${strategyName}, score ${Math.round(sig.score)})`);
   } catch (e) { console.error('[StrategyLab] email failed:', e.message); }
 }
@@ -11609,6 +11676,8 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
     });
   }
   if (!email || !SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+  const fttLabTo = signalEmailToFor(symbol, timeframe);
+  if (!fttLabTo) return;
   const expiryUtc = expiry?.expiryIso
     ? new Date(expiry.expiryIso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC'
     : 'next candle';
@@ -11655,7 +11724,7 @@ async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, 
     </div>
     <p style="font-size:11px;color:#94a3b8;margin-top:8px">Fixed-time call (direction at next-candle expiry). Isolated strategy-lab signal — not the main system or FTT engine. Advisory only. — Aura Gold Strategy Lab</p></div>`;
   try {
-    await sendNotificationEmail({ to: signalEmailTo(), subject, text, html, signalId: `stratlabftt:${id}` });
+    await sendNotificationEmail({ to: fttLabTo, subject, text, html, signalId: `stratlabftt:${id}` });
     console.log(`[StrategyLab] Emailed FIXED-TIME ${sig.grade} ${ftDir} ${symbol} ${timeframe} (${strategyName}, score ${Math.round(sig.score)})`);
   } catch (e) { console.error('[StrategyLab] FTT email failed:', e.message); }
 }

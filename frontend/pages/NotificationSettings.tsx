@@ -28,6 +28,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   strategyLabFttStrategies: {},
   strategyLabRules: {},
   emailRecipients: [],
+  emailRecipientRules: {},
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
@@ -85,6 +86,7 @@ export default function NotificationSettings() {
   const { logs, refresh } = useMt5Stream();
   const [email, setEmail] = useState('aarsayem002@gmail.com');
   const [newRecipient, setNewRecipient] = useState(''); // input for the signal-recipients list
+  const [openRecipient, setOpenRecipient] = useState<string | null>(null); // which recipient's routing filters are expanded
   const [testStatus, setTestStatus] = useState<string | null>(null);
   // ── Redesigned UI state: tab navigation, per-strategy filter accordion, dirty tracking ──
   const [activeTab, setActiveTab] = useState<'routing' | 'strategies' | 'lab' | 'filters' | 'device' | 'log'>('routing');
@@ -307,8 +309,34 @@ export default function NotificationSettings() {
     setEmailSettingsStatus(null);
   };
   const removeRecipient = (e: string) => {
-    setEmailSettings((current) => ({ ...current, emailRecipients: (current.emailRecipients || []).filter((x) => x !== e) }));
+    setEmailSettings((current) => {
+      const rules = { ...(current.emailRecipientRules || {}) };
+      delete rules[e];
+      return { ...current, emailRecipients: (current.emailRecipients || []).filter((x) => x !== e), emailRecipientRules: rules };
+    });
     setEmailSettingsStatus(null);
+  };
+  // Per-recipient routing (symbols / timeframes). Empty selection = that recipient
+  // gets everything — toggling chips narrows what lands in THEIR inbox only.
+  const recipientRuleOf = (e: string) => (emailSettings.emailRecipientRules || {})[e] || {};
+  const updateRecipientRule = (e: string, patch: { symbols?: string[]; timeframes?: string[] }) => {
+    setEmailSettings((current) => {
+      const rules = { ...(current.emailRecipientRules || {}) };
+      const next = { ...(rules[e] || {}), ...patch };
+      if (!(next.symbols || []).length && !(next.timeframes || []).length) delete rules[e];
+      else rules[e] = next;
+      return { ...current, emailRecipientRules: rules };
+    });
+    setEmailSettingsStatus(null);
+  };
+  const toggleRecipientSymbol = (e: string, sym: string) => {
+    const cur = (recipientRuleOf(e).symbols || []).map((x) => x.toUpperCase());
+    const s = sym.toUpperCase();
+    updateRecipientRule(e, { symbols: cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s] });
+  };
+  const toggleRecipientTf = (e: string, tf: string) => {
+    const cur = recipientRuleOf(e).timeframes || [];
+    updateRecipientRule(e, { timeframes: cur.includes(tf) ? cur.filter((x) => x !== tf) : [...cur, tf] });
   };
 
   const handleSaveEmailSettings = async () => {
@@ -807,13 +835,63 @@ export default function NotificationSettings() {
                     ? <span className="text-emerald-600">— {emailSettings.emailRecipients!.length} address{emailSettings.emailRecipients!.length > 1 ? 'es' : ''}</span>
                     : <span className="text-slate-400">— none set = backend default is used</span>}
                 </p>
-                <div className="mt-1.5 flex flex-wrap gap-1.5">
-                  {(emailSettings.emailRecipients || []).map((r) => (
-                    <span key={r} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-bold text-emerald-700">
-                      {r}
-                      <button type="button" onClick={() => removeRecipient(r)} title="Remove recipient" className="rounded-full text-emerald-500 transition-colors hover:text-red-600">✕</button>
-                    </span>
-                  ))}
+                <div className="mt-1.5 space-y-1.5">
+                  {(emailSettings.emailRecipients || []).map((r) => {
+                    const rule = recipientRuleOf(r);
+                    const rSyms = (rule.symbols || []).map((x) => x.toUpperCase());
+                    const rTfs = rule.timeframes || [];
+                    const filtered = rSyms.length > 0 || rTfs.length > 0;
+                    const open = openRecipient === r;
+                    const summary = filtered
+                      ? `${rSyms.length ? `${rSyms.length} symbol${rSyms.length > 1 ? 's' : ''}` : 'All symbols'} · ${rTfs.length ? rTfs.join(' ') : 'All TFs'}`
+                      : 'All symbols · All timeframes';
+                    return (
+                      <div key={r} className={`rounded-lg border ${filtered ? 'border-emerald-300 bg-emerald-50/60' : 'border-slate-200 bg-white'}`}>
+                        <div className="flex items-center gap-2 px-2.5 py-1.5">
+                          <button type="button" onClick={() => setOpenRecipient(open ? null : r)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                            <span className="truncate text-[11px] font-bold text-emerald-700">{r}</span>
+                            <span className={`shrink-0 text-[10px] font-semibold ${filtered ? 'text-emerald-600' : 'text-slate-400'}`}>{summary}</span>
+                            <span className="shrink-0 text-[10px] text-slate-400">{open ? '▲' : '▼ edit'}</span>
+                          </button>
+                          <button type="button" onClick={() => removeRecipient(r)} title="Remove recipient" className="shrink-0 rounded-full text-emerald-500 transition-colors hover:text-red-600">✕</button>
+                        </div>
+                        {open && (
+                          <div className="space-y-2 border-t border-slate-100 px-2.5 py-2">
+                            <div>
+                              <p className="mb-1 text-[10px] font-semibold text-slate-500">
+                                Symbols this address receives {rSyms.length ? <span className="text-emerald-600">— {rSyms.length} selected</span> : <span className="text-slate-400">— none selected = all symbols</span>}
+                              </p>
+                              <div className="flex flex-wrap gap-1">
+                                {labSymbols.map((sym) => {
+                                  const on = rSyms.includes(sym.toUpperCase());
+                                  return (
+                                    <button key={sym} type="button" onClick={() => toggleRecipientSymbol(r, sym)} className={`rounded-md border px-1.5 py-0.5 text-[10px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{sym}</button>
+                                  );
+                                })}
+                                {!labSymbols.length && <p className="text-[10px] font-medium text-slate-400">No symbols available (MT5 feed offline) — leave empty for all symbols.</p>}
+                              </div>
+                            </div>
+                            <div>
+                              <p className="mb-1 text-[10px] font-semibold text-slate-500">
+                                Timeframes {rTfs.length ? <span className="text-emerald-600">— {rTfs.join(', ')}</span> : <span className="text-slate-400">— none selected = all timeframes</span>}
+                              </p>
+                              <div className="flex flex-wrap gap-1">
+                                {['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'].map((tf) => {
+                                  const on = rTfs.includes(tf);
+                                  return (
+                                    <button key={tf} type="button" onClick={() => toggleRecipientTf(r, tf)} className={`rounded-md border px-2 py-0.5 text-[10px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{tf}</button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            {filtered && (
+                              <button type="button" onClick={() => updateRecipientRule(r, { symbols: [], timeframes: [] })} className="rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500 transition-colors hover:border-red-200 hover:text-red-600">Reset — receive everything</button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
                 <div className="mt-1.5 flex gap-2">
                   <input
@@ -826,7 +904,7 @@ export default function NotificationSettings() {
                   />
                   <button type="button" onClick={addRecipient} className="shrink-0 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700 transition-colors hover:bg-emerald-100">+ Add</button>
                 </div>
-                <p className="mt-1 text-[10px] font-medium text-slate-400">Remember to Save — the list applies instantly to all signal emails (forex, fixed-time, lab, breakout, tracker, forecast, news reminders).</p>
+                <p className="mt-1 text-[10px] font-medium text-slate-400">Remember to Save — the list applies instantly to all signal emails (forex, fixed-time, lab, breakout, tracker, forecast, news reminders). Click a recipient to route only chosen symbols/timeframes to that address; system emails without a symbol (tests, daily digests) always go to everyone.</p>
               </div>
               <div className="rounded-lg bg-slate-50 px-3 py-2 text-[11px] font-medium text-slate-500">
                 <p>Trade emails → <b className="text-slate-700">{emailSettingsMeta.emailTo || 'not configured'}</b></p>

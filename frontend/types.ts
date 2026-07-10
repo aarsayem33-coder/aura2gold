@@ -405,6 +405,9 @@ export interface EmailAlertSettings {
   strategyControls?: Record<string, StrategyControl>;
   // Signal email recipients (user-managed, up to 10). Empty = backend env default address.
   emailRecipients?: string[];
+  // Per-recipient routing (keyed by address): which symbols/timeframes THAT address
+  // receives. Missing entry / empty lists = everything. Delivery-only.
+  emailRecipientRules?: Record<string, { symbols?: string[]; timeframes?: string[] }>;
   // Per-strategy EMAIL refinements (score / grade / symbols / direction). DELIVERY-only — cuts
   // email noise per strategy without touching signal generation, logging, popups, or ranking.
   // Applies to BOTH the forex and fixed-time strategy-lab email framings. symbols empty/absent =
