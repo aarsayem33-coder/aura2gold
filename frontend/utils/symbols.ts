@@ -6,6 +6,7 @@
 // Exness "EURUSDM" symbol as well as a plain "EURUSD".
 export const CURATED_BASES: string[] = [
   'XAUUSD', // Gold
+  'USTEC',  // Nasdaq 100 (broker: USTECm) — forex-style signals on M5–H4 only
   'EURUSD',
   'GBPUSD',
   'USDJPY',

@@ -11,7 +11,7 @@ const TF_OPTIONS = ['M1', 'M5', 'M15', 'M30', 'H1'];
 
 function digitsFor(symbol: string) {
   const s = (symbol || '').toUpperCase();
-  return /XAU|GOLD|XAG/.test(s) ? 2 : /JPY/.test(s) ? 3 : 5;
+  return /USTEC|US30|US100|US500|NAS/.test(s) ? 2 : /XAU|GOLD|XAG/.test(s) ? 2 : /JPY/.test(s) ? 3 : 5;
 }
 function px(v: number | null | undefined, symbol: string) {
   return v === null || v === undefined || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(digitsFor(symbol));

@@ -24,7 +24,7 @@ input int               InpHeartbeatSec  = 60;                      // Heartbeat
 input group             "Snapshot Settings"
 input bool              InpSendSnapshot  = true;                    // Send Account/Candles/Trades/Indicators Snapshot
 input int               InpSnapshotSec   = 5;                       // Snapshot Interval (seconds)
-input string            InpSymbols       = "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY"; // Symbols CSV (* = all). Default = curated liquid set
+input string            InpSymbols       = "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY,USTEC"; // Symbols CSV (* = all). Curated set + Nasdaq (USTEC resolves to broker USTECm)
 input int               InpMaxSymbols    = 0;                       // Max auto symbols, 0 = unlimited
 input string            InpTimeframes    = "*";                     // Timeframes CSV, * = all MT5 timeframes
 input int               InpBarsPerTf     = 200;                      // Candles per symbol/timeframe
@@ -42,7 +42,7 @@ input int               InpNewsDeltaSec  = 7;                       // Fast delt
 
 input group             "Real-Time Priority Symbols"
 input bool              InpSendPriorityRT = true;                   // Stream curated symbols in real time every second
-input string            InpPrioritySymbols   = "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY"; // Curated liquid symbols kept real-time
+input string            InpPrioritySymbols   = "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY,USTEC"; // Curated liquid symbols kept real-time (USTEC = Nasdaq/USTECm)
 input string            InpPriorityTimeframes = "M1,M5,M15";        // Timeframes kept real-time for priority symbols
 
 input group             "Alert Settings"

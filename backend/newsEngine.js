@@ -14,6 +14,7 @@
 
 import { aggregateSignals } from './signalEngine.js';
 import { getEconomicEvents, symbolCurrencies } from './economicCalendar.js';
+import { indexNewsCurrencyFor } from './instruments.js';
 
 const CODES = ['XAU', 'XAG', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD', 'CHF', 'CNH', 'CNY', 'SGD', 'HKD', 'SEK', 'NOK', 'MXN', 'ZAR', 'TRY'];
 
@@ -34,7 +35,12 @@ export function affectedSymbols(currency, trackedSymbols = []) {
   const out = [];
   for (const sym of trackedSymbols) {
     const p = parsePair(sym);
-    if (!p) continue;
+    if (!p) {
+      // Not a currency pair — index CFDs (USTEC etc.) are macro-sensitive (CPI/NFP/
+      // FOMC move the Nasdaq like a USD pair) but can't be parsed as base/quote.
+      if (indexNewsCurrencyFor(sym) === cur) out.push(sym);
+      continue;
+    }
     if (p.base === cur || p.quote === cur) out.push(sym);
   }
   return out;

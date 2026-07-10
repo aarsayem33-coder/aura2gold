@@ -101,7 +101,7 @@ export default function RulesManagement() {
                   </optgroup>
                   <optgroup label="Indices">
                     <option value="US30">US30 (Dow Jones)</option>
-                    <option value="NAS100">NAS100 (Nasdaq)</option>
+                    <option value="USTEC">USTEC (Nasdaq 100 · USTECm)</option>
                     <option value="SPX500">SPX500 (S&P 500)</option>
                     <option value="GER40">GER40 (DAX)</option>
                     <option value="UK100">UK100 (FTSE)</option>

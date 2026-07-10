@@ -133,7 +133,7 @@ export function roundStepFor(symbol) {
   if (/BTC/.test(s)) return { step: 500, major: 1000 };
   if (/ETH/.test(s)) return { step: 50, major: 100 };
   if (/JPY/.test(s)) return { step: 0.5, major: 1 };             // 150.00, 150.50
-  if (/US30|NAS|SPX|GER|UK100|JP225|DJI|NDX/.test(s)) return { step: 50, major: 100 };
+  if (/US30|NAS|SPX|GER|UK100|JP225|DJI|NDX|USTEC|US100|US500/.test(s)) return { step: 50, major: 100 };
   return { step: 0.0050, major: 0.0100 };                        // 5-digit FX: 50-pip halves + big figures
 }
 

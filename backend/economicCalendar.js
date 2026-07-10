@@ -23,6 +23,7 @@ import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { indexNewsCurrencyFor } from './instruments.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CACHE_FILE = path.join(__dirname, '.cache', 'economic_calendar.json');
@@ -246,6 +247,10 @@ function symbolCurrencies(symbol) {
     currencies.add('USD');
     currencies.add('XAU');
   }
+  // Index CFDs (USTEC etc.) carry no currency code in the name but are macro-USD
+  // sensitive — CPI/NFP/FOMC must blackout Nasdaq signals like any USD pair.
+  const idxCur = indexNewsCurrencyFor(raw);
+  if (idxCur) currencies.add(idxCur);
   const fx = raw.replace(/^XAU|^XAG|^GOLD|^SILVER/, '');
   const knownCodes = ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD', 'CHF', 'CNH', 'CNY', 'SGD', 'HKD', 'SEK', 'NOK', 'MXN', 'ZAR', 'TRY'];
   for (const code of knownCodes) {

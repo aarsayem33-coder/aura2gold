@@ -22,6 +22,7 @@ import { aggregateSignals, detectSupportResistance, detectMarketStructure, detec
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
+import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -4079,6 +4080,8 @@ app.get('/api/ai/decisions/latest', (req, res) => {
 
 function forexSizingPipSize(symbol) {
   const s = String(symbol || '').toUpperCase();
+  const caps = symbolCapsFor(s);
+  if (caps?.pipSize) return caps.pipSize;              // index: risk measured in points
   if (s.includes('XAU') || s.includes('GOLD')) return 0.01;
   if (s.includes('JPY')) return 0.01;
   return 0.0001;
@@ -4086,6 +4089,8 @@ function forexSizingPipSize(symbol) {
 
 function forexSizingPipValuePerLot(symbol) {
   const s = String(symbol || '').toUpperCase();
+  const caps = symbolCapsFor(s);
+  if (caps?.pipValuePerLot) return caps.pipValuePerLot; // index: ~$1/point/lot (Exness USTEC)
   if (s.includes('XAU') || s.includes('GOLD')) return 1;
   if (s.includes('JPY')) return 9;
   return 10;
@@ -5699,7 +5704,10 @@ const alertDiagnostics = {
   lastSkippedStale: null,
 };
 
-const CURATED_BASES = ['XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD', 'EURJPY', 'GBPJPY'];
+// USTEC (Nasdaq 100 CFD, broker symbol USTECm) is curated for DATA + forex-style
+// signals only — its capabilities (approved TFs M5–H4, no fixed-time, no forecasts,
+// USD news sensitivity, index point math) live in backend/instruments.js.
+const CURATED_BASES = ['XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD', 'EURJPY', 'GBPJPY', 'USTEC'];
 function getCuratedSymbols(allSymbols = []) {
   const set = new Set();
   for (const sym of allSymbols) {
@@ -6015,6 +6023,8 @@ function scanForexSymbol(symbol, timeframe) {
 
 function digitsFor(symbol) {
   const s = String(symbol).toUpperCase();
+  const caps = symbolCapsFor(s);
+  if (caps?.digits != null) return caps.digits;        // index CFDs: 2 (e.g. 22150.50)
   return /XAU|GOLD|XAG/.test(s) ? 2 : /JPY/.test(s) ? 3 : 5;
 }
 function px(v, symbol) { return (v === null || v === undefined) ? 'n/a' : Number(v).toFixed(digitsFor(symbol)); }
@@ -7069,6 +7079,8 @@ function buildGroupedStats(items, dimensions, accessors) {
 
 function pipSizeForSymbol(symbol) {
   const s = String(symbol).toUpperCase();
+  const caps = symbolCapsFor(s);
+  if (caps?.pipSize) return caps.pipSize;              // index CFDs: 1 "pip" = 1 point
   if (/XAU|GOLD/.test(s)) return 0.1;
   if (/XAG/.test(s)) return 0.01;
   if (/JPY/.test(s)) return 0.01;
@@ -9432,6 +9444,7 @@ async function runScanCycle() {
     for (const expiry of FTT_EXPIRIES) {
       const results = [];
       for (const symbol of symbols) {
+        if (!symbolAllowsFixedTime(symbol)) continue;    // e.g. USTEC: fixed-time disabled
         try {
           const inputs = getFttInputs(symbol, expiry);
           if (!inputs.candles || inputs.candles.length < 5) continue;
@@ -9677,6 +9690,7 @@ async function runExecutionForecastScan() {
     if (!symbols.length) return;
     let written = 0;
     for (const symbol of symbols) {
+      if (!symbolAllowsForecast(symbol)) continue;       // e.g. USTEC: forecasts assume FX sessions
       const newsHit = nearestHighImpactEvent(symbol, Date.now());
       const upcomingEvent = newsHit && newsHit.isUpcoming ? newsHit.event : null;
       for (const tf of FORECAST_TIMEFRAMES) {
@@ -11661,6 +11675,7 @@ function fixedTimeCandleRead(candles, ftDir, lookback = 5) {
 // same direction the strategy's fixed-time win rate is measured on. Isolated lab, never
 // the main FTT engine.
 async function emitStrategyLabFttSignal({ id, strategy, symbol, timeframe, sig, refClose = null, popup = true, email = false, kind = 'NEW', madeMs = Date.now() }) {
+  if (!symbolAllowsFixedTime(symbol)) return;            // e.g. USTEC: fixed-time disabled
   const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
   const ftDir = /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN';
   const expiry = strategyLabFttExpiry(timeframe);
@@ -11899,6 +11914,7 @@ async function runStrategyNotifyPass(pairs) {
   const pool = await initializeDatabase();
   for (const pair of pairs) {
     const [symbol, tf] = pair.split('|');
+    if (!symbolAllowsSignalTf(symbol, tf)) continue;     // e.g. USTEC: no M1/D1 signals
     for (const stratId of Object.keys(STRATEGY_LAB_REGISTRY)) {
       try {
         const ctx = buildStrategyContext(symbol, tf);
@@ -11967,6 +11983,7 @@ async function runStrategyLabScan() {
     for (const stratId of Object.keys(STRATEGY_LAB_REGISTRY)) {
       for (const symbol of symbols) {
         for (const tf of STRATEGY_LAB_TIMEFRAMES) {
+          if (!symbolAllowsSignalTf(symbol, tf)) continue; // e.g. USTEC: no M1/D1 signals
           const ctx = buildStrategyContext(symbol, tf);
           if (!ctx) continue;
           const sig = evaluateStrategy(stratId, ctx);
