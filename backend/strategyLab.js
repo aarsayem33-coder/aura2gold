@@ -2331,6 +2331,490 @@ function specialForexSniper(ctx) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Books-Institutional — fused engine distilled from the 7 trading books in
+// GUIDES/KNOWLEDGE (Candlestick Bible, Breakout Trading, Cloud Charts, Trading
+// with Ichimoku, Order Flow Setups, Volume Profile Insider's Guide, McAllen).
+// Two DELIBERATELY DIFFERENT engines share one "institutional read" core:
+//   • books-institutional-forex      — forex rules: trade AT a level with a
+//     structural stop and a ≥2R ladder to the next real obstacle.
+//   • books-institutional-fixed-time — fixed-time rules: next-candle direction
+//     call with exhaustion/obstacle vetoes, entry at the close, ATR-framed.
+// Pure, isolated, no I/O — never blended into live signals (lab law).
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Midpoint (highest high + lowest low)/2 over `period` bars ending at endIdx —
+// the Ichimoku primitive (NOT a moving average of closes; plateaus are the point).
+// (The books* core helpers are exported for tests only — engines stay the API.)
+export function booksMidpoint(candles, endIdx, period) {
+  const from = endIdx - period + 1;
+  if (from < 0 || endIdx >= candles.length) return NaN;
+  let hi = -Infinity, lo = Infinity;
+  for (let i = from; i <= endIdx; i++) {
+    const h = n(candles[i].high), l = n(candles[i].low);
+    if (h > hi) hi = h;
+    if (l < lo) lo = l;
+  }
+  return Number.isFinite(hi) && Number.isFinite(lo) ? (hi + lo) / 2 : NaN;
+}
+
+// Ichimoku Kinko Hyo read (fixed 9-26-52 — the books are explicit: never change
+// the settings). The cloud AT the current bar was projected from 26 bars ago;
+// the FUTURE cloud (what lies ahead) is projected from now. The Lagging Span
+// (current close plotted 26 back) validates a move only when it clears the past
+// price action — the books' single most important confirmation.
+export function booksIchimoku(candles) {
+  const i = candles.length - 1;
+  if (i < 78) return null;                       // needs 52 + 26 history
+  const close = n(candles[i].close);
+  const tenkan = booksMidpoint(candles, i, 9);
+  const kijun = booksMidpoint(candles, i, 26);
+  const j = i - 26;                              // cloud under the current bar
+  const ssa = (booksMidpoint(candles, j, 9) + booksMidpoint(candles, j, 26)) / 2;
+  const ssb = booksMidpoint(candles, j, 52);
+  const cloudTop = Math.max(ssa, ssb), cloudBot = Math.min(ssa, ssb);
+  const cloudPos = close > cloudTop ? 'ABOVE' : close < cloudBot ? 'BELOW' : 'INSIDE';
+  const ssaF = (tenkan + kijun) / 2;             // future cloud (bull/bear ahead)
+  const ssbF = booksMidpoint(candles, i, 52);
+  const prevClose = n(candles[i - 1].close);
+  const prevKijun = booksMidpoint(candles, i - 1, 26);
+  const past = candles[j];
+  return {
+    tenkan, kijun, ssa, ssb, cloudTop, cloudBot, cloudPos,
+    cloudThickness: cloudTop - cloudBot,
+    futureBull: ssaF > ssbF,
+    kijunBreakUp: prevClose <= prevKijun && close > kijun,
+    kijunBreakDown: prevClose >= prevKijun && close < kijun,
+    laggingClearUp: close > n(past.high),        // Chikou free above past price
+    laggingClearDown: close < n(past.low),
+  };
+}
+
+// Volume-at-price profile from tick volume (Volume Profile / Order Flow books).
+// Each bar's volume is spread across the bins its H–L range covers. Gracefully
+// returns ok:false when the feed carries no usable volume (spot feeds vary) —
+// callers then skip volume checks instead of dying (three-candle-combo pattern).
+export function booksVolumeProfile(candles, { window = 120, bins = 24 } = {}) {
+  const win = candles.slice(-window);
+  if (win.length < 40) return { ok: false };
+  let usable = 0;
+  for (const c of win) { const v = Number(c.volume); if (Number.isFinite(v) && v > 0) usable++; }
+  if (usable < win.length * 0.6) return { ok: false };
+  let hi = -Infinity, lo = Infinity;
+  for (const c of win) { const h = n(c.high), l = n(c.low); if (h > hi) hi = h; if (l < lo) lo = l; }
+  if (!(hi > lo)) return { ok: false };
+  const size = (hi - lo) / bins;
+  const acc = new Array(bins).fill(0);
+  for (const c of win) {
+    const v = Number(c.volume);
+    if (!Number.isFinite(v) || v <= 0) continue;
+    const bTop = Math.min(bins - 1, Math.max(0, Math.floor((n(c.high) - lo) / size)));
+    const bBot = Math.min(bins - 1, Math.max(0, Math.floor((n(c.low) - lo) / size)));
+    const span = bTop - bBot + 1;
+    for (let b = bBot; b <= bTop; b++) acc[b] += v / span;      // spread across the range
+  }
+  let pocBin = 0;
+  for (let b = 1; b < bins; b++) if (acc[b] > acc[pocBin]) pocBin = b;
+  const pocVol = acc[pocBin];
+  const total = acc.reduce((a, b) => a + b, 0);
+  const center = (b) => lo + (b + 0.5) * size;
+  const poc = center(pocBin);
+  const hvns = [];
+  for (let b = 0; b < bins; b++) if (acc[b] >= pocVol * 0.7) hvns.push({ price: r5(center(b)), vol: acc[b] });
+  const price = n(candles[candles.length - 1].close);
+  let hvnAbove = null, hvnBelow = null;
+  for (const h of hvns) {
+    if (h.price > price && (!hvnAbove || h.price < hvnAbove.price)) hvnAbove = h;
+    if (h.price < price && (!hvnBelow || h.price > hvnBelow.price)) hvnBelow = h;
+  }
+  // Profile shape by POC position (D balance / P uptrend / b downtrend — books 05/06).
+  const pocFrac = (poc - lo) / (hi - lo);
+  const shape = pocFrac > 0.66 ? 'P' : pocFrac < 0.34 ? 'b' : 'D';
+  // Volume confirmation on the last CLOSED bar vs its 20-bar average (McAllen: "the
+  // Great Confirmer" — breakouts without volume are likely false).
+  const last20 = win.slice(-21, -1).map((c) => Number(c.volume)).filter((v) => Number.isFinite(v) && v > 0);
+  const avgVol = last20.length ? last20.reduce((a, b) => a + b, 0) / last20.length : 0;
+  const lastVol = Number(win[win.length - 1].volume);
+  const volSpike = avgVol > 0 && Number.isFinite(lastVol) ? lastVol / avgVol : null;
+  return { ok: true, poc: r5(poc), pocShare: total > 0 ? pocVol / total : 0, hvns, hvnAbove, hvnBelow, shape, volSpike };
+}
+
+// Retracement read (McAllen ⅓–⅔ rule + the Fib 50/61.8 sweet spot every book cites).
+// Finds the last impulse leg from the fractal swings and measures how far the current
+// counter-move has retraced it. >78.6% = the prior trend is failing (veto depth).
+export function booksRetracement(candles) {
+  const { highs, lows } = fractalSwings(candles);
+  if (!highs.length || !lows.length) return null;
+  const H = highs[highs.length - 1], L = lows[lows.length - 1];
+  const price = n(candles[candles.length - 1].close);
+  const range = Math.abs(H.price - L.price);
+  if (!(range > 0)) return null;
+  if (H.i < L.i) {
+    // Last leg was DOWN (high → low); the current bounce retraces it.
+    return { legDir: 'DOWN', frac: Math.max(0, Math.min(1.5, (price - L.price) / range)), high: H.price, low: L.price };
+  }
+  // Last leg was UP (low → high); the current pullback retraces it.
+  return { legDir: 'UP', frac: Math.max(0, Math.min(1.5, (H.price - price) / range)), high: H.price, low: L.price };
+}
+
+// Regime classification — the unanimous first gate across all seven books:
+// classify trend/range/choppy BEFORE looking for a signal; choppy = stay away.
+export function booksRegime(candles, ichi, atr) {
+  const win = candles.slice(-60);
+  let hi = -Infinity, lo = Infinity;
+  for (const c of win) { const h = n(c.high), l = n(c.low); if (h > hi) hi = h; if (l < lo) lo = l; }
+  if (!(atr > 0) || !(hi > lo)) return 'CHOPPY';
+  if ((hi - lo) < 4 * atr) return 'CHOPPY';                     // tight noise — not worth trading
+  // Cloud position IS the regime (Linton/Péloille 3-state: above = bullish zone,
+  // below = bearish, inside = equilibrium). Swing structure only VETOES a trend
+  // call when it actively contradicts (McAllen: lower-highs + lower-lows against
+  // an above-cloud read) — it is never required, so quiet tapes still classify.
+  const { highs, lows } = fractalSwings(candles);
+  const hh = highs.length >= 2 && highs[highs.length - 1].price > highs[highs.length - 2].price;
+  const hl = lows.length >= 2 && lows[lows.length - 1].price > lows[lows.length - 2].price;
+  const lh = highs.length >= 2 && highs[highs.length - 1].price < highs[highs.length - 2].price;
+  const ll = lows.length >= 2 && lows[lows.length - 1].price < lows[lows.length - 2].price;
+  if (ichi.cloudPos === 'ABOVE' && !(lh && ll)) return 'TREND_UP';
+  if (ichi.cloudPos === 'BELOW' && !(hh && hl)) return 'TREND_DOWN';
+  return 'RANGE';
+}
+
+// Candidate LEVELS around price — Kijun, cloud edges, POC/HVN, key liquidity.
+// The books' shared law: never trade "in the middle of nowhere"; the level is the
+// gate, the candle is only the trigger.
+export function booksLevels(ctx, ichi, vp) {
+  const out = [
+    { price: ichi.kijun, kind: 'KIJUN' },
+    { price: ichi.cloudTop, kind: 'CLOUD_EDGE' },
+    { price: ichi.cloudBot, kind: 'CLOUD_EDGE' },
+  ];
+  if (vp.ok) {
+    out.push({ price: vp.poc, kind: 'POC' });
+    if (vp.hvnAbove) out.push({ price: vp.hvnAbove.price, kind: 'HVN' });
+    if (vp.hvnBelow) out.push({ price: vp.hvnBelow.price, kind: 'HVN' });
+  }
+  try {
+    const { levels } = detectKeyLiquidityLevels(ctx.candles, { symbol: ctx.symbol });
+    for (const l of levels || []) {
+      if (l.strength >= 3 && Number.isFinite(l.price)) out.push({ price: l.price, kind: 'KEY_LEVEL', strength: l.strength, label: l.label || l.type });
+    }
+  } catch { /* key levels optional */ }
+  return out.filter((l) => Number.isFinite(l.price));
+}
+
+// How many bars recently TRADED at the level (first-touch rule, books 05/06:
+// trade the first test; retests are lower probability). Excludes the trigger bars.
+function booksTouchCount(candles, level, { window = 40, excludeLast = 3 } = {}) {
+  const from = Math.max(0, candles.length - window);
+  const to = candles.length - 1 - excludeLast;
+  let touches = 0;
+  for (let i = from; i <= to; i++) {
+    if (n(candles[i].low) <= level && level <= n(candles[i].high)) touches++;
+  }
+  return touches;
+}
+
+// ── Books-Institutional FOREX — trade AT a level, structural stop, ≥2R ladder ──
+function booksInstitutionalForex(ctx) {
+  const { candles, symbol = '', h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const minRR = config.minRR ?? 2;
+  const minScore = config.minScore ?? 68;
+  const levelTolAtr = config.levelTolAtr ?? 0.5;   // "at the level" tolerance
+  const stopBufAtr = config.stopBufAtr ?? 0.25;
+  if (!Array.isArray(candles) || candles.length < 140) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const ichi = booksIchimoku(candles);
+  if (!ichi) return null;
+  const vp = booksVolumeProfile(candles);
+  const regime = booksRegime(candles, ichi, atr);
+  if (regime === 'CHOPPY') return null;            // unanimous book rule: stay away
+
+  const lastIdx = candles.length - 1;
+  const c = candles[lastIdx], prev = candles[lastIdx - 1];
+  const price = n(c.close);
+
+  // Direction: with the trend; in a RANGE only fade the boundary (Candlestick Bible
+  // range rules). Never fight a clearly-trending H4 (house law).
+  let dir = null;
+  if (regime === 'TREND_UP') dir = 'BUY';
+  else if (regime === 'TREND_DOWN') dir = 'SELL';
+  else {
+    // RANGE: direction = away from the nearer boundary of the 60-bar range.
+    const win = candles.slice(-60);
+    const hi = Math.max(...win.map((x) => n(x.high)));
+    const lo = Math.min(...win.map((x) => n(x.low)));
+    const pct = (price - lo) / Math.max(hi - lo, 1e-9);
+    if (pct <= 0.25) dir = 'BUY';
+    else if (pct >= 0.75) dir = 'SELL';
+    else return null;                              // middle of the range = no trade
+  }
+  if (h4Trend === 'BULLISH' && dir === 'SELL') return null;
+  if (h4Trend === 'BEARISH' && dir === 'BUY') return null;
+
+  // LEVEL: the trigger sequence must have TESTED a supporting level on the entry
+  // side — the rejection wick reaches the level, the close moves away from it
+  // (Candlestick Bible: the pin/engulf is only meaningful AT the level).
+  const testLow = Math.min(n(c.low), n(candles[lastIdx - 1].low));
+  const testHigh = Math.max(n(c.high), n(candles[lastIdx - 1].high));
+  const levels = booksLevels(ctx, ichi, vp);
+  const side = levels.filter((l) => dir === 'BUY'
+    ? (l.price <= price && Math.abs(testLow - l.price) <= levelTolAtr * atr)
+    : (l.price >= price && Math.abs(testHigh - l.price) <= levelTolAtr * atr));
+  if (!side.length) return null;                   // middle of nowhere — books veto
+  const tested = dir === 'BUY' ? testLow : testHigh;
+  const level = side.sort((a, b) => Math.abs(tested - a.price) - Math.abs(tested - b.price))[0];
+
+  // TRIGGER on the just-closed candle: engulfing / pin rejection at the level, or a
+  // 4-filter GENUINE BREAKOUT through it (Breakout book: big body + one-bar break +
+  // no opposing wick + volume). The candle is the trigger, never the reason.
+  const body = Math.abs(n(c.close) - n(c.open));
+  const range = Math.max(n(c.high) - n(c.low), 1e-9);
+  const prevBody = Math.abs(n(prev.close) - n(prev.open));
+  const avgBody = candles.slice(-21, -1).reduce((a, x) => a + Math.abs(n(x.close) - n(x.open)), 0) / 20;
+  const upperWick = n(c.high) - Math.max(n(c.close), n(c.open));
+  const lowerWick = Math.min(n(c.close), n(c.open)) - n(c.low);
+  let trigger = null, trigBonus = 0;
+  if (dir === 'BUY') {
+    const bull = n(c.close) > n(c.open);
+    if (bull && body > prevBody && n(c.close) >= n(prev.high)) { trigger = 'ENGULFING'; trigBonus = 10; }
+    else if (bull && lowerWick >= body * 2 && lowerWick >= range * 0.5) { trigger = 'PIN'; trigBonus = 8; }
+    else if (bull && body >= avgBody * 1.3 && n(c.close) > level.price && n(c.open) <= level.price
+      && upperWick <= range * 0.2) {
+      trigger = 'BREAKOUT'; trigBonus = 9;
+      if (vp.ok && vp.volSpike != null && vp.volSpike >= 1.5) trigBonus = 12;   // all four filters
+    }
+  } else {
+    const bear = n(c.close) < n(c.open);
+    if (bear && body > prevBody && n(c.close) <= n(prev.low)) { trigger = 'ENGULFING'; trigBonus = 10; }
+    else if (bear && upperWick >= body * 2 && upperWick >= range * 0.5) { trigger = 'PIN'; trigBonus = 8; }
+    else if (bear && body >= avgBody * 1.3 && n(c.close) < level.price && n(c.open) >= level.price
+      && lowerWick <= range * 0.2) {
+      trigger = 'BREAKOUT'; trigBonus = 9;
+      if (vp.ok && vp.volSpike != null && vp.volSpike >= 1.5) trigBonus = 12;
+    }
+  }
+  if (!trigger) return null;
+
+  // Retracement sanity for with-trend pullback entries (McAllen ⅓–⅔, Ichimoku ≤78.6%).
+  const retr = booksRetracement(candles);
+  let retrBonus = 0;
+  if (regime !== 'RANGE' && retr && trigger !== 'BREAKOUT') {
+    const pullingBack = (dir === 'BUY' && retr.legDir === 'UP') || (dir === 'SELL' && retr.legDir === 'DOWN');
+    if (pullingBack) {
+      if (retr.frac > 0.786) return null;          // prior trend failing — no trade
+      if (retr.frac >= 0.5 && retr.frac <= 0.618) retrBonus = 6;   // the sweet spot
+      else if (retr.frac >= 0.33 && retr.frac <= 0.66) retrBonus = 3;
+      else if (retr.frac > 0.66) retrBonus = -4;
+    }
+  }
+
+  // Stop: beyond the trigger extreme AND the level, plus an ATR buffer.
+  const stop = dir === 'BUY'
+    ? Math.min(n(c.low), n(prev.low), level.price) - stopBufAtr * atr
+    : Math.max(n(c.high), n(prev.high), level.price) + stopBufAtr * atr;
+  const risk = Math.abs(price - stop);
+  if (stopTooTight(risk, atr, pip, config)) return null;
+
+  // TP3 = nearest REAL opposing obstacle that still clears minRR (Order-Flow book:
+  // take profit before the next heavy-volume area — and if the first obstacle is too
+  // close, the trade isn't worth taking at all).
+  const oppose = [];
+  if (vp.ok) { const h = dir === 'BUY' ? vp.hvnAbove : vp.hvnBelow; if (h) oppose.push({ price: h.price, kind: 'HVN' }); }
+  try {
+    const pools = detectLiquidityPools(candles);
+    const t = dir === 'BUY' ? pools.targetAbove : pools.targetBelow;
+    if (t && Number.isFinite(t.price)) oppose.push({ price: t.price, kind: `LIQUIDITY_${t.type || 'POOL'}` });
+  } catch { /* pools optional */ }
+  if (dir === 'BUY' && ichi.cloudPos !== 'ABOVE' && ichi.cloudTop > price) oppose.push({ price: ichi.cloudTop, kind: 'CLOUD_EDGE' });
+  if (dir === 'SELL' && ichi.cloudPos !== 'BELOW' && ichi.cloudBot < price) oppose.push({ price: ichi.cloudBot, kind: 'CLOUD_EDGE' });
+  const ahead = oppose
+    .filter((o) => (dir === 'BUY' ? o.price > price : o.price < price))
+    .sort((a, b) => Math.abs(price - a.price) - Math.abs(price - b.price));
+  if (ahead.length && Math.abs(ahead[0].price - price) < risk * 1.2) return null; // obstacle too close
+  let target = null, targetKind = 'MEASURED_3R', structural = false;
+  for (const o of ahead) {
+    if (Math.abs(o.price - price) / risk >= minRR) { target = o.price; targetKind = o.kind; structural = true; break; }
+  }
+  if (target == null) target = dir === 'BUY' ? price + risk * 3 : price - risk * 3;
+  const rr = Math.round((Math.abs(target - price) / risk) * 100) / 100;
+  if (rr < minRR) return null;
+
+  // Validation & score — the books' 100-point institutional checklist.
+  const laggingClear = dir === 'BUY' ? ichi.laggingClearUp : ichi.laggingClearDown;
+  const volConfirm = vp.ok && vp.volSpike != null && vp.volSpike >= 1.3;
+  const touches = booksTouchCount(candles, level.price);
+  const hour = new Date(c.time).getUTCHours();
+  const goodSession = Number.isFinite(hour) && hour >= 7 && hour < 21;
+  const dualHtf = (dir === 'BUY' && h4Trend === 'BULLISH' && h1Trend === 'BULLISH')
+    || (dir === 'SELL' && h4Trend === 'BEARISH' && h1Trend === 'BEARISH');
+  const singleHtf = !dualHtf && ((dir === 'BUY' && (h4Trend === 'BULLISH' || h1Trend === 'BULLISH'))
+    || (dir === 'SELL' && (h4Trend === 'BEARISH' || h1Trend === 'BEARISH')));
+
+  let score = 45 + trigBonus + retrBonus;
+  if (laggingClear) score += 10;                   // Ichimoku validation — the key
+  if (volConfirm) score += 7;
+  if (touches <= 1) score += 6; else if (touches > 3) score -= 6;  // first-touch rule
+  if (goodSession) score += 5;
+  if (dualHtf) score += 8; else if (singleHtf) score += 4;
+  if ((dir === 'BUY' && ichi.futureBull) || (dir === 'SELL' && !ichi.futureBull)) score += 4;
+  if (level.kind === 'KEY_LEVEL' && (level.strength ?? 0) >= 4) score += 4;
+  if (level.kind === 'POC') score += 3;
+  if (structural) score += 3;
+  score = Math.max(40, Math.min(96, Math.round(score)));
+  if (score < minScore) return null;
+
+  const ladder = tpLadder(dir, price, risk, target);
+  return {
+    decision: dir,
+    score,
+    grade: score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C',
+    entry: r5(price),
+    stopLoss: r5(stop),
+    ...ladder,
+    riskRewardRatio: rr,
+    reason: `Books ${dir}: ${regime.replace('_', ' ').toLowerCase()} + ${trigger.toLowerCase()} at ${level.kind}${level.label ? ` (${level.label})` : ''} ${r5(level.price)}${laggingClear ? ' · lagging-span clear' : ''}${volConfirm ? ' · volume confirms' : ''}${touches <= 1 ? ' · first touch' : ''} → ${targetKind} ${r5(target)} (${rr}R)`,
+    barIso: c.time,                                // dedup: one signal per trigger candle
+    meta: {
+      v: 1, regime, trigger, levelKind: level.kind, levelPrice: r5(level.price),
+      cloudPos: ichi.cloudPos, laggingClear, volSpike: vp.ok ? vp.volSpike : null,
+      profileShape: vp.ok ? vp.shape : null, touches, retraceFrac: retr ? Math.round(retr.frac * 100) / 100 : null,
+      targetKind, structuralTarget: structural, dualHtf, session: goodSession ? 'ACTIVE' : 'OFF',
+    },
+  };
+}
+
+// ── Books-Institutional FIXED-TIME — next-candle direction, veto-first design ──
+// A fixed-time call is a bet on what the NEXT candle(s) do, so this engine weights
+// short-horizon dynamics and — before anything else — applies the books' vetoes:
+// equilibrium (inside a thick cloud), indecision (doji), exhaustion (3rd same-color
+// candle — Péloille's dynamic reading), an opposing obstacle right in front (the
+// magnet that stalls the move), and over-extension from the Kijun (mean reversion).
+function booksInstitutionalFixedTime(ctx) {
+  const { candles, h4Trend = null, h1Trend = null, config = {} } = ctx;
+  const minScore = config.minScore ?? 70;
+  const minAgreement = config.minAgreement ?? 0.65;
+  const freePathAtr = config.freePathAtr ?? 0.6;   // needed clearance ahead of the call
+  const maxRun = config.maxRun ?? 3;               // 3rd same-color candle = exhaustion
+  const maxKijunAtr = config.maxKijunAtr ?? 2.5;   // over-extension veto
+  if (!Array.isArray(candles) || candles.length < 120) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const ichi = booksIchimoku(candles);
+  if (!ichi) return null;
+  const regime = booksRegime(candles, ichi, atr);
+  if (regime === 'CHOPPY') return null;
+  if (ichi.cloudPos === 'INSIDE') return null;     // equilibrium = coin-flip, no call
+
+  const lastIdx = candles.length - 1;
+  const c = candles[lastIdx];
+  const close = n(c.close);
+
+  // Indecision veto: a doji/spinning-top last bar says buyers=sellers — no call.
+  const body = Math.abs(n(c.close) - n(c.open));
+  const range = Math.max(n(c.high) - n(c.low), 1e-9);
+  if (body < range * 0.25) return null;
+
+  // Over-extension veto: too far from the Kijun (its magnet pulls price back).
+  if (Math.abs(close - ichi.kijun) > maxKijunAtr * atr) return null;
+
+  // Posture vote — Ichimoku position + short-horizon momentum + volume pressure.
+  let up = 0, dn = 0;
+  const vote = (cond, w) => { if (cond === true) up += w; else if (cond === false) dn += w; };
+  vote(close > ichi.kijun, 1);                     // Kijun side (the signal line)
+  vote(close > ichi.tenkan, 0.5);
+  vote(ichi.cloudPos === 'ABOVE' ? true : ichi.cloudPos === 'BELOW' ? false : null, 1);
+  vote(ichi.futureBull, 0.5);
+  vote(ichi.tenkan > ichi.kijun, 0.5);
+  const closePos = (close - n(c.low)) / range;     // momentum: bullish close near high
+  const bull = n(c.close) > n(c.open);
+  if (bull && closePos > 0.6) up += 1; else if (!bull && closePos < 0.4) dn += 1;
+  let m = 0;
+  for (let i = lastIdx - 2; i <= lastIdx; i++) { if (n(candles[i].close) > n(candles[i - 1].close)) m++; else m--; }
+  vote(m > 0 ? true : m < 0 ? false : null, 0.5);
+  // Volume pressure: do the with-direction candles carry more volume? (graceful no-op)
+  let volPressure = null;
+  {
+    const recent = candles.slice(-6);
+    let upV = 0, dnV = 0, any = false;
+    for (const x of recent) {
+      const v = Number(x.volume);
+      if (!Number.isFinite(v) || v <= 0) continue;
+      any = true;
+      if (n(x.close) > n(x.open)) upV += v; else if (n(x.close) < n(x.open)) dnV += v;
+    }
+    if (any && upV + dnV > 0) { volPressure = upV > dnV; vote(volPressure, 0.5); }
+  }
+  const total = up + dn;
+  if (!(total > 0)) return null;
+  const dir = up > dn ? 'BUY' : dn > up ? 'SELL' : null;
+  if (!dir) return null;                           // tie = no call
+  const agreement = Math.max(up, dn) / total;
+  if (agreement < minAgreement) return null;
+  if (h4Trend === 'BULLISH' && dir === 'SELL') return null;   // house law
+  if (h4Trend === 'BEARISH' && dir === 'BUY') return null;
+
+  // Exhaustion veto (Péloille): impulses run in 3s — never enter ON the 3rd
+  // consecutive same-color candle; the next is likely the correction.
+  let run = 0;
+  for (let i = lastIdx; i >= 1; i--) {
+    const b = n(candles[i].close) > n(candles[i].open);
+    if ((dir === 'BUY' && b) || (dir === 'SELL' && !b)) run++; else break;
+  }
+  if (run >= maxRun) return null;
+
+  // Free-path check: the nearest OPPOSING level in front of the call. An obstacle
+  // within freePathAtr stalls the very candle we're calling (the books' magnet).
+  const vp = booksVolumeProfile(candles);
+  const obstacles = booksLevels(ctx, ichi, vp)
+    .filter((l) => (dir === 'BUY' ? l.price > close : l.price < close))
+    .map((l) => Math.abs(l.price - close) / atr)
+    .sort((a, b) => a - b);
+  const freePath = obstacles.length ? obstacles[0] : 3;
+  if (freePath < freePathAtr) return null;
+
+  const retr = booksRetracement(candles);
+  if (retr) {
+    // Calling against a leg that has already retraced >66% of the prior impulse is
+    // fighting a probable reversal (McAllen ⅔ rule).
+    const against = (dir === 'BUY' && retr.legDir === 'UP' && retr.frac > 0.66)
+      || (dir === 'SELL' && retr.legDir === 'DOWN' && retr.frac > 0.66);
+    if (against) return null;
+  }
+
+  const laggingClear = dir === 'BUY' ? ichi.laggingClearUp : ichi.laggingClearDown;
+  const sess = ftfSessionWeight(c.time);
+  let score = 40 + agreement * 35;
+  score += Math.min(10, freePath * 5);             // more clearance = better call
+  if (laggingClear) score += 5;
+  if (volPressure === (dir === 'BUY')) score += 5;
+  if (run === 1) score += 5;                       // fresh impulse candle — best entry
+  const htfAligned = (dir === 'BUY' && (h4Trend === 'BULLISH' || h1Trend === 'BULLISH'))
+    || (dir === 'SELL' && (h4Trend === 'BEARISH' || h1Trend === 'BEARISH'));
+  if (htfAligned) score += 5;
+  score = Math.max(40, Math.min(96, Math.round(score * sess)));
+  if (score < minScore) return null;
+
+  const slDist = atr, tpDist = atr * 1.5;          // ATR framing (fixed-time convention)
+  return {
+    decision: dir,
+    score,
+    grade: score >= 85 ? 'A+' : score >= 78 ? 'A' : 'B',
+    entry: r5(close),
+    stopLoss: r5(dir === 'BUY' ? close - slDist : close + slDist),
+    takeProfit1: r5(dir === 'BUY' ? close + tpDist : close - tpDist),
+    takeProfit2: r5(dir === 'BUY' ? close + tpDist * 1.5 : close - tpDist * 1.5),
+    riskRewardRatio: 1.5,
+    reason: `Books FT ${dir === 'BUY' ? 'UP' : 'DOWN'}: ${ichi.cloudPos.toLowerCase()} cloud + ${Math.round(agreement * 100)}% posture, free path ${Math.round(freePath * 10) / 10}×ATR${laggingClear ? ' · lagging-span clear' : ''}${run === 1 ? ' · fresh impulse' : ''}${htfAligned ? ' · HTF aligned' : ''}`,
+    barIso: c.time,                                // fixed-time = per-bar
+    meta: {
+      v: 1, regime, cloudPos: ichi.cloudPos, agreement: Math.round(agreement * 100),
+      freePathAtr: Math.round(freePath * 100) / 100, run, laggingClear,
+      volPressure, sessionWeight: sess, kijunDistAtr: Math.round((Math.abs(close - ichi.kijun) / atr) * 100) / 100,
+    },
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // LIL SWEEP-PRO+ — trades the KEY LIQUIDITY MAP itself: only the strongest fresh
 // levels (●●●● / ●●●●● — PDH/PDL, session highs/lows, equal highs/lows, round
 // numbers) via the two-plan playbook:
@@ -2647,6 +3131,24 @@ export const STRATEGIES = {
     timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
     config: { minScore: 72, minAgreement: 0.68, minVoters: 3 },
     evaluate: fixedTimeFusion,
+  },
+  'books-institutional-forex': {
+    id: 'books-institutional-forex',
+    name: 'Books-Institutional (Forex)',
+    source: 'Fused from the 7-book GUIDES/KNOWLEDGE distillation — Ichimoku (Péloille/Linton) + Volume Profile & Order Flow (Trader Dale) + Candlestick Bible + Breakout (Indrazith) + McAllen classical TA',
+    description: 'FOREX (TP/SL) rules by design — a level trade, never a next-candle call. The seven books\' unanimous playbook, mechanically encoded: (1) REGIME first — Ichimoku 9-26-52 cloud + swing structure classify trend/range/choppy; choppy = silent, range = only fade the 60-bar boundary. (2) LEVEL — price must be AT a real institutional level (Kijun, cloud edge, volume-profile POC/HVN from tick volume, or a key liquidity level strength ≥3); "middle of nowhere" is vetoed. (3) TRIGGER — the just-closed candle must be an engulfing/pin rejection at the level or a 4-filter GENUINE breakout through it (big body ≥1.3× avg, one-bar break, opposing wick <20%, volume spike when volume exists). (4) VALIDATION — Lagging-Span clear (the Ichimoku books\' key confirmation), volume confirms (McAllen\'s Great Confirmer, graceful when the feed has no volume), FIRST-TOUCH of the level preferred (retests down-scored), pullback depth sane (33–66% healthy, 50–61.8% sweet, >78.6% = veto). Stop beyond trigger+level with an ATR buffer; TP1/TP2 = 1R/2R, TP3 = the nearest REAL opposing obstacle (HVN → liquidity pool → cloud edge) that clears 2R — and if the first obstacle is closer than 1.2R the trade is skipped entirely (Order-Flow book: not worth taking). Never fights a clear H4. Scored on the books\' checklist; below 68 stays silent. Isolated lab strategy.',
+    timeframes: ['M15', 'M30', 'H1', 'H4'],
+    config: { minScore: 68, minRR: 2, levelTolAtr: 0.5, stopBufAtr: 0.25, minStopAtr: 0.35, minStopPips: 3 },
+    evaluate: booksInstitutionalForex,
+  },
+  'books-institutional-fixed-time': {
+    id: 'books-institutional-fixed-time',
+    name: 'Books-Institutional (Fixed-Time)',
+    source: 'Fused from the 7-book GUIDES/KNOWLEDGE distillation — next-candle rules: Ichimoku posture + Péloille dynamic 3-candle reading + obstacle/magnet logic (Trader Dale) + McAllen ⅔ rule',
+    description: 'FIXED-TIME (next-candle) rules by design — deliberately DIFFERENT from the forex twin: it bets on what the NEXT candle does, so it is veto-first. Hard vetoes from the books: choppy regime; price INSIDE the cloud (equilibrium = coin-flip, the Ichimoku books are explicit); a doji/spinning-top last bar (indecision); the 3rd consecutive same-color candle (Péloille: impulses run in threes — the next bar is likely the correction); an opposing level (Kijun/cloud edge/POC/HVN/key level) within 0.6×ATR in front of the call (the magnet that stalls the very candle being called); over-extension >2.5×ATR from the Kijun (mean-reversion pull); calling with a leg already >66% retraced (McAllen); and a clear opposing H4 (house law). What remains votes: Kijun/Tenkan side, cloud position, future-cloud color, close-position momentum, 3-bar drift, and tick-volume pressure (graceful no-op without volume) — fires only at ≥65% agreement. Score rewards FREE PATH ahead (clearance in ATR), a lagging-span-clear read, a FRESH impulse (1st candle after a color flip — the books\' best next-candle bet), HTF alignment, and London/NY session (Asian down-weighted). Entry at the close, ATR-framed SL/TP for the as-traded measurement; the lab scores the next-candle direction win-rate. Isolated lab strategy.',
+    timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
+    config: { minScore: 70, minAgreement: 0.65, freePathAtr: 0.6, maxRun: 3, maxKijunAtr: 2.5 },
+    evaluate: booksInstitutionalFixedTime,
   },
   'three-candle-combo': {
     id: 'three-candle-combo',

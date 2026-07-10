@@ -39,3 +39,6 @@ Thumbs.db
 *.ex4
 *.sql
 .gstack/
+
+# Trading-book PDF library (60MB, copyrighted material) — knowledge source for books-institutional, never committed
+GUIDES/
