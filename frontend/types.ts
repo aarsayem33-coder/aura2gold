@@ -731,11 +731,30 @@ export interface StrategyEntryWatchItem {
   currentGrade: string | null;
   currentDirection: string | null;
   strengthTrend: 'STRONGER' | 'SAME' | 'WEAKER' | 'GONE';
-  executability: 'EXECUTE_NOW' | 'WAIT' | 'CAUTION' | 'MISSED';
+  executability: 'EXECUTE_NOW' | 'WAIT' | 'CAUTION' | 'MISSED' | 'FILLED';
   execMessage: string | null;
   entryPrice: number | null;
   currentPrice: number | null;
   pipsToEntry: number | null;
+  liveEntryPrice: number | null;
+  liveStopLoss: number | null;
+  liveTakeProfit1: number | null;
+  liveTakeProfit2: number | null;
+  liveTakeProfit3: number | null;
+  liveRiskReward: number | null;
+  betterEntryAvailable: boolean;
+  betterEntryPrice: number | null;
+  betterStopLoss: number | null;
+  betterTakeProfit1: number | null;
+  betterTakeProfit2: number | null;
+  betterTakeProfit3: number | null;
+  betterRiskReward: number | null;
+  betterLots: number | null;
+  betterLossAtStop: number | null;
+  entryImprovementPips: number | null;
+  pipsToBetterEntry: number | null;
+  activeEntryPrice: number | null;
+  pipsToActiveEntry: number | null;
   stopLoss: number | null;
   takeProfit1: number | null;
   takeProfit2: number | null;
@@ -743,6 +762,8 @@ export interface StrategyEntryWatchItem {
   riskReward: number | null;
   lots: number | null;
   lossAtStop: number | null;
+  activeLots: number | null;
+  activeLossAtStop: number | null;
   entryStatus: 'WAIT' | 'AT_ENTRY' | 'MISSED';
   reachedEntry: boolean;
   executableNow: boolean;
@@ -755,8 +776,10 @@ export interface StrategyEntryWatchItem {
 export interface StrategyEntryWatchResponse {
   ok: boolean;
   minScore: number;
+  maxScore: number;
   windowHours: number;
   strategies: string[];
+  filters?: { strategies: string[]; symbols: string[]; timeframes: string[] };
   items: StrategyEntryWatchItem[];
   generatedAt: string;
 }
@@ -768,10 +791,11 @@ export interface StrategyMeta {
   source: string | null;
   description: string;
   timeframes: string[];
+  forexOnly?: boolean;
   control?: StrategyControl; // controller state from /strategies (default = enabled)
 }
 export interface StrategyTiming {
-  status: 'WAIT' | 'TRADABLE' | 'EXPIRED' | 'SETTLED';
+  status: 'WAIT' | 'TRADABLE' | 'FILLED' | 'EXPIRED' | 'SETTLED';
   expectEntryBy: string | null;
   message: string;
 }
@@ -796,6 +820,15 @@ export interface StrategySignal {
   takeProfit3: number | null;
   riskReward: number | null;
   reason: string | null;
+  strategyVersion?: number | null;
+  setupPlan?: string | null;
+  entryOrderType?: 'MARKET' | 'LIMIT' | 'STOP' | string | null;
+  entryState?: string | null;
+  entryFilledAt?: string | null;
+  validUntil?: string | null;
+  correctedOutcome?: string | null;
+  correctedPips?: number | null;
+  correctionReason?: string | null;
   lots: number | null;
   stopPips: number | null;
   lossAtStop: number | null;
@@ -803,7 +836,7 @@ export interface StrategySignal {
   outcome: string;
   profitLossPips: number | null;
   tpHitLevel: number | null;
-  ftOutcome: string;
+  ftOutcome: string | null;
   ftPips: number | null;
   ftActionable?: boolean | null;
   ftExpiryIso?: string | null;
@@ -821,6 +854,7 @@ export interface StrategySignal {
   resolvedAt: string | null;
 }
 export interface StrategyForexBucket {
+  total?: number;
   wins: number; losses: number; expired: number; pending: number;
   winLossSettled: number; winRate: number | null;
   expectancyPips: number | null; expectancyR: number | null;
@@ -828,23 +862,31 @@ export interface StrategyForexBucket {
   avgRR?: number | null;
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
+export interface StrategyCorrectedForexBucket {
+  wins: number; losses: number; expired: number; ambiguous: number;
+  winLossSettled: number; winRate: number | null;
+  expectancyPips: number | null;
+  confidence: 'weak' | 'early' | 'usable' | 'strong';
+}
 export interface StrategyFtBucket {
+  total?: number;
   wins: number; losses: number; draws: number; pending: number;
   winLossSettled: number; winRate: number | null;
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
 // As-traded (realistic) fixed-time bucket: live entry at signal time, expiry at +duration.
 export interface StrategyAtBucket {
+  total?: number;
   wins: number; losses: number; draws: number;
   winLossSettled: number; winRate: number | null;
   expectancyPips: number | null;
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
 export interface StrategyTfRow {
-  timeframe: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
+  timeframe: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket; correctedForex?: StrategyCorrectedForexBucket | null;
 }
 export interface StrategySymbolRow {
-  symbol: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
+  symbol: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket; correctedForex?: StrategyCorrectedForexBucket | null;
 }
 export interface StrategySessionRow {
   session: string; sessionLabel: string; bdRange: string;
@@ -852,10 +894,11 @@ export interface StrategySessionRow {
 }
 export interface StrategyComboRow {
   strategy: string; strategyName: string; symbol: string; timeframe: string;
+  forexOnly?: boolean;
   total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategySessionStrategyRow {
-  id: string; name: string; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
+  id: string; name: string; forexOnly?: boolean; total: number; forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
 }
 export interface StrategyScoreRow {
   band: string; label: string; range: string; order: number;
@@ -869,7 +912,8 @@ export interface StrategySessionBreakdown {
 }
 export interface StrategyPerf {
   id: string; name: string; source: string | null; total: number;
-  forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket;
+  forexOnly?: boolean;
+  forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket; correctedForex?: StrategyCorrectedForexBucket | null;
   byTimeframe: StrategyTfRow[];
   bySymbol: StrategySymbolRow[];
   bySession: StrategySessionRow[];
@@ -982,7 +1026,10 @@ export type SignalTrackerStatus = 'OPEN' | 'TP1_HIT' | 'TP2_HIT' | 'TP3_HIT' | '
 
 export interface SignalTrackerItem {
   id: string;
-  source: 'system' | 'email';
+  source: 'system' | 'email' | 'strategy-lab';
+  // Set when source === 'strategy-lab' (filled lab trades handed off to the tracker).
+  strategy?: string | null;
+  strategyName?: string | null;
   symbol: string;
   timeframe: string;
   direction: string;

@@ -3,7 +3,7 @@ import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe,
 import { Link } from 'react-router-dom';
 import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence } from '../mt5Api';
 import type {
-  StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyFtBucket, StrategyAtBucket,
+  StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyCorrectedForexBucket, StrategyFtBucket, StrategyAtBucket,
   StrategyTfRow, StrategySymbolRow, StrategySessionRow, StrategyComboRow, StrategySignal,
   StrategySessionBreakdown, StrategySessionStrategyRow, StrategyScoreRow,
   ConfluenceResponse, ConfluenceWin,
@@ -40,6 +40,7 @@ const confClass: Record<string, string> = {
 type AnyBucketRow = { forex: StrategyForexBucket; fixedTime: StrategyFtBucket; asTraded?: StrategyAtBucket };
 const pick = (row: AnyBucketRow, m: Metric): StrategyForexBucket | StrategyFtBucket | StrategyAtBucket =>
   (m === 'ftt' ? row.fixedTime : m === 'at' ? (row.asTraded ?? EMPTY_AT) : row.forex);
+const metricTotal = (row: AnyBucketRow & { total: number }, m: Metric) => pick(row, m).total ?? row.total;
 
 function rankByMetric<T extends AnyBucketRow>(rows: T[], m: Metric, minSample: number): T[] {
   return [...rows].sort((a, b) => {
@@ -66,7 +67,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 // Win-rate cell with a tiny progress bar + confidence chip.
-function WinCell({ b, minSample, bar = true }: { b: StrategyForexBucket | StrategyFtBucket | StrategyAtBucket | null | undefined; minSample: number; bar?: boolean }) {
+function WinCell({ b, minSample, bar = true }: { b: StrategyForexBucket | StrategyCorrectedForexBucket | StrategyFtBucket | StrategyAtBucket | null | undefined; minSample: number; bar?: boolean }) {
   if (!b) return <div className="min-w-[92px] text-right text-sm font-bold text-slate-300">—</div>;
   const settled = b.winLossSettled ?? 0;
   const trusted = settled >= minSample;
@@ -217,12 +218,18 @@ export default function StrategyLabReports() {
   const activePerf = useMemo(() => perf?.strategies.find((s) => s.id === selected) || null, [perf, selected]);
 
   // Client-side re-rank by the chosen metric (forex / fixed-time).
-  const rankedStrategies = useMemo(() => rankByMetric(perf?.strategies || [], metric, minSample), [perf, metric, minSample]);
+  const rankedStrategies = useMemo(() => rankByMetric((perf?.strategies || []).filter((s) => metric === 'forex' || !s.forexOnly), metric, minSample), [perf, metric, minSample]);
   const rankedTf = useMemo(() => rankByMetric(perf?.timeframeRanking || [], metric, minSample), [perf, metric, minSample]);
   const rankedSymbols = useMemo(() => rankByMetric(perf?.symbolRanking || [], metric, minSample), [perf, metric, minSample]);
   const rankedSessions = useMemo(() => rankByMetric(perf?.sessionRanking || [], metric, minSample), [perf, metric, minSample]);
   const rankedScore = useMemo(() => rankByMetric(perf?.scoreRanking || [], metric, minSample), [perf, metric, minSample]);
-  const rankedCombos = useMemo(() => rankByMetric(perf?.combos || [], metric, minSample), [perf, metric, minSample]);
+  const rankedCombos = useMemo(() => rankByMetric((perf?.combos || []).filter((c) => metric === 'forex' || !c.forexOnly), metric, minSample), [perf, metric, minSample]);
+  const metricStrategies = useMemo(() => metric === 'forex' ? strategies : strategies.filter((s) => !s.forexOnly), [metric, strategies]);
+  useEffect(() => {
+    if (metric === 'forex' || !strategies.length) return;
+    const current = strategies.find((s) => s.id === selected);
+    if (current?.forexOnly) setSelected(strategies.find((s) => !s.forexOnly)?.id || '');
+  }, [metric, selected, strategies]);
   // Search filter (applies to the leaderboard + combos).
   const visibleStrategies = useMemo(() => rankedStrategies.filter((s) => matchq(query, s.name, s.source, s.id)), [rankedStrategies, query]);
   const visibleCombos = useMemo(() => rankedCombos.filter((c) => matchq(query, c.strategyName, c.symbol, c.timeframe)), [rankedCombos, query]);
@@ -326,12 +333,13 @@ export default function StrategyLabReports() {
           <span className="ml-1 text-[11px] font-semibold text-slate-400">ranked by {metricLabel(metric)} win rate · trusted once ≥ {minSample} scored · {totalSignals} signals total{query ? ` · filtered: “${query}”` : ''}</span>
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[820px] text-left text-sm">
+          <table className="w-full min-w-[940px] text-left text-sm">
             <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
               <tr>
                 <th className="px-4 py-2 w-10">#</th>
                 <th className="px-4 py-2">Strategy</th>
                 <th className="px-4 py-2 text-right">Forex win%</th>
+                <th className="px-4 py-2 text-right" title="Preserves the original LIL v1 result and replays it with corrected STOP/MARKET entry semantics.">Corrected v1</th>
                 <th className="px-4 py-2 text-right">Expectancy</th>
                 <th className="px-4 py-2 text-right" title="Average signal risk-to-reward the strategy's forex plans offered (TP3 vs SL at signal time).">Avg RR</th>
                 <th className="px-4 py-2 text-right" title="Idealized: signal-bar close → next-bar close.">Fixed-time win%</th>
@@ -345,14 +353,15 @@ export default function StrategyLabReports() {
                   <td className="px-4 py-2 font-black text-slate-400">{i + 1}</td>
                   <td className="px-4 py-2"><span className="font-bold text-slate-800">{s.name}</span>{s.source && <span className="block text-[10px] font-semibold text-slate-400 max-w-[260px] truncate" title={s.source}>{s.source}</span>}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.forex} minSample={minSample} /></div></td>
+                  <td className="px-4 py-2"><div className="flex justify-end">{s.correctedForex ? <WinCell b={s.correctedForex} minSample={minSample} /> : <span className="text-slate-300">—</span>}</div></td>
                   <td className="px-4 py-2 text-right font-mono text-xs">{expLabel(s.forex)}</td>
                   <td className="px-4 py-2 text-right font-mono text-xs font-bold text-slate-700">{rrLabel(s.forex)}</td>
-                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.fixedTime} minSample={minSample} /></div></td>
-                  <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={s.asTraded} minSample={minSample} /></div></td>
-                  <td className="px-4 py-2 text-right font-mono font-bold">{s.total}</td>
+                  <td className="px-4 py-2"><div className="flex justify-end">{s.forexOnly ? <span className="text-slate-300">—</span> : <WinCell b={s.fixedTime} minSample={minSample} />}</div></td>
+                  <td className="px-4 py-2"><div className="flex justify-end">{s.forexOnly ? <span className="text-slate-300">—</span> : <WinCell b={s.asTraded} minSample={minSample} />}</div></td>
+                  <td className="px-4 py-2 text-right font-mono font-bold">{metricTotal(s, metric)}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No strategies match “${query}”.` : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
+                <tr><td colSpan={9} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No strategies match “${query}”.` : 'No strategy signals settled yet — they populate as the lab scans and outcomes resolve.'}</td></tr>
               )}
             </tbody>
           </table>
@@ -402,7 +411,7 @@ export default function StrategyLabReports() {
           <span className="ml-1 text-[11px] font-semibold text-slate-400">the sharpest edges, ranked by {metricLabel(metric)} win rate</span>
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[860px] text-left text-sm">
+          <table className="w-full min-w-[960px] text-left text-sm">
             <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
               <tr>
                 <th className="px-4 py-2 w-10">#</th>
@@ -429,7 +438,7 @@ export default function StrategyLabReports() {
                   <td className="px-4 py-2 text-right font-mono text-xs font-bold text-slate-700">{rrLabel(c.forex)}</td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.fixedTime} minSample={minSample} bar={false} /></div></td>
                   <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={c.asTraded} minSample={minSample} bar={false} /></div></td>
-                  <td className="px-4 py-2 text-right font-mono font-bold">{c.total}</td>
+                  <td className="px-4 py-2 text-right font-mono font-bold">{metricTotal(c, metric)}</td>
                 </tr>
               )) : (
                 <tr><td colSpan={10} className="px-4 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : query ? `No combos match “${query}”.` : 'No combos settled yet.'}</td></tr>
@@ -448,7 +457,7 @@ export default function StrategyLabReports() {
             <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Deep dive · {activePerf?.name || selected}</h3>
           </div>
           <select value={selected} onChange={(e) => setSelected(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-            {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {metricStrategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
         <div className="grid grid-cols-1 gap-0 lg:grid-cols-2 xl:grid-cols-4 lg:divide-x lg:divide-slate-100">
@@ -472,7 +481,7 @@ export default function StrategyLabReports() {
             <span className="ml-1 text-[11px] font-semibold text-slate-400">every call tracked by system &amp; email · live position · {logSignals.length} in {perf?.window?.label || 'window'}</span>
           </div>
           <select value={selected} onChange={(e) => setSelected(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-            {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {metricStrategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
         <div className="overflow-x-auto">
@@ -484,7 +493,8 @@ export default function StrategyLabReports() {
                 <th className="px-3 py-2 text-right">Score</th>
                 <th className="px-3 py-2 text-right" title="Signal risk-to-reward of the forex plan (TP3 vs SL at signal time).">RR</th>
                 <th className="px-3 py-2">Forex result</th>
-                <th className="px-3 py-2 text-right">Pips</th>
+                <th className="px-3 py-2" title="LIL v1 only: preserved original result replayed with corrected STOP/MARKET entry semantics.">Corrected</th>
+                <th className="px-3 py-2 text-right">Original pips</th>
                 <th className="px-3 py-2">Fixed-time (live/result)</th>
                 <th className="px-3 py-2">Track</th>
                 <th className="px-3 py-2">Signal made</th>
@@ -505,6 +515,16 @@ export default function StrategyLabReports() {
                     <td className="px-3 py-2 text-right">{s.score === null ? <span className="text-slate-300">—</span> : <span className="font-black text-slate-700">{Math.round(s.score)}{s.grade ? ` ${s.grade}` : ''}</span>}</td>
                     <td className="px-3 py-2 text-right font-mono text-xs font-bold text-slate-700">{s.riskReward == null ? <span className="text-slate-300">—</span> : `1:${s.riskReward}`}</td>
                     <td className="px-3 py-2"><span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.outcome)}`}>{s.outcome}{s.tpHitLevel ? ` (TP${s.tpHitLevel})` : ''}</span></td>
+                    <td className="px-3 py-2">
+                      {s.correctedOutcome ? (
+                        <div className="flex items-center gap-1.5 whitespace-nowrap">
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${outcomeChip(s.correctedOutcome)}`} title={s.correctionReason || undefined}>{s.correctedOutcome}</span>
+                          {s.correctedPips !== null && s.correctedPips !== undefined && (
+                            <span className={`font-mono text-[11px] font-bold ${s.correctedPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>{s.correctedPips > 0 ? '+' : ''}{s.correctedPips}p</span>
+                          )}
+                        </div>
+                      ) : <span className="text-slate-300">—</span>}
+                    </td>
                     <td className="px-3 py-2 text-right font-mono text-[12px]">{s.profitLossPips === null ? '—' : <span className={s.profitLossPips >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{s.profitLossPips > 0 ? '+' : ''}{s.profitLossPips}</span>}</td>
                     <td className="px-3 py-2"><FtResultCell s={s} /></td>
                     <td className="px-3 py-2"><SourceChips popupSent={s.popupSent} emailSent={s.emailSent} /></td>
@@ -512,7 +532,7 @@ export default function StrategyLabReports() {
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={9} className="px-3 py-8 text-center text-sm font-medium text-slate-400">No signals logged yet for this strategy.</td></tr>
+                <tr><td colSpan={10} className="px-3 py-8 text-center text-sm font-medium text-slate-400">No signals logged yet for this strategy.</td></tr>
               )}
             </tbody>
           </table>
@@ -625,7 +645,7 @@ function ConfluenceTab({ strategies, rangeParams, rangeLabel }: {
       <SectionLabel>Custom combo · pick 2–3 strategies to test together</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
         <div className="flex flex-wrap gap-1.5">
-          {strategies.map((s) => {
+          {strategies.filter((s) => !s.forexOnly).map((s) => {
             const on = combo.includes(s.id);
             return <button key={s.id} type="button" onClick={() => toggle(s.id)} className={`rounded-full border px-2.5 py-1 text-[11px] font-bold transition ${on ? 'border-indigo-500 bg-indigo-600 text-white' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} ${!on && combo.length >= 3 ? 'opacity-40' : ''}`}>{s.name}</button>;
           })}
@@ -712,7 +732,7 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
-                <td className="px-4 py-2 text-right font-mono font-bold">{r.total}</td>
+                <td className="px-4 py-2 text-right font-mono font-bold">{metricTotal(r, metric)}</td>
               </tr>
             )) : (
               <tr><td colSpan={6} className="px-4 py-8 text-center text-sm font-medium text-slate-400">No data yet.</td></tr>
@@ -799,7 +819,7 @@ function MiniRank<T extends AnyBucketRow & { total: number }>({ title, icon, row
                 <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
                 <td className="px-3 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
-                <td className="px-3 py-2 text-right font-mono font-bold">{r.total}</td>
+                <td className="px-3 py-2 text-right font-mono font-bold">{metricTotal(r, metric)}</td>
               </tr>
             )) : (
               <tr><td colSpan={6} className="px-3 py-6 text-center text-[12px] font-medium text-slate-400">{empty}</td></tr>
@@ -829,7 +849,7 @@ function SessionBreakdownSection({ data, metric, minSample, query, loading }: {
     );
   }
   const active = data.find((d) => d.session === tab) || data[0];
-  const strategyRows = active.byStrategy.filter((s) => matchq(query, s.name, s.id));
+  const strategyRows = active.byStrategy.filter((s) => (metric === 'forex' || !s.forexOnly) && matchq(query, s.name, s.id));
   return (
     <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
       <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-100 px-3 py-2.5">

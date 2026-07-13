@@ -31,28 +31,24 @@ function flatCandles(nBars = 120, base = 1.1) {
   return mkCandles(rows);
 }
 
-// Synthetic Plan A: a rising market stalls under the 5-dot round number `lvl`
-// (with equal highs AT it), then a sweep candle wicks through, closes back below,
-// the next candle drives down, and price holds below into the last bar.
+// Synthetic Plan A: a bearish cloud stays below an untouched 5-dot round number,
+// then a completed sweep candle wicks through it and closes back below. The next
+// CLOSED candle follows through; the final row is the current forming candle.
 function sweepRejectCandles() {
   const rows = [];
-  const lvl = 1.11000; // full-grid round number → strength 5, qualifies under the 5-dot rule
-  let p = 1.10100;
-  for (let i = 0; i < 70; i++) { const o = p; p += 0.00012; rows.push([o, Math.max(o, p) + 0.0002, Math.min(o, p) - 0.0002, p]); }
-  // Two equal highs AT the level (visible stop cluster), pull back between them.
-  rows.push([p, lvl, p - 0.0004, lvl - 0.0012]);
-  for (let i = 0; i < 6; i++) rows.push([lvl - 0.0012, lvl - 0.0008, lvl - 0.0022, lvl - 0.0015]);
-  rows.push([lvl - 0.0015, lvl, lvl - 0.0018, lvl - 0.0010]);
-  for (let i = 0; i < 4; i++) rows.push([lvl - 0.0010, lvl - 0.0006, lvl - 0.0020, lvl - 0.0012]);
-  // THE SWEEP: wick 8 pips through the equal highs, close back 6 pips below.
-  rows.push([lvl - 0.0012, lvl + 0.0008, lvl - 0.0014, lvl - 0.0006]);
-  // Follow-through down, then holding below the level (never re-closing above).
-  rows.push([lvl - 0.0006, lvl - 0.0004, lvl - 0.0016, lvl - 0.0014]);
-  rows.push([lvl - 0.0014, lvl - 0.0010, lvl - 0.0020, lvl - 0.0016]);
+  let p = 1.09750;
+  for (let i = 0; i < 100; i++) {
+    const o = p;
+    p -= 0.000035;
+    rows.push([o, Math.max(o, p) + 0.00012, Math.min(o, p) - 0.00012, p]);
+  }
+  rows.push([p, 1.10030, p - 0.00020, p + 0.00005]); // completed sweep; body remains below 1.10000
+  rows.push([p + 0.00005, p + 0.00010, p - 0.00065, p - 0.00055]); // completed bearish follow-through
+  rows.push([p - 0.00055, p - 0.00025, p - 0.00060, p - 0.00058]); // forming bar has not touched confirmation trigger
   return mkCandles(rows);
 }
 
-const ctxFor = (candles, extra = {}) => ({ symbol: 'EURUSDM', timeframe: 'M15', candles, pip: 0.0001, h4Trend: null, h1Trend: null, ...extra });
+const ctxFor = (candles, extra = {}) => ({ symbol: 'EURUSDM', timeframe: 'M15', candles, candlesIncludeFormingBar: true, pip: 0.0001, h4Trend: null, h1Trend: null, config: { maxTargetAtr: 30 }, ...extra });
 
 test('registry contract: id, name, forex TFs, evaluate function', () => {
   const s = STRATEGIES[ID];
@@ -82,15 +78,65 @@ test('deterministic: same candles → identical result', () => {
 
 test('synthetic sweep-rejection + H1 alignment → well-formed SELL trigger', () => {
   const sig = evaluateStrategy(ID, ctxFor(sweepRejectCandles(), { h1Trend: 'BEARISH' }));
-  assert(sig !== null, 'expected a signal (equal-highs sweep, all 4 conditions, H1 aligned)');
+  assert(sig !== null, 'expected a signal (round-number sweep, closed confirmation, H1 aligned)');
   assert(sig.decision === 'SELL', `direction should be SELL, got ${sig.decision}`);
   assert(sig.meta?.plan === 'SWEEP-REJECT', 'plan A');
   assert(sig.meta?.requiresFill === true, 'fill-gated honest measurement');
+  assert(sig.meta?.entryOrderType === 'STOP', 'Plan A must be a stop entry');
+  assert(sig.meta?.strategyVersion === 2, 'new signal must be version 2');
+  assert(sig.meta?.measureFixedTime === false, 'forex-only strategy must not be scored as fixed-time');
   assert(sig.meta?.forexOnly === true, 'forex framing only');
   assert(Number.isFinite(sig.entry) && Number.isFinite(sig.stopLoss) && Number.isFinite(sig.takeProfit3), 'prices');
   assert(sig.stopLoss > sig.entry && sig.takeProfit3 < sig.entry, 'SELL geometry');
   assert(sig.riskRewardRatio >= 1.8, 'RR floor respected');
   assert(sig.score >= 72 && sig.score <= 97, 'score in band');
+});
+
+test('forming follow-through candle cannot create a signal', () => {
+  const withoutTrailingFormingBar = sweepRejectCandles().slice(0, -1);
+  assert(evaluateStrategy(ID, ctxFor(withoutTrailingFormingBar, { h1Trend: 'BEARISH' })) === null, 'confirmation must be closed');
+});
+
+test('closed-bar scanner context keeps the latest confirmation bar', () => {
+  const closedBars = sweepRejectCandles().slice(0, -1);
+  const sig = evaluateStrategy(ID, ctxFor(closedBars, { candlesIncludeFormingBar: false, h1Trend: 'BEARISH' }));
+  assert(sig?.meta?.plan === 'SWEEP-REJECT', 'must not drop the second valid closed bar');
+  assert(sig.barIso === closedBars[closedBars.length - 1].time, 'alert is anchored to the closed confirmation');
+});
+
+test('pre-alert touch of the confirmation trigger is rejected as late', () => {
+  const candles = sweepRejectCandles();
+  candles[candles.length - 1].low = candles[candles.length - 2].low - 0.00001;
+  assert(evaluateStrategy(ID, ctxFor(candles, { h1Trend: 'BEARISH' })) === null, 'late trigger must not alert');
+});
+
+test('an older closed confirmation cannot alert after a later candle', () => {
+  const candles = sweepRejectCandles();
+  const forming = candles.pop();
+  const confirmation = candles[candles.length - 1];
+  const tfMs = 15 * 60 * 1000;
+  candles.push({
+    ...forming,
+    time: new Date(Date.parse(confirmation.time) + tfMs).toISOString(),
+    high: confirmation.high - 0.00005,
+    low: confirmation.low + 0.00005,
+    close: confirmation.close,
+  });
+  candles.push({
+    ...forming,
+    time: new Date(Date.parse(confirmation.time) + 2 * tfMs).toISOString(),
+    high: confirmation.high - 0.00005,
+    low: confirmation.low + 0.00006,
+    close: confirmation.close,
+  });
+  assert(evaluateStrategy(ID, ctxFor(candles, { h1Trend: 'BEARISH' })) === null, 'stale confirmation must not alert');
+});
+
+test('strategy hard-rejects every timeframe except M15/M30', () => {
+  const candles = sweepRejectCandles();
+  for (const timeframe of ['M1', 'M5', 'H1', 'H4', 'D1']) {
+    assert(evaluateStrategy(ID, ctxFor(candles, { timeframe, h1Trend: 'BEARISH' })) === null, `${timeframe} must be rejected`);
+  }
 });
 
 test('never fights a clear H4: bullish H4 kills the synthetic SELL', () => {

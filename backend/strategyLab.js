@@ -10,7 +10,7 @@
 //              takeProfit3?, riskRewardRatio, reason, barIso, meta }
 // Pure: no I/O. New strategies = add one entry to STRATEGIES.
 
-import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels, detectDisplacement } from './liquidityEngine.js';
+import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels, detectDisplacement, roundStepFor } from './liquidityEngine.js';
 import { buildBreakoutCandidate, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
@@ -31,15 +31,41 @@ function stopTooTight(risk, atr, pip, { minStopAtr = 0.35, minStopPips = 3 } = {
 // the opposing liquidity draw (breaker/trap) or the strategy's fixed target (3-step).
 // Always returns strictly-ordered, correct-side targets so the outcome replay can
 // never see a degenerate level (see the null-TP false-win fix in the resolver).
-function tpLadder(dir, entry, risk, finalTarget) {
+// TP ladder: TP1 = 1R, TP3 = the HONEST structural draw, TP2 = 2R when the draw
+// clears it meaningfully. Previously a draw between 2R and 2.5R stacked TP2≈TP3
+// (0.6-pip gap on the GBPUSD Jul 13 audit signal), and a draw below 2R was silently
+// replaced by a fantasy 3R that contradicted the signal's stated RR. Now TP3 always
+// stays the real draw and, when the draw is under 2.5R, TP2 compresses to the
+// 1R↔draw midpoint so every step is a meaningful scale-out. Draw ≤ 1.25R (engine RR
+// floors should prevent it) falls back to the plain 1R/2R/3R ladder.
+export function tpLadder(dir, entry, risk, finalTarget) {
   const r = Math.abs(risk);
   const sign = dir === 'BUY' ? 1 : -1;
-  const t1 = entry + sign * r * 1;
-  const t2 = entry + sign * r * 2;
-  let t3 = Number.isFinite(finalTarget) ? finalTarget : entry + sign * r * 3;
-  // Structural target must sit beyond TP2; clamp defensively so the ladder never inverts.
-  if (dir === 'BUY' ? t3 <= t2 : t3 >= t2) t3 = entry + sign * r * 3;
-  return { takeProfit1: r5(t1), takeProfit2: r5(t2), takeProfit3: r5(t3) };
+  const t3 = Number.isFinite(finalTarget) ? finalTarget : entry + sign * r * 3;
+  const t3R = (sign * (t3 - entry)) / r;                 // structural draw in R units
+  if (!(r > 0) || !(t3R > 0)) return null;
+  // Keep the real structural draw as TP3. If it is inside 1R, compress all three
+  // scale-outs instead of replacing it with an invented 3R objective.
+  const t1R = t3R <= 1 ? t3R / 3 : 1;
+  const t2R = t3R >= 2.5 ? 2 : t1R + (t3R - t1R) / 2;
+  const raw = [entry + sign * r * t1R, entry + sign * r * t2R, t3];
+  const rounded = raw.map(r5);
+  const ordered = dir === 'BUY'
+    ? rounded[0] < rounded[1] && rounded[1] < rounded[2]
+    : rounded[0] > rounded[1] && rounded[1] > rounded[2];
+  const [takeProfit1, takeProfit2, takeProfit3] = ordered ? rounded : raw;
+  return { takeProfit1, takeProfit2, takeProfit3 };
+}
+
+// A raided level is only valid on the SIDE that was swept: a BULLISH signal comes
+// from SELL-side liquidity being taken (lows — PDL, session lows, equal/swing lows),
+// a BEARISH one from BUY-side (highs). Round numbers are side-neutral magnets.
+// Matching by price distance alone once attached an equal-HIGHS cluster to a low
+// sweep and inflated the score past the emit floor (GBPUSD Jul 13 audit).
+function raidLevelSideOk(type, dir) {
+  const t = String(type || '').toUpperCase();
+  if (/ROUND/.test(t)) return true;
+  return dir === 'BULLISH' ? (t === 'PDL' || /LOW$/.test(t)) : (t === 'PDH' || /HIGH$/.test(t));
 }
 
 // ── Strategy 1: ICT Breaker (Maine — "$10M ICT Blueprint", Chart Fanatics) ───
@@ -82,6 +108,7 @@ function ictBreaker(ctx) {
 
   // TP ladder: 1R / 2R scaling rungs, with TP3 = the opposing liquidity pool (the draw).
   const ladder = tpLadder(dir, plan.entry, Math.abs(plan.entry - plan.stop), plan.target);
+  if (!ladder) return null;
 
   return {
     decision: dir,
@@ -189,6 +216,7 @@ function marketMechanics3Step(ctx) {
   // TP ladder: 1R / 2R partial rungs, TP3 = Brett's fixed structural target (tpR, default 3R).
   const finalTarget = dir === 'BUY' ? price + risk * tpR : price - risk * tpR;
   const ladder = tpLadder(dir, price, risk, finalTarget);
+  if (!ladder) return null;
 
   // Deterministic confidence: base + how deep into discount/premium + rejection strength.
   let score = 55;
@@ -297,6 +325,7 @@ function liquidityTrap(ctx) {
 
   // TP ladder: 1R / 2R scaling rungs, TP3 = the opposing liquidity pool (the draw).
   const ladder = tpLadder(dir, entry, Math.abs(entry - stop), t.target.price);
+  if (!ladder) return null;
 
   let score = 52;
   score += Math.min(18, Math.round((rr - 2) * 6));                 // R:R above the 2R floor
@@ -417,6 +446,7 @@ function littleRizzy(ctx) {
     if (stopTooTight(risk, atr, pip, config)) return null;
 
     const ladder = tpLadder('SELL', entry, risk, measuredTarget); // TP1/TP2 = 1R/2R rungs, TP3 = measured move
+    if (!ladder) return null;
     let score = 50;
     score += Math.min(15, Math.round((D / atr) * 2));      // impulse strength (capped)
     score += Math.min(10, Math.round((rr - minRR) * 4));   // realistic RR above the floor (capped — no fantasy)
@@ -473,6 +503,7 @@ function littleRizzy(ctx) {
   if (stopTooTight(risk, atr, pip, config)) return null;
 
   const ladder = tpLadder('BUY', entry, risk, measuredTarget);
+  if (!ladder) return null;
   let score = 50;
   score += Math.min(15, Math.round((D / atr) * 2));
   score += Math.min(10, Math.round((rr - minRR) * 4));
@@ -629,6 +660,7 @@ function stageAnalysis(ctx) {
     const rr = tpR;
     if (!(rr >= minRR)) return null;
     const ladder = tpLadder(decision, entry, risk, target);
+    if (!ladder) return null;
     let score = Math.max(40, Math.min(95, 55 + extraScore + htfBonus));
     return {
       decision, score,
@@ -971,6 +1003,7 @@ function swingStructureCandles(ctx) {
     if (verdict === 'CONTRADICT') return null;              // LTF disagrees → skip
     if (verdict === 'MISSING' && ltfReq) return null;       // strict: no LTF data → skip
     const ladder = tpLadder(decision, entry, risk, finalTarget);
+    if (!ladder) return null;
     let score = 52;
     score += strength >= 4 ? 14 : strength === 3 ? 10 : 4;             // swing-strength ranking
     score += Math.min(14, Math.round((pat?.weight ?? 0) * 1.5));       // pattern reliability
@@ -1088,28 +1121,46 @@ function swingStructureCandles(ctx) {
 // Most recent CONFIRMED sweep + reclaim ("no sweep, no trade"): a fractal swing a
 // later bar pierced, then a bar CLOSED back inside. dir 'BULLISH' = a low was swept
 // (look BUY), 'BEARISH' = a high (look SELL). extreme = the wick beyond the level.
-function smcRecentSweep(candles, { lookback = 50 } = {}) {
+export function smcRecentSweep(candles, { lookback = 50, maxReclaimBars = 3 } = {}) {
+  if (!Array.isArray(candles) || candles.length < 5) return null;
   const { highs, lows } = fractalSwings(candles);
   const last = candles.length - 1;
   let best = null;
   const scan = (points, side) => {
     for (const p of points) {
-      for (let j = p.i + 1; j < candles.length; j++) {
+      const from = Math.max(p.i + 1, last - Math.max(0, lookback));
+      let active = null;
+      let candidate = null;
+      for (let j = from; j <= last; j++) {
         const pierced = side === 'low' ? n(candles[j].low) < p.price : n(candles[j].high) > p.price;
-        if (!pierced) continue;
-        for (let k = j; k < candles.length; k++) {
-          const reclaimed = side === 'low' ? n(candles[k].close) > p.price : n(candles[k].close) < p.price;
-          if (reclaimed) {
-            if (last - k <= lookback && (!best || k > best.reclaimIdx)) {
-              let ext = side === 'low' ? Infinity : -Infinity;
-              for (let m = j; m <= k; m++) ext = side === 'low' ? Math.min(ext, n(candles[m].low)) : Math.max(ext, n(candles[m].high));
-              best = { dir: side === 'low' ? 'BULLISH' : 'BEARISH', sweepLevel: r5(p.price), sweepIdx: j, reclaimIdx: k, reclaimIso: candles[k].time, extreme: r5(ext) };
-            }
-            break;
+        if (pierced) {
+          // A later breach starts/extends the current episode and invalidates any
+          // earlier reclaimed episode at this level.
+          candidate = null;
+          if (!active || j - active.sweepIdx > maxReclaimBars) {
+            active = { sweepIdx: j, extreme: side === 'low' ? n(candles[j].low) : n(candles[j].high) };
+          } else {
+            active.extreme = side === 'low'
+              ? Math.min(active.extreme, n(candles[j].low))
+              : Math.max(active.extreme, n(candles[j].high));
           }
         }
-        break;
+        if (!active) continue;
+        const reclaimed = side === 'low' ? n(candles[j].close) > p.price : n(candles[j].close) < p.price;
+        if (reclaimed && j - active.sweepIdx <= maxReclaimBars) {
+          candidate = {
+            dir: side === 'low' ? 'BULLISH' : 'BEARISH',
+            sweepLevel: r5(p.price), sweepIdx: active.sweepIdx, reclaimIdx: j,
+            reclaimIso: candles[j].time, extreme: r5(active.extreme),
+          };
+          active = null;
+        } else if (j - active.sweepIdx >= maxReclaimBars) {
+          active = null; // do not pair a stale pierce with an unrelated later close
+        }
       }
+      if (candidate && last - candidate.sweepIdx <= lookback
+        && (!best || candidate.reclaimIdx > best.reclaimIdx
+          || (candidate.reclaimIdx === best.reclaimIdx && candidate.sweepIdx > best.sweepIdx))) best = candidate;
     }
   };
   scan(lows, 'low');
@@ -1117,12 +1168,13 @@ function smcRecentSweep(candles, { lookback = 50 } = {}) {
   return best;
 }
 
-// Freshest displacement fair value gap in `dir`, created at/after sinceIdx.
+// Freshest displacement fair value gap in `dir`, completed after the reclaim.
 // Bullish FVG: candle3.low > candle1.high (gap below price). low/high = gap edges.
-function smcFreshFvg(candles, dir, atr, { sinceIdx = 0, minDispAtr = 0.6 } = {}) {
+export function smcFreshFvg(candles, dir, atr, { reclaimIdx, minDispAtr = 0.6 } = {}) {
+  if (!Array.isArray(candles) || !Number.isInteger(reclaimIdx)) return null;
   const lastIdx = candles.length - 1;
   let best = null;
-  for (let i = Math.max(sinceIdx, 2); i <= lastIdx; i++) {
+  for (let i = Math.max(reclaimIdx + 1, 2); i <= lastIdx; i++) {
     const c1 = candles[i - 2], c2 = candles[i - 1], c3 = candles[i];
     const bull = n(c3.low) > n(c1.high) && n(c2.close) > n(c2.open);
     const bear = n(c3.high) < n(c1.low) && n(c2.close) < n(c2.open);
@@ -1131,19 +1183,37 @@ function smcFreshFvg(candles, dir, atr, { sinceIdx = 0, minDispAtr = 0.6 } = {})
     if (disp < minDispAtr) continue;
     const low = dir === 'BULLISH' ? n(c1.high) : n(c3.high);
     const high = dir === 'BULLISH' ? n(c3.low) : n(c1.low);
+    let fullyFilled = false;
+    for (let j = i + 1; j <= lastIdx; j++) {
+      if (dir === 'BULLISH' ? n(candles[j].low) <= low : n(candles[j].high) >= high) {
+        fullyFilled = true;
+        break;
+      }
+    }
+    if (fullyFilled) continue;
     best = { low: r5(low), high: r5(high), mid: r5((low + high) / 2), createIdx: i, createIso: c3.time, dispAtr: Math.round(disp * 100) / 100 };
   }
   return best;
 }
 
-// Dealing range = the most recent fractal swing high & low (external liquidity).
-function smcDealingRange(candles) {
+// Dealing range = the latest coherent high↔low swing leg that was already known
+// before eventIdx. This prevents a post-event pivot from redefining the setup's range.
+export function smcDealingRange(candles, eventIdx = candles?.length ?? 0) {
   const { highs, lows } = fractalSwings(candles);
-  if (!highs.length || !lows.length) return null;
-  const hi = highs[highs.length - 1], lo = lows[lows.length - 1];
-  const high = Math.max(hi.price, lo.price), low = Math.min(hi.price, lo.price);
-  if (!(high > low)) return null;
-  return { high: r5(high), low: r5(low), eq: r5((high + low) / 2), hiIdx: hi.i, loIdx: lo.i };
+  const swings = [
+    // A 2+2 fractal only exists once its two right-hand bars have closed.
+    ...highs.filter((p) => p.i + 2 < eventIdx).map((p) => ({ ...p, side: 'high' })),
+    ...lows.filter((p) => p.i + 2 < eventIdx).map((p) => ({ ...p, side: 'low' })),
+  ].sort((a, b) => a.i - b.i);
+  for (let i = swings.length - 1; i > 0; i--) {
+    const a = swings[i - 1], b = swings[i];
+    if (a.side === b.side) continue;
+    const hi = a.side === 'high' ? a : b;
+    const lo = a.side === 'low' ? a : b;
+    if (hi.i === lo.i || !(hi.price > lo.price)) continue;
+    return { high: r5(hi.price), low: r5(lo.price), eq: r5((hi.price + lo.price) / 2), hiIdx: hi.i, loIdx: lo.i };
+  }
+  return null;
 }
 
 const smcGrade = (score) => (score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C');
@@ -1161,7 +1231,7 @@ function smcFvg(ctx) {
   if (h4Trend === 'BULLISH' && decision === 'SELL') return null;
   if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
 
-  const fvg = smcFreshFvg(candles, dir, atr, { sinceIdx: sweep.sweepIdx, minDispAtr: config.dispAtr ?? 0.6 });
+  const fvg = smcFreshFvg(candles, dir, atr, { reclaimIdx: sweep.reclaimIdx, minDispAtr: config.dispAtr ?? 0.6 });
   if (!fvg) return null;                                            // FVG must form AFTER the sweep
   const price = n(candles[candles.length - 1].close);
   if (dir === 'BULLISH' ? price <= fvg.mid : price >= fvg.mid) return null; // pullback still pending
@@ -1174,11 +1244,12 @@ function smcFvg(ctx) {
 
   const pools = detectLiquidityPools(candles);
   const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
-  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk);
+  if (!tgt) return null;
+  const target = tgt.price;
   const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
   if (!(rr >= minRR)) return null;
 
-  const range = smcDealingRange(candles);
+  const range = smcDealingRange(candles, sweep.sweepIdx);
   const discountBuy = !!range && decision === 'BUY' && entry <= range.eq;
   const premiumSell = !!range && decision === 'SELL' && entry >= range.eq;
 
@@ -1191,10 +1262,11 @@ function smcFvg(ctx) {
   score = Math.max(40, Math.min(95, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
-    reason: `Sweep ${sweep.sweepLevel} reclaimed → FVG ${fvg.low}-${fvg.high} (disp ${fvg.dispAtr}×) → 50% @ ${r5(entry)}; draw ${tgt ? tgt.type + ' ' + tgt.price : '3R'}`,
+    reason: `Sweep ${sweep.sweepLevel} reclaimed → FVG ${fvg.low}-${fvg.high} (disp ${fvg.dispAtr}×) → 50% @ ${r5(entry)}; draw ${tgt.type} ${tgt.price}`,
     barIso: fvg.createIso,
     meta: { sweepLevel: sweep.sweepLevel, fvgLow: fvg.low, fvgHigh: fvg.high, dispAtr: fvg.dispAtr, location: discountBuy ? 'discount' : premiumSell ? 'premium' : 'mid' },
   };
@@ -1208,10 +1280,10 @@ function smcMmxm(ctx) {
   if (!Array.isArray(candles) || candles.length < 80) return null;
   const atr = atr14(candles); if (!atr) return null;
 
-  const range = smcDealingRange(candles);
-  if (!range) return null;
   const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 60 });
   if (!sweep) return null;
+  const range = smcDealingRange(candles, sweep.sweepIdx);
+  if (!range) return null;
   const dir = sweep.dir, decision = dir === 'BULLISH' ? 'BUY' : 'SELL';
   if (h4Trend === 'BULLISH' && decision === 'SELL') return null;
   if (h4Trend === 'BEARISH' && decision === 'BUY') return null;
@@ -1220,7 +1292,7 @@ function smcMmxm(ctx) {
   const tol = atr * (config.extremeTolAtr ?? 1.0);
   if (dir === 'BULLISH' ? Math.abs(sweep.sweepLevel - range.low) > tol : Math.abs(sweep.sweepLevel - range.high) > tol) return null;
 
-  const fvg = smcFreshFvg(candles, dir, atr, { sinceIdx: sweep.sweepIdx, minDispAtr: config.dispAtr ?? 0.6 });
+  const fvg = smcFreshFvg(candles, dir, atr, { reclaimIdx: sweep.reclaimIdx, minDispAtr: config.dispAtr ?? 0.6 });
   if (!fvg) return null;
   const entry = fvg.mid;
   if (decision === 'BUY' ? entry > range.eq : entry < range.eq) return null; // discount/premium only
@@ -1244,6 +1316,7 @@ function smcMmxm(ctx) {
   score = Math.max(40, Math.min(95, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
@@ -1283,7 +1356,8 @@ function smcCct(ctx) {
 
   const pools = detectLiquidityPools(candles);
   const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
-  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk);
+  if (!tgt) return null;
+  const target = tgt.price;
   const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
   if (!(rr >= minRR)) return null;
 
@@ -1296,6 +1370,7 @@ function smcCct(ctx) {
   score = Math.max(40, Math.min(95, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
@@ -1374,6 +1449,7 @@ function smcTwoLines(ctx) {
   score = Math.max(40, Math.min(95, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry, stopLoss: stop, ...ladder, riskRewardRatio: Math.round(Math.abs(target - entry) / risk * 100) / 100,
@@ -1434,6 +1510,7 @@ function smcAsianSweep(ctx) {
   score = Math.max(40, Math.min(95, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry, stopLoss: stop, ...ladder, riskRewardRatio: rr,
@@ -1482,12 +1559,13 @@ function ictPlus(ctx) {
 
   const pools = detectLiquidityPools(candles);
   const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
-  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + minRR * risk : entry - minRR * risk);
+  if (!tgt) return null;
+  const target = tgt.price;
   const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
   if (!(rr >= minRR)) return null;
 
   // ── Stacked confluences (the "+") ──
-  const range = smcDealingRange(candles);
+  const range = smcDealingRange(candles, breaker.reclaimIdx);
   const pdOk = !!range && (decision === 'BUY' ? entry <= range.eq : entry >= range.eq);   // discount/premium
   const secondDrive = !!detectSecondDrive(candles, dir).isSecondDrive;                    // never the first drive
   const htf4 = (decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH');
@@ -1510,6 +1588,7 @@ function ictPlus(ctx) {
   score = Math.max(45, Math.min(98, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry, stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
@@ -1648,6 +1727,7 @@ function threeCandleCombo(ctx) {
     : (lows.length ? n(lows[lows.length - 1].price) : null);
   const finalTarget = (Number.isFinite(oppSwing) && (dir === 'BUY' ? oppSwing > entry : oppSwing < entry)) ? oppSwing : null;
   const ladder = tpLadder(dir, entry, risk, finalTarget);
+  if (!ladder) return null;
   const rr = Math.abs(ladder.takeProfit3 - entry) / risk;
   if (!(rr >= minRR)) return null;
 
@@ -1713,6 +1793,7 @@ function failedBreakReversion(ctx) {
     if (rr < minRR) return null;
     if (stopTooTight(risk, atr, pip, config)) return null;
     const ladder = tpLadder(dir, entry, risk, target);   // TP3 = the reversion target (opposite range side)
+    if (!ladder) return null;
     let score = 52;
     score += Math.min(15, Math.round((rr - minRR) * 6));                 // RR above the floor
     // A failed break that was COUNTER to the higher-timeframe trend = the cleanest fade
@@ -1821,20 +1902,20 @@ function fixedTimeFusion(ctx) {
   const atr = atr14(candles) || 0;
   if (!(close > 0) || !(atr > 0)) return null;
 
-  const votes = []; // { src, dir, weight }
+  const votes = []; // { src, dir, weight, family? }
 
   // 1) Panel of existing lab strategies — each casts a weighted directional vote.
   const panel = [
-    ['ICT breaker', ictBreaker, 1.0], ['Liquidity trap', liquidityTrap, 1.0],
-    ['Market mechanics', marketMechanics3Step, 1.0], ['Little Rizzy', littleRizzy, 0.8],
-    ['SMC FVG', smcFvg, 0.8], ['Stage analysis', stageAnalysis, 0.7], ['3-candle combo', threeCandleCombo, 0.9],
+    ['ICT breaker', ictBreaker, 1.0, 'liquidity-event'], ['Liquidity trap', liquidityTrap, 1.0, 'liquidity-event'],
+    ['Market mechanics', marketMechanics3Step, 1.0, null], ['Little Rizzy', littleRizzy, 0.8, null],
+    ['SMC FVG', smcFvg, 0.8, 'liquidity-event'], ['Stage analysis', stageAnalysis, 0.7, null], ['3-candle combo', threeCandleCombo, 0.9, null],
   ];
-  for (const [name, fn, w] of panel) {
+  for (const [name, fn, w, family] of panel) {
     let s = null;
     try { s = fn({ ...ctx, config: {} }); } catch { s = null; }
     if (s && (s.decision === 'BUY' || s.decision === 'SELL')) {
       const conf = Math.min(1, Math.max(0.4, (Number(s.score) || 60) / 100));
-      votes.push({ src: name, dir: s.decision, weight: w * conf });
+      votes.push({ src: name, dir: s.decision, weight: w * conf, family });
     }
   }
 
@@ -1852,14 +1933,15 @@ function fixedTimeFusion(ctx) {
   const sh = ftfShortHorizon(candles);
   if (sh.dir) votes.push({ src: 'Momentum', dir: sh.dir, weight: 0.9 * sh.strength });
 
-  if (!votes.length) return null;
+  const independentVotes = dedupeStrategyVotes(votes);
+  if (!independentVotes.length) return null;
   let buy = 0, sell = 0;
-  for (const v of votes) { if (v.dir === 'BUY') buy += v.weight; else sell += v.weight; }
+  for (const v of independentVotes) { if (v.dir === 'BUY') buy += v.weight; else sell += v.weight; }
   const total = buy + sell;
   if (total <= 0) return null;
   const dir = buy >= sell ? 'BUY' : 'SELL';
   const agreement = Math.max(buy, sell) / total;
-  const agreeVoters = votes.filter((v) => v.dir === dir).length;
+  const agreeVoters = independentVotes.filter((v) => v.dir === dir).length;
 
   // HTF alignment (h4Trend/h1Trend come from the context).
   const htfAligned = (dir === 'BUY' && (ctx.h4Trend === 'BULLISH' || ctx.h1Trend === 'BULLISH'))
@@ -1881,7 +1963,7 @@ function fixedTimeFusion(ctx) {
   const tpDist = atr * 1.5;
   const stopLoss = dir === 'BUY' ? close - slDist : close + slDist;
   const takeProfit1 = dir === 'BUY' ? close + tpDist : close - tpDist;
-  const topVoters = votes.filter((v) => v.dir === dir).sort((a, b) => b.weight - a.weight).slice(0, 4).map((v) => v.src);
+  const topVoters = independentVotes.filter((v) => v.dir === dir).sort((a, b) => b.weight - a.weight).slice(0, 4).map((v) => v.src);
   return {
     decision: dir,
     score,
@@ -1889,13 +1971,13 @@ function fixedTimeFusion(ctx) {
     entry: close, stopLoss, takeProfit1,
     takeProfit2: dir === 'BUY' ? close + tpDist * 1.5 : close - tpDist * 1.5,
     riskRewardRatio: 1.5,
-    reason: `Fusion ${dir} — ${agreeVoters}/${votes.length} sources agree (${Math.round(agreement * 100)}%): ${topVoters.join(', ')}${htfAligned ? ' · H4 aligned' : ''}`,
+    reason: `Fusion ${dir} — ${agreeVoters}/${independentVotes.length} independent sources agree (${Math.round(agreement * 100)}%): ${topVoters.join(', ')}${htfAligned ? ' · H4 aligned' : ''}`,
     barIso: last.time,
     meta: {
-      agreement: Math.round(agreement * 100), agreeVoters, totalVoters: votes.length,
+      agreement: Math.round(agreement * 100), agreeVoters, totalVoters: independentVotes.length,
       buyWeight: Math.round(buy * 100) / 100, sellWeight: Math.round(sell * 100) / 100,
       htfAligned, sessionWeight: sess,
-      sources: votes.map((v) => ({ src: v.src, dir: v.dir, w: Math.round(v.weight * 100) / 100 })),
+      sources: independentVotes.map((v) => ({ src: v.src, dir: v.dir, w: Math.round(v.weight * 100) / 100 })),
     },
   };
 }
@@ -1905,30 +1987,53 @@ function fixedTimeFusion(ctx) {
 // not several SMC clones detecting the same setup. Each votes a direction; ≥2 agreeing fires,
 // graded up for 3/4/all + situational modifiers (HTF, session, location, key-level proximity).
 const CONFLUENCE_PANEL = [
-  ['ICT Breaker', ictBreaker],            // structure / ICT
-  ['Liquidity Trap', liquidityTrap],      // reversal / liquidity
-  ['Little Rizzy', littleRizzy],          // trend / continuation
-  ['Market Mechanics', marketMechanics3Step], // location / mechanics
-  ['SMC FVG', smcFvg],                    // SMC representative
-  ['Liquidity Sweep Pro', liquiditySweepPro], // graded sweep
+  ['ICT Breaker', ictBreaker, 'liquidity-event'],
+  ['Liquidity Trap', liquidityTrap, 'liquidity-event'],
+  ['Little Rizzy', littleRizzy, null],
+  ['Market Mechanics', marketMechanics3Step, null],
+  ['SMC FVG', smcFvg, 'liquidity-event'],
+  ['Liquidity Sweep Pro', liquiditySweepPro, 'liquidity-event'],
 ];
+
+// Correlated strategies that describe the same liquidity raid are one observation.
+// Collapse those families before direction is counted, otherwise three sweep clones
+// can outvote two genuinely independent opposing reads.
+export function dedupeStrategyVotes(votes) {
+  const out = [];
+  const familySlots = new Map();
+  for (const vote of votes || []) {
+    if (!vote?.family) { out.push(vote); continue; }
+    const priorIdx = familySlots.get(vote.family);
+    if (priorIdx == null) {
+      familySlots.set(vote.family, out.length);
+      out.push(vote);
+      continue;
+    }
+    const prior = out[priorIdx];
+    const strength = Number(vote.weight ?? vote.score) || 0;
+    const priorStrength = Number(prior.weight ?? prior.score) || 0;
+    if (strength > priorStrength) out[priorIdx] = vote;
+  }
+  return out;
+}
 
 // Run the panel; return the agreeing side (≥2, no tie) or null.
 function evalConfluencePanel(ctx) {
   const votes = [];
-  for (const [name, fn] of CONFLUENCE_PANEL) {
+  for (const [name, fn, family] of CONFLUENCE_PANEL) {
     let s = null;
     try { s = fn({ ...ctx, config: {} }); } catch { s = null; }
-    if (s && (s.decision === 'BUY' || s.decision === 'SELL')) votes.push({ name, dir: s.decision, score: Number(s.score) || 60, sig: s });
+    if (s && (s.decision === 'BUY' || s.decision === 'SELL')) votes.push({ name, dir: s.decision, score: Number(s.score) || 60, sig: s, family });
   }
-  const buy = votes.filter((v) => v.dir === 'BUY');
-  const sell = votes.filter((v) => v.dir === 'SELL');
+  const independentVotes = dedupeStrategyVotes(votes);
+  const buy = independentVotes.filter((v) => v.dir === 'BUY');
+  const sell = independentVotes.filter((v) => v.dir === 'SELL');
   const dir = buy.length > sell.length ? 'BUY' : sell.length > buy.length ? 'SELL' : null; // tie = conflicting = no confluence
   if (!dir) return null;
-  const winners = dir === 'BUY' ? buy : sell;
+  const winners = (dir === 'BUY' ? buy : sell).sort((a, b) => b.score - a.score);
   if (winners.length < 2) return null;
   const avgScore = winners.reduce((a, v) => a + v.score, 0) / winners.length;
-  return { dir, agree: winners.length, winners, avgScore, total: votes.length };
+  return { dir, agree: winners.length, winners, avgScore, total: independentVotes.length };
 }
 
 // Situational context for the agreeing direction: premium/discount location, session, HTF, key level.
@@ -1947,9 +2052,9 @@ function confluenceSituation(ctx, dir) {
   const htfConflict = dir === 'BUY' ? ctx.h4Trend === 'BEARISH' : ctx.h4Trend === 'BULLISH';
   let atKeyLevel = false;
   try {
-    const { levels } = detectKeyLiquidityLevels(candles, { symbol: ctx.symbol });
+    const { levels } = detectKeyLiquidityLevels(candles, { symbol: ctx.symbol, dailyCandles: ctx.dailyCandles || null });
     const atr = atr14(candles) || 0;
-    atKeyLevel = atr > 0 && levels.some((l) => l.strength >= 3 && l.distanceAtr != null && l.distanceAtr <= 0.4);
+    atKeyLevel = atr > 0 && levels.some((l) => l.fresh === true && !l.swept && l.strength >= 3 && l.distanceAtr != null && l.distanceAtr <= 0.4);
   } catch { /* key levels optional */ }
   return { pct: Math.round(pct), goodLocation, goodSession, htfAligned, htfConflict, atKeyLevel };
 }
@@ -1989,13 +2094,15 @@ function forexConfluence(ctx) {
   // are surfaced so the quality of the confluence is visible, and they feed the grade via avgScore.
   const parts = c.winners.map((v) => `${v.name} ${Math.round(v.score)}`);
   const components = c.winners.map((v) => ({ name: v.name, score: Math.round(v.score), grade: v.sig.grade ?? null }));
+  const anchorOrderType = p.meta?.entryOrderType
+    || (['ICT Breaker', 'SMC FVG'].includes(anchor.name) ? 'LIMIT' : 'MARKET');
   return {
     decision: c.dir, score, grade,
     entry: p.entry, stopLoss: p.stopLoss, takeProfit1: p.takeProfit1, takeProfit2: p.takeProfit2 ?? null, takeProfit3: p.takeProfit3 ?? null,
     riskRewardRatio: p.riskRewardRatio ?? null,
     reason: `Forex confluence: ${c.agree} agree ${c.dir} (${parts.join(', ')}); anchored to ${anchor.name}${sit.htfAligned ? ' · H4 aligned' : ''}${sit.goodLocation ? ` · ${c.dir === 'BUY' ? 'discount' : 'premium'}` : ''}${sit.atKeyLevel ? ' · at key level' : ''}`,
     barIso: p.barIso || ctx.candles[ctx.candles.length - 1].time, // dedup on the anchor setup
-    meta: { agree: c.agree, components, avgComponentScore: Math.round(c.avgScore), situation: sit, anchor: anchor.name },
+    meta: { agree: c.agree, components, avgComponentScore: Math.round(c.avgScore), situation: sit, anchor: anchor.name, entryOrderType: anchorOrderType, requiresFill: anchorOrderType !== 'MARKET' },
   };
 }
 
@@ -2033,7 +2140,7 @@ function fixedTimeConfluence(ctx) {
 // obvious-pool set here — session highs/lows, round numbers, and equal highs/lows are.
 function liquiditySweepPro(ctx) {
   const cfg = ctx.config || {};
-  const sig = gradeSweep(ctx.candles, { symbol: ctx.symbol, h4Trend: ctx.h4Trend, h1Trend: ctx.h1Trend, minRR: cfg.minRR ?? 1.8, minGrade: cfg.minGrade ?? 'B' });
+  const sig = gradeSweep(ctx.candles, { symbol: ctx.symbol, dailyCandles: ctx.dailyCandles || null, h4Trend: ctx.h4Trend, h1Trend: ctx.h1Trend, minRR: cfg.minRR ?? 1.8, minGrade: cfg.minGrade ?? 'B' });
   if (!sig) return null;
   // gradeSweep doesn't enforce the lab's minimum-stop rule, so M1 sweeps could emit sub-spread
   // stops (e.g. a 0.3-pip stop → RR 100+, inflated score, absurd lot size — untradeable). Apply
@@ -2061,7 +2168,7 @@ function liquiditySweepPro(ctx) {
 // 1R/2R, TP3 = the opposing resting liquidity (the draw). Min 2R. Forex (TP/SL)
 // framing ONLY by design — this is not a next-candle call. Pure; isolated.
 function xauSessionRaid(ctx) {
-  const { candles, symbol = '', h4Trend = null, h1Trend = null, config = {}, pip = 0.1 } = ctx;
+  const { candles, symbol = '', h4Trend = null, h1Trend = null, dailyCandles = null, config = {}, pip = 0.1 } = ctx;
   if (!/XAU|GOLD/.test(String(symbol).toUpperCase())) return null;   // dedicated: gold only
   const minRR = config.minRR ?? 2;
   const maxAgeBars = config.maxAgeBars ?? 5;                          // raid must be fresh
@@ -2092,9 +2199,9 @@ function xauSessionRaid(ctx) {
   //    Round dollars / session extremes / equal highs-lows, strength ≥ 3.
   let raidLevel = null;
   try {
-    const { levels } = detectKeyLiquidityLevels(candles, { symbol });
+    const { levels } = detectKeyLiquidityLevels(candles, { symbol, dailyCandles });
     raidLevel = (levels || [])
-      .filter((l) => l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= levelTolAtr * atr)
+      .filter((l) => raidLevelSideOk(l.type, dir) && l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= levelTolAtr * atr)
       .sort((a, b) => b.strength - a.strength)[0] || null;
   } catch { raidLevel = null; }
   if (!raidLevel) return null;                                        // random swing raid = noise, skip
@@ -2120,7 +2227,8 @@ function xauSessionRaid(ctx) {
   // 6) Target = the opposing resting liquidity (the draw). Min 2R to it.
   const pools = detectLiquidityPools(candles);
   const tgt = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
-  const target = tgt ? tgt.price : (dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk);
+  if (!tgt) return null;
+  const target = tgt.price;
   const rr = Math.round(Math.abs(target - entry) / risk * 100) / 100;
   if (!(rr >= minRR)) return null;
 
@@ -2137,12 +2245,16 @@ function xauSessionRaid(ctx) {
   score = Math.max(40, Math.min(95, score));
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
-    reason: `Gold raid ${decision}: swept ${raidLevel.label || raidLevel.type} ${r5(sweep.sweepLevel)} (str ${raidLevel.strength}/5) → reclaim + displacement ${disp.atrMultiple}× → ${entryMode} @ ${r5(entry)}; draw ${tgt ? `${tgt.type} ${tgt.price}` : '3R'} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : 'New York'}`,
+    reason: `Gold raid ${decision}: swept ${raidLevel.label || raidLevel.type} ${r5(sweep.sweepLevel)} (str ${raidLevel.strength}/5) → reclaim + displacement ${disp.atrMultiple}× → ${entryMode} @ ${r5(entry)}; draw ${tgt.type} ${tgt.price} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : 'New York'}`,
     barIso: sweep.reclaimIso,                                          // dedup: one signal per raid
     meta: {
+      forexOnly: true, measureFixedTime: false,
+      entryOrderType: entryMode === 'FVG 50% pullback' ? 'LIMIT' : 'MARKET',
+      requiresFill: entryMode === 'FVG 50% pullback',
       raidedLevel: { type: raidLevel.type, label: raidLevel.label, price: raidLevel.price, strength: raidLevel.strength },
       sweepLevel: sweep.sweepLevel, sweepExtreme: sweep.extreme, dispAtr: disp.atrMultiple,
       entryMode, session: inOverlap ? 'OVERLAP' : inLondon ? 'LONDON' : 'NY', h4Trend, h1Trend,
@@ -2166,7 +2278,7 @@ function xauSessionRaid(ctx) {
 // M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong
 // displacement, RR ≥2.5, London/NY, no HTF conflict, tight fast gap).
 function specialForexSniper(ctx) {
-  const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, dailyCandles = null, config = {}, pip = 0.0001 } = ctx;
   const minScore = config.minScore ?? 75;
   const minRR = config.minRR ?? 2.0;
   const minPre = config.minPreEntryPips ?? 4;
@@ -2194,24 +2306,26 @@ function specialForexSniper(ctx) {
   //    trap sprung) preferred; a fresh displaced breaker as the alternative.
   const sweep = smcRecentSweep(candles, { lookback: config.sweepLookback ?? 40 });
   let keyLevels = [];
-  try { keyLevels = detectKeyLiquidityLevels(candles, { symbol }).levels || []; } catch { keyLevels = []; }
+  try { keyLevels = detectKeyLiquidityLevels(candles, { symbol, dailyCandles }).levels || []; } catch { keyLevels = []; }
   // Obvious-level match is a QUALITY BONUS, not a hard requirement: a sweep+reclaim with
   // displacement is institutionally meaningful on its own (the proven lsp edge) — an obvious
   // raided level (session H/L, round number, equal H/L) scores it higher, its absence scores
   // it lower. Gate-bisection showed the hard requirement starved the trigger to near-zero.
   const raidLevel = sweep
-    ? keyLevels.filter((l) => l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= (config.levelTolAtr ?? 0.6) * atr).sort((a, b) => b.strength - a.strength)[0] || null
+    ? keyLevels.filter((l) => raidLevelSideOk(l.type, sweep.dir) && l.strength >= (config.minLevelStrength ?? 3) && Math.abs(l.price - sweep.sweepLevel) <= (config.levelTolAtr ?? 0.6) * atr).sort((a, b) => b.strength - a.strength)[0] || null
     : null;
   const breaker = detectBreaker(candles, { maxAgeBars: 50 });
   const freshBreaker = breaker && breaker.ageBars <= maxAgeBars && breaker.displacement?.present ? breaker : null;
 
-  let dir, trigger, levelStrength, triggerIso, disp, rawStop;
+  let dir, trigger, levelStrength, triggerIso, triggerEventIdx, disp, rawStop;
   if (sweep && lastIdx - sweep.reclaimIdx <= maxAgeBars) {
     dir = sweep.dir; trigger = 'sweep'; levelStrength = raidLevel ? raidLevel.strength : 0; triggerIso = sweep.reclaimIso;
+    triggerEventIdx = sweep.sweepIdx;
     disp = detectDisplacement(candles, sweep.reclaimIdx, dir, atr, { minAtr: config.dispMinAtr ?? 0.6 });
     rawStop = sweep.extreme;
   } else if (freshBreaker) {
     dir = freshBreaker.type; trigger = 'breaker'; levelStrength = 3; triggerIso = freshBreaker.confirmedIso;
+    triggerEventIdx = freshBreaker.reclaimIdx;
     disp = freshBreaker.displacement;
     rawStop = freshBreaker.stop;
   } else return null;
@@ -2229,7 +2343,7 @@ function specialForexSniper(ctx) {
   if (stopTooTight(risk, atr, pip, { minStopAtr: config.minStopAtr ?? 0.35, minStopPips: config.minStopPips ?? 5 })) return null;
 
   // 3) TP3 structural priority: opposing fresh liquidity → session H/L → PDH/PDL →
-  //    equal highs/lows → 3R fallback. Mid-range with no logical draw = handled by RR floor.
+  //    equal highs/lows → round number. No logical draw means no trade.
   const pools = detectLiquidityPools(candles);
   const opposing = dir === 'BULLISH' ? pools.targetAbove : pools.targetBelow;
   const sideWanted = dir === 'BULLISH' ? 'above' : 'below';
@@ -2243,7 +2357,8 @@ function specialForexSniper(ctx) {
   if (target == null) { target = pickLevel((t) => /^(ASIAN|LONDON|NY)_/.test(t)); if (target != null) targetType = 'session level'; }
   if (target == null) { target = pickLevel((t) => /^PD[HL]$/.test(t)); if (target != null) targetType = 'prev-day level'; }
   if (target == null) { target = pickLevel((t) => /EQUAL/.test(t)); if (target != null) targetType = 'equal highs/lows'; }
-  if (target == null) { target = dir === 'BULLISH' ? entry + 3 * risk : entry - 3 * risk; targetType = '3R'; }
+  if (target == null) { target = pickLevel((t) => /ROUND/.test(t)); if (target != null) targetType = 'round number'; }
+  if (target == null) return null;
   const reward = Math.abs(target - entry);
   const rr = Math.round((reward / risk) * 100) / 100;
   if (rr < minRR) return null;                                   // RR floor
@@ -2275,7 +2390,7 @@ function specialForexSniper(ctx) {
   const upSwings = Math.min(risingTail(highs), risingTail(lows));
   const downSwings = Math.min(fallingTail(highs), fallingTail(lows));
   const structureOk = decision === 'BUY' ? upSwings >= 2 : downSwings >= 2;
-  const range = smcDealingRange(candles);
+  const range = smcDealingRange(candles, triggerEventIdx);
   const pdOk = !!range && (decision === 'BUY' ? entry <= range.eq : entry >= range.eq);
   const secondDrive = !!detectSecondDrive(candles, dir).isSecondDrive;
   const htf4 = (decision === 'BUY' && h4Trend === 'BULLISH') || (decision === 'SELL' && h4Trend === 'BEARISH');
@@ -2314,13 +2429,14 @@ function specialForexSniper(ctx) {
   }
 
   const ladder = tpLadder(decision, entry, risk, target);
+  if (!ladder) return null;
   return {
     decision, score, grade: smcGrade(score),
     entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
     reason: `Sniper ${decision}: ${trigger === 'sweep' ? `swept ${raidLevel ? `${raidLevel.label || raidLevel.type} ` : ''}${r5(sweep.sweepLevel)}${raidLevel ? ` (str ${levelStrength}/5)` : ''}` : `${dir.toLowerCase()} breaker reclaim`} + displacement ${disp.atrMultiple}× → LIMIT ${r5(entry)} (${entryMode}); stop ${r5(stop)}; draw ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''}${secondDrive ? ' · 2nd drive' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`,
     barIso: triggerIso,                                          // dedup: ONE signal per raid/breaker
     meta: {
-      v: 1, trigger, requiresFill: true, preEntryAlert: true,
+      v: 1, trigger, requiresFill: true, preEntryAlert: true, forexOnly: true, measureFixedTime: false,
       limitEntry: r5(entry), preEntryPips: Math.round(gapPips * 10) / 10, entryMode,
       raidedLevel: raidLevel ? { type: raidLevel.type, label: raidLevel.label, strength: raidLevel.strength } : null,
       dispAtr: disp.atrMultiple, targetType, rrToTarget: rr,
@@ -2493,9 +2609,9 @@ export function booksLevels(ctx, ichi, vp) {
     if (vp.hvnBelow) out.push({ price: vp.hvnBelow.price, kind: 'HVN' });
   }
   try {
-    const { levels } = detectKeyLiquidityLevels(ctx.candles, { symbol: ctx.symbol });
+    const { levels } = detectKeyLiquidityLevels(ctx.candles, { symbol: ctx.symbol, dailyCandles: ctx.dailyCandles || null });
     for (const l of levels || []) {
-      if (l.strength >= 3 && Number.isFinite(l.price)) out.push({ price: l.price, kind: 'KEY_LEVEL', strength: l.strength, label: l.label || l.type });
+      if (l.fresh === true && !l.swept && l.strength >= 3 && Number.isFinite(l.price)) out.push({ price: l.price, kind: 'KEY_LEVEL', strength: l.strength, label: l.label || l.type });
     }
   } catch { /* key levels optional */ }
   return out.filter((l) => Number.isFinite(l.price));
@@ -2664,6 +2780,7 @@ function booksInstitutionalForex(ctx) {
   if (score < minScore) return null;
 
   const ladder = tpLadder(dir, price, risk, target);
+  if (!ladder) return null;
   return {
     decision: dir,
     score,
@@ -2839,7 +2956,9 @@ function booksInstitutionalFixedTime(ctx) {
 // HONESTY: meta.requiresFill — Plan A resolves as a trigger order (no break = no
 // trade = EXPIRED, excluded from the win rate). Never fights a clear H4 trend.
 function lilSweepProPlus(ctx) {
-  const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, config = {}, pip = 0.0001 } = ctx;
+  const { candles, symbol = '', timeframe = 'M15', h4Trend = null, h1Trend = null, dailyCandles = null, config = {}, pip = 0.0001 } = ctx;
+  const tfU = String(timeframe || 'M15').toUpperCase();
+  if (!['M15', 'M30'].includes(tfU)) return null;
   const minScore = config.minScore ?? 72;
   const minRR = config.minRR ?? 1.8;
   const minStrength = config.minLevelStrength ?? 4;
@@ -2850,31 +2969,65 @@ function lilSweepProPlus(ctx) {
   const minBreakPips = config.minBreakPips ?? 2;      // same absolute floor for the break
   const maxTargetAtr = config.maxTargetAtr ?? 6;      // a structural draw >6×ATR away is not a realistic magnet for THIS timeframe
   const retestTolAtr = config.retestTolAtr ?? 0.35;   // Plan B: how close the pullback must tag the broken level
+  const maxRetestPenAtr = config.maxRetestPenAtr ?? 0.15;
   const retestWindowBars = config.retestWindowBars ?? 14;
   const maxWaitAtr = config.maxWaitAtr ?? 1.0;        // Plan A pending trigger can't sit absurdly far from price
   const enterNowAtr = config.enterNowAtr ?? 0.3;      // trigger already broke: only this far past = still takeable
   const minTargetPips = config.minTargetPips ?? 12;   // pips-value floor — RR on a micro target is not profit
-  if (!Array.isArray(candles) || candles.length < 80) return null;
-  const atr = atr14(candles);
+  const entryValidBars = Math.max(1, Number(config.entryValidBars) || 4);
+  const candlesIncludeFormingBar = ctx.candlesIncludeFormingBar === true;
+  if (!Array.isArray(candles) || candles.length < (candlesIncludeFormingBar ? 81 : 80)) return null;
+  const closedCandles = candlesIncludeFormingBar ? candles.slice(0, -1) : candles;
+  if (closedCandles.length < 80) return null;
+  const atr = atr14(closedCandles);
   if (!(atr > 0)) return null;
-  const lastIdx = candles.length - 1;
-  const last = candles[lastIdx];
+  const livePrice = n(candles[candles.length - 1].close);
+  const lastIdx = closedCandles.length - 1;
+  const last = closedCandles[lastIdx];
   const price = n(last.close);
 
   const hour = new Date(last.time).getUTCHours();
   const inLondon = hour >= 7 && hour < 16;
   const inNy = hour >= 12 && hour < 21;
   const inOverlap = hour >= 12 && hour < 16;
+  if (!inLondon && !inNy) return null;                // Tokyo/off-hours were the weakest bucket by far
   const sessionScore = inOverlap ? 10 : (inLondon || inNy) ? 7 : 3;
 
+  const ichi = booksIchimoku(closedCandles);
+  if (!ichi || ichi.cloudPos === 'INSIDE') return null;
+  const ichiGate = (decision, plan) => {
+    const buy = decision === 'BUY';
+    const laggingClear = buy ? ichi.laggingClearUp : ichi.laggingClearDown;
+    const kijunAligned = buy ? price >= ichi.kijun : price <= ichi.kijun;
+    if (plan === 'BREAK-HOLD') {
+      const cloudAligned = buy ? ichi.cloudPos === 'ABOVE' : ichi.cloudPos === 'BELOW';
+      const futureAligned = buy ? ichi.futureBull : !ichi.futureBull;
+      return laggingClear && kijunAligned && cloudAligned && futureAligned;
+    }
+    return laggingClear && kijunAligned;
+  };
+
   let keyLevels = [];
-  try { keyLevels = detectKeyLiquidityLevels(candles, { symbol }).levels || []; } catch { keyLevels = []; }
+  try { keyLevels = detectKeyLiquidityLevels(closedCandles, { symbol, dailyCandles }).levels || []; } catch { keyLevels = []; }
   // Level-rank rule: EVERY level must be 5 dots — except PDH/PDL and session
   // highs/lows, which qualify at 4 (what every desk watches regardless); strength
   // still feeds the score either way.
   const isPd = (t) => /^PD[HL]$/.test(t);
   const isSession = (t) => /^(ASIAN|LONDON|NY)_/.test(t);
+  const levelIdentityValid = (l) => {
+    if (/ROUND/.test(l.type)) {
+      const step = roundStepFor(symbol).step;
+      return step > 0 && Math.abs(n(l.price) / step - Math.round(n(l.price) / step)) < 1e-5;
+    }
+    if (isPd(l.type) && Array.isArray(dailyCandles) && dailyCandles.length >= 2) {
+      const prev = dailyCandles[dailyCandles.length - 2];
+      const expected = l.type === 'PDH' ? n(prev.high) : n(prev.low);
+      return Number.isFinite(expected) && Math.abs(n(l.price) - expected) <= Math.max(pip, 1e-8);
+    }
+    return true;
+  };
   const watch = keyLevels.filter((l) => Number.isFinite(n(l.price))
+    && levelIdentityValid(l)
     && (l.strength >= 5 || (l.strength >= minStrength && (isPd(l.type) || isSession(l.type)))));
   if (!watch.length) return null;
   // Label importance ranking: PDH/PDL (1) > session H/L (2) > equal highs/lows (3,
@@ -2882,43 +3035,52 @@ function lilSweepProPlus(ctx) {
   const labelBonus = (t) => (isPd(t) ? 5 : isSession(t) ? 4 : /EQUAL/.test(t) ? 4 : /ROUND/.test(t) ? 3 : 1);
 
   const candidates = [];
+  const eventFresh = (lvl, side, eventIdx) => {
+    const from = Math.max(0, (Number.isFinite(Number(lvl?.formedIdx)) ? Number(lvl.formedIdx) : 0) + 1);
+    for (let j = from; j < eventIdx; j++) {
+      const h = n(closedCandles[j].high), l = n(closedCandles[j].low);
+      if (!Number.isFinite(h) || !Number.isFinite(l)) continue;
+      if (side === 'above' ? h > n(lvl.price) : l < n(lvl.price)) return false;
+    }
+    return true;
+  };
   for (const lvl of watch) {
     const L = n(lvl.price);
 
     // ── PLAN A: sweep + rejection, scanned in BOTH directions ────────────────
     for (let i = Math.max(2, lastIdx - maxAgeBars); i < lastIdx; i++) {
-      const c = candles[i];
+      const c = closedCandles[i];
       const upWick = n(c.high) - L;   // buy-side sweep depth (→ SELL)
       const dnWick = L - n(c.low);    // sell-side sweep depth (→ BUY)
       const sweepFloor = Math.max(sweepMinAtr * atr, minSweepPips * pip);
-      if (upWick >= sweepFloor && n(c.close) < L) {
-        const next = candles[i + 1];
-        if (!(n(next.close) < n(c.close) || n(next.close) < n(next.open))) continue; // (3) next candle moves down
-        let held = true, wickExtreme = n(c.high);
+      if (upWick >= sweepFloor && n(c.high) > L && n(c.open) < L && n(c.close) < L && eventFresh(lvl, 'above', i)) {
+        const next = closedCandles[i + 1];
+        const movedAway = n(next.close) < n(c.close) - 0.1 * atr && n(next.close) < n(next.open) && n(next.low) < n(c.low);
+        if (!movedAway) continue;
+        let held = true;
         for (let j = i + 1; j <= lastIdx; j++) {
-          if (n(candles[j].close) > L) { held = false; break; }                      // (4) fails to hold above
-          wickExtreme = Math.max(wickExtreme, n(candles[j].high));
+          if (n(closedCandles[j].close) > L) { held = false; break; }                // (4) fails to hold above
         }
         if (!held) continue;
         candidates.push({
-          plan: 'SWEEP-REJECT', decision: 'SELL', lvl, evIdx: i, excursion: upWick,
-          trigger: n(c.low), wickExtreme, closeBack: L - n(c.close),
-          followStrong: n(next.close) < n(next.open) && n(next.close) < n(c.low),
+          plan: 'SWEEP-REJECT', decision: 'SELL', lvl, evIdx: i, alertIdx: i + 1, excursion: upWick,
+          trigger: n(next.low), wickExtreme: n(c.high), closeBack: L - n(c.close),
+          followStrong: n(next.close) < n(next.open) && n(next.low) < n(c.low),
         });
       }
-      if (dnWick >= sweepFloor && n(c.close) > L) {
-        const next = candles[i + 1];
-        if (!(n(next.close) > n(c.close) || n(next.close) > n(next.open))) continue;
-        let held = true, wickExtreme = n(c.low);
+      if (dnWick >= sweepFloor && n(c.low) < L && n(c.open) > L && n(c.close) > L && eventFresh(lvl, 'below', i)) {
+        const next = closedCandles[i + 1];
+        const movedAway = n(next.close) > n(c.close) + 0.1 * atr && n(next.close) > n(next.open) && n(next.high) > n(c.high);
+        if (!movedAway) continue;
+        let held = true;
         for (let j = i + 1; j <= lastIdx; j++) {
-          if (n(candles[j].close) < L) { held = false; break; }
-          wickExtreme = Math.min(wickExtreme, n(candles[j].low));
+          if (n(closedCandles[j].close) < L) { held = false; break; }
         }
         if (!held) continue;
         candidates.push({
-          plan: 'SWEEP-REJECT', decision: 'BUY', lvl, evIdx: i, excursion: dnWick,
-          trigger: n(c.high), wickExtreme, closeBack: n(c.close) - L,
-          followStrong: n(next.close) > n(next.open) && n(next.close) > n(c.high),
+          plan: 'SWEEP-REJECT', decision: 'BUY', lvl, evIdx: i, alertIdx: i + 1, excursion: dnWick,
+          trigger: n(next.high), wickExtreme: n(c.low), closeBack: n(c.close) - L,
+          followStrong: n(next.close) > n(next.open) && n(next.high) > n(c.high),
         });
       }
     }
@@ -2931,38 +3093,54 @@ function lilSweepProPlus(ctx) {
       const beyond = (v) => (up ? v - L : L - v);
       // Retest rejection on the last bar: tags the level, closes back on the trade side.
       const tag = up ? L + retestTolAtr * atr : L - retestTolAtr * atr;
-      const tagged = up ? n(last.low) <= tag && n(last.close) > L : n(last.high) >= tag && n(last.close) < L;
+      const tagged = up
+        ? n(last.low) <= tag && n(last.low) >= L - maxRetestPenAtr * atr && n(last.close) > L
+        : n(last.high) >= tag && n(last.high) <= L + maxRetestPenAtr * atr && n(last.close) < L;
       if (!tagged) continue;
       const range = Math.max(n(last.high) - n(last.low), 1e-12);
       const rejWick = up ? (Math.min(n(last.close), n(last.open)) - n(last.low)) / range : (n(last.high) - Math.max(n(last.close), n(last.open))) / range;
-      const bullishRejection = (up ? n(last.close) > n(last.open) : n(last.close) < n(last.open)) || rejWick >= 0.4;
+      const body = Math.abs(n(last.close) - n(last.open));
+      const bullishRejection = ((up ? n(last.close) > n(last.open) : n(last.close) < n(last.open)) && body >= 0.08 * atr) || rejWick >= 0.4;
       if (!bullishRejection) continue;
       // Find the break bar: a BODY close beyond the level, coming FROM the other side.
       let breakIdx = -1;
       for (let b = lastIdx - 1; b >= Math.max(2, lastIdx - retestWindowBars); b--) {
-        const cb = candles[b];
+        const cb = closedCandles[b];
         const bodyBeyond = beyond(n(cb.close));
         const wasOtherSide = beyond(n(candles[b - 1].close)) < 0;
-        if (bodyBeyond >= Math.max(breakCloseAtr * atr, minBreakPips * pip) && (up ? n(cb.close) > n(cb.open) : n(cb.close) < n(cb.open)) && wasOtherSide) { breakIdx = b; break; }
+        const bodySize = Math.abs(n(cb.close) - n(cb.open));
+        const crossedLevel = up ? n(cb.open) <= L && n(cb.close) > L : n(cb.open) >= L && n(cb.close) < L;
+        if (bodyBeyond >= Math.max(breakCloseAtr * atr, minBreakPips * pip) && bodySize >= Math.max(breakCloseAtr * atr, minBreakPips * pip) && crossedLevel && (up ? n(cb.close) > n(cb.open) : n(cb.close) < n(cb.open)) && wasOtherSide) { breakIdx = b; break; }
       }
       if (breakIdx < 0) continue;
+      // Only the first completed retest belongs to this break. Repeated tags are stale,
+      // lower-quality attempts and must not create a new row/alert every candle.
+      let earlierRetest = false;
+      for (let j = breakIdx + 1; j < lastIdx; j++) {
+        const cj = closedCandles[j];
+        const taggedEarlier = up
+          ? n(cj.low) <= L + retestTolAtr * atr
+          : n(cj.high) >= L - retestTolAtr * atr;
+        if (taggedEarlier) { earlierRetest = true; break; }
+      }
+      if (earlierRetest) continue;
       // Holds: no strong close back through the level since the break.
       let holds = true;
       for (let j = breakIdx + 1; j <= lastIdx; j++) {
-        if (beyond(n(candles[j].close)) < -0.1 * atr) { holds = false; break; }
+        if (beyond(n(closedCandles[j].close)) < -0.1 * atr) { holds = false; break; }
       }
       if (!holds) continue;
       const retestExtreme = up ? Math.min(n(last.low), L) : Math.max(n(last.high), L);
       candidates.push({
         plan: 'BREAK-HOLD', decision: dir, lvl, evIdx: breakIdx, retestIdx: lastIdx,
         trigger: price, wickExtreme: retestExtreme,
-        bodyBeyond: beyond(n(candles[breakIdx].close)), rejWick,
+        bodyBeyond: beyond(n(closedCandles[breakIdx].close)), rejWick,
       });
     }
   }
   if (!candidates.length) return null;
 
-  const pools = detectLiquidityPools(candles);
+  const pools = detectLiquidityPools(closedCandles);
   const pickLevel = (sideWanted, match, validTarget) => {
     const c = keyLevels.filter((l) => l.side === sideWanted && l.fresh && match(l.type) && validTarget(n(l.price))).sort((a, b) => a.distance - b.distance)[0];
     return c ? n(c.price) : null;
@@ -2975,47 +3153,48 @@ function lilSweepProPlus(ctx) {
     if (h4Trend === 'BULLISH' && !buy) continue;   // never fight a clear H4
     if (h4Trend === 'BEARISH' && buy) continue;
     const planA = plan === 'SWEEP-REJECT';
+    if (planA && cand.alertIdx !== lastIdx) continue;         // only the latest closed confirmation is actionable
+    if (!ichiGate(decision, plan)) continue;
 
-    // Entry mechanics. Plan A = trigger order at the rejection candle's extreme:
-    // alert while pending (price hasn't broken it) or just after the break — a
-    // trigger that price has already run past is a chased trade, skipped.
-    let entry, entryMode, timingScore;
+    // Entry mechanics. Plan A = trigger beyond the completed follow-through candle.
+    // The older rejection-extreme trigger had already broken before the four-condition
+    // setup was confirmed, so it could only produce late, unactionable alerts.
+    let entry, entryMode, timingScore, entryState = 'WAIT', fillAtSignal = false;
     if (planA) {
       entry = cand.trigger;
-      const distToTrigger = buy ? entry - price : price - entry;
-      if (distToTrigger > 0) {                               // trigger still pending
-        if (distToTrigger > maxWaitAtr * atr) continue;
-        const p = Math.round((distToTrigger / pip) * 10) / 10;
-        entryMode = `awaiting break — trigger ${p}p away`;
-        timingScore = distToTrigger <= 0.5 * atr ? 10 : 7;
-      } else {                                               // broke already
-        if (-distToTrigger > enterNowAtr * atr) continue;    // ran off = gone
-        entryMode = 'ENTER NOW — trigger just broke';
-        timingScore = 8;
-      }
+      const postAlertBars = candles.slice(cand.alertIdx + 1);
+      const triggerAlreadyTouched = postAlertBars.some((bar) => buy ? n(bar.high) >= entry : n(bar.low) <= entry);
+      // The setup only becomes known after follow-through closes. A trigger touched
+      // before this scan was never actionable, so do not issue a late entry alert.
+      if (triggerAlreadyTouched) continue;
+      const distToTrigger = buy ? entry - livePrice : livePrice - entry;
+      if (distToTrigger <= 0 || distToTrigger > maxWaitAtr * atr) continue;
+      const p = Math.round((distToTrigger / pip) * 10) / 10;
+      entryMode = `awaiting break — trigger ${p}p away`;
+      timingScore = distToTrigger <= 0.5 * atr ? 10 : 7;
     } else {
-      entry = price;                                         // Plan B enters at the retest rejection close
+      if (Math.abs(livePrice - price) > enterNowAtr * atr) continue;
+      entry = livePrice;                                     // MARKET entry at the price available when alerted
       entryMode = 'ENTER NOW — retest held';
       timingScore = 9;
+      entryState = 'FILLED';
+      fillAtSignal = true;
     }
     const stop = buy ? Math.min(cand.wickExtreme, entry) - 0.2 * atr : Math.max(cand.wickExtreme, entry) + 0.2 * atr;
     const risk = Math.abs(entry - stop);
     if (stopTooTight(risk, atr, pip, { minStopAtr: config.minStopAtr ?? 0.3, minStopPips: config.minStopPips ?? 4 })) continue;
 
-    // Target = the user's ladder: nearest opposing swing pool → round → equal →
-    // session/PD level → 2.5R fallback.
+    // Target = nearest opposing swing pool → round → equal → session/PD level.
     const sideWanted = buy ? 'above' : 'below';
-    const validTarget = (p) => Number.isFinite(p) && (buy ? p > entry + risk : p < entry - risk);
+    const validTarget = (p) => Number.isFinite(p) && (buy ? p >= entry + minRR * risk : p <= entry - minRR * risk);
     const opposing = buy ? pools.targetAbove : pools.targetBelow;
     let target = opposing && validTarget(n(opposing.price)) ? n(opposing.price) : null;
     let targetType = target != null ? `${opposing.type}${opposing.equal ? ' (equal)' : ''}` : null;
     if (target == null) { target = pickLevel(sideWanted, (t) => /ROUND/.test(t), validTarget); if (target != null) targetType = 'round number'; }
     if (target == null) { target = pickLevel(sideWanted, (t) => /EQUAL/.test(t), validTarget); if (target != null) targetType = 'equal highs/lows'; }
     if (target == null) { target = pickLevel(sideWanted, (t) => /^(ASIAN|LONDON|NY)_/.test(t) || /^PD[HL]$/.test(t), validTarget); if (target != null) targetType = 'session/prev-day level'; }
-    if (target == null) { target = buy ? entry + 2.5 * risk : entry - 2.5 * risk; targetType = '2.5R'; }
-    // Realism clamp: a structural level many ATRs away isn't this timeframe's draw —
-    // fall back to a bounded 2.5R rather than advertise a fantasy RR.
-    if (Math.abs(target - entry) > maxTargetAtr * atr) { target = buy ? entry + 2.5 * risk : entry - 2.5 * risk; targetType = '2.5R'; }
+    if (target == null) continue;                                  // no invented target: no real draw, no trade
+    if (Math.abs(target - entry) > maxTargetAtr * atr) continue;   // distant level is not this timeframe's draw
     const reward = Math.abs(target - entry);
     const rr = Math.round((reward / risk) * 100) / 100;
     if (rr < minRR) continue;
@@ -3040,6 +3219,7 @@ function lilSweepProPlus(ctx) {
     score += ageBars <= 3 ? 8 : ageBars <= 6 ? 6 : 4;
     score += htf4 ? 10 : (h4Trend === null ? 5 : 2);
     score += htf1 ? 5 : 2;
+    score += planA ? 5 : 8;                                               // Ichimoku gate passed; continuation needs stricter posture
     score += sessionScore;
     score += Math.min(10, 4 + Math.round((rr - minRR) * 4));
     score += timingScore;
@@ -3047,20 +3227,44 @@ function lilSweepProPlus(ctx) {
     if (score < minScore) continue;
 
     const ladder = tpLadder(decision, entry, risk, target);
+    if (!ladder) continue;
     const dots = '●'.repeat(Math.max(1, Math.min(5, lvl.strength)));
+    const setupEventIso = closedCandles[cand.evIdx].time;
+    const alertBarIso = planA ? closedCandles[cand.alertIdx].time : last.time;
+    const notifyKey = `${plan}|${lvl.type}|${r5(n(lvl.price))}|${setupEventIso}`;
     const sig = {
       decision, score, grade: smcGrade(score),
       entry: r5(entry), stopLoss: r5(stop), ...ladder, riskRewardRatio: rr,
       reason: planA
-        ? `SWEEP-REJECT ${decision}: ${lvl.label || lvl.type} ${r5(n(lvl.price))} ${dots} swept (${Math.round((cand.excursion / pip) * 10) / 10}p through), closed back ${buy ? 'above' : 'below'}, follow-through, no re-close — ${decision} on break of ${r5(entry)} (${entryMode}); stop beyond sweep wick ${r5(stop)}; target ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`
+        ? `SWEEP-REJECT ${decision}: ${lvl.label || lvl.type} ${r5(n(lvl.price))} ${dots} swept (${Math.round((cand.excursion / pip) * 10) / 10}p through), closed back ${buy ? 'above' : 'below'}, follow-through, no re-close — ${decision} on break of confirmation extreme ${r5(entry)} (${entryMode}); stop beyond sweep wick ${r5(stop)}; target ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`
         : `BREAK-HOLD ${decision}: ${lvl.label || lvl.type} ${r5(n(lvl.price))} ${dots} broken by BODY close, retested and HELD with rejection — ${decision} ${r5(entry)} (${entryMode}); stop ${r5(stop)}; target ${targetType} ${r5(target)} · ${rr}R${htf4 ? ' · H4 aligned' : ''} · ${inOverlap ? 'LDN/NY overlap' : inLondon ? 'London' : inNy ? 'New York' : 'off-session'}`,
-      barIso: candles[cand.evIdx].time,                    // dedup: ONE signal per sweep/break event
+      barIso: alertBarIso,
       meta: {
-        v: 1, plan, requiresFill: true, forexOnly: true, preEntryAlert: planA,
+        v: 2,
+        strategyVersion: 2,
+        plan,
+        setupEventIso,
+        alertBarIso,
+        notifyKey,
+        requiresFill: planA,
+        entryOrderType: planA ? 'STOP' : 'MARKET',
+        entryState,
+        fillAtSignal,
+        validBars: entryValidBars,
+        forexOnly: true,
+        measureFixedTime: false,
+        preEntryAlert: planA && entryState === 'WAIT',
+        skipCloseConfirm: true,
         level: { type: lvl.type, label: lvl.label, price: r5(n(lvl.price)), strength: lvl.strength },
         triggerPrice: r5(entry), entryMode, targetType, rrToTarget: rr,
         session: inOverlap ? 'OVERLAP' : inLondon ? 'LONDON' : inNy ? 'NY' : 'OFF',
         htf4, htf1, ageBars,
+        ichimoku: {
+          cloudPos: ichi.cloudPos,
+          futureBull: ichi.futureBull,
+          laggingClear: buy ? ichi.laggingClearUp : ichi.laggingClearDown,
+          kijun: r5(ichi.kijun),
+        },
       },
     };
     if (!best || sig.score > best.score) best = sig;
@@ -3072,8 +3276,11 @@ export const STRATEGIES = {
   'special-forex-sniper': {
     id: 'special-forex-sniper',
     name: 'Special Forex Sniper',
+    forexOnly: true,
+    measureFixedTime: false,
+    entryOrderType: 'LIMIT',
     source: 'Composite institutional forex engine — liquidity, structure, displacement, RR, and PRE-ENTRY timing (alerts 10–12 pips before the entry)',
-    description: 'FOREX-ONLY sniper that alerts BEFORE the entry: it fires while price is still ~6–15 pips (ideal 10–12) on the approach side of the planned limit with momentum drifting toward it — so the trade can be taken within ~5 minutes; price that has run past the entry is never chased. Setup = an OBVIOUS-level liquidity sweep + reclaim (PDH/PDL, session highs/lows, round numbers, equal highs/lows, strength ≥3) or a fresh displaced breaker, confirmed by a displacement FVG (entry = its 50%), stop beyond the raid wick, structure (HH/HL·LH/LL), premium/discount location, second-drive preference and dual-HTF agreement (never fights a clear H4). Profit discipline: minimum 2R to a STRUCTURAL TP3 (opposing fresh liquidity → session H/L → prev-day H/L → equal extremes → 3R) AND a minimum 20-pip target — RR alone is not profit. Scored on a 100-point institutional checklist; below 75 stays silent. M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong displacement, RR ≥2.5, London/NY, tight fast gap). HONEST MEASUREMENT: signals are resolved as LIMIT orders — if price never fills the entry the signal EXPIRES and is excluded from the win rate, so the recorded performance is only of trades that could actually be taken.',
+    description: 'FOREX-ONLY sniper that alerts BEFORE the entry: it fires while price is still ~6–15 pips (ideal 10–12) on the approach side of the planned limit with momentum drifting toward it — so the trade can be taken within ~5 minutes; price that has run past the entry is never chased. Setup = an OBVIOUS-level liquidity sweep + reclaim (PDH/PDL, session highs/lows, round numbers, equal highs/lows, strength ≥3) or a fresh displaced breaker, confirmed by a displacement FVG (entry = its 50%), stop beyond the raid wick, structure (HH/HL·LH/LL), premium/discount location, second-drive preference and dual-HTF agreement (never fights a clear H4). Profit discipline: minimum 2R to a STRUCTURAL TP3 (opposing fresh liquidity → session H/L → prev-day H/L → equal extremes → round number; no real draw means no trade) AND a minimum 20-pip target — RR alone is not profit. Scored on a 100-point institutional checklist; below 75 stays silent. M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong displacement, RR ≥2.5, London/NY, tight fast gap). HONEST MEASUREMENT: signals are resolved as LIMIT orders — if price never fills the entry the signal EXPIRES and is excluded from the win rate, so the recorded performance is only of trades that could actually be taken.',
     timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
     config: { minScore: 75, minRR: 2.0, minPreEntryPips: 4, idealPreEntryPips: 12, maxPreEntryPips: 18, enterNowPips: 3, minTargetPips: 20, maxChaseAtr: 1.2, maxAgeBars: 12, minLevelStrength: 3, levelTolAtr: 0.6, dispMinAtr: 0.6, minStopPips: 5, minStopAtr: 0.35, m1ExceptionalScore: 90, m1MinRR: 2.5, sweepLookback: 40 },
     evaluate: specialForexSniper,
@@ -3081,6 +3288,8 @@ export const STRATEGIES = {
   'xau-session-raid': {
     id: 'xau-session-raid',
     name: 'Gold Desk — XAU Session Raid',
+    forexOnly: true,
+    measureFixedTime: false,
     source: 'Dedicated XAUUSD engine — session AMD (Power of 3) + obvious-level raid, distilled from the lab\'s two best sweep models',
     description: 'GOLD ONLY (returns nothing on any other symbol) and FOREX (TP/SL) framing only by design. Encodes gold\'s crowd psychology: gold is the retail magnet, so stops cluster at OBVIOUS levels (round dollars, session highs/lows, equal highs/lows) and the market is structured around raiding them — Asia accumulates the range, London manipulates it (the Judas swing), London/NY distribute the true move. The engine fires only in London/NY when: an obvious key level (strength ≥3) is SWEPT then RECLAIMED (the trap), followed by DISPLACEMENT (FVG — institutional sponsorship). Entry at the FVG 50% pullback (sniper) or the fresh reclaim close; stop beyond the raid wick + 0.3×ATR (gold-wide buffer, hard $0.80 minimum stop); TP1/TP2 = 1R/2R, TP3 = the opposing resting liquidity. Never fights a clear H4 trend; never chases (>1.2×ATR from entry = skip). Min 2R. Scored on the gold-desk checklist: displacement strength, level obviousness, session (overlap best), dual-HTF alignment, raid freshness, equal-highs/lows draw.',
     timeframes: ['M5', 'M15', 'M30', 'H1'],
@@ -3099,10 +3308,12 @@ export const STRATEGIES = {
   'lil-sweep-pro-plus': {
     id: 'lil-sweep-pro-plus',
     name: 'LIL SWEEP-PRO+',
+    forexOnly: true,
+    measureFixedTime: false,
     source: 'Key Liquidity Levels playbook — Plan A sweep-rejection / Plan B break-and-hold on the strongest (●●●●–●●●●●) map levels',
-    description: 'FOREX-ONLY engine that trades the key liquidity map itself — every level must be FULL 5 dots, except PDH/PDL and session highs/lows which qualify at 4 (level rank: PDH/PDL > session H/L > equal highs/lows > round numbers > swings; strength always feeds the score). PLAN A (sweep-rejection): fires only after the full 4-condition checklist prints — (1) wick trades THROUGH the level, (2) candle CLOSES back on the original side, (3) the next candle follows through away from the level, (4) price FAILS TO HOLD beyond (no re-close through it). Entry = break of the rejection candle\'s extreme (alerted while the trigger is pending or just broke — never chased), stop beyond the sweep wick, target the nearest opposing liquidity (swing pool → round → equal → session/PD). PLAN B (break-and-hold continuation): a strong BODY close through the level (not a wick), then a retest that tags it and HOLDS with a rejection candle — enter the continuation, stop beyond the retest, target the next fresh liquidity ahead. "SWEPT = do not enter late" is a hard rule: the rejection must be recent (≤8 bars). Never fights a clear H4. Min 1.8R and a 12-pip minimum target. HONEST MEASUREMENT: resolved as trigger orders (meta.requiresFill) — if the break never comes the signal EXPIRES and is excluded from the win rate.',
-    timeframes: ['M5', 'M15', 'M30', 'H1'],
-    config: { minScore: 72, minRR: 1.8, minLevelStrength: 4, maxAgeBars: 8, sweepMinAtr: 0.12, minSweepPips: 2, breakCloseAtr: 0.25, minBreakPips: 2, retestTolAtr: 0.35, retestWindowBars: 14, maxWaitAtr: 1.0, enterNowAtr: 0.3, minTargetPips: 12, maxTargetAtr: 6, minStopPips: 4, minStopAtr: 0.3 },
+    description: 'FOREX-ONLY engine that trades the key liquidity map itself — every level must be FULL 5 dots, except PDH/PDL and session highs/lows which qualify at 4 (level rank: PDH/PDL > session H/L > equal highs/lows > round numbers > swings; strength always feeds the score). Restricted to M15/M30 and London/New York hours. PLAN A (sweep-rejection): fires only after the full 4-condition checklist prints on CLOSED candles — (1) wick trades THROUGH the level without a body break, (2) candle CLOSES back on the original side, (3) the next CLOSED candle follows through away from the level, (4) price FAILS TO HOLD beyond (no re-close through it). Entry = stop-style break beyond that completed confirmation candle; if the trigger never breaks within 4 bars the setup expires. PLAN B (break-and-hold continuation): a strong BODY close through the level, then the last CLOSED candle retests and HOLDS with rejection — enter at the live alert price, never using a forming candle as confirmation. Ichimoku 9-26-52 gates both plans: inside-cloud = no trade, lagging span and Kijun must agree, and continuation must align with cloud/future cloud. Never fights a clear H4. Min 1.8R and a 12-pip minimum target. HONEST MEASUREMENT: Plan A resolves as a STOP entry, Plan B as a MARKET entry; fixed-time stats are disabled.',
+    timeframes: ['M15', 'M30'],
+    config: { minScore: 72, minRR: 1.8, minLevelStrength: 4, maxAgeBars: 8, sweepMinAtr: 0.12, minSweepPips: 2, breakCloseAtr: 0.25, minBreakPips: 2, retestTolAtr: 0.35, maxRetestPenAtr: 0.15, retestWindowBars: 14, maxWaitAtr: 1.0, enterNowAtr: 0.3, minTargetPips: 12, maxTargetAtr: 6, minStopPips: 4, minStopAtr: 0.3, entryValidBars: 4 },
     evaluate: lilSweepProPlus,
   },
   'forex-confluence': {
@@ -3162,15 +3373,22 @@ export const STRATEGIES = {
   'ict-breaker': {
     id: 'ict-breaker',
     name: 'ICT Breaker',
+    entryOrderType: 'LIMIT',
     source: 'Maine — "The SIMPLE $10M ICT Blueprint" (Chart Fanatics)',
     description: 'Liquidity sweep → close back through the prior swing (breaker) with displacement, entered at the breaker with stop beyond the sweep, targeting the opposing resting liquidity. HTF-aligned, minimum 2R.',
-    timeframes: ['M15', 'M30', 'H1'],
+    // Timeframes = MEASURED reality, not the original seed guess: the live winner earns
+    // 81–100% across every scanned TF (M1 260×81% · M5 184×87.7% · M15 104×87.3% ·
+    // M30 63×96.7% · H1 38×84.2% · H4 14×100% · D1 5×100%). The scanner enforces this
+    // list as a contract, so narrowing it would delete proven cohorts (M5 is its
+    // second-largest and beats the "declared" M15).
+    timeframes: ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'],
     config: { minRR: 2, maxAgeBars: 3 },
     evaluate: ictBreaker,
   },
   'ict-plus': {
     id: 'ict-plus',
     name: 'ICT+',
+    entryOrderType: 'LIMIT',
     source: 'ICT breaker, upgraded — FVG sniper entry + premium/discount + second-drive + dual-HTF confluence',
     description: 'An improved ICT breaker (the original ict-breaker is untouched). Same sweep → breaker + displacement base, then stacks A+ filters: enter the 50% of the displacement FAIR VALUE GAP (sniper fill, not the breaker zone) for a tighter stop and better RR; only in the discount (buy) / premium (sell) half of the dealing range; only on a SECOND drive (skips the first-drive fakeout); aligned with both H4 and H1; bonus for an equal-highs/lows target and a fresh breaker. Requires a minimum stacked-confluence count and a higher 3R floor — fewer, cleaner signals. Stop beyond the sweep.',
     timeframes: ['M15', 'M30', 'H1', 'H4'],
@@ -3225,6 +3443,7 @@ export const STRATEGIES = {
   'smc-fvg': {
     id: 'smc-fvg',
     name: 'SMC Fair Value Gap',
+    entryOrderType: 'LIMIT',
     source: 'Smart Money Concepts core — liquidity sweep → displacement FVG → 50% mitigation',
     description: 'Liquidity sweep of a swing extreme (taken then reclaimed) → a displacement leg that prints a fair value gap AFTER the sweep → enter the 50% of that gap on the pullback, stop beyond the sweep, target the opposing resting liquidity (draw). Discount-for-buy / premium-for-sell bonus. HTF-aligned, minimum 2R.',
     timeframes: ['M5', 'M15', 'M30', 'H1'],
@@ -3234,6 +3453,7 @@ export const STRATEGIES = {
   'smc-mmxm': {
     id: 'smc-mmxm',
     name: 'Market Makers Model',
+    entryOrderType: 'LIMIT',
     source: 'Smart Money Concepts — market makers buy/sell model (external↔internal)',
     description: 'Dealing range = most recent external swing high↔low. Price sweeps the range extreme (external liquidity), then a displacement FVG forms in the discount (buy) / premium (sell) half — the smart-money reversal. Enter the FVG 50%, stop beyond the swept extreme, target the OPPOSITE external extreme (original consolidation). HTF-aligned, minimum 2.5R.',
     timeframes: ['M15', 'M30', 'H1', 'H4'],
@@ -3285,8 +3505,32 @@ export function listStrategies() {
 export function evaluateStrategy(id, ctx) {
   const s = STRATEGIES[id];
   if (!s) return null;
-  try { return s.evaluate({ ...ctx, config: { ...(s.config || {}), ...(ctx.config || {}) } }); }
-  catch { return null; }
+  const input = ctx || {};
+  try {
+    const result = s.evaluate({ ...input, config: { ...(s.config || {}), ...(input.config || {}) } });
+    if (!result) return result;
+    const entryOrderType = String(result.meta?.entryOrderType || s.entryOrderType || 'MARKET').toUpperCase();
+    return {
+      ...result,
+      meta: {
+        ...(result.meta || {}),
+        entryOrderType,
+        requiresFill: result.meta?.requiresFill ?? entryOrderType !== 'MARKET',
+        ...(s.forexOnly ? { forexOnly: true, measureFixedTime: false } : {}),
+      },
+    };
+  } catch (error) {
+    const candles = Array.isArray(input.candles) ? input.candles : [];
+    console.error('[strategy-lab] strategy evaluation failed', {
+      strategy: id,
+      symbol: input.symbol || null,
+      timeframe: input.timeframe || null,
+      candleCount: candles.length,
+      lastBarIso: candles.length ? candles[candles.length - 1]?.time || null : null,
+      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    });
+    return null;
+  }
 }
 
 export function strategyTimeframes(id) {

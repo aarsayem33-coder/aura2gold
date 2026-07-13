@@ -19,6 +19,8 @@ test('registered with forex-sniper contract', () => {
   const s = STRATEGIES['special-forex-sniper'];
   assert.ok(s, 'missing from registry');
   assert.equal(s.name, 'Special Forex Sniper');
+  assert.equal(s.forexOnly, true);
+  assert.equal(s.measureFixedTime, false);
   assert.ok(s.config.minRR >= 2, 'RR floor must be >= 2');
   assert.ok(s.config.idealPreEntryPips >= 10 && s.config.idealPreEntryPips <= 12, 'ideal pre-entry band 10-12');
   assert.ok(s.config.m1ExceptionalScore >= 90, 'M1 gate must demand >= 90');

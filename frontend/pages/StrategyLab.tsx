@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Loader2, RefreshCw, FlaskConical, TrendingUp, TrendingDown, BarChart3, Timer, Hourglass, Mail, Radio } from 'lucide-react';
+import { Loader2, RefreshCw, FlaskConical, TrendingUp, TrendingDown, BarChart3, Timer, Hourglass, Mail, Radio, Check, ChevronDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { fetchStrategies, fetchStrategySignals, fetchStrategyLive, fetchStrategyLiveFtt } from '../mt5Api';
 import type { StrategyMeta, StrategySignal, StrategyLiveResponse, StrategyLiveRow, StrategyFttLiveResponse, StrategyFttLiveRow } from '../types';
@@ -35,6 +35,52 @@ const px = (v: number | null | undefined, _symbol?: string) => {
 };
 
 type Tab = 'forex' | 'ftt';
+type FilterOption = { value: string; label: string };
+
+function MultiSelectFilter({ label, options, selected, onChange }: {
+  label: string;
+  options: FilterOption[];
+  selected: string[];
+  onChange: (values: string[]) => void;
+}) {
+  const selectedSet = new Set(selected);
+  const summary = selected.length === 0 ? 'All' : selected.length === 1
+    ? options.find((option) => option.value === selected[0])?.label || selected[0]
+    : `${selected.length} selected`;
+  const toggle = (value: string) => onChange(selectedSet.has(value)
+    ? selected.filter((item) => item !== value)
+    : [...selected, value]);
+
+  return (
+    <details className="group relative">
+      <summary className={`flex cursor-pointer list-none items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-bold transition marker:hidden [&::-webkit-details-marker]:hidden ${selected.length ? 'border-violet-300 bg-violet-50 text-violet-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}>
+        <span className="text-[10px] uppercase tracking-wide text-slate-400">{label}</span>
+        <span className="max-w-[150px] truncate">{summary}</span>
+        <ChevronDown size={12} className="text-slate-400 transition group-open:rotate-180" />
+      </summary>
+      <div className="absolute left-0 top-full z-50 mt-1 w-64 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2">
+          <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">{label}</span>
+          <button type="button" onClick={() => onChange([])} className="text-[10px] font-bold text-violet-600 hover:text-violet-800">Select all</button>
+        </div>
+        <div className="max-h-64 overflow-y-auto p-1.5">
+          {options.map((option) => {
+            const checked = selectedSet.has(option.value);
+            return (
+              <label key={option.value} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+                <input type="checkbox" checked={checked} onChange={() => toggle(option.value)} className="sr-only" />
+                <span className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${checked ? 'border-violet-600 bg-violet-600 text-white' : 'border-slate-300 bg-white'}`}>
+                  {checked && <Check size={11} strokeWidth={3} />}
+                </span>
+                <span className="truncate">{option.label}</span>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    </details>
+  );
+}
 
 function outcomeChip(o: string) {
   const s = (o || '').toUpperCase();
@@ -74,6 +120,7 @@ function ExpiryCountdown({ iso, tradeTime, label }: { iso: string | null | undef
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+
   if (!iso) return <span className="text-slate-300">—</span>;
   const secs = Math.max(0, Math.round((new Date(iso).getTime() - now) / 1000));
   const mm = Math.floor(secs / 60);
@@ -101,6 +148,7 @@ function TimingCell({ timing }: { timing: import('../types').StrategyTiming | un
   const map: Record<string, { cls: string; label: string }> = {
     WAIT: { cls: 'bg-amber-100 text-amber-700', label: '⏳ WAIT' },
     TRADABLE: { cls: 'bg-emerald-100 text-emerald-700', label: '✅ TRADABLE NOW' },
+    FILLED: { cls: 'bg-blue-100 text-blue-700', label: 'FILLED' },
     EXPIRED: { cls: 'bg-slate-100 text-slate-400', label: '✖ EXPIRED & GONE' },
     SETTLED: { cls: 'bg-blue-50 text-blue-600', label: 'DONE' },
   };
@@ -272,14 +320,29 @@ function GridFilters({ minScore, setMinScore, dir, setDir, mode }: { minScore: n
 export default function StrategyLab() {
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [timeframes, setTimeframes] = useState<string[]>(LIVE_TFS);
+  const [symbols, setSymbols] = useState<string[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]); // strategies shown in the live grids (multi-select)
   const [liveTf, setLiveTf] = useState('M15');
-  const [histTf, setHistTf] = useState('');
-  const [histStrategy, setHistStrategy] = useState(''); // '' = all strategies (recent tables)
-  const [scoreBucket, setScoreBucket] = useState(''); // score-range filter for the recent tables
-  const [symbolFilter, setSymbolFilter] = useState(''); // symbol filter for the recent tables
+  const [histTfs, setHistTfs] = useState<string[]>([]);
+  const [histStrategies, setHistStrategies] = useState<string[]>([]);
+  const [scoreBuckets, setScoreBuckets] = useState<string[]>([]);
+  const [symbolFilters, setSymbolFilters] = useState<string[]>([]);
   const [showMuted, setShowMuted] = useState(false);    // reveal strategies muted in the Strategy Controller
   const [tab, setTab] = useState<Tab>('forex');
+  // Fixed-time tab hides forex-only strategies (e.g. LIL SWEEP-PRO+, Special Forex
+  // Sniper) — they never produce FTT alerts, so listing them there is noise. On tab
+  // switch, prune any selected/filtered strategy that isn't valid for the FTT view.
+  const tabStrategies = useMemo(() => (tab === 'ftt' ? strategies.filter((s) => !s.forexOnly) : strategies), [strategies, tab]);
+  useEffect(() => {
+    if (tab !== 'ftt' || !strategies.length) return;
+    const allowed = new Set(strategies.filter((s) => !s.forexOnly).map((s) => s.id));
+    setSelectedIds((prev) => {
+      const next = prev.filter((id) => allowed.has(id));
+      if (next.length === prev.length) return prev;
+      return next.length ? next : (allowed.size ? [allowed.values().next().value as string] : []);
+    });
+    setHistStrategies((prev) => prev.filter((id) => allowed.has(id)));
+  }, [strategies, tab]);
   const [live, setLive] = useState<StrategyLiveResponse | null>(null);
   const [ftLive, setFtLive] = useState<StrategyFttLiveResponse | null>(null);
   const [signals, setSignals] = useState<StrategySignal[]>([]);
@@ -293,6 +356,7 @@ export default function StrategyLab() {
       const visible = (m.strategies || []).filter((s) => s.control?.enabled !== false);
       setStrategies(visible);
       if (m.timeframes?.length) setTimeframes(m.timeframes);
+      if (m.symbols?.length) setSymbols(m.symbols);
       setSelectedIds((c) => c.length ? c : (visible[0]?.id ? [visible[0].id] : []));
     }).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load strategies'));
   }, []);
@@ -325,12 +389,12 @@ export default function StrategyLab() {
     } catch { /* live grid best-effort */ }
   }, [selectedIds, liveTf, tab]);
 
-  // Recent-signals table loads independently (ALL strategies) so a live-scan hiccup never
-  // blanks the recent history. Stays on the steady 30s cadence.
+  // Load one broad history dataset; the four history controls combine client-side so
+  // selecting several strategies/timeframes never causes serial API requests.
   const loadSignals = useCallback(async () => {
-    try { const sg = await fetchStrategySignals(histStrategy || undefined, histTf || undefined, showMuted); setSignals(sg.signals); setError(null); }
+    try { const sg = await fetchStrategySignals(undefined, undefined, showMuted, 500); setSignals(sg.signals); setError(null); }
     catch (err) { setError(err instanceof Error ? err.message : 'Failed to load strategy signals'); }
-  }, [histStrategy, histTf, showMuted]);
+  }, [showMuted]);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -397,15 +461,21 @@ export default function StrategyLab() {
   const holdCount = tab === 'ftt'
     ? (ftLive?.rows.length || 0) - (ftLive?.rows || []).filter((r) => r.command === 'CALL').length
     : (live?.rows.length || 0) - (live?.rows || []).filter((r) => r.command === 'ENTRY').length;
-  // Recent-table filters: symbol + score bucket (applied to BOTH recent tables).
-  const histSymbolOptions = useMemo(() => Array.from(new Set(signals.map((s) => s.symbol))).sort(), [signals]);
+  // Recent-table multi-filters apply to BOTH recent tables. Empty selection means all.
+  const histSymbolOptions = useMemo(() => Array.from(new Set([...symbols, ...signals.map((s) => s.symbol)])).sort(), [symbols, signals]);
   const filteredSignals = useMemo(
-    () => signals.filter((s) => (!symbolFilter || s.symbol === symbolFilter) && inScoreBucket(s.score, scoreBucket)),
-    [signals, symbolFilter, scoreBucket],
+    () => signals.filter((s) =>
+      (!histStrategies.length || histStrategies.includes(s.strategy))
+      && (!histTfs.length || histTfs.includes(s.timeframe))
+      && (!symbolFilters.length || symbolFilters.includes(s.symbol))
+      && (!scoreBuckets.length || scoreBuckets.some((bucket) => inScoreBucket(s.score, bucket)))),
+    [signals, histStrategies, histTfs, symbolFilters, scoreBuckets],
   );
   // Recent tables: actionable-NOW first (forex TRADABLE limit / fixed-time LIVE open call),
   // then newest signal first.
-  const sortedSignals = useMemo(() => [...filteredSignals].sort((a, b) => {
+  const sortedSignals = useMemo(() => filteredSignals
+    .filter((s) => tab !== 'ftt' || s.ftOutcome !== null)
+    .sort((a, b) => {
     const act = (s: StrategySignal) => (tab === 'ftt' ? Number(Boolean(s.live)) : Number(s.timing?.status === 'TRADABLE'));
     return (act(b) - act(a)) || (new Date(b.signalTime || 0).getTime() - new Date(a.signalTime || 0).getTime());
   }), [filteredSignals, tab]);
@@ -463,6 +533,42 @@ export default function StrategyLab() {
       )}
     </div>
   );
+  const historyFiltersActive = histStrategies.length + histTfs.length + scoreBuckets.length + symbolFilters.length > 0;
+  const historyFilters = (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className="mr-0.5 text-[10px] font-black uppercase tracking-wider text-slate-400">Filter history</span>
+      <MultiSelectFilter
+        label="Strategy"
+        options={tabStrategies.map((strategy) => ({ value: strategy.id, label: strategy.name }))}
+        selected={histStrategies}
+        onChange={setHistStrategies}
+      />
+      <MultiSelectFilter
+        label="Timeframe"
+        options={timeframes.map((timeframe) => ({ value: timeframe, label: timeframe }))}
+        selected={histTfs}
+        onChange={setHistTfs}
+      />
+      <MultiSelectFilter
+        label="Score"
+        options={SCORE_BUCKETS.filter((bucket) => bucket.key).map((bucket) => ({ value: bucket.key, label: bucket.label }))}
+        selected={scoreBuckets}
+        onChange={setScoreBuckets}
+      />
+      <MultiSelectFilter
+        label="Symbol"
+        options={histSymbolOptions.map((symbol) => ({ value: symbol, label: symbol }))}
+        selected={symbolFilters}
+        onChange={setSymbolFilters}
+      />
+      {historyFiltersActive && (
+        <button type="button" onClick={() => { setHistStrategies([]); setHistTfs([]); setScoreBuckets([]); setSymbolFilters([]); }} className="rounded-lg px-2 py-1.5 text-[11px] font-bold text-rose-500 hover:bg-rose-50">
+          Clear filters
+        </button>
+      )}
+      <button type="button" onClick={() => setShowMuted((value) => !value)} title="Muted strategies are hidden by default" className={`rounded-lg border px-2 py-1.5 text-xs font-bold transition-colors ${showMuted ? 'border-gold-500 bg-gold-50 text-gold-700' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>{showMuted ? 'Incl. muted' : 'Active only'}</button>
+    </div>
+  );
 
   return (
     <div className="space-y-3 pb-8">
@@ -504,7 +610,7 @@ export default function StrategyLab() {
               </button>
             </div>
           </div>
-          {/* Row 2 — live-grid + history filters (shared) */}
+          {/* Row 2 — live-grid filters */}
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-1.5">
             <select value={liveTf} onChange={(e) => setLiveTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="Live grid timeframe">
               <option value="ALL">All TFs (live)</option>
@@ -515,27 +621,10 @@ export default function StrategyLab() {
               className={`rounded-lg border px-2 py-1 text-xs font-bold transition ${actionableView ? 'border-emerald-300 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>
               {actionableView ? '● Signals only' : `○ All rows (+${holdCount} hold)`}
             </button>
-            <span className="mx-0.5 hidden h-4 w-px bg-slate-200 sm:block" />
-            <select value={histStrategy} onChange={(e) => setHistStrategy(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="History: strategy">
-              <option value="">History: all strategies</option>
-              {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
-            <select value={histTf} onChange={(e) => setHistTf(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold" title="History: timeframe">
-              <option value="">All TFs</option>
-              {timeframes.map((t) => <option key={t} value={t}>{t}</option>)}
-            </select>
-            <select value={scoreBucket} onChange={(e) => setScoreBucket(e.target.value)} title="History: score range" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-              {SCORE_BUCKETS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
-            </select>
-            <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)} title="History: symbol" className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
-              <option value="">All symbols</option>
-              {histSymbolOptions.map((sym) => <option key={sym} value={sym}>{sym}</option>)}
-            </select>
-            <button type="button" onClick={() => setShowMuted((v) => !v)} title="Muted strategies are hidden by default — toggle to include strategies switched off in the Strategy Controller" className={`rounded-lg border px-2 py-1 text-xs font-bold transition-colors ${showMuted ? 'border-gold-500 bg-gold-50 text-gold-700' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>{showMuted ? 'Incl. muted' : 'Active only'}</button>
           </div>
           {/* Row 3 — strategy chips */}
           <div className="mt-1.5 border-t border-slate-100 pt-1.5">
-            <StrategyChips list={strategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
+            <StrategyChips list={tabStrategies} selectedIds={selectedIds} onToggle={toggleStrategy} />
           </div>
         </div>
       </div>
@@ -607,13 +696,16 @@ export default function StrategyLab() {
           </div>
 
           {/* RECENT SIGNALS — tradable-now pinned on top, then newest first */}
-          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
-              <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent signals &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· {showMuted ? 'incl. muted' : 'active only'} · tradable pinned first</span></h3>
-              <div className="flex flex-wrap items-center gap-2">
-                {headerStatChips}
-                <span className="text-[11px] font-bold text-slate-400">{sortedSignals.length} shown</span>
+          <div className="relative rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="space-y-2 border-b border-slate-100 px-4 py-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent signals &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· {showMuted ? 'incl. muted' : 'active only'} · tradable pinned first</span></h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  {headerStatChips}
+                  <span className="text-[11px] font-bold text-slate-400">{sortedSignals.length} shown</span>
+                </div>
               </div>
+              {historyFilters}
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1000px] text-left text-sm">
@@ -657,7 +749,7 @@ export default function StrategyLab() {
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={13} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No signals match the score / symbol filter.' : 'No signals logged yet for this strategy.')}</td></tr>
+                    <tr><td colSpan={13} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No signals match the selected history filters.' : 'No signals logged yet.')}</td></tr>
                   )}
                 </tbody>
               </table>
@@ -721,13 +813,16 @@ export default function StrategyLab() {
           </div>
 
           {/* RECENT FIXED-TIME OUTCOMES — live calls pinned first, then newest */}
-          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2">
-              <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent fixed-time calls &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· live pinned first</span></h3>
-              <div className="flex flex-wrap items-center gap-2">
-                {headerStatChips}
-                <span className="text-[11px] font-bold text-slate-400">{tableStats.pending} pending · {sortedSignals.length} shown</span>
+          <div className="relative rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="space-y-2 border-b border-slate-100 px-4 py-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Recent fixed-time calls &amp; outcomes <span className="text-[11px] font-bold text-slate-400">· live pinned first</span></h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  {headerStatChips}
+                  <span className="text-[11px] font-bold text-slate-400">{tableStats.pending} pending · {sortedSignals.length} shown</span>
+                </div>
               </div>
+              {historyFilters}
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[820px] text-left text-sm">
@@ -762,7 +857,7 @@ export default function StrategyLab() {
                       </tr>
                     );
                   }) : (
-                    <tr><td colSpan={7} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No calls match the score / symbol filter.' : 'No fixed-time calls logged yet for this strategy.')}</td></tr>
+                    <tr><td colSpan={7} className="px-3 py-8 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : (signals.length ? 'No calls match the selected history filters.' : 'No fixed-time calls logged yet.')}</td></tr>
                   )}
                 </tbody>
               </table>

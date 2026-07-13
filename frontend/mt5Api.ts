@@ -419,11 +419,12 @@ export async function fetchLiveMarketTracker(symbol?: string, timeframe = 'M5'):
 export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; symbols: string[]; timeframes: string[]; ftExpiryBars: number }> {
   return fetchJson('/api/strategy-lab/strategies');
 }
-export async function fetchStrategySignals(strategy?: string, timeframe?: string, includeMuted?: boolean): Promise<{ ok: boolean; signals: StrategySignal[] }> {
+export async function fetchStrategySignals(strategy?: string, timeframe?: string, includeMuted?: boolean, limit?: number): Promise<{ ok: boolean; signals: StrategySignal[] }> {
   const p = new URLSearchParams();
   if (strategy) p.set('strategy', strategy);
   if (timeframe) p.set('timeframe', timeframe);
   if (includeMuted) p.set('includeMuted', '1');
+  if (limit) p.set('limit', String(limit));
   const qs = p.toString();
   return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
 }
@@ -455,9 +456,22 @@ export async function fetchStrategyLiveFtt(strategy: string, timeframe = 'M15'):
   return fetchJson<StrategyFttLiveResponse>(`/api/strategy-lab/live-ftt?${p.toString()}`);
 }
 
-export async function fetchStrategyEntryWatch(minScore?: number): Promise<StrategyEntryWatchResponse> {
-  const qs = minScore != null ? `?minScore=${minScore}` : '';
-  return fetchJson<StrategyEntryWatchResponse>(`/api/strategy-lab/entry-watch${qs}`);
+export async function fetchStrategyEntryWatch(options: number | {
+  minScore?: number;
+  maxScore?: number;
+  strategies?: string[];
+  symbols?: string[];
+  timeframes?: string[];
+} = {}): Promise<StrategyEntryWatchResponse> {
+  const opts = typeof options === 'number' ? { minScore: options } : options;
+  const params = new URLSearchParams();
+  if (opts.minScore != null) params.set('minScore', String(opts.minScore));
+  if (opts.maxScore != null) params.set('maxScore', String(opts.maxScore));
+  if (opts.strategies?.length) params.set('strategies', opts.strategies.join(','));
+  if (opts.symbols?.length) params.set('symbols', opts.symbols.join(','));
+  if (opts.timeframes?.length) params.set('timeframes', opts.timeframes.join(','));
+  const qs = params.toString();
+  return fetchJson<StrategyEntryWatchResponse>(`/api/strategy-lab/entry-watch${qs ? `?${qs}` : ''}`);
 }
 
 export async function fetchBreakoutLive(timeframe = 'ALL'): Promise<BreakoutLiveResponse> {

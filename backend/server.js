@@ -21,8 +21,9 @@ import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
-import { listStrategies, evaluateStrategy, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
+import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
+import { findOrderFillIndex } from './orderFill.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -819,6 +820,18 @@ async function initializeDatabase() {
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_exit_price', 'DOUBLE NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_pips', 'DOUBLE NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'at_expiry_time', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'strategy_version', 'INT NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'setup_plan', 'VARCHAR(32) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'entry_order_type', 'VARCHAR(16) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'entry_state', 'VARCHAR(16) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'entry_filled_at', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'setup_event_time', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'alert_bar_time', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'valid_until', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'measure_fixed_time', 'TINYINT NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'corrected_outcome', 'VARCHAR(16) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'corrected_pips', 'DOUBLE NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'correction_reason', 'VARCHAR(255) NULL');
 
       return pool;
     })().catch((error) => {
@@ -3547,7 +3560,7 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
     try {
       const ctx = buildStrategyContext(symbol, timeframe);
       if (ctx) {
-        strategies = enabledStrategyIds().map((id) => {
+        strategies = enabledStrategyIds().filter((id) => strategyTimeframes(id).includes(timeframe)).map((id) => {
           const sig = evaluateStrategy(id, ctx);
           return sig && sig.decision && sig.decision !== 'HOLD'
             ? { id, name: STRATEGY_LAB_REGISTRY[id]?.name || id, decision: sig.decision, score: sig.score ?? null, grade: sig.grade ?? null }
@@ -6599,9 +6612,10 @@ function collapseCandlesToBars(candles, timeframe) {
   return [...byBar.entries()].sort((a, b) => a[0] - b[0]).map(([, c]) => c);
 }
 
-function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill = false } = {}) {
+function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill = false, orderType = null, filledAtSignal = false, validUntilIso = null, replayStartIso = null } = {}) {
   const signalMs = Date.parse(report.signalTime || '');
   if (!Number.isFinite(signalMs)) return { outcome: 'PENDING', valid: false };
+  const replayStartMs = replayStartIso ? Date.parse(replayStartIso) : signalMs;
 
   const isBuy = String(report.direction).toUpperCase().includes('BUY');
   const entry = Number(report.entryPrice);
@@ -6618,11 +6632,13 @@ function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill 
   // guard a missing TP2/TP3 (single-target strategies) would register as an
   // instantly-hit target for BUYs (high >= 0 is always true) and produce a bogus win.
   const validTp = (tp) => Number.isFinite(tp) && tp > 0 && (isBuy ? tp > entry : tp < entry);
+  const normalizedOrderType = String(orderType || (requiresFill ? 'LIMIT' : 'MARKET')).toUpperCase();
+  const validUntilMs = validUntilIso ? Date.parse(validUntilIso) : NaN;
 
   const horizonMs = Math.max(1, Number(horizonHours) || 72) * 3600 * 1000;
   const laterCandles = candles
     .map((candle) => ({ ...candle, timeMs: Date.parse(candle.time || '') }))
-    .filter((candle) => Number.isFinite(candle.timeMs) && candle.timeMs >= signalMs && candle.timeMs <= signalMs + horizonMs)
+    .filter((candle) => Number.isFinite(candle.timeMs) && candle.timeMs >= (Number.isFinite(replayStartMs) ? replayStartMs : signalMs) && candle.timeMs <= signalMs + horizonMs)
     .sort((a, b) => a.timeMs - b.timeMs);
 
   if (!laterCandles.length) {
@@ -6637,15 +6653,10 @@ function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill 
   // may understate wins, can never overstate them.
   let startIdx = 0;
   let fillBarIdx = -1;
-  if (requiresFill) {
-    for (let i = 0; i < laterCandles.length; i++) {
-      const lo = Number(laterCandles[i].low);
-      const hi = Number(laterCandles[i].high);
-      if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
-      if (isBuy ? lo <= entry : hi >= entry) { fillBarIdx = i; break; }
-    }
+  if ((normalizedOrderType === 'LIMIT' || normalizedOrderType === 'STOP') && !filledAtSignal) {
+    fillBarIdx = findOrderFillIndex(laterCandles, { isBuy, entry, orderType: normalizedOrderType, validUntilMs });
     if (fillBarIdx === -1) {
-      return { outcome: 'EXPIRED', valid: true, exitPrice: null, resolvedAt: null, barsToResolution: laterCandles.length, tpHitLevel: 0, mfePips: 0, maePips: 0 };
+      return { outcome: 'EXPIRED', valid: true, filledAt: null, exitPrice: null, resolvedAt: null, barsToResolution: laterCandles.length, tpHitLevel: 0, mfePips: 0, maePips: 0 };
     }
     startIdx = fillBarIdx;
   }
@@ -6662,15 +6673,16 @@ function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill 
 
   for (let ci = startIdx; ci < laterCandles.length; ci++) {
     const candle = laterCandles[ci];
-    const isFillBar = requiresFill && ci === fillBarIdx;
+    const isLimitFillBar = normalizedOrderType === 'LIMIT' && ci === fillBarIdx && !filledAtSignal;
+    const isStopFillBar = normalizedOrderType === 'STOP' && ci === fillBarIdx && !filledAtSignal;
     barsToResolution += 1;
     const low = Number(candle.low);
     const high = Number(candle.high);
     if (!Number.isFinite(low) || !Number.isFinite(high)) continue;
     const close = Number(candle.close);
     // On the fill bar the favorable extreme may predate the fill — use the close instead.
-    const favHigh = isFillBar && Number.isFinite(close) ? close : high;
-    const favLow = isFillBar && Number.isFinite(close) ? close : low;
+    const favHigh = isLimitFillBar && Number.isFinite(close) ? close : high;
+    const favLow = isLimitFillBar && Number.isFinite(close) ? close : low;
 
     const favorable = isBuy ? (favHigh - entry) / pip : (entry - favLow) / pip;
     const adverse = isBuy ? (low - entry) / pip : (entry - high) / pip;
@@ -6684,6 +6696,15 @@ function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill 
     const hitLevel = hitTp3 ? 3 : hitTp2 ? 2 : hitTp1 ? 1 : 0;
     const hitSl = isBuy ? low <= sl : high >= sl;
 
+    // STOP-entry fill bars are path-ambiguous: the adverse wick may predate the breakout trigger,
+    // while the favorable side can only happen after it. When that same bar also touches the
+    // stop, we cannot honestly know whether the trade ever existed long enough to lose.
+    if (isStopFillBar && hitSl) {
+      outcome = 'AMBIGUOUS';
+      resolvedAt = candle.time;
+      break;
+    }
+
     if (hitSl && !hitAnyTarget) {
       if (bestRank === 0) {
         outcome = 'LOSS';
@@ -6693,9 +6714,13 @@ function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill 
       break;
     }
 
-    if (hitAnyTarget && hitSl && hitLevel > bestRank) {
-      outcome = 'AMBIGUOUS';
-      resolvedAt = candle.time;
+    if (hitAnyTarget && hitSl) {
+      // A target banked on an earlier candle remains a known win. A later candle
+      // touching both a higher target and SL cannot honestly upgrade or erase it.
+      if (bestRank === 0) {
+        outcome = 'AMBIGUOUS';
+        resolvedAt = candle.time;
+      }
       break;
     }
 
@@ -6724,6 +6749,7 @@ function evaluateForexReplay(report, candles, { horizonHours = 72, requiresFill 
   return {
     valid: true,
     outcome,
+    filledAt: filledAtSignal ? new Date(signalMs).toISOString() : fillBarIdx >= 0 ? laterCandles[fillBarIdx]?.time || null : new Date(signalMs).toISOString(),
     exitPrice,
     resolvedAt,
     barsToResolution,
@@ -7519,7 +7545,8 @@ function saveEmailAlertSettings(nextSettings) {
         if (['ANY', 'LONG', 'SHORT'].includes(d)) c.direction = d;
       }
       if (Array.isArray(ctrl.timeframes)) {
-        c.timeframes = [...new Set(ctrl.timeframes.map((t) => String(t).toUpperCase()).filter(Boolean))];
+        const allowed = new Set(strategyTimeframes(id));
+        c.timeframes = [...new Set(ctrl.timeframes.map((t) => String(t).toUpperCase()).filter((t) => t && allowed.has(t)))];
       }
       out[String(id)] = c;
     }
@@ -7893,9 +7920,9 @@ async function buildSignalTrackerView() {
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
   const winH = SIGNAL_TRACKER_WINDOW_HOURS;
   const merged = new Map();
-  // Collapse to ONE active trade per symbol|timeframe|direction — consecutive
-  // same-direction signals are the same ongoing position, anchored to the most
-  // recent entry. Queries are signal_time DESC, so the first row per key wins.
+  // System and email logs can describe the same trade, so collapse those by market
+  // identity. Strategy Lab rows keep their own persisted IDs because two isolated
+  // strategies can legitimately hold different entries/stops in the same market.
   const keyOf = (sym, tf, dir) => `${sym}|${tf}|${dir}`;
 
   try {
@@ -7937,6 +7964,65 @@ async function buildSignalTrackerView() {
       });
     }
   } catch (e) { console.error('[SignalTracker] email reports query failed:', e.message); }
+
+  // Strategy Lab handoff: lab signals that are actually IN the trade get the
+  // same live-health lifecycle (P/L, danger detection, CLOSE/MANAGE alerts) as system
+  // and emailed signals. "In the trade" = MARKET entries immediately; pending LIMIT/
+  // STOP entries only once the entry really filled (persisted entry_state, else
+  // detected from post-alert M1 candles via the shared fill locator — M1 so a fill
+  // inside the alert's own M15 bar is not missed). Unfilled rows stay in Entry Watch.
+  try {
+    const [labRows] = await pool.query(
+      "SELECT * FROM mt5_strategy_signals WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) ORDER BY signal_time DESC LIMIT 200",
+      [winH],
+    );
+    const enabled = new Set(enabledStrategyIds());
+    for (const r of labRows) {
+      const stratId = String(r.strategy || '');
+      if (!enabled.has(stratId)) continue;                          // controller OFF = hidden everywhere
+      const entryState = String(r.entry_state || '').toUpperCase();
+      if (entryState === 'EXPIRED') continue;                       // trigger never came — no trade to track
+      const sym = String(r.symbol).toUpperCase(), tf = String(r.timeframe).toUpperCase(), dir = String(r.direction).toUpperCase();
+      const ms = new Date(r.signal_time).getTime();
+      if (!Number.isFinite(ms)) continue;
+      const k = `strategy-lab|${r.id}`;
+      const orderType = strategySignalOrderType(r);
+      let inTrade = orderType === 'MARKET' || entryState === 'FILLED';
+      let filledAt = r.entry_filled_at ? new Date(r.entry_filled_at) : null;
+      if (!inTrade) {
+        const entry = num(r.entry_price);
+        if (entry === null) continue;
+        const fine = (getRecentCandles(sym, 'M1', 1000) || [])
+          .map((c) => ({ ...c, timeMs: Date.parse(c.time) }))
+          .filter((c) => Number.isFinite(c.timeMs) && c.timeMs >= ms);
+        const coarse = fine.length ? fine : (getRecentCandles(sym, tf, 500) || [])
+          .map((c) => ({ ...c, timeMs: Date.parse(c.time) }))
+          .filter((c) => Number.isFinite(c.timeMs) && c.timeMs >= ms);
+        const validUntilMs = r.valid_until ? Date.parse(new Date(r.valid_until).toISOString()) : NaN;
+        const fillIndex = findOrderFillIndex(coarse, { isBuy: /BUY/.test(dir), entry, orderType, validUntilMs });
+        inTrade = fillIndex >= 0;
+        if (inTrade) {
+          const fillMs = Date.parse(coarse[fillIndex]?.time || '');
+          filledAt = Number.isFinite(fillMs) ? new Date(fillMs) : new Date();
+          try {
+            await pool.execute(
+              "UPDATE mt5_strategy_signals SET entry_state='FILLED', entry_filled_at=COALESCE(entry_filled_at, ?) WHERE id=? AND COALESCE(entry_state,'WAIT') <> 'FILLED'",
+              [toMysqlDate(filledAt), r.id],
+            );
+          } catch (e) { console.error(`[SignalTracker] failed to persist fill for ${r.id}:`, e.message); }
+        }
+      }
+      if (!inTrade) continue;                                       // still waiting for the entry — Entry Watch owns it
+      merged.set(k, {
+        id: r.id, source: 'strategy-lab', strategy: stratId,
+        strategyName: STRATEGY_LAB_REGISTRY[stratId]?.name || stratId,
+        symbol: sym, timeframe: tf, direction: dir,
+        signalTime: new Date(r.signal_time).toISOString(), signalMs: ms, grade: r.grade || null, outcome: r.outcome,
+        entryPrice: num(r.entry_price), stopLoss: num(r.stop_loss),
+        takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
+      });
+    }
+  } catch (e) { console.error('[SignalTracker] strategy-lab query failed:', e.message); }
 
   const openTrades = await fetchOpenMt5Trades(pool);
   const dismissed = new Set();
@@ -7988,6 +8074,7 @@ async function buildSignalTrackerView() {
 
       items.push({
         id: sig.id, source: sig.source, symbol: sig.symbol, timeframe: sig.timeframe, direction: sig.direction,
+        strategy: sig.strategy || null, strategyName: sig.strategyName || null,
         signalTime: sig.signalTime, grade: sig.grade,
         entryPrice: sig.entryPrice, stopLoss: sig.stopLoss,
         takeProfit1: sig.takeProfit1, takeProfit2: sig.takeProfit2, takeProfit3: sig.takeProfit3,
@@ -10729,7 +10816,9 @@ app.get('/api/day-trading/brief', async (req, res) => {
 // HTF bias, the armed setup, extension guard, and the entry/SL/target plan.
 // Read-only; reuses the live detectors (no change to signal logic).
 function buildStructureDesk(symbol, tf) {
-  const candles = getRecentCandles(symbol, tf, 250);
+  const rawCandles = getRecentCandles(symbol, tf, 250);
+  if (!rawCandles || rawCandles.length < 30) return null;
+  const candles = closedBarsOnly(rawCandles, tf);
   if (!candles || candles.length < 30) return null;
   const { adr, dailyHighLow } = computeAdrDaily(symbol);
   let sd;
@@ -10738,7 +10827,8 @@ function buildStructureDesk(symbol, tf) {
       symbol, timeframe: tf, candles,
       indicators: getRecentIndicators(symbol, tf, 500),
       marketLevels, accountSnapshot: mt5State.accountSnapshot, adr, dailyHighLow,
-      h4Candles: getRecentCandles(symbol, 'H4', 150), h1Candles: getRecentCandles(symbol, 'H1', 150),
+       h4Candles: closedBarsOnly(getRecentCandles(symbol, 'H4', 150), 'H4'),
+       h1Candles: closedBarsOnly(getRecentCandles(symbol, 'H1', 150), 'H1'),
     }).systemDecision;
   } catch { return null; }
   const struct = detectMarketStructure(candles);
@@ -10762,13 +10852,13 @@ function buildStructureDesk(symbol, tf) {
 
   // Most recent order block in the trend direction = the demand/supply zone.
   const wantOb = dir === 'BULLISH' ? 'BULLISH' : dir === 'BEARISH' ? 'BEARISH' : null;
-  const zoneOb = wantOb ? [...obs].reverse().find((o) => o.type === wantOb) : null;
+  const zoneOb = wantOb ? [...obs].reverse().find((o) => o.type === wantOb && o.actionable) : null;
   let zone = null;
   if (zoneOb) {
     const low = Math.min(Number(zoneOb.top), Number(zoneOb.bottom));
     const high = Math.max(Number(zoneOb.top), Number(zoneOb.bottom));
     // Imbalance = an unfilled FVG of the same direction overlapping the zone.
-    const imbalance = fvgs.some((f) => f.type === wantOb && Number(f.bottom) <= high && Number(f.top) >= low);
+    const imbalance = fvgs.some((f) => f.type === wantOb && f.actionable && Number(f.bottom) <= high && Number(f.top) >= low);
     zone = { kind: wantOb === 'BULLISH' ? 'DEMAND' : 'SUPPLY', low, high, imbalance };
   }
 
@@ -10955,15 +11045,17 @@ function lmtAnalyzeOrderBlocks(candles, obs, fvgs, price, atr, pip, dirBias) {
     const inside = price >= low && price <= high;
     const dist = inside ? 0 : (price < low ? low - price : price - high);
     const distAtr = atr ? Math.round((dist / atr) * 100) / 100 : null;
-    const imbalance = fvgs.some((f) => f.type === ob.type && Number(f.bottom) <= high && Number(f.top) >= low);
-    // Mitigated = price has traded back into the zone since it formed. Also gather zone activity.
-    const obMs = Date.parse(ob.time);
-    let mitigated = false, zoneVol = 0, reactions = 0;
+    const imbalance = fvgs.some((f) => f.type === ob.type && f.actionable && Number(f.bottom) <= high && Number(f.top) >= low);
+    // Lifecycle is computed by the detector strictly after BOS confirmation. Gather
+    // activity from the same boundary so pre-confirmation candles cannot consume a zone.
+    const confirmationMs = Date.parse(ob.confirmationTime || '');
+    const mitigated = !ob.actionable;
+    let zoneVol = 0, reactions = 0;
     for (const c of candles) {
       const t = Date.parse(c.time || '');
-      if (!Number.isFinite(t) || t <= obMs) continue;
+      if (!Number.isFinite(t) || !Number.isFinite(confirmationMs) || t <= confirmationMs) continue;
       const ch = Number(c.high), clo = Number(c.low);
-      if (Number.isFinite(ch) && Number.isFinite(clo) && ch >= low && clo <= high) { mitigated = true; zoneVol += Number(c.volume) || 0; reactions++; }
+      if (Number.isFinite(ch) && Number.isFinite(clo) && ch >= low && clo <= high) { zoneVol += Number(c.volume) || 0; reactions++; }
     }
     let score = 40;
     if (dirBias && ob.type === dirBias) score += 20; // aligned with bias
@@ -10979,6 +11071,7 @@ function lmtAnalyzeOrderBlocks(candles, obs, fvgs, price, atr, pip, dirBias) {
       imbalance, displacement: imbalance, mitigated,
       zoneActivity: { tickVolume: zoneVol, reactions, note: 'Tick-volume that transacted inside the zone (honest stand-in for "buyers/sellers in the OB").' },
       score, grade: score >= 80 ? 'A' : score >= 65 ? 'B' : 'C', time: ob.time,
+      confirmationTime: ob.confirmationTime || null, lifecycle: ob.lifecycle || null,
     };
   });
   out.sort((a, b) => (b.score - a.score) || ((a.distanceAtr ?? 99) - (b.distanceAtr ?? 99)));
@@ -10997,11 +11090,14 @@ function lmtVerdict({ fresh, marketOpen, desk, obAnalysis, pressure }) {
     : dec.includes('BUY') ? 'BUY' : dec.includes('SELL') ? 'SELL'
     : desk.htfBias === 'BULLISH' ? 'BUY' : desk.htfBias === 'BEARISH' ? 'SELL' : null;
 
-  const nearStrongOb = obAnalysis.find((o) => o.score >= 65 && (o.inside || (o.distanceAtr !== null && o.distanceAtr <= 0.5))) || null;
+  // Actionable zones must be UNMITIGATED — a block price already traded back through
+  // is spent (its orders consumed); it may display, but it can't arm an entry verdict.
+  const wantedKind = dir === 'BUY' ? 'DEMAND' : dir === 'SELL' ? 'SUPPLY' : null;
+  const nearStrongOb = obAnalysis.find((o) => wantedKind && o.kind === wantedKind && !o.mitigated && o.score >= 65 && (o.inside || (o.distanceAtr !== null && o.distanceAtr <= 0.5))) || null;
   const inDiscount = desk.premiumDiscount && desk.premiumDiscount.zone === 'DISCOUNT';
   const inPremium = desk.premiumDiscount && desk.premiumDiscount.zone === 'PREMIUM';
   const goodLocation = (dir === 'BUY' && inDiscount) || (dir === 'SELL' && inPremium);
-  const swept = Boolean(desk.sweep);
+  const swept = (dir === 'BUY' && desk.sweep === 'bullish') || (dir === 'SELL' && desk.sweep === 'bearish');
   const imbalance = Boolean(nearStrongOb && nearStrongOb.imbalance);
   const pressureAligns = dir === 'BUY' ? pressure.dominant === 'BUYERS' : dir === 'SELL' ? pressure.dominant === 'SELLERS' : false;
   const notExtended = !desk.extended;
@@ -11027,28 +11123,30 @@ function lmtVerdict({ fresh, marketOpen, desk, obAnalysis, pressure }) {
 function buildLiveMarketTracker(symbol, tf) {
   const candles = getRecentCandles(symbol, tf, 250);
   if (!candles || candles.length < 30) return null;
+  const analysisCandles = closedBarsOnly(candles, tf);
+  if (!analysisCandles || analysisCandles.length < 30) return null;
   const desk = buildStructureDesk(symbol, tf);
   if (!desk) return null;
   const fresh = candleFreshness(candles[candles.length - 1], tf);
   const marketOpen = liveSignalsAllowed();
   const price = Number(candles[candles.length - 1].close);
-  const atr = lmtAtr14(candles);
+  const atr = lmtAtr14(analysisCandles);
   const pip = pipSizeForSymbol(symbol) || 0.0001;
   const dirBias = desk.htfBias === 'BULLISH' || desk.phase === 'UPTREND' ? 'BULLISH'
     : desk.htfBias === 'BEARISH' || desk.phase === 'DOWNTREND' ? 'BEARISH' : null;
 
-  const obAnalysis = lmtAnalyzeOrderBlocks(candles, detectOrderBlocks(candles), detectFVGs(candles), price, atr, pip, dirBias).slice(0, 6);
-  const pressure = lmtPressureProxy(candles);
+  const obAnalysis = lmtAnalyzeOrderBlocks(analysisCandles, detectOrderBlocks(analysisCandles), detectFVGs(analysisCandles), price, atr, pip, dirBias).slice(0, 6);
+  const pressure = lmtPressureProxy(analysisCandles);
   const verdict = lmtVerdict({ fresh: fresh.dataFresh, marketOpen, desk, obAnalysis, pressure });
   // Institutional liquidity map (computed once in buildStructureDesk): PDH/PDL, session H/L,
   // round numbers, equal highs/lows, major swings.
   const keyLevels = desk.keyLevels || { levels: [], nearestAbove: null, nearestBelow: null };
   // High-probability sweep grade (5-component model) for the current chart — same engine as the
   // liquidity-sweep-pro strategy. minGrade 'C' so the cockpit shows borderline reads too.
-  const sweepGrade = gradeSweep(candles, { symbol, dailyCandles: getRecentCandles(symbol, 'D1', 8), h4Trend: desk.htfBias || null, h1Trend: dirBias, minGrade: 'C' });
+  const sweepGrade = gradeSweep(analysisCandles, { symbol, dailyCandles: getRecentCandles(symbol, 'D1', 8), h4Trend: desk.htfBias || null, h1Trend: dirBias, minGrade: 'C' });
 
-  const nearestDemand = obAnalysis.filter((o) => o.kind === 'DEMAND').sort((a, b) => (a.distanceAtr ?? 99) - (b.distanceAtr ?? 99))[0] || null;
-  const nearestSupply = obAnalysis.filter((o) => o.kind === 'SUPPLY').sort((a, b) => (a.distanceAtr ?? 99) - (b.distanceAtr ?? 99))[0] || null;
+  const nearestDemand = obAnalysis.filter((o) => o.kind === 'DEMAND' && !o.mitigated).sort((a, b) => (a.distanceAtr ?? 99) - (b.distanceAtr ?? 99))[0] || null;
+  const nearestSupply = obAnalysis.filter((o) => o.kind === 'SUPPLY' && !o.mitigated).sort((a, b) => (a.distanceAtr ?? 99) - (b.distanceAtr ?? 99))[0] || null;
   const pdPct = desk.premiumDiscount?.pct ?? null;
 
   return {
@@ -11196,10 +11294,62 @@ function strategyLabSizing(symbol, entry, stop, targets = {}) {
 //               scanner will surface the next best setup on its next pass.
 //   SETTLED   — outcome already resolved (WIN/LOSS) → it has played out.
 const STRATEGY_LAB_ENTRY_VALID_BARS = Math.max(1, Number(process.env.STRATEGY_LAB_ENTRY_VALID_BARS || 4));
+function strategySignalPlan(source) {
+  const raw = source?.setup_plan ?? source?.setupPlan ?? source?.meta?.plan ?? source?.plan;
+  if (raw) return String(raw).toUpperCase();
+  const reason = String(source?.reason || '').toUpperCase();
+  if (reason.startsWith('SWEEP-REJECT')) return 'SWEEP-REJECT';
+  if (reason.startsWith('BREAK-HOLD')) return 'BREAK-HOLD';
+  return null;
+}
+function strategySignalVersion(source) {
+  const raw = source?.strategy_version ?? source?.strategyVersion ?? source?.meta?.strategyVersion ?? source?.meta?.v;
+  return Number.isFinite(Number(raw)) ? Number(raw) : null;
+}
+function strategySignalOrderType(source) {
+  const raw = source?.entry_order_type ?? source?.entryOrderType ?? source?.meta?.entryOrderType;
+  if (raw) return String(raw).toUpperCase();
+  const strategy = String(source?.strategy || '').toLowerCase();
+  const declared = STRATEGY_LAB_REGISTRY[strategy]?.entryOrderType;
+  if (declared) return String(declared).toUpperCase();
+  if (strategy === 'special-forex-sniper') return 'LIMIT';
+  if (strategy === 'lil-sweep-pro-plus') {
+    const plan = strategySignalPlan(source);
+    return plan === 'BREAK-HOLD' ? 'MARKET' : plan === 'SWEEP-REJECT' ? 'STOP' : 'STOP';
+  }
+  return 'MARKET';
+}
+function strategySignalMeasuresFixedTime(source) {
+  const strategy = String(source?.strategy || source?.id || '').toLowerCase();
+  if (STRATEGY_LAB_REGISTRY[strategy]?.forexOnly) return false;
+  const raw = source?.measure_fixed_time ?? source?.measureFixedTime ?? source?.meta?.measureFixedTime;
+  if (raw === 0 || raw === false) return false;
+  if (raw === 1 || raw === true) return true;
+  return true;
+}
+function strategySignalValidUntilMs(source, timeframe) {
+  const explicit = source?.valid_until ?? source?.validUntilIso ?? source?.meta?.validUntilIso;
+  const explicitMs = explicit ? Date.parse(explicit) : NaN;
+  if (Number.isFinite(explicitMs)) return explicitMs;
+  const sigMs = source?.signal_time ? new Date(source.signal_time).getTime() : source?.signalTime ? Date.parse(source.signalTime) : NaN;
+  const tfMs = (timeframeMinutes(timeframe) || 0) * 60000;
+  const bars = Number(source?.valid_bars ?? source?.validBars ?? source?.meta?.validBars);
+  if (Number.isFinite(sigMs) && tfMs > 0 && Number.isFinite(bars) && bars > 0) return sigMs + bars * tfMs;
+  if (Number.isFinite(sigMs) && tfMs > 0 && String(source?.strategy || '').toLowerCase() === 'lil-sweep-pro-plus') return sigMs + STRATEGY_LAB_ENTRY_VALID_BARS * tfMs;
+  return NaN;
+}
+function strategySignalFilledAtSignal(source) {
+  if (source?.meta?.fillAtSignal === true) return true;
+  const state = String((source?.entry_state ?? source?.entryState ?? source?.meta?.entryState) || '').toUpperCase();
+  if (state !== 'FILLED') return false;
+  const fillMs = source?.entry_filled_at ? new Date(source.entry_filled_at).getTime() : source?.entryFilledAt ? Date.parse(source.entryFilledAt) : NaN;
+  const sigMs = source?.signal_time ? new Date(source.signal_time).getTime() : source?.signalTime ? Date.parse(source.signalTime) : NaN;
+  return !Number.isFinite(fillMs) || !Number.isFinite(sigMs) || fillMs <= sigMs;
+}
 function strategyLabTiming(row) {
   const sigMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
   const tfMin = timeframeMinutes(row.timeframe);
-  const expectByMs = Number.isFinite(sigMs) ? sigMs + STRATEGY_LAB_ENTRY_VALID_BARS * tfMin * 60000 : NaN;
+  const expectByMs = strategySignalValidUntilMs(row, row.timeframe);
   const expectEntryBy = Number.isFinite(expectByMs) ? new Date(expectByMs).toISOString() : null;
   const hhmm = Number.isFinite(expectByMs)
     ? new Date(expectByMs).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC'
@@ -11214,25 +11364,60 @@ function strategyLabTiming(row) {
   // PENDING — decide from price action since the signal bar.
   const entry = Number(row.entry_price), stop = Number(row.stop_loss);
   const buy = /BUY/.test(String(row.direction).toUpperCase());
-  const candles = getRecentCandles(row.symbol, row.timeframe, 300);
-  let touchedEntry = false, hitStop = false;
+  const orderType = strategySignalOrderType(row);
+  const filledAtSignal = strategySignalFilledAtSignal(row);
+  if (orderType === 'MARKET') {
+    return { status: 'FILLED', expectEntryBy, message: 'Entered at signal time — waiting for TP/SL outcome' };
+  }
+  // Post-alert evidence: prefer M1 bars from the first complete minute after the
+  // alert — signal-TF bars are keyed by OPEN time, so the alert's own (still-open)
+  // bar was skipped entirely and a fill inside it went unseen (the GBPUSD sniper
+  // "filled but WAIT" audit case). Falls back to signal-TF bars when M1 is absent.
+  let candles = null, usingM1 = false;
+  if (Number.isFinite(sigMs)) {
+    const m1From = Math.ceil(sigMs / 60000) * 60000;
+    const fine = (getRecentCandles(row.symbol, 'M1', 1000) || []).filter((c) => (Date.parse(c.time) || 0) >= m1From);
+    if (fine.length) { candles = fine; usingM1 = true; }
+  }
+  if (!candles) candles = getRecentCandles(row.symbol, row.timeframe, 300);
+  let touchedEntry = filledAtSignal, hitStop = false;
+  let filledAtIso = row.entry_filled_at ? new Date(row.entry_filled_at).toISOString() : null;
   if (candles && candles.length && Number.isFinite(sigMs)) {
+    const includeLilV2SignalBar = String(row.strategy) === 'lil-sweep-pro-plus'
+      && strategySignalVersion(row) >= 2
+      && orderType === 'STOP';
+    const timingStartMs = usingM1 ? 0 // M1 list is already trimmed to post-alert bars
+      : includeLilV2SignalBar
+        ? Math.floor(sigMs / (tfMin * 60000)) * tfMin * 60000
+        : sigMs;
     for (const c of candles) {
       const t = Date.parse(c.time || '');
-      if (!Number.isFinite(t) || t <= sigMs) continue;
+      if (!Number.isFinite(t) || (usingM1 ? false : (includeLilV2SignalBar ? t < timingStartMs : t <= timingStartMs))) continue;
+      if (Number.isFinite(expectByMs) && t >= expectByMs) break;
       const hi = Number(c.high), lo = Number(c.low);
       if (Number.isFinite(hi) && Number.isFinite(lo)) {
-        if (Number.isFinite(entry) && lo <= entry && entry <= hi) touchedEntry = true;
-        if (Number.isFinite(stop) && (buy ? lo <= stop : hi >= stop)) hitStop = true;
+        const hitEntry = Number.isFinite(entry) && (orderType === 'STOP' ? (buy ? hi >= entry : lo <= entry) : (lo <= entry && entry <= hi));
+        const stopTouched = Number.isFinite(stop) && (buy ? lo <= stop : hi >= stop);
+        if (!touchedEntry) {
+          if (hitEntry) { touchedEntry = true; filledAtIso = c.time || filledAtIso; }
+          else if (stopTouched) { hitStop = true; break; }
+        }
       }
     }
   }
   if (hitStop) return { status: 'EXPIRED', expectEntryBy, message: 'Invalidated (stop touched before entry) — returns after next scan' };
-  if (touchedEntry) return { status: 'TRADABLE', expectEntryBy, message: 'Entry reached — tradable now' };
-  if (Number.isFinite(expectByMs) && Date.now() <= expectByMs) {
-    return { status: 'WAIT', expectEntryBy, message: `Wait for limit @ entry — valid until ${hhmm}` };
+  if (touchedEntry) {
+    // A touched LIMIT is a FILL — the resting order executed at the touch. Labeling it
+    // "TRADABLE" kept rows shouting EXECUTE_NOW long after price had left the entry
+    // (EURUSD M30 audit contradiction). Filled trades belong to the live tracker.
+    return orderType === 'STOP'
+      ? { status: 'FILLED', expectEntryBy, filledAtIso, message: 'Break trigger filled — waiting for TP/SL outcome' }
+      : { status: 'FILLED', expectEntryBy, filledAtIso, message: 'Limit entry filled — trade is live; track it in the Signal Tracker' };
   }
-  return { status: 'EXPIRED', expectEntryBy, message: 'Entry not reached in time — expired & gone; returns after next scan' };
+  if (Number.isFinite(expectByMs) && Date.now() <= expectByMs) {
+    return { status: 'WAIT', expectEntryBy, message: orderType === 'STOP' ? `Wait for breakout trigger @ entry — valid until ${hhmm}` : `Wait for limit @ entry — valid until ${hhmm}` };
+  }
+  return { status: 'EXPIRED', expectEntryBy, message: orderType === 'STOP' ? 'Trigger never broke in time — expired & gone; returns after next scan' : 'Entry not reached in time — expired & gone; returns after next scan' };
 }
 
 // Honesty gate for FIXED-TIME: a next-candle call is only valid if it was surfaced while
@@ -11249,15 +11434,23 @@ function strategyFtActionable(barMs, timeframe, atMs = Date.now()) {
 // limit entries at a level, so the actionable call is: has price reached the entry yet
 // (take it now), is it still away (wait for the pullback/approach), or has the stop
 // already been breached (skip — the scanner will surface the next setup).
-function strategyLabLiveTiming(symbol, direction, price, entry, stop) {
+function strategyLabLiveTiming(symbol, direction, price, entry, stop, signalMeta = null) {
   const buy = /BUY/.test(String(direction).toUpperCase());
   const p = Number(price), e = Number(entry), s = Number(stop);
+  const orderType = strategySignalOrderType(signalMeta || {});
   if (![p, e, s].every(Number.isFinite)) return { status: 'WAIT', message: 'Awaiting price' };
   if (buy ? p <= s : p >= s) return { status: 'EXPIRED', message: 'Stop already hit — skip; next scan brings the best setup' };
-  if (buy ? p <= e : p >= e) return { status: 'TRADABLE', message: 'Price at entry — tradable now' };
+  if (orderType === 'MARKET') return { status: 'TRADABLE', message: 'Retest candle closed — enter at market now' };
+  if (orderType === 'STOP') {
+    if (buy ? p >= e : p <= e) return { status: 'TRADABLE', message: 'Break trigger just fired — tradable now' };
+  } else if (buy ? p <= e : p >= e) {
+    return { status: 'TRADABLE', message: 'Price at entry — tradable now' };
+  }
   const pip = pipSizeForSymbol(symbol) || 0.0001;
   const distPips = Math.round((Math.abs(p - e) / pip) * 10) / 10;
-  return { status: 'WAIT', message: `Wait — ${distPips} pips ${buy ? 'pullback' : 'rally'} to entry ${px(e, symbol)}` };
+  return orderType === 'STOP'
+    ? { status: 'WAIT', message: `Wait — ${distPips} pips to breakout trigger ${px(e, symbol)}` }
+    : { status: 'WAIT', message: `Wait — ${distPips} pips ${buy ? 'pullback' : 'rally'} to entry ${px(e, symbol)}` };
 }
 
 // Short advisory for a forex strategy signal: enter now / wait for the pullback / skip,
@@ -11266,10 +11459,20 @@ function strategyLabLiveTiming(symbol, direction, price, entry, stop) {
 function strategyForexAdvisory(symbol, timeframe, sig) {
   let price = NaN;
   try { const c = getRecentCandles(symbol, timeframe, 2); if (c && c.length) price = Number(c[c.length - 1].close); } catch { /* ignore */ }
-  const t = strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss);
+  const orderType = strategySignalOrderType(sig.meta || sig);
+  const t = strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss, sig.meta || sig);
   const conv = (sig.score ?? 0) >= 85 ? ' High-conviction setup.' : (sig.score ?? 0) < 70 ? ' Lower-conviction — be selective.' : '';
-  if (t.status === 'TRADABLE') return `ENTER NOW — price is at the entry. Set SL ${px(sig.stopLoss, symbol)} and scale out at TP1/TP2/TP3.${conv}`;
+  if (t.status === 'TRADABLE') {
+    return orderType === 'STOP'
+      ? `ENTER NOW — the breakout trigger just fired. Manage from market with SL ${px(sig.stopLoss, symbol)} and scale out at TP1/TP2/TP3.${conv}`
+      : orderType === 'MARKET'
+        ? `ENTER NOW — the retest candle just closed. Enter at market with SL ${px(sig.stopLoss, symbol)} and scale out at TP1/TP2/TP3.${conv}`
+        : `ENTER NOW — price is at the entry. Set SL ${px(sig.stopLoss, symbol)} and scale out at TP1/TP2/TP3.${conv}`;
+  }
+  if (t.status === 'FILLED') return 'FILLED — the trade is already open and waiting on TP/SL outcome.';
   if (t.status === 'EXPIRED') return 'SKIP — price already reached the stop side; this setup is gone. Wait for the next one.';
+  if (orderType === 'STOP') return `WAIT for the break — ${t.message.replace(/^Wait — /, '')}. If the trigger never breaks in time, skip it and wait for the next setup.${conv}`;
+  if (orderType === 'MARKET') return `WAIT for the retest close — ${t.message.replace(/^Wait — /, '')}.${conv}`;
   return `WAIT for a pullback — ${t.message.replace(/^Wait — /, '')}. If price runs away without tagging the entry, skip it and wait for the next setup.${conv}`;
 }
 
@@ -11417,7 +11620,8 @@ function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing
   const tp1Pips = pips(sig.takeProfit1, sig.entry), tp2Pips = pips(sig.takeProfit2, sig.entry), tp3Pips = pips(sig.takeProfit3, sig.entry);
 
   const kindTag = kind && kind !== 'NEW' ? ` · ${kind}` : '';
-  const subject = `GOLD | ${Math.round(sig.score)} ${sig.grade} SETUP | ${sig.decision} ${timeframe}${kindTag}`.slice(0, 180);
+  const subjectAction = t.status === 'TRADABLE' ? 'ENTER NOW' : t.status === 'EXPIRED' ? 'SKIP' : 'WAIT FOR PB';
+  const subject = `GOLD | ${Math.round(sig.score)} ${sig.grade} SETUP | ${sig.decision} ${timeframe} | ${subjectAction}${kindTag}`.slice(0, 180);
 
   const psychology = [
     `The raid: gold is the retail magnet — stops cluster at OBVIOUS levels. ${raided.label || raided.type || 'A key level'} (${raided.strength ?? '?'}/5 obviousness) was swept, trapping breakout traders, then price closed back inside. That trap is the trade.`,
@@ -11521,10 +11725,16 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
     return;
   }
   const advisory = strategyForexAdvisory(symbol, timeframe, sig);
-  // LIL SWEEP-PRO+ gets its named subject: `LIL SWEEP-PRO+ | <score> <grade> <PLAN> | <dir> <symbol> <tf>`.
-  const subject = (strategy === 'lil-sweep-pro-plus'
-    ? `LIL SWEEP-PRO+ | ${Math.round(sig.score)} ${sig.grade || ''} ${sig.meta?.plan || 'SWEEP'} | ${sig.decision} ${symbol} ${timeframe}${kind && kind !== 'NEW' ? ` · ${kind}` : ''}`
-    : `[STRATEGY ${STRATEGY_NOTIFY_KIND_LABEL[kind] || ''}${sig.grade || ''}] ${strategyName}: ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)}${sig.riskRewardRatio != null ? ` · RR 1:${sig.riskRewardRatio}` : ''})`).slice(0, 180);
+  // Lab forex subject (user format): Symbol | Direction | Score + Setup + RR |
+  // Strategy Name | ENTER NOW / WAIT FOR PB / SKIP — the action judged from the
+  // LIVE price vs the entry at send time (TRADABLE→ENTER NOW, WAIT→pullback pending,
+  // EXPIRED→stop side already touched). LIL SWEEP-PRO+ shows its plan next to the name.
+  let liveNow = NaN;
+  try { const c = getRecentCandles(symbol, timeframe, 2); if (c && c.length) liveNow = Number(c[c.length - 1].close); } catch { /* best effort */ }
+  const liveT = strategyLabLiveTiming(symbol, sig.decision, liveNow, sig.entry, sig.stopLoss, sig.meta || null);
+  const actionTag = liveT.status === 'TRADABLE' ? 'ENTER NOW' : liveT.status === 'EXPIRED' ? 'SKIP' : 'WAIT FOR PB';
+  const stratTag = strategy === 'lil-sweep-pro-plus' && sig.meta?.plan ? `${strategyName} ${sig.meta.plan}` : strategyName;
+  const subject = `${symbol} ${timeframe} | ${sig.decision} | ${Math.round(sig.score)} ${sig.grade || ''} SETUP · RR 1:${sig.riskRewardRatio ?? 'n/a'} | ${stratTag} | ${actionTag}${kind && kind !== 'NEW' ? ` · ${kind}` : ''}`.slice(0, 180);
   const lotLine = lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a';
   const text = [
     `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})${kind !== 'NEW' ? ` — ${kind}` : ''}`,
@@ -11751,17 +11961,31 @@ const NEXT_HIGHER_TF = { M1: 'M5', M5: 'M15', M15: 'M30', M30: 'H1', H1: 'H4', H
 // confirmation source on its own (too noisy); M5 maps to M1 only as a last resort.
 const NEXT_LOWER_TF = { D1: 'H4', H4: 'H1', H1: 'M30', M30: 'M15', M15: 'M5', M5: 'M1', M1: null };
 
+// Drop the trailing bar when its timeframe window is still OPEN — the store carries
+// the in-progress bar (partial OHLC that repaints until close), and engines that read
+// it as a closed candle can print sweeps/BOS/FVGs that vanish at the close. Lab
+// engines must reason over CLOSED bars only; the context explicitly records that contract.
+// (Main live scanner is deliberately untouched — its timing is the working setup.)
+function closedBarsOnly(list, tf) {
+  if (!Array.isArray(list) || !list.length) return list;
+  const tfMs = Math.max(1, timeframeMinutes(tf)) * 60000;
+  const openMs = Date.parse(list[list.length - 1].time);
+  return Number.isFinite(openMs) && Date.now() < openMs + tfMs ? list.slice(0, -1) : list;
+}
+
 function buildStrategyContext(symbol, tf) {
-  const candles = getRecentCandles(symbol, tf, 400);
+  const candles = closedBarsOnly(getRecentCandles(symbol, tf, 400), tf);
   if (!candles || candles.length < 60) return null;
   const htfTf = NEXT_HIGHER_TF[tf] || null;
-  const htfCandles = htfTf ? getRecentCandles(symbol, htfTf, 200) : null;
+  const htfCandles = htfTf ? closedBarsOnly(getRecentCandles(symbol, htfTf, 200), htfTf) : null;
   const ltfTf = NEXT_LOWER_TF[tf] || null;
-  const ltfCandles = ltfTf ? getRecentCandles(symbol, ltfTf, 200) : null;
+  const ltfCandles = ltfTf ? closedBarsOnly(getRecentCandles(symbol, ltfTf, 200), ltfTf) : null;
+  const dailyCandles = getRecentCandles(symbol, 'D1', 8); // keep the forming D1 — it IS "today" (PDH/PDL use [-2])
   return {
-    symbol, timeframe: tf, candles, pip: pipSizeForSymbol(symbol),
-    h4Trend: getTimeframeTrend(getRecentCandles(symbol, 'H4', 150)),
-    h1Trend: getTimeframeTrend(getRecentCandles(symbol, 'H1', 150)),
+    symbol, timeframe: tf, candles, candlesIncludeFormingBar: false, pip: pipSizeForSymbol(symbol),
+    h4Trend: getTimeframeTrend(closedBarsOnly(getRecentCandles(symbol, 'H4', 150), 'H4')),
+    h1Trend: getTimeframeTrend(closedBarsOnly(getRecentCandles(symbol, 'H1', 150), 'H1')),
+    dailyCandles,
     htfTimeframe: htfTf, htfCandles,
     ltfTimeframe: ltfTf, ltfCandles,
   };
@@ -11781,8 +12005,8 @@ const STRATEGY_NOTIFY_PRUNE_MS = 24 * 3600 * 1000;
 const STRATEGY_NOTIFY_IMPROVE_SCORE = Math.max(1, Number(process.env.STRATEGY_LAB_IMPROVE_SCORE || 3));
 const STRATEGY_NOTIFY_IMPROVE_RR = Math.max(0.05, Number(process.env.STRATEGY_LAB_IMPROVE_RR || 0.2));
 
-function strategyNotifyKey(strategy, symbol, tf, direction) {
-  return `${strategy}|${symbol}|${tf}|${String(direction).toUpperCase()}`;
+function strategyNotifyKey(strategy, symbol, tf, direction, customKey = null) {
+  return `${strategy}|${symbol}|${tf}|${String(direction).toUpperCase()}|${customKey || 'default'}`;
 }
 
 // Genuine improvement over the best already notified for this setup? (score / grade / RR;
@@ -11796,9 +12020,9 @@ function strategySignalImproved(sig, best) {
 
 // Decide what (if anything) to notify for a freshly-evaluated signal; updates state.
 function strategyNotifyDecide(strategy, symbol, tf, sig) {
-  const key = strategyNotifyKey(strategy, symbol, tf, sig.decision);
+  const key = strategyNotifyKey(strategy, symbol, tf, sig.decision, sig?.meta?.notifyKey || null);
   const tfMs = Math.max(1, timeframeMinutes(tf)) * 60000;
-  const barMs = Date.parse(sig.barIso || '') || Date.now();
+  const barMs = Date.parse(sig?.meta?.alertBarIso || sig.barIso || '') || Date.now();
   const now = Date.now();
   const st = strategyNotifyState.get(key);
   let kind = null;
@@ -11807,11 +12031,12 @@ function strategyNotifyDecide(strategy, symbol, tf, sig) {
   else kind = strategySignalImproved(sig, st.best) ? 'IMPROVED' : null;
 
   if (kind === 'NEW' || kind === 'RE-ENTRY') {
+    const alreadyClosed = now >= barMs + tfMs;
     strategyNotifyState.set(key, {
       createdBarMs: barMs, createdBarCloseMs: barMs + tfMs, lastBarMs: barMs,
       firstScore: sig.score ?? null, firstGrade: sig.grade ?? null,
       best: { score: sig.score ?? 0, grade: sig.grade ?? null, rr: sig.riskRewardRatio ?? 0 },
-      confirmedSent: false, episode: (st?.episode || 0) + 1, updatedAt: now,
+      confirmedSent: alreadyClosed, skipCloseConfirm: alreadyClosed || !!sig?.meta?.skipCloseConfirm, episode: (st?.episode || 0) + 1, updatedAt: now,
       strategy, symbol, tf, direction: sig.decision,
     });
   } else if (st) {
@@ -11848,7 +12073,7 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
   // setup bar closed ≥ STRATEGY_LAB_STALE_SETUP_BARS bars ago; DB logging (caller) is
   // untouched so the ranking keeps measuring every detection. Before strategyNotifyDecide
   // so the de-spam state isn't polluted (a later fresh re-detection still alerts as NEW).
-  const barMs = Date.parse(sig.barIso || '') || Date.now();
+  const barMs = Date.parse(sig?.meta?.alertBarIso || sig.barIso || '') || Date.now();
   const tfMsNotify = Math.max(1, timeframeMinutes(tf)) * 60000;
   // PRE-ENTRY alerts (meta.preEntryAlert, e.g. special-forex-sniper) are exempt: their anchor
   // bar is intentionally a few bars old — the setup waits for the pullback, and the engine's
@@ -11875,7 +12100,7 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
     const refClose = ctx ? Number(ctx.candles[ctx.candles.length - 1].close) : null;
     void emitStrategyLabFttSignal({ id, strategy, symbol, timeframe: tf, sig, refClose, popup: wantPopup, email: wantFttEmail, kind, madeMs });
   }
-  return { popupSent: wantPopup, emailSent: wantEmail || wantFttEmail, kind };
+  return { popupSent: wantPopup, emailSent: wantEmail || (!sig?.meta?.forexOnly && wantFttEmail), kind };
 }
 
 // Candle-close confirmation pass: for any active setup whose creation candle has closed
@@ -11885,7 +12110,7 @@ async function processStrategyNotifyConfirms() {
   const now = Date.now();
   for (const [key, st] of strategyNotifyState) {
     if (now - st.updatedAt > STRATEGY_NOTIFY_PRUNE_MS) { strategyNotifyState.delete(key); continue; }
-    if (st.confirmedSent || now < st.createdBarCloseMs) continue;
+    if (st.confirmedSent || st.skipCloseConfirm || now < st.createdBarCloseMs) continue;
     if (!strategyDelivers(st.strategy, { score: st.firstScore, direction: st.direction, timeframe: st.tf })) continue; // controller OFF
     st.confirmedSent = true; // mark once so we never nag
     try {
@@ -11916,6 +12141,7 @@ async function runStrategyNotifyPass(pairs) {
     const [symbol, tf] = pair.split('|');
     if (!symbolAllowsSignalTf(symbol, tf)) continue;     // e.g. USTEC: no M1/D1 signals
     for (const stratId of Object.keys(STRATEGY_LAB_REGISTRY)) {
+      if (!strategyTimeframes(stratId).includes(tf)) continue; // registry timeframes are a contract
       try {
         const ctx = buildStrategyContext(symbol, tf);
         if (!ctx) continue;
@@ -11948,24 +12174,52 @@ async function runStrategyNotifyPass(pairs) {
 // the report. Idempotent: ON DUPLICATE keeps the first score/grade for that bar.
 async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, nowDate = new Date(), livePrice = null) {
   const id = `${stratId}:${symbol}:${tf}:${barMs}`;
+  const meta = sig?.meta || {};
+  const strategyVersion = strategySignalVersion(meta);
+  const setupPlan = strategySignalPlan(meta);
+  const entryOrderType = strategySignalOrderType({ ...meta, strategy: stratId });
+  const entryState = String(meta.entryState || (entryOrderType === 'MARKET' ? 'FILLED' : 'WAIT')).toUpperCase();
+  const measureFixedTime = strategySignalMeasuresFixedTime({ ...meta, strategy: stratId });
+  const signalMs = nowDate.getTime();
+  const validBars = Math.max(1, Number(meta.validBars) || STRATEGY_LAB_ENTRY_VALID_BARS);
+  const validUntil = Number.isFinite(signalMs) ? new Date(signalMs + validBars * timeframeMinutes(tf) * 60000) : null;
+  const filledAt = meta.fillAtSignal || entryState === 'FILLED' ? nowDate : null;
+  const setupEventMs = Date.parse(meta.setupEventIso || '');
+  const alertBarMs = Date.parse(meta.alertBarIso || sig.barIso || '');
   // The realistic AS-TRADED reference: the live price at the instant the signal fires (i.e. when
   // you'd see the alert / get the email). Kept from the FIRST insert for this bar (COALESCE), so a
   // re-detect on the same bar never overwrites the original fill price.
-  const atRef = Number.isFinite(Number(livePrice)) ? Number(livePrice) : null;
+  const atRef = measureFixedTime && Number.isFinite(Number(livePrice)) ? Number(livePrice) : null;
+  const ftOutcome = measureFixedTime ? 'PENDING' : 'EXPIRED';
   const [res] = await pool.execute(
     `INSERT INTO mt5_strategy_signals
        (id, strategy, symbol, timeframe, bar_time, signal_time, direction, score, grade,
-        entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
-        risk_reward, reason, outcome, ft_outcome, at_ref_price, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','PENDING',?,?)
+         entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
+         risk_reward, reason, outcome, ft_outcome, at_ref_price, created_at,
+         strategy_version, setup_plan, entry_order_type, entry_state, entry_filled_at,
+         setup_event_time, alert_bar_time, valid_until, measure_fixed_time)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?,?,?, ?,?,?,?,?,?,?,?,?)
      ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade)),
        at_ref_price = COALESCE(at_ref_price, VALUES(at_ref_price)),
+       strategy_version = COALESCE(strategy_version, VALUES(strategy_version)),
+       setup_plan = COALESCE(setup_plan, VALUES(setup_plan)),
+       entry_order_type = COALESCE(entry_order_type, VALUES(entry_order_type)),
+       entry_state = CASE WHEN entry_state='FILLED' THEN entry_state ELSE COALESCE(VALUES(entry_state), entry_state) END,
+       entry_filled_at = COALESCE(entry_filled_at, VALUES(entry_filled_at)),
+       setup_event_time = COALESCE(setup_event_time, VALUES(setup_event_time)),
+       alert_bar_time = COALESCE(alert_bar_time, VALUES(alert_bar_time)),
+       valid_until = COALESCE(valid_until, VALUES(valid_until)),
+       measure_fixed_time = COALESCE(measure_fixed_time, VALUES(measure_fixed_time)),
        score_updated_at = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(signal_time), score_updated_at),
        latest_grade    = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(grade), COALESCE(latest_grade, grade)),
        latest_score    = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(score), COALESCE(latest_score, score))`,
     [id, stratId, symbol, tf, toMysqlDate(new Date(barMs)), toMysqlDate(nowDate), sig.decision, sig.score ?? null, sig.grade ?? null,
      sig.entry ?? null, sig.stopLoss ?? null, sig.takeProfit1 ?? null, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
-     sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), atRef, toMysqlDate(nowDate)],
+     sig.riskRewardRatio ?? null, String(sig.reason || '').slice(0, 255), ftOutcome, atRef, toMysqlDate(nowDate),
+     strategyVersion, setupPlan, entryOrderType, entryState, filledAt ? toMysqlDate(filledAt) : null,
+     Number.isFinite(setupEventMs) ? toMysqlDate(new Date(setupEventMs)) : null,
+     Number.isFinite(alertBarMs) ? toMysqlDate(new Date(alertBarMs)) : null,
+     validUntil ? toMysqlDate(validUntil) : null, measureFixedTime ? 1 : 0],
   );
   return { id, affectedRows: res.affectedRows };
 }
@@ -11981,8 +12235,10 @@ async function runStrategyLabScan() {
     const now = new Date();
     let logged = 0;
     for (const stratId of Object.keys(STRATEGY_LAB_REGISTRY)) {
+      const declaredTfs = strategyTimeframes(stratId);
       for (const symbol of symbols) {
         for (const tf of STRATEGY_LAB_TIMEFRAMES) {
+          if (!declaredTfs.includes(tf)) continue;         // registry timeframes are a contract, not a hint
           if (!symbolAllowsSignalTf(symbol, tf)) continue; // e.g. USTEC: no M1/D1 signals
           const ctx = buildStrategyContext(symbol, tf);
           if (!ctx) continue;
@@ -12070,11 +12326,82 @@ function resolveStrategyAsTraded(row, candles, nowMs = Date.now()) {
   return { outcome: diff > 0 ? 'WIN' : diff < 0 ? 'LOSS' : 'DRAW', exitPrice: exit, pips: Math.round((diff / pip) * 10) / 10, expiryIso: new Date(expiryMs).toISOString() };
 }
 
+let lastLilCorrectionAt = 0;
+async function processLilSweepCorrections(pool, nowMs = Date.now()) {
+  if (!pool || nowMs - lastLilCorrectionAt < 5 * 60 * 1000) return;
+  lastLilCorrectionAt = nowMs;
+  const [rows] = await pool.query(
+    `SELECT * FROM mt5_strategy_signals
+      WHERE strategy='lil-sweep-pro-plus'
+        AND (strategy_version IS NULL OR strategy_version < 2)
+        AND (corrected_outcome IS NULL
+             OR (corrected_outcome IN ('TP1_WIN','TP2_WIN')
+                 AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 72 HOUR)))
+        AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+      ORDER BY signal_time DESC LIMIT 250`,
+    [STRATEGY_LAB_RETENTION_DAYS],
+  );
+  for (const row of rows) {
+    const signalMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+    if (!Number.isFinite(signalMs)) continue;
+    const endMs = Math.min(nowMs, signalMs + 72 * 3600 * 1000);
+    const candles = await getCandlesFromDbRange(row.symbol, row.timeframe, new Date(signalMs).toISOString(), new Date(endMs).toISOString(), 10000);
+    if (!candles || candles.length < 2) continue;
+    const plan = strategySignalPlan(row);
+    const orderType = plan === 'BREAK-HOLD' ? 'MARKET' : 'STOP';
+    const tfMs = timeframeMinutes(row.timeframe) * 60000;
+    const validUntilMs = signalMs + STRATEGY_LAB_ENTRY_VALID_BARS * tfMs;
+    const replayStartMs = orderType === 'MARKET' ? Math.ceil(signalMs / tfMs) * tfMs : signalMs;
+    const priorCorrected = String(row.corrected_outcome || 'PENDING').toUpperCase();
+    const priorRank = forexOutcomeRank(priorCorrected);
+    const report = {
+      symbol: row.symbol,
+      timeframe: row.timeframe,
+      signalTime: new Date(signalMs).toISOString(),
+      direction: row.direction,
+      entryPrice: row.entry_price,
+      stopLoss: row.stop_loss,
+      takeProfit1: row.take_profit_1,
+      payload: { takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3 },
+      outcome: priorCorrected,
+      exitPrice: priorRank === 3 ? row.take_profit_3 : priorRank === 2 ? row.take_profit_2 : priorRank === 1 ? row.take_profit_1 : null,
+      resolvedAt: null,
+    };
+    const replay = evaluateForexReplay(report, candles, {
+      orderType,
+      filledAtSignal: orderType === 'MARKET' || /ENTER NOW/i.test(String(row.reason || '')),
+      validUntilIso: new Date(validUntilMs).toISOString(),
+      replayStartIso: new Date(replayStartMs).toISOString(),
+    });
+    let corrected = null;
+    let reason = null;
+    if (replay.valid && ['LOSS', 'TP1_WIN', 'TP2_WIN', 'TP3_WIN', 'WIN', 'AMBIGUOUS'].includes(replay.outcome)) {
+      corrected = replay.outcome;
+      reason = `v2 ${orderType} replay${orderType === 'MARKET' ? ' from first full post-alert candle' : ''}`;
+    } else if (!replay.filledAt && nowMs > validUntilMs) {
+      corrected = 'EXPIRED';
+      reason = `v2 ${orderType} replay: entry never filled within ${STRATEGY_LAB_ENTRY_VALID_BARS} bars`;
+    } else if (nowMs - signalMs > 72 * 3600 * 1000) {
+      corrected = 'EXPIRED';
+      reason = `v2 ${orderType} replay: unresolved after 72h`;
+    }
+    if (!corrected) continue;
+    await pool.execute(
+      `UPDATE mt5_strategy_signals
+          SET corrected_outcome=?, corrected_pips=?, correction_reason=?
+        WHERE id=?
+          AND (corrected_outcome IS NULL OR corrected_outcome IN ('TP1_WIN','TP2_WIN'))`,
+      [corrected, replay.profitLossPips ?? null, reason, row.id],
+    );
+  }
+}
+
 async function processStrategyLabOutcomes() {
   const pool = await initializeDatabase();
   if (!pool) return;
   const nowMs = Date.now();
   try {
+    await processLilSweepCorrections(pool, nowMs);
     // Repair pass (idempotent): re-open any impossible win so it re-resolves with the
     // corrected replay. A win can never have negative pips, and a TP level can't be hit
     // if that target was never defined (the old Number(null)->0 bug faked TP3 wins for
@@ -12105,13 +12432,18 @@ async function processStrategyLabOutcomes() {
     // in-memory buffer, so the replay can never see where TP/SL hit) pile up faster than the row
     // loop reaches them and the whole table appears stuck on PENDING.
     await pool.execute(
-      "UPDATE mt5_strategy_signals SET outcome='EXPIRED', resolved_at=UTC_TIMESTAMP() WHERE outcome='PENDING' AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
+      `UPDATE mt5_strategy_signals
+          SET outcome='EXPIRED', resolved_at=UTC_TIMESTAMP()
+        WHERE outcome='PENDING'
+          AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR
+          AND NOT (strategy='lil-sweep-pro-plus' AND COALESCE(strategy_version, 1) >= 2)
+        LIMIT 5000`,
     );
     await pool.execute(
-      "UPDATE mt5_strategy_signals SET ft_outcome='EXPIRED' WHERE ft_outcome='PENDING' AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
+      "UPDATE mt5_strategy_signals SET ft_outcome='EXPIRED' WHERE strategy <> 'lil-sweep-pro-plus' AND COALESCE(measure_fixed_time, 1) <> 0 AND ft_outcome='PENDING' AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
     );
     await pool.execute(
-      "UPDATE mt5_strategy_signals SET at_outcome='EXPIRED' WHERE at_ref_price IS NOT NULL AND at_outcome IS NULL AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
+      "UPDATE mt5_strategy_signals SET at_outcome='EXPIRED' WHERE strategy <> 'lil-sweep-pro-plus' AND COALESCE(measure_fixed_time, 1) <> 0 AND at_ref_price IS NOT NULL AND at_outcome IS NULL AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR LIMIT 5000",
     );
     // NEWEST-first: the bulk-expire above already clears the >72h tail, so the row-by-row pass
     // should prioritise recent signals — those are the ones whose post-signal candles are still
@@ -12119,18 +12451,53 @@ async function processStrategyLabOutcomes() {
     // trading. Oldest-first starved them: the resolver spun on the un-resolvable old cluster
     // (post-signal candles long evicted) and never reached today's signals. Older un-resolvable
     // rows simply wait for the 72h bulk-expire.
-    const [rows] = await pool.query(
-      "SELECT * FROM mt5_strategy_signals WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN') OR ft_outcome = 'PENDING' OR (at_ref_price IS NOT NULL AND at_outcome IS NULL) ORDER BY signal_time DESC LIMIT 800",
+    const [overdueLilRows] = await pool.query(
+      `SELECT * FROM mt5_strategy_signals
+        WHERE strategy='lil-sweep-pro-plus'
+          AND COALESCE(strategy_version, 1) >= 2
+          AND outcome='PENDING'
+          AND signal_time < UTC_TIMESTAMP() - INTERVAL 72 HOUR
+        ORDER BY signal_time ASC LIMIT 100`,
     );
+    const [recentRows] = await pool.query(
+      `SELECT * FROM mt5_strategy_signals
+        WHERE outcome IN ('PENDING','TP1_WIN','TP2_WIN')
+           OR (strategy <> 'lil-sweep-pro-plus' AND COALESCE(measure_fixed_time, 1) <> 0 AND ft_outcome = 'PENDING')
+           OR (strategy <> 'lil-sweep-pro-plus' AND COALESCE(measure_fixed_time, 1) <> 0 AND at_ref_price IS NOT NULL AND at_outcome IS NULL)
+        ORDER BY signal_time DESC LIMIT 800`,
+    );
+    const overdueIds = new Set(overdueLilRows.map((row) => row.id));
+    const rows = [...overdueLilRows, ...recentRows.filter((row) => !overdueIds.has(row.id))];
     for (const row of rows) {
       const signalMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
       if (!Number.isFinite(signalMs)) continue;
       const ageHrs = (nowMs - signalMs) / (3600 * 1000);
-      const candles = getRecentCandles(row.symbol, row.timeframe, 1000);
+      const isLilV2 = String(row.strategy) === 'lil-sweep-pro-plus' && Number(row.strategy_version) >= 2;
+      const measureFixedTime = strategySignalMeasuresFixedTime(row);
+      let candles = getRecentCandles(row.symbol, row.timeframe, 1000);
+      if (isLilV2 && ageHrs > 72 && String(row.outcome).toUpperCase() === 'PENDING') {
+        const tfMs = timeframeMinutes(row.timeframe) * 60000;
+        const replayEndMs = signalMs + 72 * 3600 * 1000;
+        const dbCandles = await getCandlesFromDbRange(
+          row.symbol,
+          row.timeframe,
+          new Date(signalMs - tfMs).toISOString(),
+          new Date(replayEndMs).toISOString(),
+          10000,
+        );
+        if (dbCandles?.length >= 2) candles = dbCandles;
+        else {
+          await pool.execute(
+            "UPDATE mt5_strategy_signals SET outcome='EXPIRED', resolved_at=? WHERE id=? AND outcome='PENDING'",
+            [toMysqlDate(), row.id],
+          );
+          continue;
+        }
+      }
 
       // Forex outcome (TP/SL). Only PENDING expires past 72h — never overwrite a win.
       if (['PENDING', 'TP1_WIN', 'TP2_WIN'].includes(String(row.outcome).toUpperCase())) {
-        if (ageHrs > 72 && String(row.outcome).toUpperCase() === 'PENDING') {
+        if (ageHrs > 72 && String(row.outcome).toUpperCase() === 'PENDING' && !isLilV2) {
           await pool.execute("UPDATE mt5_strategy_signals SET outcome='EXPIRED', resolved_at=? WHERE id=?", [toMysqlDate(), row.id]);
         } else if (candles && candles.length >= 2) {
           const report = {
@@ -12139,10 +12506,30 @@ async function processStrategyLabOutcomes() {
             payload: { takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3 },
             outcome: row.outcome, exitPrice: row.exit_price, resolvedAt: row.resolved_at,
           };
-          // special-forex-sniper (limit) and lil-sweep-pro-plus (break trigger) log
-          // pending entries — resolve fill-gated so an unfilled
-          // limit can never produce a phantom win (see evaluateForexReplay).
-          const replay = evaluateForexReplay(report, candles, { requiresFill: ['special-forex-sniper', 'lil-sweep-pro-plus'].includes(String(row.strategy)) });
+          const orderType = strategySignalOrderType(row);
+          const requiresFill = orderType === 'LIMIT' || orderType === 'STOP';
+          const filledAtSignal = strategySignalFilledAtSignal(row);
+          const tfMs = timeframeMinutes(row.timeframe) * 60000;
+          const replayStartIso = isLilV2 && orderType === 'MARKET'
+            ? new Date(Math.ceil(signalMs / tfMs) * tfMs).toISOString()
+            : isLilV2 && orderType === 'STOP'
+              ? new Date(Math.floor(signalMs / tfMs) * tfMs).toISOString()
+              : null;
+          // Every strategy now declares honest order semantics. Market-at-close setups
+          // replay immediately; FVG/breaker LIMITs and LIL STOPs must actually fill.
+          const replay = evaluateForexReplay(report, candles, {
+            requiresFill,
+            orderType,
+            filledAtSignal,
+            validUntilIso: row.valid_until ? new Date(row.valid_until).toISOString() : null,
+            replayStartIso,
+          });
+          if (replay.filledAt && String(row.entry_state || '').toUpperCase() !== 'FILLED') {
+            await pool.execute(
+              "UPDATE mt5_strategy_signals SET entry_state='FILLED', entry_filled_at=COALESCE(entry_filled_at, ?) WHERE id=?",
+              [toMysqlDate(replay.filledAt), row.id],
+            );
+          }
           if (replay.valid && !['PENDING', 'EXPIRED'].includes(replay.outcome)) {
             if (replay.outcome === 'AMBIGUOUS') {
               await pool.execute("UPDATE mt5_strategy_signals SET outcome='AMBIGUOUS', resolved_at=? WHERE id=?", [toMysqlDate(replay.resolvedAt || new Date()), row.id]);
@@ -12152,6 +12539,16 @@ async function processStrategyLabOutcomes() {
                 [replay.outcome, replay.exitPrice ?? null, replay.profitLossPips ?? null, replay.tpHitLevel ?? null, replay.mfePips ?? null, replay.maePips ?? null, toMysqlDate(replay.resolvedAt || new Date()), row.id],
               );
             }
+          } else if (requiresFill && !replay.filledAt && row.valid_until && nowMs >= new Date(row.valid_until).getTime()) {
+            await pool.execute(
+              "UPDATE mt5_strategy_signals SET outcome='EXPIRED', entry_state='EXPIRED', resolved_at=? WHERE id=? AND outcome='PENDING'",
+              [toMysqlDate(), row.id],
+            );
+          } else if (isLilV2 && ageHrs > 72) {
+            await pool.execute(
+              "UPDATE mt5_strategy_signals SET outcome='EXPIRED', resolved_at=? WHERE id=? AND outcome='PENDING'",
+              [toMysqlDate(), row.id],
+            );
           }
         }
       }
@@ -12160,7 +12557,7 @@ async function processStrategyLabOutcomes() {
       // view always shows a real WIN/LOSS/DRAW. "Tradable vs late" is a separate flag
       // (ftActionable) computed from timestamps — late-surfaced calls still show their
       // result, they're just excluded from the tradable win-rate.
-      if (String(row.ft_outcome).toUpperCase() === 'PENDING') {
+      if (measureFixedTime && String(row.ft_outcome).toUpperCase() === 'PENDING') {
         const ft = candles && candles.length ? resolveStrategyFixedTime(row, candles) : null;
         if (ft) {
           await pool.execute("UPDATE mt5_strategy_signals SET ft_outcome=?, ft_exit_price=?, ft_pips=? WHERE id=?", [ft.outcome, ft.exitPrice, ft.pips, row.id]);
@@ -12171,7 +12568,7 @@ async function processStrategyLabOutcomes() {
 
       // AS-TRADED outcome (realistic: live entry @ at_ref_price, expiry = signal_time + 1 candle).
       // Independent of the idealized ft_outcome above; only rows with a captured ref settle here.
-      if (row.at_ref_price != null && (row.at_outcome == null || String(row.at_outcome).toUpperCase() === 'PENDING')) {
+      if (measureFixedTime && row.at_ref_price != null && (row.at_outcome == null || String(row.at_outcome).toUpperCase() === 'PENDING')) {
         const at = candles && candles.length ? resolveStrategyAsTraded(row, candles, nowMs) : null;
         if (at) {
           await pool.execute("UPDATE mt5_strategy_signals SET at_outcome=?, at_exit_price=?, at_pips=?, at_expiry_time=? WHERE id=?", [at.outcome, at.exitPrice, at.pips, toMysqlDate(new Date(at.expiryIso)), row.id]);
@@ -12190,7 +12587,7 @@ async function pruneStrategyLabSignals() {
   if (!pool) return;
   try {
     await pool.query(
-      "DELETE FROM mt5_strategy_signals WHERE outcome <> 'PENDING' AND ft_outcome <> 'PENDING' AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT 5000",
+      "DELETE FROM mt5_strategy_signals WHERE outcome <> 'PENDING' AND (strategy='lil-sweep-pro-plus' OR COALESCE(measure_fixed_time, 1) = 0 OR ft_outcome <> 'PENDING') AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT 5000",
       [STRATEGY_LAB_RETENTION_DAYS],
     );
   } catch (e) { console.error('[StrategyLab] prune failed:', e.message); }
@@ -12198,6 +12595,7 @@ async function pruneStrategyLabSignals() {
 
 // Aggregate per-strategy (and per-timeframe) performance — forex + fixed-time win rates.
 function strategyLabAccumulate(b, row) {
+  b.fxTotal += 1;
   const fo = String(row.outcome || 'PENDING').toUpperCase();
   if (fo.endsWith('_WIN') || fo === 'WIN') { b.fxWins += 1; }
   else if (fo === 'LOSS') { b.fxLosses += 1; }
@@ -12210,6 +12608,8 @@ function strategyLabAccumulate(b, row) {
     const rm = rMultiple(row.symbol, row.entry_price, row.stop_loss, row.profit_loss_pips);
     if (rm !== null) { b.fxNetR += rm; b.fxRN += 1; }
   }
+  const measureFixedTime = strategySignalMeasuresFixedTime(row);
+  if (measureFixedTime) { b.ftTotal += 1; b.atTotal += 1; }
   const fto = String(row.ft_outcome || 'PENDING').toUpperCase();
   // Fixed-time win-rate counts only TRADABLE calls (surfaced before their expiry candle
   // closed). Late-surfaced calls still have a real outcome (shown in the recent view) but
@@ -12217,23 +12617,36 @@ function strategyLabAccumulate(b, row) {
   const bt = row.bar_time ? new Date(row.bar_time).getTime() : NaN;
   const st = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
   const ftAct = (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, row.timeframe, st) : true;
-  if (fto === 'PENDING') b.ftPending += 1;
-  else if (ftAct) { if (fto === 'WIN') b.ftWins += 1; else if (fto === 'LOSS') b.ftLosses += 1; else if (fto === 'DRAW') b.ftDraws += 1; }
+  if (measureFixedTime && fto === 'PENDING') b.ftPending += 1;
+  else if (measureFixedTime && ftAct) { if (fto === 'WIN') b.ftWins += 1; else if (fto === 'LOSS') b.ftLosses += 1; else if (fto === 'DRAW') b.ftDraws += 1; }
   // AS-TRADED (realistic): entered at the live price when the signal fired — tradable by
   // construction, so no ftActionable gate. Only counts rows that captured a ref (going-forward).
   const ato = String(row.at_outcome || '').toUpperCase();
-  if (ato === 'WIN') b.atWins += 1; else if (ato === 'LOSS') b.atLosses += 1; else if (ato === 'DRAW') b.atDraws += 1;
-  if (Number.isFinite(Number(row.at_pips)) && (ato === 'WIN' || ato === 'LOSS')) { b.atNetPips += Number(row.at_pips); b.atPipsN += 1; }
+  if (measureFixedTime) {
+    if (ato === 'WIN') b.atWins += 1; else if (ato === 'LOSS') b.atLosses += 1; else if (ato === 'DRAW') b.atDraws += 1;
+    if (Number.isFinite(Number(row.at_pips)) && (ato === 'WIN' || ato === 'LOSS')) { b.atNetPips += Number(row.at_pips); b.atPipsN += 1; }
+  }
+  const corrected = String(row.corrected_outcome || '').toUpperCase();
+  if (corrected.endsWith('_WIN') || corrected === 'WIN') b.correctedWins += 1;
+  else if (corrected === 'LOSS') b.correctedLosses += 1;
+  else if (corrected === 'EXPIRED') b.correctedExpired += 1;
+  else if (corrected === 'AMBIGUOUS') b.correctedAmbiguous += 1;
+  if (Number.isFinite(Number(row.corrected_pips)) && (corrected.endsWith('_WIN') || corrected === 'WIN' || corrected === 'LOSS')) {
+    b.correctedNetPips += Number(row.corrected_pips);
+    b.correctedPipsN += 1;
+  }
 }
 function strategyLabBucket() {
-  return { total: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, fxRRSum: 0, fxRRCount: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0, atWins: 0, atLosses: 0, atDraws: 0, atNetPips: 0, atPipsN: 0 };
+  return { total: 0, fxTotal: 0, ftTotal: 0, atTotal: 0, fxWins: 0, fxLosses: 0, fxExpired: 0, fxPending: 0, fxNetPips: 0, fxPipsN: 0, fxNetR: 0, fxRN: 0, fxRRSum: 0, fxRRCount: 0, ftWins: 0, ftLosses: 0, ftDraws: 0, ftPending: 0, atWins: 0, atLosses: 0, atDraws: 0, atNetPips: 0, atPipsN: 0, correctedWins: 0, correctedLosses: 0, correctedExpired: 0, correctedAmbiguous: 0, correctedNetPips: 0, correctedPipsN: 0 };
 }
 function strategyLabFinalize(b) {
   const fxScored = b.fxWins + b.fxLosses;
   const ftScored = b.ftWins + b.ftLosses;
+  const correctedScored = b.correctedWins + b.correctedLosses;
   return {
     total: b.total,
     forex: {
+      total: b.fxTotal,
       wins: b.fxWins, losses: b.fxLosses, expired: b.fxExpired, pending: b.fxPending,
       winLossSettled: fxScored,
       winRate: fxScored ? Math.round((b.fxWins / fxScored) * 1000) / 10 : null,
@@ -12243,6 +12656,7 @@ function strategyLabFinalize(b) {
       confidence: sampleConfidence(fxScored),
     },
     fixedTime: {
+      total: b.ftTotal,
       wins: b.ftWins, losses: b.ftLosses, draws: b.ftDraws, pending: b.ftPending,
       winLossSettled: ftScored,
       winRate: ftScored ? Math.round((b.ftWins / ftScored) * 1000) / 10 : null,
@@ -12253,6 +12667,7 @@ function strategyLabFinalize(b) {
     asTraded: (() => {
       const atScored = b.atWins + b.atLosses;
       return {
+        total: b.atTotal,
         wins: b.atWins, losses: b.atLosses, draws: b.atDraws,
         winLossSettled: atScored,
         winRate: atScored ? Math.round((b.atWins / atScored) * 1000) / 10 : null,
@@ -12260,6 +12675,16 @@ function strategyLabFinalize(b) {
         confidence: sampleConfidence(atScored),
       };
     })(),
+    correctedForex: (correctedScored || b.correctedExpired || b.correctedAmbiguous) ? {
+      wins: b.correctedWins,
+      losses: b.correctedLosses,
+      expired: b.correctedExpired,
+      ambiguous: b.correctedAmbiguous,
+      winLossSettled: correctedScored,
+      winRate: correctedScored ? Math.round((b.correctedWins / correctedScored) * 1000) / 10 : null,
+      expectancyPips: b.correctedPipsN ? Math.round((b.correctedNetPips / b.correctedPipsN) * 10) / 10 : null,
+      confidence: sampleConfidence(correctedScored),
+    } : null,
   };
 }
 
@@ -12302,7 +12727,7 @@ async function buildStrategyLabPerformance({ days = 90, preset = null, from = nu
   const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], sessionBreakdown: [], scoreRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
-    "SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
+    "SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time, strategy_version, measure_fixed_time, corrected_outcome, corrected_pips FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
     [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
   );
   const byStrat = new Map();
@@ -12376,7 +12801,7 @@ async function buildStrategyLabPerformance({ days = 90, preset = null, from = nu
     return ((b.forex.winRate ?? -1) - (a.forex.winRate ?? -1)) || ((b.forex.winLossSettled ?? 0) - (a.forex.winLossSettled ?? 0));
   };
   out.strategies = [...byStrat.entries()].map(([id, s]) => ({
-    id, name: meta[id]?.name || id, source: meta[id]?.source || null,
+    id, name: meta[id]?.name || id, source: meta[id]?.source || null, forexOnly: Boolean(meta[id]?.forexOnly),
     ...strategyLabFinalize(s.overall),
     byTimeframe: [...s.byTf.entries()].map(([tf, b]) => ({ timeframe: tf, ...strategyLabFinalize(b) }))
       .sort(rankByWin),
@@ -12397,12 +12822,12 @@ async function buildStrategyLabPerformance({ days = 90, preset = null, from = nu
   const sessionOrder = out.sessionRanking.map((s) => s.session);
   out.sessionBreakdown = [...sessionBreakdown.values()].map(({ meta: m, byStrategy, bySymbol, byTf }) => ({
     session: m.key, sessionLabel: m.label, bdRange: m.bdRange,
-    byStrategy: [...byStrategy.entries()].map(([id, b]) => ({ id, name: meta[id]?.name || id, ...strategyLabFinalize(b) })).sort(rankByWin),
+    byStrategy: [...byStrategy.entries()].map(([id, b]) => ({ id, name: meta[id]?.name || id, forexOnly: Boolean(meta[id]?.forexOnly), ...strategyLabFinalize(b) })).sort(rankByWin),
     bySymbol: [...bySymbol.entries()].map(([symbol, b]) => ({ symbol, ...strategyLabFinalize(b) })).sort(rankByWin),
     byTimeframe: [...byTf.entries()].map(([timeframe, b]) => ({ timeframe, ...strategyLabFinalize(b) })).sort(rankByWin),
   })).sort((a, b) => sessionOrder.indexOf(a.session) - sessionOrder.indexOf(b.session));
   out.combos = [...comboMap.values()]
-    .map((c) => ({ strategy: c.strategy, strategyName: meta[c.strategy]?.name || c.strategy, symbol: c.symbol, timeframe: c.timeframe, ...strategyLabFinalize(c.b) }))
+    .map((c) => ({ strategy: c.strategy, strategyName: meta[c.strategy]?.name || c.strategy, forexOnly: Boolean(meta[c.strategy]?.forexOnly), symbol: c.symbol, timeframe: c.timeframe, ...strategyLabFinalize(c.b) }))
     .filter((c) => (c.forex.winLossSettled ?? 0) > 0 || (c.fixedTime.winLossSettled ?? 0) > 0)
     .sort(rankByWin)
     .slice(0, 60);
@@ -12436,7 +12861,7 @@ async function buildStrategyLabConfluence({ days = 90, preset = null, from = nul
   const out = { ok: true, window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSample, agreementLadder: [], topPairs: [], combo: null, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const params = [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))];
-  let sql = "SELECT strategy, symbol, timeframe, bar_time, direction, ft_outcome, at_outcome FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ?";
+  let sql = "SELECT strategy, symbol, timeframe, bar_time, direction, ft_outcome, at_outcome FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? AND strategy <> 'lil-sweep-pro-plus' AND COALESCE(measure_fixed_time, 1) <> 0";
   if (timeframe) { sql += " AND timeframe = ?"; params.push(String(timeframe).toUpperCase()); }
   if (symbol) { sql += " AND symbol = ?"; params.push(String(symbol).toUpperCase()); }
   sql += " LIMIT 50000";
@@ -12457,7 +12882,9 @@ async function buildStrategyLabConfluence({ days = 90, preset = null, from = nul
     if (!m.atOut && (ao === 'WIN' || ao === 'LOSS' || ao === 'DRAW')) m.atOut = ao;
   }
 
-  const meta = Object.fromEntries(listStrategies().map((x) => [x.id, x.name]));
+  const strategyMeta = listStrategies();
+  const meta = Object.fromEntries(strategyMeta.map((x) => [x.id, x.name]));
+  const forexOnlyIds = new Set(strategyMeta.filter((x) => x.forexOnly).map((x) => x.id));
   // 1) Agreement ladder: bucket every moment by how many strategies agreed (1 / 2 / 3 / 4+).
   const ladder = new Map(); // bucketKey -> confluenceBucket
   // 2) Per-pair: every co-occurring pair gets credited on each moment they share.
@@ -12497,7 +12924,7 @@ async function buildStrategyLabConfluence({ days = 90, preset = null, from = nul
     .slice(0, 25);
 
   // 3) Custom combo: moments where ALL the selected strategies fired together.
-  const sel = (Array.isArray(strategies) ? strategies : []).filter(Boolean);
+  const sel = (Array.isArray(strategies) ? strategies : []).filter((id) => id && !forexOnlyIds.has(id));
   if (sel.length >= 2) {
     const comboB = confluenceBucket();
     const bySymbol = new Map();
@@ -12536,7 +12963,13 @@ app.get('/api/strategy-lab/strategies', (req, res) => {
   const controls = loadEmailAlertSettings().strategyControls || {};
   // Attach each strategy's controller state (default = enabled) so the Settings page and
   // dashboard can render the on/off switch + refinements and grey muted strategies.
-  const strategies = listStrategies().map((m) => ({ ...m, control: controls[m.id] || { enabled: true } }));
+  const strategies = listStrategies().map((m) => {
+    const saved = controls[m.id] || { enabled: true };
+    const control = Array.isArray(saved.timeframes)
+      ? { ...saved, timeframes: saved.timeframes.filter((tf) => strategyTimeframes(m.id).includes(tf)) }
+      : saved;
+    return { ...m, control };
+  });
   // Curated symbol universe the lab scans — lets the Settings page build the per-strategy
   // email symbol filter (empty selection = all symbols).
   const symbols = getCuratedSymbols(getMt5Status().symbols);
@@ -12583,8 +13016,13 @@ app.get('/api/strategy-lab/live', async (req, res) => {
     if (!includeMuted && strategyMuted(strategy)) {
       return res.json({ ok: true, hidden: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, rows: [], generatedAt: new Date().toISOString() });
     }
-    // "ALL" → scan every lab timeframe and return one row per symbol×timeframe.
-    const tfs = tfParam === 'ALL' ? STRATEGY_LAB_TIMEFRAMES : [tfParam];
+    // Registry timeframes are an execution contract. ICT Breaker intentionally declares
+    // the full M1/M5/M15/M30/H1/H4/D1 ladder and therefore remains available on all seven.
+    const declaredTfs = strategyTimeframes(strategy);
+    if (tfParam !== 'ALL' && !declaredTfs.includes(tfParam)) {
+      return res.status(400).json({ error: `${STRATEGY_LAB_REGISTRY[strategy].name} does not support ${tfParam}.`, allowedTimeframes: declaredTfs });
+    }
+    const tfs = tfParam === 'ALL' ? declaredTfs : [tfParam];
     const symbols = getCuratedSymbols(getMt5Status().symbols);
     const rows = [];
     for (const symbol of symbols) {
@@ -12605,7 +13043,7 @@ app.get('/api/strategy-lab/live', async (req, res) => {
             riskReward: sig.riskRewardRatio ?? null, reason: sig.reason || null,
             lots: sizing?.suggestedLots ?? null, stopPips: sizing?.stopPips ?? null,
             lossAtStop: sizing?.lossAtStop ?? null, riskPercent: sizing?.riskPercent ?? null,
-            timing: strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss),
+            timing: strategyLabLiveTiming(symbol, sig.decision, price, sig.entry, sig.stopLoss, sig.meta || null),
             dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds,
           });
         } else {
@@ -12632,11 +13070,18 @@ app.get('/api/strategy-lab/live-ftt', async (req, res) => {
     const strategy = req.query.strategy ? String(req.query.strategy) : (enabledStrategyIds()[0] || Object.keys(STRATEGY_LAB_REGISTRY)[0]);
     if (!STRATEGY_LAB_REGISTRY[strategy]) return res.status(404).json({ error: 'Unknown strategy.' });
     const tfParam = (req.query.timeframe ? String(req.query.timeframe) : 'M15').toUpperCase();
+    if (STRATEGY_LAB_REGISTRY[strategy].forexOnly) {
+      return res.json({ ok: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, forexOnly: true, rows: [], generatedAt: new Date().toISOString() });
+    }
     // Disabled strategies are hidden everywhere (see /live) unless includeMuted.
     if (!includeMuted && strategyMuted(strategy)) {
       return res.json({ ok: true, hidden: true, strategy, strategyName: STRATEGY_LAB_REGISTRY[strategy].name, timeframe: tfParam, expiryBars: STRATEGY_LAB_FT_EXPIRY_BARS, rows: [], generatedAt: new Date().toISOString() });
     }
-    const tfs = tfParam === 'ALL' ? STRATEGY_LAB_TIMEFRAMES : [tfParam];
+    const declaredTfs = strategyTimeframes(strategy);
+    if (tfParam !== 'ALL' && !declaredTfs.includes(tfParam)) {
+      return res.status(400).json({ error: `${STRATEGY_LAB_REGISTRY[strategy].name} does not support ${tfParam}.`, allowedTimeframes: declaredTfs });
+    }
+    const tfs = tfParam === 'ALL' ? declaredTfs : [tfParam];
     const symbols = getCuratedSymbols(getMt5Status().symbols);
     const rows = [];
     for (const symbol of symbols) {
@@ -12646,7 +13091,7 @@ app.get('/api/strategy-lab/live-ftt', async (req, res) => {
         const price = Number(ctx.candles[ctx.candles.length - 1].close);
         const fresh = candleFreshness(ctx.candles[ctx.candles.length - 1], tf);
         const sig = evaluateStrategy(strategy, ctx);
-        if (sig && sig.decision && sig.decision !== 'HOLD' && liveSignalsAllowed()) {
+        if (sig && sig.decision && sig.decision !== 'HOLD' && liveSignalsAllowed() && !sig?.meta?.forexOnly) {
           const expiry = strategyLabFttExpiry(tf);
           const ftDir = /BUY/.test(String(sig.decision)) ? 'UP' : 'DOWN';
           rows.push({
@@ -12728,6 +13173,7 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
       ok: true,
       signals: rows.map((r) => {
         const sizing = strategyLabSizing(r.symbol, r.entry_price, r.stop_loss, { tp1: r.take_profit_1, tp2: r.take_profit_2, tp3: r.take_profit_3 });
+        const measureFixedTime = strategySignalMeasuresFixedTime(r);
         return {
           id: r.id, strategy: r.strategy, symbol: r.symbol, timeframe: r.timeframe,
           signalTime: r.signal_time ? new Date(r.signal_time).toISOString() : null,
@@ -12740,20 +13186,29 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
           entryPrice: num(r.entry_price), stopLoss: num(r.stop_loss),
           takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
           riskReward: num(r.risk_reward), reason: r.reason,
+          strategyVersion: r.strategy_version === null || r.strategy_version === undefined ? null : Number(r.strategy_version),
+          setupPlan: r.setup_plan || strategySignalPlan(r),
+          entryOrderType: r.entry_order_type || strategySignalOrderType(r),
+          entryState: r.entry_state || null,
+          entryFilledAt: r.entry_filled_at ? new Date(r.entry_filled_at).toISOString() : null,
+          validUntil: r.valid_until ? new Date(r.valid_until).toISOString() : null,
+          correctedOutcome: r.corrected_outcome || null,
+          correctedPips: num(r.corrected_pips),
+          correctionReason: r.correction_reason || null,
           lots: sizing?.suggestedLots ?? null, stopPips: sizing?.stopPips ?? null, lossAtStop: sizing?.lossAtStop ?? null,
           timing: strategyLabTiming(r),
           outcome: r.outcome, profitLossPips: num(r.profit_loss_pips), tpHitLevel: r.tp_hit_level === null ? null : Number(r.tp_hit_level),
-          ftOutcome: r.ft_outcome, ftPips: num(r.ft_pips),
+          ftOutcome: measureFixedTime ? r.ft_outcome : null, ftPips: measureFixedTime ? num(r.ft_pips) : null,
           // As-traded (realistic) outcome alongside the idealized ft_outcome. atRefPrice null = logged
           // before this feature (no retroactive settle). atGapPips = how much the signal→entry delay cost.
-          atOutcome: r.at_outcome || null, atRefPrice: num(r.at_ref_price), atExitPrice: num(r.at_exit_price), atPips: num(r.at_pips),
-          atGapPips: (r.at_pips != null && r.ft_pips != null) ? Math.round((Number(r.at_pips) - Number(r.ft_pips)) * 10) / 10 : null,
-          atExpiryIso: r.at_expiry_time ? new Date(r.at_expiry_time).toISOString() : (() => { const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; const tfMs = (timeframeMinutes(r.timeframe) || 0) * 60000; return (Number.isFinite(st) && tfMs > 0) ? new Date(st + STRATEGY_LAB_FT_EXPIRY_BARS * tfMs).toISOString() : null; })(),
-          ftActionable: (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; return (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, r.timeframe, st) : null; })(),
+          atOutcome: measureFixedTime ? (r.at_outcome || null) : null, atRefPrice: measureFixedTime ? num(r.at_ref_price) : null, atExitPrice: measureFixedTime ? num(r.at_exit_price) : null, atPips: measureFixedTime ? num(r.at_pips) : null,
+          atGapPips: measureFixedTime && r.at_pips != null && r.ft_pips != null ? Math.round((Number(r.at_pips) - Number(r.ft_pips)) * 10) / 10 : null,
+          atExpiryIso: measureFixedTime ? (r.at_expiry_time ? new Date(r.at_expiry_time).toISOString() : (() => { const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; const tfMs = (timeframeMinutes(r.timeframe) || 0) * 60000; return (Number.isFinite(st) && tfMs > 0) ? new Date(st + STRATEGY_LAB_FT_EXPIRY_BARS * tfMs).toISOString() : null; })()) : null,
+          ftActionable: measureFixedTime ? (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const st = r.signal_time ? new Date(r.signal_time).getTime() : NaN; return (Number.isFinite(bt) && Number.isFinite(st)) ? strategyFtActionable(bt, r.timeframe, st) : null; })() : null,
           // Real fixed-time expiry (signal-bar close + expiry candles) so the live "just fired"
           // panel can show a true countdown and drop a call once its expiry has passed.
-          ftExpiryIso: (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const tfMs = (timeframeMinutes(r.timeframe) || 0) * 60000; return (Number.isFinite(bt) && tfMs > 0) ? new Date(bt + STRATEGY_LAB_FT_EXPIRY_BARS * tfMs).toISOString() : null; })(),
-          live: strategyLabFtLivePosition(r),
+          ftExpiryIso: measureFixedTime ? (() => { const bt = r.bar_time ? new Date(r.bar_time).getTime() : NaN; const tfMs = (timeframeMinutes(r.timeframe) || 0) * 60000; return (Number.isFinite(bt) && tfMs > 0) ? new Date(bt + STRATEGY_LAB_FT_EXPIRY_BARS * tfMs).toISOString() : null; })() : null,
+          live: measureFixedTime ? strategyLabFtLivePosition(r) : null,
           popupSent: r.popup_sent === null || r.popup_sent === undefined ? null : !!r.popup_sent,
           emailSent: r.email_sent === null || r.email_sent === undefined ? null : !!r.email_sent,
           resolvedAt: r.resolved_at ? new Date(r.resolved_at).toISOString() : null,
@@ -12788,25 +13243,55 @@ app.get('/api/strategy-lab/performance', async (req, res) => {
 // (grade A / A+, score ≥ threshold ~80) that are still PENDING entry, with LIVE price
 // vs the limit entry so you can watch the moment price reaches entry. Read-only — never
 // scores, settles, or sends anything. Powers the Signal Tracker "Entry Watch" tab.
-const ENTRY_WATCH_STRATEGIES = ['ict-breaker', 'ict-plus', 'smc-fvg', 'smc-mmxm', 'smc-cct', 'smc-two-lines', 'smc-asian-sweep'];
+// Keep the tracker aligned with the Strategy Lab registry. Every registered strategy
+// returns a Forex/as-traded entry plan, even when its primary label is fixed-time.
+// A hand-maintained subset went stale as new strategies shipped and hid them from filters.
+const ENTRY_WATCH_STRATEGIES = Object.keys(STRATEGY_LAB_REGISTRY);
 const ENTRY_WATCH_MIN_SCORE = Math.max(0, Number(process.env.STRATEGY_ENTRY_WATCH_MIN_SCORE || 80));
 const ENTRY_WATCH_WINDOW_HOURS = Math.max(1, Number(process.env.STRATEGY_ENTRY_WATCH_WINDOW_HOURS || 48));
+const ENTRY_WATCH_CACHE_MS = 1500;
+const entryWatchResponseCache = new Map();
 app.get('/api/strategy-lab/entry-watch', async (req, res) => {
   const pool = await initializeDatabase();
   if (!pool) return res.status(500).json({ error: 'Database not available.' });
   try {
-    const minScore = req.query.minScore ? Math.max(0, Number(req.query.minScore)) : ENTRY_WATCH_MIN_SCORE;
-    const placeholders = ENTRY_WATCH_STRATEGIES.map(() => '?').join(',');
-    const [rows] = await pool.query(
-      `SELECT * FROM mt5_strategy_signals
-        WHERE strategy IN (${placeholders})
-          AND outcome = 'PENDING'
-          AND score >= ?
-          AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)
-        ORDER BY signal_time DESC
-        LIMIT 200`,
-      [...ENTRY_WATCH_STRATEGIES, minScore, ENTRY_WATCH_WINDOW_HOURS],
-    );
+    const csv = (value, transform = (v) => v) => String(value || '').split(',').map((v) => transform(v.trim())).filter(Boolean);
+    const minRaw = Number(req.query.minScore);
+    const maxRaw = Number(req.query.maxScore);
+    const minScore = Number.isFinite(minRaw) ? Math.max(0, Math.min(100, minRaw)) : ENTRY_WATCH_MIN_SCORE;
+    const maxScore = Number.isFinite(maxRaw) ? Math.max(minScore, Math.min(100, maxRaw)) : 100;
+    const rawStrategies = csv(req.query.strategies);
+    const requestedStrategies = [...new Set(rawStrategies.filter((id) => ENTRY_WATCH_STRATEGIES.includes(id)))].slice(0, ENTRY_WATCH_STRATEGIES.length);
+    if (rawStrategies.length && !requestedStrategies.length) return res.status(400).json({ error: 'No valid strategies requested.' });
+    const strategies = requestedStrategies.length ? requestedStrategies : ENTRY_WATCH_STRATEGIES;
+    const allowedSymbols = new Set(getCuratedSymbols(getMt5Status().symbols).map((v) => String(v).toUpperCase()));
+    const rawSymbols = csv(req.query.symbols, (v) => v.toUpperCase());
+    const rawTimeframes = csv(req.query.timeframes, (v) => v.toUpperCase());
+    const symbols = [...new Set(rawSymbols.filter((v) => allowedSymbols.has(v)))].slice(0, 25);
+    const timeframes = [...new Set(rawTimeframes.filter((v) => STRATEGY_LAB_TIMEFRAMES.includes(v)))].slice(0, STRATEGY_LAB_TIMEFRAMES.length);
+    if (rawSymbols.length && !symbols.length) return res.status(400).json({ error: 'No valid symbols requested.' });
+    if (rawTimeframes.length && !timeframes.length) return res.status(400).json({ error: 'No valid timeframes requested.' });
+    const cacheKey = JSON.stringify({ minScore, maxScore, strategies: [...strategies].sort(), symbols: [...symbols].sort(), timeframes: [...timeframes].sort() });
+    const cached = entryWatchResponseCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < ENTRY_WATCH_CACHE_MS) return res.json(cached.payload);
+    const placeholders = strategies.map(() => '?').join(',');
+    let sql = `SELECT * FROM mt5_strategy_signals
+      WHERE strategy IN (${placeholders})
+        AND outcome = 'PENDING'
+        AND COALESCE(entry_state, 'WAIT') NOT IN ('FILLED', 'EXPIRED')
+        AND score >= ? AND score <= ?
+        AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)`;
+    const params = [...strategies, minScore, maxScore, ENTRY_WATCH_WINDOW_HOURS];
+    if (symbols.length) {
+      sql += ` AND symbol IN (${symbols.map(() => '?').join(',')})`;
+      params.push(...symbols);
+    }
+    if (timeframes.length) {
+      sql += ` AND timeframe IN (${timeframes.map(() => '?').join(',')})`;
+      params.push(...timeframes);
+    }
+    sql += ' ORDER BY signal_time DESC LIMIT 200';
+    const [rows] = await pool.query(sql, params);
     const num = (v) => (v === null || v === undefined ? null : Number(v));
     // Per-request caches so re-evaluating the live strength never rebuilds the same
     // multi-timeframe context twice (several signals can share a symbol×timeframe).
@@ -12827,7 +13312,7 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
       }
       return liveCache.get(k);
     };
-    const items = rows.map((r) => {
+    const items = rows.filter((r) => strategyTimeframes(r.strategy).includes(String(r.timeframe).toUpperCase())).map((r) => {
       const pip = pipSizeForSymbol(r.symbol) || 0.0001;
       const buy = /BUY/.test(String(r.direction).toUpperCase());
       let current = null;
@@ -12841,6 +13326,7 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
         : null;
       const timing = strategyLabTiming(r);
       const entryStatus = timing.status === 'TRADABLE' ? 'AT_ENTRY'
+        : timing.status === 'FILLED' ? 'FILLED'
         : timing.status === 'EXPIRED' ? 'MISSED'
         : 'WAIT';
       const sizing = strategyLabSizing(r.symbol, r.entry_price, r.stop_loss, { tp1: r.take_profit_1, tp2: r.take_profit_2, tp3: r.take_profit_3 });
@@ -12864,27 +13350,64 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
       else if (loggedScore != null && currentScore <= loggedScore - 2) strengthTrend = 'WEAKER';
       else strengthTrend = 'SAME';
 
+      // Keep the original logged entry immutable. A live strategy re-evaluation may find
+      // a fresher, more favorable same-direction entry as structure changes. Surface that
+      // separately only when it improves price by >=1 pip, preserves RR, has a complete
+      // live plan, and price has not already run materially through it.
+      const liveEntryPrice = sameDir ? num(live?.entry) : null;
+      const liveStopLoss = sameDir ? num(live?.stopLoss) : null;
+      const liveTakeProfit1 = sameDir ? num(live?.takeProfit1) : null;
+      const liveTakeProfit2 = sameDir ? num(live?.takeProfit2) : null;
+      const liveTakeProfit3 = sameDir ? num(live?.takeProfit3) : null;
+      const liveRiskReward = sameDir ? num(live?.riskRewardRatio) : null;
+      const originalRiskReward = num(r.risk_reward);
+      const entryImprovementPips = (entry != null && liveEntryPrice != null)
+        ? Math.round(((buy ? entry - liveEntryPrice : liveEntryPrice - entry) / pip) * 10) / 10
+        : null;
+      const pipsToLiveEntry = (current != null && liveEntryPrice != null)
+        ? Math.round(((buy ? current - liveEntryPrice : liveEntryPrice - current) / pip) * 10) / 10
+        : null;
+      const completeLivePlan = liveEntryPrice != null && liveStopLoss != null && liveTakeProfit1 != null;
+      const rrPreserved = originalRiskReward == null
+        ? true
+        : liveRiskReward != null && liveRiskReward >= originalRiskReward - 0.05;
+      const notRunPast = pipsToLiveEntry == null || pipsToLiveEntry >= -1;
+      const betterEntryAvailable = Boolean(sameDir && completeLivePlan && rrPreserved && notRunPast && entryImprovementPips != null && entryImprovementPips >= 1);
+      const betterEntryPrice = betterEntryAvailable ? liveEntryPrice : null;
+      const pipsToBetterEntry = betterEntryAvailable ? pipsToLiveEntry : null;
+      const activeEntryPrice = betterEntryAvailable ? liveEntryPrice : entry;
+      const pipsToActiveEntry = betterEntryAvailable ? pipsToLiveEntry : pipsToEntry;
+      const betterSizing = betterEntryAvailable
+        ? strategyLabSizing(r.symbol, liveEntryPrice, liveStopLoss, { tp1: liveTakeProfit1, tp2: liveTakeProfit2, tp3: liveTakeProfit3 })
+        : null;
+      const activeAtEntry = entryStatus !== 'FILLED'
+        && pipsToActiveEntry != null && pipsToActiveEntry <= 0 && pipsToActiveEntry >= -1;
+
       // ── Executability verdict: take it now, wait for a better position, or be cautious.
       let executability, execMessage;
       if (entryStatus === 'MISSED') {
         executability = 'MISSED';
         execMessage = timing.message;
-      } else if (entryStatus === 'AT_ENTRY') {
+      } else if (entryStatus === 'FILLED') {
+        // Filled = the trade is LIVE, not executable-later; the Signal Tracker owns it now.
+        executability = 'FILLED';
+        execMessage = timing.message;
+      } else if (activeAtEntry) {
         if (strengthTrend === 'GONE') {
           executability = 'CAUTION';
-          execMessage = 'Price is at entry but the setup no longer confirms live — be cautious / skip.';
+          execMessage = 'Price is at the active entry but the setup no longer confirms live — be cautious / skip.';
         } else {
           executability = 'EXECUTE_NOW';
-          execMessage = `Executable now — price at entry and the setup still confirms (${currentGrade || '—'} ${currentScore != null ? Math.round(currentScore) : '—'}).`;
+          execMessage = `Executable now — price at ${betterEntryAvailable ? 'the better live entry' : 'the original entry'} and the setup still confirms (${currentGrade || '—'} ${currentScore != null ? Math.round(currentScore) : '—'}).`;
         }
       } else { // WAIT — price not yet at the limit entry
-        const away = pipsToEntry != null ? Math.abs(pipsToEntry) : null;
+        const away = pipsToActiveEntry != null ? Math.abs(pipsToActiveEntry) : null;
         if (strengthTrend === 'GONE') {
           executability = 'CAUTION';
           execMessage = `Wait — the live setup has weakened; only take it if it re-confirms when price reaches entry${away != null ? ` (${away}p away)` : ''}.`;
         } else {
           executability = 'WAIT';
-          execMessage = `Wait for a better position — ${away != null ? `${away}p ` : ''}${buy ? 'pullback' : 'rally'} to entry ${px(entry, r.symbol)}.`;
+          execMessage = `Wait for a better position — ${away != null ? `${away}p ` : ''}${buy ? 'pullback' : 'rally'} to ${betterEntryAvailable ? 'better live entry' : 'entry'} ${px(activeEntryPrice, r.symbol)}.`;
         }
       }
 
@@ -12897,25 +13420,49 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
         currentScore, currentGrade, currentDirection, strengthTrend,
         executability, execMessage,
         entryPrice: entry, currentPrice: current, pipsToEntry,
+        liveEntryPrice, liveStopLoss, liveTakeProfit1, liveTakeProfit2, liveTakeProfit3, liveRiskReward,
+        betterEntryAvailable, betterEntryPrice,
+        betterStopLoss: betterEntryAvailable ? liveStopLoss : null,
+        betterTakeProfit1: betterEntryAvailable ? liveTakeProfit1 : null,
+        betterTakeProfit2: betterEntryAvailable ? liveTakeProfit2 : null,
+        betterTakeProfit3: betterEntryAvailable ? liveTakeProfit3 : null,
+        betterRiskReward: betterEntryAvailable ? liveRiskReward : null,
+        betterLots: betterSizing?.suggestedLots ?? null,
+        betterLossAtStop: betterSizing?.lossAtStop ?? null,
+        entryImprovementPips: betterEntryAvailable ? entryImprovementPips : null,
+        pipsToBetterEntry, activeEntryPrice, pipsToActiveEntry,
         stopLoss: num(r.stop_loss),
         takeProfit1: num(r.take_profit_1), takeProfit2: num(r.take_profit_2), takeProfit3: num(r.take_profit_3),
         riskReward: num(r.risk_reward),
         lots: sizing?.suggestedLots ?? null, lossAtStop: sizing?.lossAtStop ?? null,
-        entryStatus, reachedEntry: entryStatus === 'AT_ENTRY',
+        activeLots: betterSizing?.suggestedLots ?? sizing?.suggestedLots ?? null,
+        activeLossAtStop: betterSizing?.lossAtStop ?? sizing?.lossAtStop ?? null,
+        entryStatus, reachedEntry: entryStatus === 'FILLED' || activeAtEntry,
         executableNow: executability === 'EXECUTE_NOW',
-        timingMessage: timing.message, reason: r.reason || null,
+        timingMessage: timing.message, filledAtIso: timing.filledAtIso || null, reason: r.reason || null,
         popupSent: r.popup_sent == null ? null : !!r.popup_sent,
         emailSent: r.email_sent == null ? null : !!r.email_sent,
       };
     });
-    // EXECUTE NOW first (most actionable), then WAIT (nearest to entry), CAUTION, MISSED.
+    // Keep this GET read-only. Dynamically detected fills disappear from Entry Watch;
+    // Signal Tracker independently detects and persists the same handoff when opened.
+    const visibleItems = items.filter((item) => item.entryStatus !== 'FILLED');
+
+    // Nearest active entry first. The active entry is the verified better live entry when
+    // available, otherwise the immutable original. Actionability and strength break ties.
     const rank = (s) => (s === 'EXECUTE_NOW' ? 3 : s === 'WAIT' ? 2 : s === 'CAUTION' ? 1 : 0);
-    items.sort((a, b) => (rank(b.executability) - rank(a.executability))
-      || (Math.abs(a.pipsToEntry ?? 1e9) - Math.abs(b.pipsToEntry ?? 1e9)));
-    res.json({
-      ok: true, minScore, windowHours: ENTRY_WATCH_WINDOW_HOURS,
-      strategies: ENTRY_WATCH_STRATEGIES, items, generatedAt: new Date().toISOString(),
-    });
+    visibleItems.sort((a, b) => (Math.abs(a.pipsToActiveEntry ?? 1e9) - Math.abs(b.pipsToActiveEntry ?? 1e9))
+      || (rank(b.executability) - rank(a.executability))
+      || ((b.currentScore ?? b.score ?? 0) - (a.currentScore ?? a.score ?? 0))
+      || (Date.parse(b.signalTime || '') - Date.parse(a.signalTime || '')));
+    const payload = {
+      ok: true, minScore, maxScore, windowHours: ENTRY_WATCH_WINDOW_HOURS,
+      filters: { strategies, symbols, timeframes },
+      strategies: ENTRY_WATCH_STRATEGIES, items: visibleItems, generatedAt: new Date().toISOString(),
+    };
+    entryWatchResponseCache.set(cacheKey, { at: Date.now(), payload });
+    if (entryWatchResponseCache.size > 50) entryWatchResponseCache.delete(entryWatchResponseCache.keys().next().value);
+    res.json(payload);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
