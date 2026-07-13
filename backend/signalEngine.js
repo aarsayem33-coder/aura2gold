@@ -168,6 +168,51 @@ function calculateStochasticVal(candles, period = 14, smoothK = 3) {
   };
 }
 
+function classifyZoneLifecycle(zone, candles, startIndex, terminalState) {
+  let mitigationIndex = null;
+  let terminalIndex = null;
+
+  for (let i = startIndex; i < candles.length; i++) {
+    const high = Number(candles[i].high);
+    const low = Number(candles[i].low);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
+
+    const mitigated = zone.type === 'BULLISH' ? low <= zone.top : high >= zone.bottom;
+    const terminal = zone.type === 'BULLISH' ? low <= zone.bottom : high >= zone.top;
+    if (mitigationIndex === null && mitigated) mitigationIndex = i;
+    if (terminalIndex === null && terminal) terminalIndex = i;
+  }
+
+  const isTerminal = terminalIndex !== null;
+  const isMitigated = mitigationIndex !== null;
+  const state = isTerminal ? terminalState : isMitigated ? 'MITIGATED' : 'ACTIVE';
+  const firstTouchNow = !isTerminal && mitigationIndex === candles.length - 1;
+  const lifecycle = {
+    state,
+    active: state === 'ACTIVE',
+    // The first partial revisit is the actionable retest. It is spent on every
+    // later evaluation, but must remain eligible on the candle that first touches it.
+    actionable: state === 'ACTIVE' || firstTouchNow,
+    firstTouchNow,
+    unmitigated: !isMitigated,
+    mitigated: isMitigated,
+    mitigationIndex,
+    mitigationTime: mitigationIndex === null ? null : candles[mitigationIndex]?.time ?? null,
+  };
+
+  if (terminalState === 'FILLED') {
+    lifecycle.filled = isTerminal;
+    lifecycle.fillIndex = terminalIndex;
+    lifecycle.fillTime = terminalIndex === null ? null : candles[terminalIndex]?.time ?? null;
+  } else {
+    lifecycle.invalidated = isTerminal;
+    lifecycle.invalidationIndex = terminalIndex;
+    lifecycle.invalidationTime = terminalIndex === null ? null : candles[terminalIndex]?.time ?? null;
+  }
+
+  return { ...lifecycle, lifecycle };
+}
+
 function detectFVGs(candles) {
   const fvgs = [];
   if (candles.length < 3) return fvgs;
@@ -184,6 +229,8 @@ function detectFVGs(candles) {
         bottom: h3,
         midpoint: (l1 + h3) / 2,
         time: c2.time,
+        completionTime: c1.time,
+        completionIndex: i,
       });
     }
     const l3 = Number(c3.low);
@@ -195,10 +242,15 @@ function detectFVGs(candles) {
         bottom: h1,
         midpoint: (l3 + h1) / 2,
         time: c2.time,
+        completionTime: c1.time,
+        completionIndex: i,
       });
     }
   }
-  return fvgs;
+  return fvgs.map((fvg) => ({
+    ...fvg,
+    ...classifyZoneLifecycle(fvg, candles, fvg.completionIndex + 1, 'FILLED'),
+  }));
 }
 
 function detectOrderBlocks(candles) {
@@ -217,12 +269,14 @@ function detectOrderBlocks(candles) {
       for (let j = i + 1; j < candles.length; j++) {
         if (Number(candles[j].close) > h) {
           let lowestBearish = null;
+          let lowestBearishIndex = null;
           let minLow = Infinity;
           for (let k = i; k < j; k++) {
             const ck = candles[k];
             if (Number(ck.close) < Number(ck.open) && Number(ck.low) < minLow) {
               minLow = Number(ck.low);
               lowestBearish = ck;
+              lowestBearishIndex = k;
             }
           }
           if (lowestBearish) {
@@ -231,6 +285,9 @@ function detectOrderBlocks(candles) {
               top: Math.max(Number(lowestBearish.open), Number(lowestBearish.close)),
               bottom: Number(lowestBearish.low),
               time: lowestBearish.time,
+              sourceIndex: lowestBearishIndex,
+              confirmationTime: candles[j].time,
+              confirmationIndex: j,
             });
           }
           break;
@@ -241,12 +298,14 @@ function detectOrderBlocks(candles) {
       for (let j = i + 1; j < candles.length; j++) {
         if (Number(candles[j].close) < l) {
           let highestBullish = null;
+          let highestBullishIndex = null;
           let maxHigh = -Infinity;
           for (let k = i; k < j; k++) {
             const ck = candles[k];
             if (Number(ck.close) > Number(ck.open) && Number(ck.high) > maxHigh) {
               maxHigh = Number(ck.high);
               highestBullish = ck;
+              highestBullishIndex = k;
             }
           }
           if (highestBullish) {
@@ -255,6 +314,9 @@ function detectOrderBlocks(candles) {
               top: Number(highestBullish.high),
               bottom: Math.min(Number(highestBullish.open), Number(highestBullish.close)),
               time: highestBullish.time,
+              sourceIndex: highestBullishIndex,
+              confirmationTime: candles[j].time,
+              confirmationIndex: j,
             });
           }
           break;
@@ -262,7 +324,19 @@ function detectOrderBlocks(candles) {
       }
     }
   }
-  return obs;
+  // De-duplicate: several broken swings can resolve to the SAME source candle (the
+  // same lowest-bearish/highest-bullish bar), and duplicates crowd distinct zones out
+  // of downstream top-N selections. One zone per (type, source-candle time).
+  const seen = new Set();
+  return obs.filter((ob) => {
+    const key = `${ob.type}|${ob.time}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((ob) => ({
+    ...ob,
+    ...classifyZoneLifecycle(ob, candles, ob.confirmationIndex + 1, 'INVALIDATED'),
+  }));
 }
 
 function detectMarketStructure(candles) {
@@ -798,6 +872,13 @@ function pushSignal(list, name, direction, weight, strength, reason, metadata = 
   list.push({ name, direction, weight, strength, reason, ...metadata });
 }
 
+function closedCandlesOnly(candles, timeframe) {
+  if (!Array.isArray(candles) || !candles.length || !timeframe) return candles || [];
+  const lastOpenMs = Date.parse(candles[candles.length - 1]?.time || '');
+  const tfMs = timeframeToMs(timeframe);
+  return Number.isFinite(lastOpenMs) && Date.now() < lastOpenMs + tfMs ? candles.slice(0, -1) : candles;
+}
+
 function aggregateSignals({ 
   symbol, 
   timeframe, 
@@ -812,10 +893,14 @@ function aggregateSignals({
   skipNews = false
 }) {
   const latestIndicators = latestByIndicator(indicators);
-  const latestCandles = [...candles]
+  const sortedCandles = [...candles]
     .filter((candle) => !symbol || candle.symbol === symbol)
     .filter((candle) => !timeframe || candle.timeframe === timeframe)
     .sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+  // Structural evidence must come from closed candles. Historical replay arrays are
+  // unchanged because their final bars have already closed; only the live partial bar
+  // is removed, preventing transient sweep/BOS/FVG/OB points from repainting alerts.
+  const latestCandles = closedCandlesOnly(sortedCandles, timeframe);
   const latestCandle = latestCandles[latestCandles.length - 1] || null;
   const recentCandles = latestCandles.slice(-20);
   const close = toNumber(latestCandle?.close);
@@ -954,7 +1039,7 @@ function aggregateSignals({
   }
 
   // 1. Higher Timeframe Bias
-  const h4Trend = getTimeframeTrend(h4Candles);
+  const h4Trend = getTimeframeTrend(closedCandlesOnly(h4Candles, 'H4'));
   if (h4Trend === 'BULLISH') {
     const pts = Math.round(20 * trendMultiplier);
     buyScore += pts;
@@ -965,7 +1050,7 @@ function aggregateSignals({
     confluences.push({ name: 'H4 Trend Match', type: 'bearish', points: pts, reason: 'H4 structure is bearish (EMA20 < EMA50)' });
   }
 
-  const h1Trend = getTimeframeTrend(h1Candles);
+  const h1Trend = getTimeframeTrend(closedCandlesOnly(h1Candles, 'H1'));
   if (h1Trend === 'BULLISH') {
     const pts = Math.round(15 * trendMultiplier);
     buyScore += pts;
@@ -1003,15 +1088,16 @@ function aggregateSignals({
 
   // 4. Fair Value Gaps (FVG)
   const fvgs = detectFVGs(latestCandles);
+  const liveFvgs = fvgs.filter((fvg) => fvg.actionable && !fvg.filled);
   let bullishFvgRetest = false;
   let bearishFvgRetest = false;
-  if (close !== null && fvgs.length > 0) {
-    const bullishFvgs = fvgs.filter(f => f.type === 'BULLISH');
+  if (close !== null && liveFvgs.length > 0) {
+    const bullishFvgs = liveFvgs.filter(f => f.type === 'BULLISH');
     if (bullishFvgs.length > 0) {
       const f = bullishFvgs[bullishFvgs.length - 1];
       if (close >= f.bottom && close <= f.top) bullishFvgRetest = true;
     }
-    const bearishFvgs = fvgs.filter(f => f.type === 'BEARISH');
+    const bearishFvgs = liveFvgs.filter(f => f.type === 'BEARISH');
     if (bearishFvgs.length > 0) {
       const f = bearishFvgs[bearishFvgs.length - 1];
       if (close >= f.bottom && close <= f.top) bearishFvgRetest = true;
@@ -1029,15 +1115,16 @@ function aggregateSignals({
 
   // 5. Order Blocks (OB)
   const obs = detectOrderBlocks(latestCandles);
+  const liveObs = obs.filter((ob) => ob.actionable && !ob.invalidated);
   let insideBullishOb = false;
   let insideBearishOb = false;
-  if (close !== null && obs.length > 0) {
-    const bullishOBs = obs.filter(ob => ob.type === 'BULLISH' && ob.bottom < close);
+  if (close !== null && liveObs.length > 0) {
+    const bullishOBs = liveObs.filter(ob => ob.type === 'BULLISH' && ob.bottom < close);
     if (bullishOBs.length > 0) {
       const ob = bullishOBs[bullishOBs.length - 1];
       if (close >= ob.bottom && close <= ob.top) insideBullishOb = true;
     }
-    const bearishOBs = obs.filter(ob => ob.type === 'BEARISH' && ob.top > close);
+    const bearishOBs = liveObs.filter(ob => ob.type === 'BEARISH' && ob.top > close);
     if (bearishOBs.length > 0) {
       const ob = bearishOBs[bearishOBs.length - 1];
       if (close >= ob.bottom && close <= ob.top) insideBearishOb = true;
@@ -1163,7 +1250,7 @@ function aggregateSignals({
   ];
   const candlePatterns = detectCandlestickPatterns(latestCandles, preliminaryAtr, structuralLevels);
   const ote = detectOteZone(latestCandles);
-  const bpr = detectBpr(fvgs, close);
+  const bpr = detectBpr(liveFvgs, close);
   const amd = detectAmdPhase(latestCandles, preliminaryAtr, struct, sweep, sessionContext);
 
   const bullishTrigger = candlePatterns.find((p) => p.direction === 'bullish' && p.strength >= 0.65);
@@ -1449,7 +1536,7 @@ function aggregateSignals({
     const recentHigh = Math.max(...recentCandles.slice(-10).map(c => Number(c.high)).filter(v => !isNaN(v)));
 
     if (calcDirection.includes('BUY')) {
-      const bullishOBs = obs.filter(ob => ob.type === 'BULLISH' && ob.bottom < close);
+      const bullishOBs = liveObs.filter(ob => ob.type === 'BULLISH' && ob.bottom < close);
       bullishOBs.sort((a, b) => b.bottom - a.bottom);
       const nearestOB = bullishOBs[0];
 
@@ -1473,7 +1560,7 @@ function aggregateSignals({
       tpTip = "Fixed Risk-Reward: TP1 (1:1 R:R), TP2 (1:2 R:R), TP3 (1:3 R:R)";
       rr = 2.0;
     } else if (calcDirection.includes('SELL')) {
-      const bearishOBs = obs.filter(ob => ob.type === 'BEARISH' && ob.top > close);
+      const bearishOBs = liveObs.filter(ob => ob.type === 'BEARISH' && ob.top > close);
       bearishOBs.sort((a, b) => a.top - b.top);
       const nearestBearishOB = bearishOBs[0];
 
@@ -1510,12 +1597,12 @@ function aggregateSignals({
     const riskDist = Math.abs(close - sl);
     const candidates = [];
     if (direction.includes('BUY')) {
-      obs.filter((ob) => ob.type === 'BEARISH' && ob.bottom > close).forEach((ob) => candidates.push(ob.bottom));
+      liveObs.filter((ob) => ob.type === 'BEARISH' && ob.bottom > close).forEach((ob) => candidates.push(ob.bottom));
       if (struct.lastSwingHigh && struct.lastSwingHigh > close) candidates.push(struct.lastSwingHigh);
       if (bbUpper !== null && bbUpper > close) candidates.push(bbUpper);
       if (candidates.length) realisticTarget = Math.min(...candidates);
     } else {
-      obs.filter((ob) => ob.type === 'BULLISH' && ob.top < close).forEach((ob) => candidates.push(ob.top));
+      liveObs.filter((ob) => ob.type === 'BULLISH' && ob.top < close).forEach((ob) => candidates.push(ob.top));
       if (struct.lastSwingLow && struct.lastSwingLow < close) candidates.push(struct.lastSwingLow);
       if (bbLower !== null && bbLower < close) candidates.push(bbLower);
       if (candidates.length) realisticTarget = Math.max(...candidates);

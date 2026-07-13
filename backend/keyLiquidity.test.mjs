@@ -73,4 +73,45 @@ test('nearest unswept level each side is surfaced', () => {
   assert.ok(r.nearestBelow && r.nearestBelow.side === 'below', 'nearestBelow');
 });
 
+function flatAt({ price, high, low, start = Date.UTC(2026, 5, 26), count = 40 }) {
+  return Array.from({ length: count }, (_, i) => ({
+    time: new Date(start + i * 15 * 60000).toISOString(), open: price, high, low, close: price, volume: 100,
+  }));
+}
+
+test('PDH/PDL sweep polarity is semantic even after price crosses the level', () => {
+  const above = detectKeyLiquidityLevels(flatAt({ price: 1.11, high: 1.111, low: 1.105 }), { symbol: 'EURUSDM', dailyCandles: daily });
+  const pdh = above.levels.find((l) => l.type === 'PDH');
+  assert.ok(pdh && pdh.side === 'above' && pdh.swept, 'PDH must remain buy-side and use highs after price moves above it');
+
+  const below = detectKeyLiquidityLevels(flatAt({ price: 1.09, high: 1.093, low: 1.089 }), { symbol: 'EURUSDM', dailyCandles: daily });
+  const pdl = below.levels.find((l) => l.type === 'PDL');
+  assert.ok(pdl && pdl.side === 'below' && pdl.swept, 'PDL must remain sell-side and use lows after price moves below it');
+});
+
+test('an exact PDH/PDL touch is not a sweep', () => {
+  const rows = flatAt({ price: 1.1, high: 1.106, low: 1.094 });
+  const levels = detectKeyLiquidityLevels(rows, { symbol: 'EURUSDM', dailyCandles: daily }).levels;
+  assert.strictEqual(levels.find((l) => l.type === 'PDH')?.swept, false, 'PDH equality must remain fresh');
+  assert.strictEqual(levels.find((l) => l.type === 'PDL')?.swept, false, 'PDL equality must remain fresh');
+});
+
+test('dedup keeps the complete winning canonical record', () => {
+  const rows = flatAt({ price: 1.1, high: 1.1005, low: 1.0995, count: 80 });
+  const start = Date.UTC(2026, 5, 26);
+  rows.forEach((c, i) => { c.time = new Date(start + i * 60000).toISOString(); }); // keep every named session forming
+  const swing = (i, high) => {
+    rows[i - 2].high = 1.101; rows[i - 1].high = 1.102;
+    rows[i].open = 1.1047; rows[i].close = 1.1048; rows[i].high = high; rows[i].low = 1.104;
+    rows[i + 1].high = 1.102; rows[i + 2].high = 1.101;
+  };
+  swing(20, 1.1050);
+  swing(40, 1.1051);
+  const level = detectKeyLiquidityLevels(rows, { symbol: 'EURUSDM' }).levels.find((l) => l.type === 'EQUAL_HIGH' && Math.abs(l.price - 1.1051) < 1e-6);
+  assert.ok(level, 'equal-high cluster should beat the nearby minor round number');
+  assert.strictEqual(level.formedIdx, 40, 'winner must carry its own formation index, not the round number metadata');
+  assert.strictEqual(level.label, 'Swing high (equal ×2)');
+  assert.strictEqual(level.swept, false, 'winner must carry its own post-formation sweep state');
+});
+
 console.log(`\n${passed} passed`);

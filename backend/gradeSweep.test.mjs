@@ -1,7 +1,7 @@
 // Tests for gradeSweep (the 5-component high-probability sweep model) in liquidityEngine.js.
 // Run: node backend/gradeSweep.test.mjs
 import assert from 'node:assert';
-import { gradeSweep } from './liquidityEngine.js';
+import { detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
 
 let passed = 0;
 function test(name, fn) { try { fn(); console.log(`  ok  ${name}`); passed++; } catch (e) { console.error(`FAIL  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -36,6 +36,16 @@ function flat() {
   return out;
 }
 
+function mirrored(rows, pivot = 1.1) {
+  return rows.map((c) => ({
+    ...c,
+    open: 2 * pivot - c.open,
+    high: 2 * pivot - c.low,
+    low: 2 * pivot - c.high,
+    close: 2 * pivot - c.close,
+  }));
+}
+
 test('null on insufficient data', () => {
   assert.strictEqual(gradeSweep([], { symbol: 'EURUSDM' }), null);
 });
@@ -44,7 +54,8 @@ test('flat / no obvious sweep → null (does not fabricate a trade)', () => {
   assert.strictEqual(gradeSweep(flat(), { symbol: 'EURUSDM', h4Trend: 'NEUTRAL' }), null);
 });
 
-const sig = gradeSweep(bearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BEARISH', h1Trend: 'BEARISH' });
+const openBearishSweep = () => bearishSweep().slice(0, 42); // stop at the confirmation bar
+const sig = gradeSweep(openBearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BEARISH', h1Trend: 'BEARISH' });
 
 test('clean bearish sweep of 1.10000 fires a graded SELL', () => {
   assert.ok(sig, 'expected a signal');
@@ -62,15 +73,100 @@ test('all 5 components present + sweptLevel is an obvious pool', () => {
 
 test('valid SELL plan geometry + RR >= 1.8', () => {
   assert.ok(sig.stopLoss > sig.entry, 'SELL stop must be above entry (beyond the sweep wick)');
-  assert.ok(sig.takeProfit1 < sig.entry && sig.takeProfit3 < sig.entry, 'targets below entry');
+  assert.ok(sig.entry > sig.takeProfit1 && sig.takeProfit1 > sig.takeProfit2 && sig.takeProfit2 > sig.takeProfit3, 'SELL targets strictly ordered');
   assert.ok(sig.riskRewardRatio >= 1.8, `RR ${sig.riskRewardRatio}`);
   assert.ok(sig.barIso, 'barIso set (dedup anchor)');
 });
 
+test('entry and barIso are anchored where BOS + displacement are both knowable', () => {
+  const idx = sig.meta.confirmationIdx;
+  const rows = openBearishSweep();
+  assert.ok(idx > 39, 'confirmation must occur after the sweep bar');
+  assert.strictEqual(sig.barIso, rows[idx].time);
+  assert.strictEqual(sig.entry, rows[idx].close, 'entry is confirmation close, not hindsight sweep close');
+});
+
+const buySig = gradeSweep(mirrored(openBearishSweep()), { symbol: 'EURUSDM', h4Trend: 'BULLISH', h1Trend: 'BULLISH' });
+
+test('mirrored clean bullish sweep fires with a strictly ordered BUY ladder', () => {
+  assert.ok(buySig, 'expected mirrored BUY signal');
+  assert.strictEqual(buySig.decision, 'BUY');
+  assert.ok(buySig.stopLoss < buySig.entry && buySig.entry < buySig.takeProfit1 && buySig.takeProfit1 < buySig.takeProfit2 && buySig.takeProfit2 < buySig.takeProfit3, 'BUY geometry strictly ordered');
+  assert.ok(buySig.riskRewardRatio >= 1.8);
+});
+
+test('H4 opposition veto is non-vacuous and mirrored', () => {
+  assert.ok(sig && buySig, 'both aligned controls must exist');
+  assert.strictEqual(gradeSweep(openBearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BULLISH', h1Trend: 'BEARISH' }), null);
+  assert.strictEqual(gradeSweep(mirrored(openBearishSweep()), { symbol: 'EURUSDM', h4Trend: 'BEARISH', h1Trend: 'BULLISH' }), null);
+});
+
+test('strict pierce rejects equality in both directions', () => {
+  const sellTouch = openBearishSweep();
+  sellTouch[39] = { ...sellTouch[39], high: 1.1 };
+  const buyTouch = mirrored(openBearishSweep());
+  buyTouch[39] = { ...buyTouch[39], low: 1.1 };
+  assert.strictEqual(gradeSweep(sellTouch, { symbol: 'EURUSDM', h4Trend: 'BEARISH' }), null);
+  assert.strictEqual(gradeSweep(buyTouch, { symbol: 'EURUSDM', h4Trend: 'BULLISH' }), null);
+});
+
+test('displacement is a hard gate and exact completed fill rejects it, mirrored', () => {
+  const sellFilled = bearishSweep();
+  sellFilled[42] = { ...sellFilled[42], high: 1.099 };
+  const buyFilled = mirrored(sellFilled);
+  assert.strictEqual(gradeSweep(sellFilled, { symbol: 'EURUSDM', h4Trend: 'BEARISH' }), null);
+  assert.strictEqual(gradeSweep(buyFilled, { symbol: 'EURUSDM', h4Trend: 'BULLISH' }), null);
+});
+
+test('semantic high/low polarity produces mirrored PDH SELL and PDL BUY controls', () => {
+  const sellDaily = [
+    { time: '2026-06-23T00:00:00Z', high: 1.11, low: 1.07 },
+    { time: '2026-06-24T00:00:00Z', high: 1.1, low: 1.08 },
+    { time: '2026-06-25T00:00:00Z', high: 1.1, low: 1.08 },
+  ];
+  const buyDaily = sellDaily.map((d) => ({ ...d, high: 2.2 - d.low, low: 2.2 - d.high }));
+  const sell = gradeSweep(openBearishSweep(), { symbol: 'XAUUSDM', dailyCandles: sellDaily, h4Trend: 'BEARISH' });
+  const buy = gradeSweep(mirrored(openBearishSweep()), { symbol: 'XAUUSDM', dailyCandles: buyDaily, h4Trend: 'BULLISH' });
+  assert.ok(sell && sell.decision === 'SELL' && sell.meta.sweptLevel.type === 'PDH', 'PDH is valid only as buy-side liquidity for SELL');
+  assert.ok(buy && buy.decision === 'BUY' && buy.meta.sweptLevel.type === 'PDL', 'PDL is valid only as sell-side liquidity for BUY');
+});
+
+test('an already-consumed stronger level is skipped for the fresh same-bar level, mirrored', () => {
+  const sellRows = openBearishSweep();
+  sellRows[30] = { ...sellRows[30], high: 1.1005 }; // completed London high (strength 4), also pierced at bar 39
+  const levels = detectKeyLiquidityLevels(sellRows, { symbol: 'EURUSDM' }).levels;
+  assert.ok(levels.some((l) => l.type === 'LONDON_HIGH' && l.strength === 4), 'weaker eligible control level must exist');
+  const sell = gradeSweep(sellRows, { symbol: 'EURUSDM', h4Trend: 'BEARISH' });
+  const buy = gradeSweep(mirrored(sellRows), { symbol: 'EURUSDM', h4Trend: 'BULLISH' });
+  assert.ok(sell && sell.meta.sweptLevel.type === 'LONDON_HIGH', 'SELL must skip the already-consumed round number');
+  assert.ok(buy && buy.meta.sweptLevel.type === 'LONDON_LOW', 'BUY must skip the mirrored consumed round number');
+});
+
 test('deterministic', () => {
-  const a = JSON.stringify(gradeSweep(bearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BEARISH' }));
-  const b = JSON.stringify(gradeSweep(bearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BEARISH' }));
+  const a = JSON.stringify(gradeSweep(openBearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BEARISH' }));
+  const b = JSON.stringify(gradeSweep(openBearishSweep(), { symbol: 'EURUSDM', h4Trend: 'BEARISH' }));
   assert.strictEqual(a, b);
+});
+
+test('an already-consumed level cannot sponsor a later sweep signal', () => {
+  const rows = openBearishSweep();
+  rows[20] = { ...rows[20], high: 1.1004, close: 1.0990, open: 1.0990 };
+  const result = gradeSweep(rows, { symbol: 'EURUSDM', h4Trend: 'BEARISH' });
+  assert.ok(result, 'a newly formed session level may still qualify');
+  assert.notStrictEqual(result.meta.sweptLevel.type, 'ROUND_NUMBER', 'consumed round number must not be reused');
+});
+
+test('a completed structural target is not resurrected as an active setup', () => {
+  const rows = bearishSweep();
+  rows[42] = { ...rows[42], low: 1.079 };
+  assert.strictEqual(gradeSweep(rows, { symbol: 'EURUSDM', h4Trend: 'BEARISH' }), null);
+});
+
+test('an uncompleted market-at-close setup is not emitted one bar late', () => {
+  const rows = openBearishSweep();
+  const last = rows[rows.length - 1];
+  rows.push({ ...last, time: new Date(Date.parse(last.time) + 15 * 60000).toISOString(), open: 1.0943, high: 1.0948, low: 1.0938, close: 1.0942 });
+  assert.strictEqual(gradeSweep(rows, { symbol: 'EURUSDM', h4Trend: 'BEARISH' }), null);
 });
 
 console.log(`\n${passed} passed`);

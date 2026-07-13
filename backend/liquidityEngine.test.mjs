@@ -57,8 +57,10 @@ ok('breaker: has displacement field', br && typeof br.displacement === 'object')
 ok('breaker: displacement present (strong reclaim FVG)', br && br.displacement.present === true);
 ok('breaker: displacement atrMultiple > 0', br && br.displacement.atrMultiple > 0);
 
-const plan = buildLiquidityPlan(br, pools);
-ok('plan: built', plan !== null);
+const defaultPlan = buildLiquidityPlan(br, pools);
+ok('plan: default 1.5R floor rejects the marginal target', defaultPlan === null);
+const plan = buildLiquidityPlan(br, pools, { minRR: 1 });
+ok('plan: lower explicit floor builds for detector geometry test', plan !== null);
 ok('plan: BUY direction', plan && plan.direction === 'BUY');
 ok('plan: target above entry', plan && plan.target > plan.entry);
 ok('plan: positive RR', plan && plan.rr > 0);
@@ -121,6 +123,43 @@ ok('gate: second drive → isSecondDrive true', g2.isSecondDrive === true);
 ok('gate: exposes firstDriveIdx', Number.isInteger(g2.firstDriveIdx));
 ok('gate: basis FAILED_FIRST', g2.basis === 'FAILED_FIRST');
 ok('gate: NONE dir safe', detectSecondDrive(firstOnly, null).isSecondDrive === false);
+
+// Display caps must never cap the target search surface.
+const manyPools = [];
+let mt = Date.UTC(2026, 0, 3);
+for (let i = 0; i < 80; i++) {
+  let high = 101, low = 99;
+  const highIdx = [4, 14, 24, 34, 44, 54].indexOf(i);
+  const lowIdx = [9, 19, 29, 39, 49, 59].indexOf(i);
+  if (highIdx >= 0) high = 130 - highIdx * 5;
+  if (lowIdx >= 0) low = 70 + lowIdx * 5;
+  manyPools.push(C(100, high, low, 100, mt)); mt += min5;
+}
+const cappedPools = detectLiquidityPools(manyPools, { maxPerSide: 2, equalTolAtr: 0.05 });
+ok('pools: display buy-side is capped', cappedPools.buySide.length === 2);
+ok('pools: full BSL target candidates survive display cap', cappedPools.targetCandidatesAbove.length >= 5 && cappedPools.targetCandidatesAbove.every((p) => p.type === 'BSL' && !p.swept && p.price > 100));
+ok('pools: full SSL target candidates survive display cap', cappedPools.targetCandidatesBelow.length >= 5 && cappedPools.targetCandidatesBelow.every((p) => p.type === 'SSL' && !p.swept && p.price < 100));
+
+// Equal-level clusters use the stop-side extreme, never an average.
+const clustered = manyPools.map((c) => ({ ...c }));
+clustered[4].high = 110;
+clustered[14].high = 110.1;
+clustered[9].low = 90;
+clustered[19].low = 89.9;
+const extremePools = detectLiquidityPools(clustered, { equalTolAtr: 0.2, maxPerSide: 20 });
+ok('pools: equal highs cluster at maximum', extremePools.buySide.some((p) => p.equal && p.price === 110.1));
+ok('pools: equal lows cluster at minimum', extremePools.sellSide.some((p) => p.equal && p.price === 89.9));
+
+const adjacentFailedBull = driveSeq(20, 90, 110, [
+  ...Array.from({ length: 15 }, () => [105, 109, 104, 106]),
+  [108, 113, 107, 108], [108, 114, 107, 108], [108, 112, 107, 108], [108, 113, 107, 108], [108, 114, 107, 108],
+]);
+const adjacentFailedBear = driveSeq(20, 90, 110, [
+  ...Array.from({ length: 15 }, () => [105, 109, 104, 106]),
+  [92, 93, 87, 92], [92, 93, 86, 92], [92, 93, 88, 92], [92, 93, 87, 92], [92, 93, 86, 92],
+]);
+ok('drive: adjacent bullish failed wicks remain one drive without reset', classifyDrive(adjacentFailedBull, 'BULLISH').drives === 1 && classifyDrive(adjacentFailedBull, 'BULLISH').label === 'FIRST_DRIVE');
+ok('drive: adjacent bearish failed wicks remain one drive without reset', classifyDrive(adjacentFailedBear, 'BEARISH').drives === 1 && classifyDrive(adjacentFailedBear, 'BEARISH').label === 'FIRST_DRIVE');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
