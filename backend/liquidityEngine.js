@@ -298,6 +298,104 @@ export function detectKeyLiquidityLevels(candles, { symbol = '', dailyCandles = 
   return { price: r5(price), atr: r5(atr), levels: dedup, targetCandidatesAbove, targetCandidatesBelow, nearestAbove, nearestBelow };
 }
 
+// Latest closed-candle liquidity pin: a fresh key level is pierced by the wick,
+// while the directional body opens and closes back on the original side. This is
+// deliberately only the event detector; HTF, symbol, entry, target, and delivery
+// policies belong to the strategy composing it.
+export function detectLiquidityPinRejection(candles, {
+  symbol = '',
+  dailyCandles = null,
+  pip = 0.0001,
+  minLevelStrength = 2,
+  minSweepAtr = 0.08,
+  minSweepPips = 2,
+  minRangeAtr = 0.6,
+  minWickRatio = 0.45,
+  maxBodyRatio = 0.4,
+  minClosePosition = 0.6,
+} = {}) {
+  if (!Array.isArray(candles) || candles.length < 30) return null;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+
+  const eventIdx = candles.length - 1;
+  const candle = candles[eventIdx];
+  const o = n(candle.open), h = n(candle.high), l = n(candle.low), cl = n(candle.close);
+  if ([o, h, l, cl].some((v) => !Number.isFinite(v)) || !(h > l)) return null;
+  const range = h - l;
+  const body = Math.abs(cl - o);
+  const bodyRatio = body / range;
+  if (range < minRangeAtr * atr || bodyRatio > maxBodyRatio) return null;
+
+  const sweepFloor = Math.max(minSweepAtr * atr, minSweepPips * pip);
+  const { levels } = detectKeyLiquidityLevels(candles, { symbol, dailyCandles });
+  const candidates = [];
+
+  const sideMatches = (level, decision) => {
+    const type = String(level.type || '').toUpperCase();
+    if (type === 'ROUND_NUMBER') return true;
+    const wantedSide = decision === 'BUY' ? 'below' : 'above';
+    if (level.side !== wantedSide) return false;
+    return decision === 'BUY'
+      ? type === 'PDL' || /LOW$/.test(type)
+      : type === 'PDH' || /HIGH$/.test(type);
+  };
+  const unusedBeforeEvent = (level, decision) => {
+    const formedIdx = Number.isFinite(Number(level.formedIdx)) ? Number(level.formedIdx) : -1;
+    if (formedIdx >= eventIdx) return false;
+    for (let i = Math.max(0, formedIdx + 1); i < eventIdx; i++) {
+      if (decision === 'BUY' ? n(candles[i].low) < n(level.price) : n(candles[i].high) > n(level.price)) return false;
+    }
+    return true;
+  };
+
+  for (const level of levels || []) {
+    if (!Number.isFinite(n(level.price)) || n(level.strength) < minLevelStrength) continue;
+    const price = n(level.price);
+
+    const buy = sideMatches(level, 'BUY')
+      && l < price && price - l >= sweepFloor
+      && o > price && cl > price && cl > o
+      && unusedBeforeEvent(level, 'BUY');
+    if (buy) {
+      const wickRatio = (Math.min(o, cl) - l) / range;
+      const closePosition = (cl - l) / range;
+      if (wickRatio >= minWickRatio && closePosition >= minClosePosition) {
+        candidates.push({
+          decision: 'BUY', direction: 'BULLISH', level, eventIdx,
+          eventIso: candle.time, extreme: l, triggerReference: h,
+          atr, range, rangeAtr: range / atr, bodyRatio, wickRatio, closePosition,
+          sweepDepth: price - l, sweepDepthAtr: (price - l) / atr,
+        });
+      }
+    }
+
+    const sell = sideMatches(level, 'SELL')
+      && h > price && h - price >= sweepFloor
+      && o < price && cl < price && cl < o
+      && unusedBeforeEvent(level, 'SELL');
+    if (sell) {
+      const wickRatio = (h - Math.max(o, cl)) / range;
+      const closePosition = (h - cl) / range;
+      if (wickRatio >= minWickRatio && closePosition >= minClosePosition) {
+        candidates.push({
+          decision: 'SELL', direction: 'BEARISH', level, eventIdx,
+          eventIso: candle.time, extreme: h, triggerReference: l,
+          atr, range, rangeAtr: range / atr, bodyRatio, wickRatio, closePosition,
+          sweepDepth: h - price, sweepDepthAtr: (h - price) / atr,
+        });
+      }
+    }
+  }
+
+  candidates.sort((a, b) =>
+    n(b.level.strength) - n(a.level.strength)
+    || b.wickRatio - a.wickRatio
+    || b.sweepDepthAtr - a.sweepDepthAtr
+    || String(a.level.type).localeCompare(String(b.level.type)));
+  return candidates[0] || null;
+}
+
 // ─── High-probability sweep grader (the 5-component model) ────────────────────
 // A sweep is only worth trading when 5 things line up: (1) HTF context, (2) an OBVIOUS liquidity
 // pool was the level swept (PDH/PDL/session/round/equal — not a random swing), (3) a rejection

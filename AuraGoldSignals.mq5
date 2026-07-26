@@ -45,6 +45,12 @@ input bool              InpSendPriorityRT = true;                   // Stream cu
 input string            InpPrioritySymbols   = "XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY,USTEC"; // Curated liquid symbols kept real-time (USTEC = Nasdaq/USTECm)
 input string            InpPriorityTimeframes = "M1,M5,M15";        // Timeframes kept real-time for priority symbols
 
+input group             "Auto Trading Bridge"
+input bool              InpAutoTrade     = true;                    // Enable trade bridge (backend gates all trading)
+input int               InpTradePollSec  = 3;                       // Trade command poll interval (seconds)
+input long              InpTradeMagic    = 990045;                  // Magic number for Aura auto-trades
+input int               InpTradeSlippage = 30;                      // Max slippage (points)
+
 input group             "Alert Settings"
 input bool              InpTrackTrades   = true;                    // Send Alerts on Trades (Open/Close)
 input bool              InpTrackSMACross = false;                   // Send Alerts on SMA Crossover
@@ -55,6 +61,9 @@ input int               InpSlowSmaPeriod = 20;                      // Slow SMA 
 //--- global variables
 int      timer_ticks      = 0;
 datetime last_heartbeat   = 0;
+datetime last_trade_poll  = 0;
+long     g_known_positions[];       // magic-filtered position ids seen last poll (close detection)
+bool     g_known_positions_primed = false;
 datetime last_snapshot    = 0;
 datetime last_live_candle = 0;
 datetime last_sma_alert   = 0;
@@ -190,6 +199,15 @@ void OnTimer()
    if(InpSendHeartbeat && (now - last_heartbeat >= InpHeartbeatSec))
    {
       SendHeartbeat();
+   }
+
+   // Auto-trading bridge: poll the backend for approved trade commands, execute them,
+   // and report closed positions. Runs even during history sync — a trade command is
+   // time-critical. The backend gates everything (mode/filters/caps/armed account).
+   if(InpAutoTrade && (now - last_trade_poll >= InpTradePollSec))
+   {
+      last_trade_poll = now;
+      TradeBridgePoll();
    }
 
    // ALWAYS keep real-time data flowing, even while the background history sync runs.
@@ -1904,4 +1922,263 @@ bool UploadHistoryChunk(string symbol, string tf_label, MqlRates &rates[], int s
    }
 
    return (end >= total_rates);
+}
+
+//+------------------------------------------------------------------+
+//| AUTO-TRADING BRIDGE                                              |
+//| The backend is the brain (filters, caps, approvals, armed        |
+//| account); this module is only the hands: poll for commands,      |
+//| execute them, report results and closed positions.               |
+//+------------------------------------------------------------------+
+
+// Build the JSON array of OUR open positions (magic-filtered).
+string TradeBridgePositionsJson()
+{
+   string js = "[";
+   bool first = true;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpTradeMagic) continue;
+      long pid = PositionGetInteger(POSITION_IDENTIFIER);
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(!first) js += ",";
+      js += "{\"id\":" + IntegerToString(pid) +
+            ",\"ticket\":" + IntegerToString((long)ticket) +
+            ",\"symbol\":\"" + EscapeString(sym) + "\"" +
+            ",\"profit\":" + DoubleToString(profit, 2) +
+            ",\"openPrice\":" + DoubleToString(open_price, 8) + "}";
+      first = false;
+   }
+   js += "]";
+   return js;
+}
+
+// Build the JSON array of OUR pending orders (magic-filtered).
+string TradeBridgeOrdersJson()
+{
+   string js = "[";
+   bool first = true;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != InpTradeMagic) continue;
+      string sym = OrderGetString(ORDER_SYMBOL);
+      if(!first) js += ",";
+      js += "{\"ticket\":" + IntegerToString((long)ticket) + ",\"symbol\":\"" + EscapeString(sym) + "\"}";
+      first = false;
+   }
+   js += "]";
+   return js;
+}
+
+// Detect positions (our magic) that vanished since the last poll -> they closed.
+// Look the realized P&L up in the deal history and report it to the backend.
+void TradeBridgeDetectCloses()
+{
+   long current[];
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpTradeMagic) continue;
+      int n = ArraySize(current);
+      ArrayResize(current, n + 1);
+      current[n] = PositionGetInteger(POSITION_IDENTIFIER);
+   }
+
+   if(g_known_positions_primed)
+   {
+      for(int k = 0; k < ArraySize(g_known_positions); k++)
+      {
+         long pid = g_known_positions[k];
+         bool still_open = false;
+         for(int c = 0; c < ArraySize(current); c++)
+            if(current[c] == pid) { still_open = true; break; }
+         if(still_open) continue;
+
+         // Closed - sum profit from the position deal history.
+         double profit = 0.0;
+         double close_price = 0.0;
+         if(HistorySelectByPosition(pid))
+         {
+            int deals = HistoryDealsTotal();
+            for(int d = 0; d < deals; d++)
+            {
+               ulong deal = HistoryDealGetTicket(d);
+               if(deal == 0) continue;
+               profit += HistoryDealGetDouble(deal, DEAL_PROFIT)
+                       + HistoryDealGetDouble(deal, DEAL_SWAP)
+                       + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+               if(HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+                  close_price = HistoryDealGetDouble(deal, DEAL_PRICE);
+            }
+         }
+         string body = "{\"positionId\":" + IntegerToString(pid) +
+                       ",\"profit\":" + DoubleToString(profit, 2) +
+                       ",\"closePrice\":" + DoubleToString(close_price, 8) + "}";
+         TradeBridgePost("/api/mt5/trade-closed", body);
+         Print("Aura AutoTrade: position ", pid, " closed, P/L=", DoubleToString(profit, 2));
+      }
+   }
+
+   ArrayResize(g_known_positions, ArraySize(current));
+   for(int c = 0; c < ArraySize(current); c++) g_known_positions[c] = current[c];
+   g_known_positions_primed = true;
+}
+
+// Small POST helper for bridge reports (fire-and-forget).
+void TradeBridgePost(string path, string body)
+{
+   string url = InpServerUrl + path;
+   string headers = "Content-Type: application/json\r\n";
+   char post_bytes[]; char result[]; string result_headers;
+   ArrayResize(post_bytes, StringLen(body));
+   StringToCharArray(body, post_bytes, 0, StringLen(body), CP_UTF8);
+   ResetLastError();
+   int res = WebRequest("POST", url, headers, InpTimeout, post_bytes, result, result_headers);
+   if(res < 200 || res >= 300)
+      Print("Aura AutoTrade: POST ", path, " failed, code=", res, ", err=", GetLastError());
+}
+
+// Broker-supported filling mode for a symbol.
+ENUM_ORDER_TYPE_FILLING TradeBridgeFilling(string sym)
+{
+   long filling = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   if((filling & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   return ORDER_FILLING_RETURN;
+}
+
+// Clamp lots to the symbol volume constraints.
+double TradeBridgeNormalizeLots(string sym, double lots)
+{
+   double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double vmax  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double vstep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(vstep > 0) lots = MathFloor(lots / vstep) * vstep;
+   if(lots < vmin) lots = vmin;
+   if(lots > vmax) lots = vmax;
+   return NormalizeDouble(lots, 2);
+}
+
+// Execute one CMD line: CMD|id|symbol|dir|type|lots|sl|tp|entry|expiresMsEpoch
+void TradeBridgeExecute(string line)
+{
+   string f[];
+   int n = StringSplit(line, '|', f);
+   if(n < 10) { Print("Aura AutoTrade: malformed command: ", line); return; }
+   string id = f[1];
+   string want_symbol = f[2];
+   bool is_buy = (StringFind(f[3], "BUY") >= 0);
+   string otype = f[4];
+   double lots = StringToDouble(f[5]);
+   double sl = StringToDouble(f[6]);
+   double tp = StringToDouble(f[7]);
+   double entry = StringToDouble(f[8]);
+   long expires_ms = StringToInteger(f[9]);
+
+   // Resolve to the exact broker symbol (handles suffix/case, e.g. XAUUSDM -> XAUUSDm).
+   string sym = MatchBrokerSymbol(want_symbol);
+   if(sym == "") sym = want_symbol;
+   SymbolSelect(sym, true);
+
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   lots = TradeBridgeNormalizeLots(sym, lots);
+
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.symbol   = sym;
+   req.volume   = lots;
+   req.magic    = InpTradeMagic;
+   req.deviation = InpTradeSlippage;
+   req.sl = (sl > 0) ? NormalizeDouble(sl, digits) : 0;
+   req.tp = (tp > 0) ? NormalizeDouble(tp, digits) : 0;
+   req.type_filling = TradeBridgeFilling(sym);
+   req.comment  = "AuraAuto";
+
+   if(otype == "MARKET")
+   {
+      req.action = TRADE_ACTION_DEAL;
+      req.type   = is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      req.price  = is_buy ? SymbolInfoDouble(sym, SYMBOL_ASK) : SymbolInfoDouble(sym, SYMBOL_BID);
+   }
+   else // LIMIT or STOP pending order at the signal entry
+   {
+      req.action = TRADE_ACTION_PENDING;
+      if(otype == "LIMIT") req.type = is_buy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+      else                 req.type = is_buy ? ORDER_TYPE_BUY_STOP  : ORDER_TYPE_SELL_STOP;
+      req.price = NormalizeDouble(entry, digits);
+      // Expiration in SERVER time: epoch delta applied to the trade-server clock.
+      long delta_sec = expires_ms / 1000 - (long)TimeGMT();
+      long exp_mode = SymbolInfoInteger(sym, SYMBOL_EXPIRATION_MODE);
+      if(delta_sec > 30 && (exp_mode & SYMBOL_EXPIRATION_SPECIFIED) != 0)
+      {
+         req.type_time   = ORDER_TIME_SPECIFIED;
+         req.expiration  = (datetime)(TimeTradeServer() + delta_sec);
+      }
+      else
+      {
+         req.type_time = ORDER_TIME_GTC; // broker lacks expiry support; backend reconciles
+      }
+   }
+
+   ResetLastError();
+   bool sent = OrderSend(req, res);
+   bool ok = sent && (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED || res.retcode == TRADE_RETCODE_DONE_PARTIAL);
+   long ticket = (long)(res.order > 0 ? res.order : res.deal);
+   double price = (res.price > 0) ? res.price : req.price;
+
+   string body = "{\"id\":\"" + EscapeString(id) + "\"" +
+                 ",\"ok\":" + (ok ? "true" : "false") +
+                 ",\"ticket\":" + IntegerToString(ticket) +
+                 ",\"price\":" + DoubleToString(price, 8) +
+                 ",\"retcode\":" + IntegerToString((long)res.retcode) +
+                 ",\"message\":\"" + EscapeString(res.comment) + "\"}";
+   TradeBridgePost("/api/mt5/trade-result", body);
+   Print("Aura AutoTrade: ", (ok ? "EXECUTED " : "FAILED "), otype, " ", (is_buy ? "BUY " : "SELL "), sym,
+         " lots=", DoubleToString(lots, 2), " retcode=", res.retcode, " ticket=", ticket);
+}
+
+// Main poll: report state, receive commands, execute, detect closes.
+void TradeBridgePoll()
+{
+   // 1) Detect and report closed positions FIRST (so results reach you fast).
+   TradeBridgeDetectCloses();
+
+   // 2) Poll with the live account + open-position report.
+   bool is_demo = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);
+   string body = "{\"account\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\"" +
+                 ",\"broker\":\"" + EscapeString(AccountInfoString(ACCOUNT_COMPANY)) + "\"" +
+                 ",\"server\":\"" + EscapeString(AccountInfoString(ACCOUNT_SERVER)) + "\"" +
+                 ",\"demo\":" + (is_demo ? "true" : "false") +
+                 ",\"currency\":\"" + EscapeString(AccountInfoString(ACCOUNT_CURRENCY)) + "\"" +
+                 ",\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) +
+                 ",\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
+                 ",\"positions\":" + TradeBridgePositionsJson() +
+                 ",\"orders\":" + TradeBridgeOrdersJson() + "}";
+
+   string url = InpServerUrl + "/api/mt5/trade-bridge";
+   string headers = "Content-Type: application/json\r\n";
+   char post_bytes[]; char result[]; string result_headers;
+   ArrayResize(post_bytes, StringLen(body));
+   StringToCharArray(body, post_bytes, 0, StringLen(body), CP_UTF8);
+   ResetLastError();
+   int res = WebRequest("POST", url, headers, InpTimeout, post_bytes, result, result_headers);
+   if(res < 200 || res >= 300) return; // backend down/unreachable - nothing to do
+
+   // 3) Execute any commands in the plain-text response.
+   string text = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+   string lines[];
+   int count = StringSplit(text, '\n', lines);
+   for(int i = 0; i < count; i++)
+   {
+      string line = lines[i];
+      StringReplace(line, "\r", "");
+      if(StringFind(line, "CMD|") == 0) TradeBridgeExecute(line);
+   }
 }

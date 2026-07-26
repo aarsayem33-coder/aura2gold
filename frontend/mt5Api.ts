@@ -55,6 +55,12 @@ import type {
   DayTradingBriefResponse,
   StructureDeskResponse,
   LiveMarketTrackerResponse,
+  KeyLevelProximityResponse,
+  ChallengeDashboard,
+  AutoTradeStatus,
+  AutoTradeReport,
+  AutoTradeConfig,
+  AutoTradeValidation,
   SignalTrackerResponse,
   StrategyMeta,
   StrategySignal,
@@ -189,8 +195,8 @@ function upsertById<T extends { id: string }>(items: T[], item: T, limit = 300) 
   return [item, ...items.filter((existing) => existing.id !== item.id)].slice(0, limit);
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
   if (!response.ok) throw new Error(`Request failed for ${url}: ${response.status}`);
   return response.json() as Promise<T>;
 }
@@ -416,6 +422,51 @@ export async function fetchLiveMarketTracker(symbol?: string, timeframe = 'M5'):
   return fetchJson<LiveMarketTrackerResponse>(`/api/live-market-tracker?${params.toString()}`);
 }
 
+export async function fetchKeyLevelProximity(sensitivity?: string): Promise<KeyLevelProximityResponse> {
+  const params = new URLSearchParams();
+  if (sensitivity) params.set('sensitivity', sensitivity);
+  const qs = params.toString();
+  return fetchJson<KeyLevelProximityResponse>(`/api/key-level-proximity${qs ? `?${qs}` : ''}`);
+}
+
+export async function fetchAutoTradeStatus(): Promise<AutoTradeStatus> {
+  return fetchJson<AutoTradeStatus>('/api/auto-trade');
+}
+export async function fetchAutoTradeReport(params: { from?: string; to?: string } = {}): Promise<AutoTradeReport> {
+  const q = new URLSearchParams();
+  if (params.from) q.set('from', params.from);
+  if (params.to) q.set('to', params.to);
+  const qs = q.toString();
+  return fetchJson<AutoTradeReport>(`/api/auto-trade/report${qs ? `?${qs}` : ''}`);
+}
+export async function validateAutoTrade(config: Partial<AutoTradeConfig>): Promise<AutoTradeValidation> {
+  return fetchJson<AutoTradeValidation>('/api/auto-trade/validate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ config }),
+  });
+}
+export async function approveAutoTrade(id: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/auto-trade/${encodeURIComponent(id)}/approve`, { method: 'POST' });
+}
+export async function rejectAutoTrade(id: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/auto-trade/${encodeURIComponent(id)}/reject`, { method: 'POST' });
+}
+export async function armAutoTradeAccount(account: string | null): Promise<{ ok: boolean; armed: string | null }> {
+  return fetchJson('/api/auto-trade/arm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account }) });
+}
+
+export async function fetchChallenge(): Promise<ChallengeDashboard> {
+  return fetchJson<ChallengeDashboard>('/api/challenge');
+}
+export async function logChallengeTrade(pnl: number, note?: string): Promise<ChallengeDashboard> {
+  return fetchJson<ChallengeDashboard>('/api/challenge/trade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pnl, note }) });
+}
+export async function setChallengeBalance(balance: number): Promise<ChallengeDashboard> {
+  return fetchJson<ChallengeDashboard>('/api/challenge/balance', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ balance }) });
+}
+export async function resetChallenge(initialBalance?: number): Promise<ChallengeDashboard> {
+  return fetchJson<ChallengeDashboard>('/api/challenge/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initialBalance }) });
+}
+
 export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; symbols: string[]; timeframes: string[]; ftExpiryBars: number }> {
   return fetchJson('/api/strategy-lab/strategies');
 }
@@ -494,6 +545,23 @@ export async function fetchBreakoutTracking(timeframe = 'ALL', windowHours?: num
 export async function markSignalTrackerDone(id: string): Promise<{ ok: boolean; id: string }> {
   const response = await fetch(`/api/signal-tracker/${encodeURIComponent(id)}/done`, { method: 'POST' });
   if (!response.ok) throw new Error(`Failed to mark done (${response.status})`);
+  return response.json();
+}
+
+// Executed Orders — user-tracked pending orders (Track button on tracker rows).
+export async function fetchExecutedOrders(): Promise<import('./types').ExecutedOrdersResponse> {
+  const response = await fetch('/api/executed-orders');
+  if (!response.ok) throw new Error(`Failed to load executed orders (${response.status})`);
+  return response.json();
+}
+export async function trackSignalOrder(id: string, source = 'strategy-lab'): Promise<{ ok: boolean; id: string }> {
+  const response = await fetch(`/api/signal-tracker/${encodeURIComponent(id)}/track?source=${encodeURIComponent(source)}`, { method: 'POST' });
+  if (!response.ok) throw new Error(`Failed to track order (${response.status})`);
+  return response.json();
+}
+export async function untrackSignalOrder(id: string): Promise<{ ok: boolean; id: string }> {
+  const response = await fetch(`/api/signal-tracker/${encodeURIComponent(id)}/untrack`, { method: 'POST' });
+  if (!response.ok) throw new Error(`Failed to untrack order (${response.status})`);
   return response.json();
 }
 

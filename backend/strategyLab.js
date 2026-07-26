@@ -10,7 +10,7 @@
 //              takeProfit3?, riskRewardRatio, reason, barIso, meta }
 // Pure: no I/O. New strategies = add one entry to STRATEGIES.
 
-import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels, detectDisplacement, roundStepFor } from './liquidityEngine.js';
+import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels, detectLiquidityPinRejection, detectDisplacement, roundStepFor } from './liquidityEngine.js';
 import { buildBreakoutCandidate, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
@@ -75,7 +75,7 @@ function raidLevelSideOk(type, dir) {
 // minimum RR. Only fires on a freshly-confirmed breaker (dedup by the reclaim bar).
 function ictBreaker(ctx) {
   const { candles, h4Trend = null, config = {}, pip = 0.0001 } = ctx;
-  const minRR = config.minRR ?? 2;
+  const minRR = config.minRR ?? 1.5;
   const maxAgeBars = config.maxAgeBars ?? 3;
   if (!Array.isArray(candles) || candles.length < 60) return null;
 
@@ -350,6 +350,351 @@ function liquidityTrap(ctx) {
       targetEqual: t.target.equal,
       ageBars: lastIdx - t.rejIdx,
       h4Trend,
+    },
+  };
+}
+
+// ── Strategy 3b: Liq Trap Pro ────────────────────────────────────────────────
+// A separate, stricter liquidity-reversal model. The legacy `liquidityTrap`
+// above remains untouched because the confluence/fusion engines use it as a
+// voter. Pro uses causal, locked ZigZag pivots to reject minor fractals, then
+// requires a meaningful same-bar sweep and directional close back inside.
+export function detectLiquidityTrapProPivots(candles, {
+  span = 3,
+  minLegAtr = 0.8,
+  atr = null,
+} = {}) {
+  if (!Array.isArray(candles) || candles.length < span * 2 + 5) return [];
+  const atrAvailable = Number(atr) || atr14(candles);
+  if (!(atrAvailable > 0)) return [];
+
+  const raw = [];
+  for (let i = span; i < candles.length - span; i++) {
+    const high = n(candles[i].high), low = n(candles[i].low);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
+    let isHigh = true, isLow = true;
+    for (let j = i - span; j <= i + span; j++) {
+      if (j === i) continue;
+      if (n(candles[j].high) >= high) isHigh = false;
+      if (n(candles[j].low) <= low) isLow = false;
+    }
+    // An outside bar can be both extremes. It has no unambiguous pivot side.
+    if (isHigh !== isLow) {
+      const confirmedAtIdx = i + span;
+      // Freeze volatility at the moment the pivot became knowable. Using the
+      // latest ATR would let future volatility reclassify old ZigZag legs.
+      const atrAtConfirmation = atr14(candles.slice(0, confirmedAtIdx + 1));
+      if (!(atrAtConfirmation > 0)) continue;
+      raw.push({ idx: i, confirmedAtIdx, atrAtConfirmation, kind: isHigh ? 'H' : 'L', price: isHigh ? high : low, time: candles[i].time });
+    }
+  }
+
+  const sequence = [];
+  for (const pivot of raw) {
+    const last = sequence[sequence.length - 1];
+    if (!last) { sequence.push(pivot); continue; }
+    if (last.kind === pivot.kind) {
+      const moreExtreme = pivot.kind === 'H' ? pivot.price > last.price : pivot.price < last.price;
+      if (moreExtreme) sequence[sequence.length - 1] = pivot;
+      continue;
+    }
+    if (Math.abs(pivot.price - last.price) >= minLegAtr * pivot.atrAtConfirmation) sequence.push(pivot);
+  }
+
+  // The terminal leg can still extend, so it is deliberately not a tradable
+  // source pivot. Every returned pivot already has a confirmed opposite leg.
+  return sequence.slice(0, -1).map((pivot, i) => {
+    const prev = sequence[i - 1], next = sequence[i + 1];
+    const prominenceAtr = prev && next
+      ? Math.min(Math.abs(pivot.price - prev.price), Math.abs(pivot.price - next.price)) / pivot.atrAtConfirmation
+      : 0;
+    let label = pivot.kind === 'H' ? 'HH' : 'LL';
+    for (let j = i - 1; j >= 0; j--) {
+      if (sequence[j].kind !== pivot.kind) continue;
+      label = pivot.kind === 'H'
+        ? (pivot.price > sequence[j].price ? 'HH' : 'LH')
+        : (pivot.price < sequence[j].price ? 'LL' : 'HL');
+      break;
+    }
+    return { ...pivot, prominenceAtr: Math.round(prominenceAtr * 100) / 100, label };
+  });
+}
+
+function liquidityTrapProPsar(candles, { step = 0.02, max = 0.2 } = {}) {
+  if (!Array.isArray(candles) || candles.length < 5) return null;
+  let bullish = n(candles[1].close) >= n(candles[0].close);
+  let sar = bullish
+    ? Math.min(n(candles[0].low), n(candles[1].low))
+    : Math.max(n(candles[0].high), n(candles[1].high));
+  let extreme = bullish
+    ? Math.max(n(candles[0].high), n(candles[1].high))
+    : Math.min(n(candles[0].low), n(candles[1].low));
+  let acceleration = step;
+  let lastFlipIdx = null;
+
+  for (let i = 2; i < candles.length; i++) {
+    let nextSar = sar + acceleration * (extreme - sar);
+    if (bullish) {
+      nextSar = Math.min(nextSar, n(candles[i - 1].low), n(candles[i - 2].low));
+      if (n(candles[i].low) < nextSar) {
+        bullish = false;
+        nextSar = extreme;
+        extreme = n(candles[i].low);
+        acceleration = step;
+        lastFlipIdx = i;
+      } else if (n(candles[i].high) > extreme) {
+        extreme = n(candles[i].high);
+        acceleration = Math.min(max, acceleration + step);
+      }
+    } else {
+      nextSar = Math.max(nextSar, n(candles[i - 1].high), n(candles[i - 2].high));
+      if (n(candles[i].high) > nextSar) {
+        bullish = true;
+        nextSar = extreme;
+        extreme = n(candles[i].high);
+        acceleration = step;
+        lastFlipIdx = i;
+      } else if (n(candles[i].low) < extreme) {
+        extreme = n(candles[i].low);
+        acceleration = Math.min(max, acceleration + step);
+      }
+    }
+    sar = nextSar;
+  }
+  return { trend: bullish ? 'BULLISH' : 'BEARISH', value: r5(sar), lastFlipIdx };
+}
+
+function liquidityTrapProSession(timeIso) {
+  const hour = new Date(timeIso).getUTCHours();
+  if (!Number.isFinite(hour)) return { label: 'UNKNOWN', score: 0 };
+  if (hour >= 12 && hour < 16) return { label: 'OVERLAP', score: 4 };
+  if (hour >= 7 && hour < 12) return { label: 'LONDON', score: 3 };
+  if (hour >= 16 && hour < 21) return { label: 'NEWYORK', score: 4 };
+  if (hour >= 0 && hour < 7) return { label: 'ASIAN', score: -3 };
+  return { label: 'OFF', score: -2 };
+}
+
+function liquidityTrapPro(ctx) {
+  const {
+    candles, candlesIncludeFormingBar = false, symbol = '', h4Trend = null,
+    h1Trend = null, dailyCandles = null, config = {}, pip = 0.0001,
+  } = ctx;
+  if (!Array.isArray(candles)) return null;
+  const closed = candlesIncludeFormingBar ? candles.slice(0, -1) : candles;
+  if (closed.length < 80) return null;
+  const atr = atr14(closed);
+  if (!(atr > 0)) return null;
+
+  const eventIdx = closed.length - 1;
+  const event = closed[eventIdx];
+  const o = n(event.open), h = n(event.high), l = n(event.low), cl = n(event.close);
+  const range = h - l;
+  if (![o, h, l, cl].every(Number.isFinite) || !(range > 0)) return null;
+  const minRangeAtr = config.minRangeAtr ?? 0.6;
+  const maxRangeAtr = config.maxRangeAtr ?? 2.5;
+  if (range < minRangeAtr * atr || range > maxRangeAtr * atr) return null;
+
+  const pivots = detectLiquidityTrapProPivots(closed, {
+    span: config.zigzagSpan ?? 3,
+    minLegAtr: config.minLegAtr ?? 0.8,
+    atr,
+  }).filter((p) => p.confirmedAtIdx < eventIdx);
+  if (pivots.length < 3) return null;
+
+  let keyMap;
+  try { keyMap = detectKeyLiquidityLevels(closed, { symbol, dailyCandles }); }
+  catch { keyMap = { levels: [], targetCandidatesAbove: [], targetCandidatesBelow: [] }; }
+  const keyLevels = keyMap.levels || [];
+  const equalTol = atr * (config.equalTolAtr ?? 0.15);
+  const keyTol = atr * (config.keyLevelTolAtr ?? 0.2);
+  const maxLevelAgeBars = config.maxLevelAgeBars ?? 120;
+
+  const clustersFor = (kind) => {
+    const clusters = [];
+    for (const pivot of pivots.filter((p) => p.kind === kind)) {
+      let hit = clusters.find((q) => Math.abs(q.center - pivot.price) <= equalTol);
+      if (!hit) {
+        hit = { kind, center: pivot.price, price: pivot.price, pivots: [] };
+        clusters.push(hit);
+      }
+      hit.pivots.push(pivot);
+      hit.center = hit.pivots.reduce((sum, p) => sum + p.price, 0) / hit.pivots.length;
+      hit.price = kind === 'H' ? Math.max(hit.price, pivot.price) : Math.min(hit.price, pivot.price);
+    }
+    return clusters.filter((q) => q.pivots.length >= 2);
+  };
+  const equalClusters = [...clustersFor('H'), ...clustersFor('L')];
+  const clusteredIndexes = new Set(equalClusters.flatMap((q) => q.pivots.map((p) => p.idx)));
+  const sources = [];
+
+  for (const cluster of equalClusters) {
+    const lastPivot = cluster.pivots.reduce((a, b) => b.idx > a.idx ? b : a);
+    const prominenceAtr = Math.max(...cluster.pivots.map((p) => p.prominenceAtr));
+    if (prominenceAtr < (config.minEqualProminenceAtr ?? 0.7)) continue;
+    sources.push({
+      kind: cluster.kind, price: cluster.price, type: cluster.kind === 'H' ? 'EQUAL_HIGH' : 'EQUAL_LOW',
+      touches: cluster.pivots.length, formedIdx: lastPivot.idx,
+      confirmedAtIdx: Math.max(...cluster.pivots.map((p) => p.confirmedAtIdx)), prominenceAtr,
+    });
+  }
+
+  for (const pivot of pivots) {
+    if (clusteredIndexes.has(pivot.idx)) continue;
+    const side = pivot.kind === 'H' ? 'above' : 'below';
+    const key = keyLevels
+      .filter((level) => level.side === side && Math.abs(n(level.price) - pivot.price) <= keyTol)
+      .sort((a, b) => n(b.strength) - n(a.strength))[0] || null;
+    const strongKey = key && n(key.strength) >= 3 ? key : null;
+    const minProminence = strongKey
+      ? (config.minKeySwingProminenceAtr ?? 0.8)
+      : (config.minSwingProminenceAtr ?? 1.2);
+    if (pivot.prominenceAtr < minProminence) continue;
+    sources.push({
+      kind: pivot.kind, price: pivot.price, type: strongKey ? 'KEY_SWING' : 'MAJOR_SWING', touches: 1,
+      formedIdx: pivot.idx, confirmedAtIdx: pivot.confirmedAtIdx, prominenceAtr: pivot.prominenceAtr, key: strongKey,
+    });
+  }
+  if (!sources.length) return null;
+
+  const sweepFloor = Math.max((config.minSweepAtr ?? 0.05) * atr, (config.minSweepPips ?? 1) * pip);
+  const maxSweep = (config.maxSweepAtr ?? 0.9) * atr;
+  const zoneTolerance = Math.max((config.zoneToleranceAtr ?? 0.08) * atr, (config.zoneTolerancePips ?? 0.5) * pip);
+  const minWickRatio = config.minWickRatio ?? 0.35;
+  const zoneMinWickRatio = config.zoneMinWickRatio ?? 0.3;
+  const maxBodyRatio = config.maxBodyRatio ?? 0.65;
+  const minClosePosition = config.minClosePosition ?? 0.55;
+  const zoneMinClosePosition = config.zoneMinClosePosition ?? 0.55;
+  const bodyRatio = Math.abs(cl - o) / range;
+  if (bodyRatio > maxBodyRatio) return null;
+
+  const candidates = [];
+  for (const source of sources) {
+    if (eventIdx - source.formedIdx > maxLevelAgeBars) continue;
+    let consumed = false;
+    for (let i = Math.max(source.formedIdx, source.confirmedAtIdx) + 1; i < eventIdx; i++) {
+      if (source.kind === 'H' ? n(closed[i].high) > source.price : n(closed[i].low) < source.price) { consumed = true; break; }
+    }
+    if (consumed) continue;
+
+    if (source.kind === 'H') {
+      const depth = h - source.price;
+      const wickRatio = (h - Math.max(o, cl)) / range;
+      const closePosition = (h - cl) / range;
+      if (depth >= sweepFloor && depth <= maxSweep && o < source.price && cl < source.price && cl < o
+        && wickRatio >= minWickRatio && closePosition >= minClosePosition) {
+        candidates.push({ source, decision: 'SELL', mode: 'SWEEP_REJECT', depth, wickRatio, closePosition });
+      } else if (depth < sweepFloor && h >= source.price - zoneTolerance && cl < source.price && cl < o
+        && wickRatio >= zoneMinWickRatio && closePosition >= zoneMinClosePosition) {
+        candidates.push({ source, decision: 'SELL', mode: 'ZONE_REJECT', depth, wickRatio, closePosition });
+      }
+    } else {
+      const depth = source.price - l;
+      const wickRatio = (Math.min(o, cl) - l) / range;
+      const closePosition = (cl - l) / range;
+      if (depth >= sweepFloor && depth <= maxSweep && o > source.price && cl > source.price && cl > o
+        && wickRatio >= minWickRatio && closePosition >= minClosePosition) {
+        candidates.push({ source, decision: 'BUY', mode: 'SWEEP_REJECT', depth, wickRatio, closePosition });
+      } else if (depth < sweepFloor && l <= source.price + zoneTolerance && cl > source.price && cl > o
+        && wickRatio >= zoneMinWickRatio && closePosition >= zoneMinClosePosition) {
+        candidates.push({ source, decision: 'BUY', mode: 'ZONE_REJECT', depth, wickRatio, closePosition });
+      }
+    }
+  }
+  if (!candidates.length || new Set(candidates.map((c) => c.decision)).size !== 1) return null;
+
+  const sourceRank = (candidate) => {
+    const source = candidate.source;
+    const equal = source.touches >= 2;
+    return (equal ? 30 : source.key ? 22 : 14)
+      + Math.min(8, source.prominenceAtr * 3)
+      + Math.min(6, Math.max(0, source.touches - 1) * 2)
+      + Math.min(8, n(source.key?.strength) * 2 || 0)
+      + (candidate.mode === 'SWEEP_REJECT' ? 4 : 0)
+      + candidate.wickRatio * 10;
+  };
+  candidates.sort((a, b) => sourceRank(b) - sourceRank(a) || b.source.formedIdx - a.source.formedIdx);
+  const best = candidates[0];
+  const decision = best.decision;
+
+  const buy = decision === 'BUY';
+  const stopBuffer = Math.max((config.stopBufferAtr ?? 0.1) * atr, (config.stopBufferPips ?? 2) * pip);
+  const entry = cl;
+  const stop = buy ? l - stopBuffer : h + stopBuffer;
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, atr, pip, {
+    minStopAtr: config.minStopAtr ?? 0.35,
+    minStopPips: config.minStopPips ?? 4,
+  })) return null;
+
+  const pools = detectLiquidityPools(closed);
+  const poolTargets = buy ? pools.targetCandidatesAbove : pools.targetCandidatesBelow;
+  const keyTargets = buy ? keyMap.targetCandidatesAbove : keyMap.targetCandidatesBelow;
+  const targets = [...(poolTargets || []), ...(keyTargets || [])]
+    .map((target) => ({ ...target, price: n(target.price) }))
+    .filter((target) => Number.isFinite(target.price) && (buy ? target.price > entry : target.price < entry))
+    .sort((a, b) => Math.abs(a.price - entry) - Math.abs(b.price - entry));
+  const target = targets[0] || null;
+  if (!target) return null;
+  const rr = Math.abs(target.price - entry) / risk;
+  const minRR = config.minRR ?? 2;
+  if (!(rr >= minRR)) return null;
+  const ladder = tpLadder(decision, entry, risk, target.price);
+  if (!ladder) return null;
+
+  const psar = liquidityTrapProPsar(closed, { step: config.psarStep ?? 0.02, max: config.psarMax ?? 0.2 });
+  const desiredPsar = buy ? 'BULLISH' : 'BEARISH';
+  const psarAligned = psar?.trend === desiredPsar;
+  const psarFlip = psarAligned && psar?.lastFlipIdx === eventIdx;
+  const session = liquidityTrapProSession(event.time);
+  const locationWindow = closed.slice(-60);
+  const rangeHigh = Math.max(...locationWindow.map((c) => n(c.high)));
+  const rangeLow = Math.min(...locationWindow.map((c) => n(c.low)));
+  const locationPct = rangeHigh > rangeLow ? (entry - rangeLow) / (rangeHigh - rangeLow) : 0.5;
+  const goodLocation = buy ? locationPct <= 0.35 : locationPct >= 0.65;
+  const sourceEqual = best.source.touches >= 2;
+  const h4Aligned = (buy && h4Trend === 'BULLISH') || (!buy && h4Trend === 'BEARISH');
+  const h4Against = (buy && h4Trend === 'BEARISH') || (!buy && h4Trend === 'BULLISH');
+
+  // Pro's valid setups must share the Strategy Lab's 75-point notification scale.
+  // Raising both base and emit floor by 10 preserves the candidate set while
+  // preventing valid Pro rows from being logged silently below the popup floor.
+  let score = 40;
+  score += sourceEqual ? 12 + Math.min(4, (best.source.touches - 2) * 2) : best.source.key ? 10 : 6;
+  score += Math.min(6, Math.round(best.source.prominenceAtr * 2));
+  score += Math.min(5, n(best.source.key?.strength) || 0);
+  score += Math.min(8, Math.round(best.wickRatio * 11));
+  score += Math.min(5, Math.round(best.closePosition * 6));
+  const depthAtr = best.depth / atr;
+  score += best.mode === 'SWEEP_REJECT' ? (depthAtr >= 0.1 && depthAtr <= 0.5 ? 5 : 2) : 3;
+  if (h4Aligned) score += 6;
+  else if (h4Against) score -= (config.h4AgainstPenalty ?? 8);
+  if ((buy && h1Trend === 'BULLISH') || (!buy && h1Trend === 'BEARISH')) score += 3;
+  else if ((buy && h1Trend === 'BEARISH') || (!buy && h1Trend === 'BULLISH')) score -= 3;
+  score += session.score;
+  score += goodLocation ? 4 : -3;
+  score += psarFlip ? 5 : psarAligned ? 2 : 0; // measured first; never a hard gate
+  score += Math.min(3, Math.max(0, Math.round(rr - minRR)));
+  score = Math.max(40, Math.min(97, Math.round(score)));
+  if (score < (config.minScore ?? 75)) return null;
+
+  const psarTag = psarFlip ? 'PSAR_FLIP' : psarAligned ? 'PSAR' : 'NO_PSAR';
+  const plan = `${best.mode === 'SWEEP_REJECT' ? 'SWEEP' : 'ZONE'}_${sourceEqual ? 'EQUAL' : 'SWING'}_${psarTag}`;
+  const interaction = best.mode === 'SWEEP_REJECT'
+    ? `swept ${Math.max(0, depthAtr).toFixed(2)}×ATR and rejected`
+    : `tested the ${zoneTolerance.toFixed(5)} zone and rejected`;
+  return {
+    decision, score, grade: smcGrade(score),
+    entry: r5(entry), stopLoss: r5(stop), ...ladder,
+    riskRewardRatio: Math.round(rr * 100) / 100,
+    reason: `Liq Trap Pro ${decision} ${best.mode}: ${best.source.type} ${r5(best.source.price)}${sourceEqual ? ` ×${best.source.touches}` : ''} ${interaction} (${Math.round(best.wickRatio * 100)}% wick) → ${target.type || target.label || 'liquidity'} ${r5(target.price)}; ${psarTag.toLowerCase()} · ${session.label}`,
+    barIso: event.time,
+    meta: {
+      strategyVersion: 2, plan, setupMode: best.mode,
+      sourceType: best.source.type, sourcePrice: r5(best.source.price), sourceTouches: best.source.touches,
+      swingProminenceAtr: best.source.prominenceAtr, sweepDepthAtr: Math.round(depthAtr * 100) / 100,
+      wickRatio: Math.round(best.wickRatio * 100) / 100, closePosition: Math.round(best.closePosition * 100) / 100,
+      psar: psar ? { ...psar, aligned: psarAligned, flipped: psarFlip } : null,
+      session: session.label, locationPct: Math.round(locationPct * 100), h4Trend, h1Trend, h4Aligned, h4Against,
     },
   };
 }
@@ -2150,6 +2495,125 @@ function liquiditySweepPro(ctx) {
   return sig;
 }
 
+// H4 Liquidity Pin Entry — the user's printed execution plan encoded literally:
+// strict H4 direction, a closed M15/M30 pin that raids fresh liquidity, then a
+// resting stop beyond that pin. It does not wait for another candle or BOS.
+function h4LiquidityPinEntry(ctx) {
+  const {
+    candles, candlesIncludeFormingBar = false, symbol = '', timeframe = 'M15',
+    h4Trend = null, dailyCandles = null, config = {}, pip = 0.01,
+  } = ctx;
+  if (!/XAU|GOLD/.test(String(symbol).toUpperCase())) return null;
+  const tf = String(timeframe).toUpperCase();
+  if (!['M15', 'M30'].includes(tf)) return null;
+  if (!['BULLISH', 'BEARISH'].includes(h4Trend)) return null;
+  if (!Array.isArray(candles)) return null;
+  const closedCandles = candlesIncludeFormingBar ? candles.slice(0, -1) : candles;
+  if (closedCandles.length < 80) return null;
+
+  const event = detectLiquidityPinRejection(closedCandles, {
+    symbol, dailyCandles, pip,
+    minLevelStrength: config.minLevelStrength ?? 2,
+    minSweepAtr: config.minSweepAtr ?? 0.08,
+    minSweepPips: config.minSweepPips ?? 2,
+    minRangeAtr: config.minRangeAtr ?? 0.6,
+    minWickRatio: config.minWickRatio ?? 0.45,
+    maxBodyRatio: config.maxBodyRatio ?? 0.4,
+    minClosePosition: config.minClosePosition ?? 0.6,
+  });
+  if (!event) return null;
+  if (event.decision === 'BUY' ? h4Trend !== 'BULLISH' : h4Trend !== 'BEARISH') return null;
+
+  const entryBuffer = Math.max((config.entryBufferAtr ?? 0.02) * event.atr, (config.entryBufferPips ?? 1) * pip);
+  const stopBuffer = Math.max((config.stopBufferAtr ?? 0.1) * event.atr, (config.stopBufferPips ?? 2) * pip);
+  const buy = event.decision === 'BUY';
+  const entry = buy ? event.triggerReference + entryBuffer : event.triggerReference - entryBuffer;
+  const stop = buy ? event.extreme - stopBuffer : event.extreme + stopBuffer;
+  const risk = Math.abs(entry - stop);
+  if (stopTooTight(risk, event.atr, pip, {
+    minStopAtr: config.minStopAtr ?? 0.35,
+    minStopPips: config.minStopPips ?? 4,
+  })) return null;
+
+  // The nearest opposing liquidity is an obstacle as well as a target. If that
+  // nearest draw does not leave room for the 1R partial plus a runner, skip it.
+  const keyMap = detectKeyLiquidityLevels(closedCandles, { symbol, dailyCandles });
+  const pools = detectLiquidityPools(closedCandles);
+  const rawTargets = buy
+    ? [...(pools.targetCandidatesAbove || []), ...(keyMap.targetCandidatesAbove || [])]
+    : [...(pools.targetCandidatesBelow || []), ...(keyMap.targetCandidatesBelow || [])];
+  const targets = rawTargets
+    .map((target) => ({ ...target, price: n(target.price) }))
+    .filter((target) => Number.isFinite(target.price) && (buy ? target.price > entry : target.price < entry))
+    .sort((a, b) => Math.abs(a.price - entry) - Math.abs(b.price - entry));
+  const target = targets[0] || null;
+  if (!target) return null;
+  const rr = Math.round((Math.abs(target.price - entry) / risk) * 100) / 100;
+  const minRR = config.minRR ?? 1.5;
+  if (rr < minRR) return null;
+  const ladder = tpLadder(event.decision, entry, risk, target.price);
+  if (!ladder) return null;
+
+  let score = 50;
+  score += 4 + Math.min(8, n(event.level.strength) * 2);
+  score += Math.min(10, Math.round(event.wickRatio * 12));
+  score += Math.min(8, Math.max(1, Math.round(event.sweepDepthAtr * 12)));
+  score += Math.min(7, Math.round(event.closePosition * 8));
+  score += Math.min(8, Math.max(0, Math.round((rr - minRR) * 3)));
+  score += 8; // strict H4 agreement is a hard gate above
+  score = Math.max(40, Math.min(97, Math.round(score)));
+  if (score < (config.minScore ?? 70)) return null;
+
+  const last = closedCandles[closedCandles.length - 1];
+  const hour = new Date(last.time).getUTCHours();
+  const inLondon = hour >= 7 && hour < 16;
+  const inNy = hour >= 12 && hour < 21;
+  const session = inLondon && inNy ? 'OVERLAP' : inLondon ? 'LONDON' : inNy ? 'NY' : hour < 8 ? 'ASIAN' : 'OFF';
+  const entryValidBars = Math.max(1, Number(config.entryValidBars) || 2);
+  const roundedEntry = r5(entry), roundedStop = r5(stop);
+  return {
+    decision: event.decision,
+    score,
+    grade: smcGrade(score),
+    entry: roundedEntry,
+    stopLoss: roundedStop,
+    ...ladder,
+    riskRewardRatio: rr,
+    reason: `H4 LIQUIDITY PIN ${event.decision}: ${event.level.label || event.level.type} ${r5(n(event.level.price))} swept ${Math.round((event.sweepDepth / pip) * 10) / 10}p, ${Math.round(event.wickRatio * 100)}% rejection wick; ${event.decision} STOP ${roundedEntry}, SL ${roundedStop}, take 70% at 1R then move runner to breakeven; opposing liquidity ${target.type || target.label || 'target'} ${r5(target.price)} (${rr}R) · ${session}`,
+    barIso: event.eventIso,
+    meta: {
+      v: 1,
+      strategyVersion: 1,
+      plan: 'LIQUIDITY-PIN',
+      setupEventIso: event.eventIso,
+      alertBarIso: event.eventIso,
+      notifyKey: `LIQUIDITY-PIN|${event.level.type}|${r5(n(event.level.price))}|${event.eventIso}`,
+      entryOrderType: 'STOP',
+      entryState: 'WAIT',
+      requiresFill: true,
+      fillAtSignal: false,
+      validBars: entryValidBars,
+      preEntryAlert: true,
+      skipCloseConfirm: true,
+      forexOnly: true,
+      measureFixedTime: false,
+      level: { type: event.level.type, label: event.level.label, price: r5(n(event.level.price)), strength: event.level.strength },
+      pin: {
+        wickPct: Math.round(event.wickRatio * 100),
+        bodyPct: Math.round(event.bodyRatio * 100),
+        rangeAtr: Math.round(event.rangeAtr * 100) / 100,
+        sweepDepthAtr: Math.round(event.sweepDepthAtr * 100) / 100,
+      },
+      targetType: target.type || target.label || null,
+      session,
+      h4Trend,
+      riskPercent: 1,
+      tp1ClosePercent: 70,
+      moveRunnerToBreakEven: true,
+    },
+  };
+}
+
 // ─── Gold Desk — XAU Session Raid (DEDICATED XAUUSD forex engine) ────────────
 // Gold-only. Encodes the psychology that makes gold different from FX majors:
 //   • Gold is the retail magnet — stop clusters are denser and MORE obvious (round
@@ -3279,6 +3743,11 @@ export const STRATEGIES = {
     forexOnly: true,
     measureFixedTime: false,
     entryOrderType: 'LIMIT',
+    // 0 = no fill deadline (valid_until stays NULL): the sniper is a patient limit at a
+    // raid level — its pre-2026-07-13 accounting bounded fills only by the 72h replay
+    // horizon. The blanket 4-bar valid_until stamp silently expired real setups
+    // (fills observed out to 32+ bars).
+    entryValidBars: 0,
     source: 'Composite institutional forex engine — liquidity, structure, displacement, RR, and PRE-ENTRY timing (alerts 10–12 pips before the entry)',
     description: 'FOREX-ONLY sniper that alerts BEFORE the entry: it fires while price is still ~6–15 pips (ideal 10–12) on the approach side of the planned limit with momentum drifting toward it — so the trade can be taken within ~5 minutes; price that has run past the entry is never chased. Setup = an OBVIOUS-level liquidity sweep + reclaim (PDH/PDL, session highs/lows, round numbers, equal highs/lows, strength ≥3) or a fresh displaced breaker, confirmed by a displacement FVG (entry = its 50%), stop beyond the raid wick, structure (HH/HL·LH/LL), premium/discount location, second-drive preference and dual-HTF agreement (never fights a clear H4). Profit discipline: minimum 2R to a STRUCTURAL TP3 (opposing fresh liquidity → session H/L → prev-day H/L → equal extremes → round number; no real draw means no trade) AND a minimum 20-pip target — RR alone is not profit. Scored on a 100-point institutional checklist; below 75 stays silent. M1 is scanned but hard-gated to EXCEPTIONAL setups only (score ≥90, strong displacement, RR ≥2.5, London/NY, tight fast gap). HONEST MEASUREMENT: signals are resolved as LIMIT orders — if price never fills the entry the signal EXPIRES and is excluded from the win rate, so the recorded performance is only of trades that could actually be taken.',
     timeframes: ['M1', 'M5', 'M15', 'M30', 'H1'],
@@ -3304,6 +3773,19 @@ export const STRATEGIES = {
     timeframes: ['M5', 'M15', 'M30', 'H1'],
     config: { minRR: 1.8, minGrade: 'B' },
     evaluate: liquiditySweepPro,
+  },
+  'h4-liquidity-pin-entry': {
+    id: 'h4-liquidity-pin-entry',
+    name: 'H4 Liquidity Pin Entry',
+    forexOnly: true,
+    measureFixedTime: false,
+    entryOrderType: 'STOP',
+    defaultEnabled: false,
+    source: 'Personal trading plan — strict H4 bias + M15/M30 liquidity-sweep rejection pin',
+    description: 'GOLD ONLY, M15/M30, and strict H4 alignment. A fresh named or confirmed-swing liquidity level must be meaningfully wicked through by a CLOSED directional pin bar that opens and closes back on the original side. Immediately places a STOP beyond that rejection candle; no extra follow-through candle or BOS is required. The order expires after 2 bars if unfilled. Stop sits beyond the sweep wick, TP1 is 1R (take 70% and move the runner to breakeven), and the remaining position targets the nearest opposing fresh liquidity with at least 1.5R room. All sessions are measured without a time gate. Default-muted while its independent track record accumulates.',
+    timeframes: ['M15', 'M30'],
+    config: { minScore: 70, minRR: 1.5, minLevelStrength: 2, minSweepAtr: 0.08, minSweepPips: 2, minRangeAtr: 0.6, minWickRatio: 0.45, maxBodyRatio: 0.4, minClosePosition: 0.6, entryBufferAtr: 0.02, entryBufferPips: 1, stopBufferAtr: 0.1, stopBufferPips: 2, minStopAtr: 0.35, minStopPips: 4, entryValidBars: 2 },
+    evaluate: h4LiquidityPinEntry,
   },
   'lil-sweep-pro-plus': {
     id: 'lil-sweep-pro-plus',
@@ -3373,7 +3855,14 @@ export const STRATEGIES = {
   'ict-breaker': {
     id: 'ict-breaker',
     name: 'ICT Breaker',
-    entryOrderType: 'LIMIT',
+    // MARKET, not LIMIT — measured, not stylistic. The live winner was always scored and
+    // traded as "enter at market when the alert fires" (alert = close back through the
+    // breaker, so market ≈ the breaker price). The 2026-07-13 LIMIT+4-bar-window
+    // reclassification expired 76% of its signals unfilled (only 31/128 limits touched
+    // within 4 bars) and cratered the visible win rate to 33%, while the SAME signals
+    // measured enter-at-alert scored 90.8% — better than the 83% the week before.
+    // Signal quality never dropped; the accounting did. Keep MARKET.
+    entryOrderType: 'MARKET',
     source: 'Maine — "The SIMPLE $10M ICT Blueprint" (Chart Fanatics)',
     description: 'Liquidity sweep → close back through the prior swing (breaker) with displacement, entered at the breaker with stop beyond the sweep, targeting the opposing resting liquidity. HTF-aligned, minimum 2R.',
     // Timeframes = MEASURED reality, not the original seed guess: the live winner earns
@@ -3389,6 +3878,9 @@ export const STRATEGIES = {
     id: 'ict-plus',
     name: 'ICT+',
     entryOrderType: 'LIMIT',
+    // Same deep-pullback FVG entry mechanism as smc-fvg — both observed fills so far
+    // came at 16–32 bars; a 4-bar window would have expired them.
+    entryValidBars: 32,
     source: 'ICT breaker, upgraded — FVG sniper entry + premium/discount + second-drive + dual-HTF confluence',
     description: 'An improved ICT breaker (the original ict-breaker is untouched). Same sweep → breaker + displacement base, then stacks A+ filters: enter the 50% of the displacement FAIR VALUE GAP (sniper fill, not the breaker zone) for a tighter stop and better RR; only in the discount (buy) / premium (sell) half of the dealing range; only on a SECOND drive (skips the first-drive fakeout); aligned with both H4 and H1; bonus for an equal-highs/lows target and a fresh breaker. Requires a minimum stacked-confluence count and a higher 3R floor — fewer, cleaner signals. Stop beyond the sweep.',
     timeframes: ['M15', 'M30', 'H1', 'H4'],
@@ -3412,6 +3904,27 @@ export const STRATEGIES = {
     timeframes: ['M5', 'M15', 'M30', 'H1'],
     config: { minRR: 2, maxAgeBars: 4 },
     evaluate: liquidityTrap,
+  },
+  'liq-trap-pro': {
+    id: 'liq-trap-pro',
+    name: 'Liq Trap Pro',
+    entryOrderType: 'MARKET',
+    source: 'Liquidity Trap v2 — causal ZigZag swing areas + sweep/zone rejection + measured PSAR context',
+    description: 'A separate precision liquidity-reversal strategy; the original Liquidity Trap remains unchanged. Uses only locked, non-repainting ZigZag pivots to identify equal highs/lows and prominent individual swings, rejecting minor fractals and consumed levels. Two independently measured setups act on the latest CLOSED candle: SWEEP_REJECT requires a meaningful wick through liquidity and close back inside; ZONE_REJECT accepts a touch or shallow probe of the ATR-sized swing area only when a directional rejection candle closes away. Entry is the fresh rejection close, stop is buffered beyond the wick, and the nearest opposing liquidity must leave at least 1.5R. H4 agreement/opposition adjusts quality instead of vetoing reversals; H1, session, premium/discount location and closed-bar Parabolic SAR also score the setup, but PSAR is never a hard gate. Signals are categorized by setup, equal/single swing and PSAR confirmation so forex and fixed-time outcomes remain independently measurable.',
+    timeframes: ['M5', 'M15', 'M30', 'H1'],
+    config: {
+      minScore: 75, minRR: 1.5,
+      zigzagSpan: 3, minLegAtr: 0.8, equalTolAtr: 0.15,
+      minEqualProminenceAtr: 0.7, minKeySwingProminenceAtr: 0.8, minSwingProminenceAtr: 1.2,
+      keyLevelTolAtr: 0.2, maxLevelAgeBars: 120,
+      minSweepAtr: 0.05, minSweepPips: 1, maxSweepAtr: 0.9,
+      zoneToleranceAtr: 0.08, zoneTolerancePips: 0.5,
+      minRangeAtr: 0.5, maxRangeAtr: 2.5, minWickRatio: 0.35, zoneMinWickRatio: 0.3,
+      maxBodyRatio: 0.65, minClosePosition: 0.55, zoneMinClosePosition: 0.55,
+      stopBufferAtr: 0.1, stopBufferPips: 2, minStopAtr: 0.35, minStopPips: 4,
+      h4AgainstPenalty: 8, psarStep: 0.02, psarMax: 0.2,
+    },
+    evaluate: liquidityTrapPro,
   },
   'little-rizzy': {
     id: 'little-rizzy',
@@ -3444,6 +3957,10 @@ export const STRATEGIES = {
     id: 'smc-fvg',
     name: 'SMC Fair Value Gap',
     entryOrderType: 'LIMIT',
+    // Measured fill profile (Jul 13–14, n=150): only 74 limits touch within 4 bars but
+    // 97 within 32 — the FVG 50% is a deep pullback entry. 32 bars keeps it honest
+    // without expiring real fills.
+    entryValidBars: 32,
     source: 'Smart Money Concepts core — liquidity sweep → displacement FVG → 50% mitigation',
     description: 'Liquidity sweep of a swing extreme (taken then reclaimed) → a displacement leg that prints a fair value gap AFTER the sweep → enter the 50% of that gap on the pullback, stop beyond the sweep, target the opposing resting liquidity (draw). Discount-for-buy / premium-for-sell bonus. HTF-aligned, minimum 2R.',
     timeframes: ['M5', 'M15', 'M30', 'H1'],

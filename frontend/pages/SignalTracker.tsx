@@ -1,10 +1,31 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, RefreshCw, Radar, TrendingUp, TrendingDown, AlertTriangle, ShieldCheck, Mail, Cpu, Check, Crosshair, Target, Radio, Zap } from 'lucide-react';
-import { fetchSignalTracker, markSignalTrackerDone, fetchStrategies, fetchStrategyEntryWatch } from '../mt5Api';
+import { Loader2, RefreshCw, Radar, TrendingUp, TrendingDown, AlertTriangle, ShieldCheck, Mail, Cpu, Check, Crosshair, Target, Radio, Zap, ClipboardCheck, BellRing } from 'lucide-react';
+import { fetchSignalTracker, markSignalTrackerDone, fetchStrategies, fetchStrategyEntryWatch, fetchExecutedOrders, trackSignalOrder, untrackSignalOrder } from '../mt5Api';
 import { playAlertSound, showBrowserNotification } from '../utils/notifications';
-import type { SignalTrackerResponse, SignalTrackerItem, StrategyEntryWatchItem, StrategyMeta } from '../types';
+import type { SignalTrackerResponse, SignalTrackerItem, StrategyEntryWatchItem, StrategyMeta, ExecutedOrderItem, ExecutedOrdersResponse } from '../types';
 
 const REFRESH_MS = 3000;
+
+// Persist small UI state (active tab, filters, refresh cadence) across tab switches
+// AND page reloads — tab components unmount on switch, so plain useState resets.
+function usePersisted<T>(key: string, initial: T): [T, React.Dispatch<React.SetStateAction<T>>] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(`sigtracker:${key}`);
+      return raw != null ? (JSON.parse(raw) as T) : initial;
+    } catch { return initial; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(`sigtracker:${key}`, JSON.stringify(value)); } catch { /* private mode / quota */ }
+  }, [key, value]);
+  return [value, setValue];
+}
+function usePersistedSet(key: string, initial: string[]): [Set<string>, (next: Set<string>) => void] {
+  const [arr, setArr] = usePersisted<string[]>(key, initial);
+  const set = useMemo(() => new Set(arr), [arr]);
+  const update = useCallback((next: Set<string>) => setArr([...next]), [setArr]);
+  return [set, update];
+}
 
 function fmt(v: number | null | undefined, d = 2) {
   return v === null || v === undefined || Number.isNaN(v) ? '—' : Number(v).toFixed(d);
@@ -103,16 +124,59 @@ function ProgressBar({ item }: { item: SignalTrackerItem }) {
 }
 
 // ── Existing live-trade health view ─────────────────────────────────────────
+// Track button — "I placed this signal as a pending order at my broker": moves the
+// row into the Executed Orders tab where it gets priority watching + one-time emails.
+function TrackButton({ id, source, trackedIds, onTrack }: { id: string; source: string; trackedIds: Set<string>; onTrack: (id: string, source: string) => void }) {
+  const tracked = trackedIds.has(id);
+  return (
+    <button
+      type="button"
+      disabled={tracked}
+      onClick={() => onTrack(id, source)}
+      title={tracked ? 'Tracking in Executed Orders' : 'I placed this order — track it in Executed Orders'}
+      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-bold ${tracked ? 'border-indigo-200 bg-indigo-50 text-indigo-500' : 'border-slate-200 bg-white text-slate-600 hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700'}`}
+    >
+      <ClipboardCheck size={12} /> {tracked ? 'Tracked' : 'Track'}
+    </button>
+  );
+}
+
+// Compact single-select filter used by the Live Trades / Executed Orders bars.
+function RowFilter({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (v: string) => void }) {
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} className="h-9 rounded-lg border border-slate-200 bg-white px-2 text-xs font-bold text-slate-700" title={label}>
+      <option value="ALL">{label}: all</option>
+      {options.map((o) => <option key={o} value={o}>{o}</option>)}
+    </select>
+  );
+}
+
 function LiveTradesTab({ data, loading, markDone, doneIds }: {
   data: SignalTrackerResponse | null; loading: boolean;
   markDone: (id: string) => void; doneIds: Set<string>;
 }) {
-  const items = (data?.items || []).filter((i) => !doneIds.has(i.id));
+  const [symFilter, setSymFilter] = usePersisted('live.symbol', 'ALL');
+  const [stratFilter, setStratFilter] = usePersisted('live.strategy', 'ALL');
+  const [srcFilter, setSrcFilter] = usePersisted('live.source', 'ALL');
+  const all = (data?.items || []).filter((i) => !doneIds.has(i.id));
+  const items = all
+    .filter((i) => symFilter === 'ALL' || i.symbol === symFilter)
+    .filter((i) => stratFilter === 'ALL' || (i.strategyName || (i.source === 'email' ? 'Emailed' : 'System')) === stratFilter)
+    .filter((i) => srcFilter === 'ALL' || i.source === srcFilter);
+  const symbolOpts = [...new Set(all.map((i) => i.symbol))].sort();
+  const stratOpts = [...new Set(all.map((i) => i.strategyName || (i.source === 'email' ? 'Emailed' : 'System')))].sort();
+  const srcOpts = [...new Set(all.map((i) => i.source))].sort();
   const closeNow = items.filter((i) => i.riskState === 'CLOSE_NOW');
   const danger = items.filter((i) => i.riskState === 'DANGER');
 
   return (
     <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white p-3 shadow-card">
+        <RowFilter label="Symbol" value={symFilter} options={symbolOpts} onChange={setSymFilter} />
+        <RowFilter label="Strategy" value={stratFilter} options={stratOpts} onChange={setStratFilter} />
+        <RowFilter label="Source" value={srcFilter} options={srcOpts} onChange={setSrcFilter} />
+        <span className="ml-auto text-[10px] font-semibold text-slate-400">{items.length}/{all.length} trades{symFilter !== 'ALL' || stratFilter !== 'ALL' || srcFilter !== 'ALL' ? ' · filtered' : ''}</span>
+      </div>
       {closeNow.length > 0 && (
         <div className="rounded-2xl border border-rose-300 bg-rose-50 p-4">
           <div className="flex items-center gap-2 text-rose-700 font-black"><AlertTriangle size={18} /> {closeNow.length} trade{closeNow.length > 1 ? 's' : ''} flagged CLOSE NOW</div>
@@ -256,21 +320,21 @@ function MultiFilter({ label, options, selected, onChange }: {
 
 // A/A+ strategy signals waiting for entry, continuously re-evaluated without mutating
 // the original logged signal. A better live entry is advisory and always shown separately.
-function EntryWatchTab() {
+function EntryWatchTab({ trackedIds, onTrack }: { trackedIds: Set<string>; onTrack: (id: string, source: string) => void }) {
   const [items, setItems] = useState<StrategyEntryWatchItem[]>([]);
   const [meta, setMeta] = useState<{ minScore: number; maxScore: number; windowHours: number; strategies: string[]; generatedAt: string } | null>(null);
   const [catalog, setCatalog] = useState<{ strategies: StrategyMeta[]; symbols: string[]; timeframes: string[] }>({ strategies: [], symbols: [], timeframes: [] });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [refreshMs, setRefreshMs] = useState(3000);
-  const [minScore, setMinScore] = useState(80);
-  const [maxScore, setMaxScore] = useState(100);
-  const [selectedStrategies, setSelectedStrategies] = useState<Set<string>>(() => new Set(['ict-breaker']));
-  const [selectedSymbols, setSelectedSymbols] = useState<Set<string>>(() => new Set());
-  const [selectedTimeframes, setSelectedTimeframes] = useState<Set<string>>(() => new Set(['M5', 'M15', 'M30']));
-  const [statusFilter, setStatusFilter] = useState('ALL');
-  const [strengthFilter, setStrengthFilter] = useState('ALL');
+  const [refreshMs, setRefreshMs] = usePersisted('entry.refreshMs', 3000);
+  const [minScore, setMinScore] = usePersisted('entry.minScore', 80);
+  const [maxScore, setMaxScore] = usePersisted('entry.maxScore', 100);
+  const [selectedStrategies, setSelectedStrategies] = usePersistedSet('entry.strategies', ['ict-breaker']);
+  const [selectedSymbols, setSelectedSymbols] = usePersistedSet('entry.symbols', []);
+  const [selectedTimeframes, setSelectedTimeframes] = usePersistedSet('entry.timeframes', ['M5', 'M15', 'M30']);
+  const [statusFilter, setStatusFilter] = usePersisted('entry.status', 'ALL');
+  const [strengthFilter, setStrengthFilter] = usePersisted('entry.strength', 'ALL');
   const seenExecutable = useRef<Set<string>>(new Set());
   const seenBetterEntries = useRef<Set<string>>(new Set());
   const firstLoad = useRef(true);
@@ -356,6 +420,7 @@ function EntryWatchTab() {
   const caution = filteredItems.filter((i) => i.executability === 'CAUTION');
   const betterEntries = filteredItems.filter((i) => i.betterEntryAvailable);
   const strategyOptions = catalog.strategies
+    .filter((s) => s.control?.enabled !== false)              // Strategy Controller OFF = hidden everywhere
     .filter((s) => !meta || meta.strategies.includes(s.id))
     .map((s) => ({ value: s.id, label: s.name }));
   const symbolOptions = catalog.symbols.map((s) => ({ value: s, label: s }));
@@ -408,7 +473,7 @@ function EntryWatchTab() {
                 <th className="px-3 py-2">Symbol / Strategy</th><th className="px-3 py-2">Signal Time</th><th className="px-3 py-2">Strength now</th>
                 <th className="px-3 py-2 text-right">Original Entry</th><th className="px-3 py-2 text-right">Better Entry</th><th className="px-3 py-2 text-right">Current</th>
                 <th className="px-3 py-2 text-right">Pips Diff</th><th className="px-3 py-2 text-right">SL</th><th className="px-3 py-2 text-right">Vol</th><th className="px-3 py-2 text-right">TP1</th>
-                <th className="px-3 py-2">Dir</th><th className="px-3 py-2">Tradable?</th><th className="px-3 py-2">Src</th>
+                <th className="px-3 py-2">Dir</th><th className="px-3 py-2">Tradable?</th><th className="px-3 py-2">Src</th><th className="px-3 py-2 text-center">Track</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700">
@@ -434,9 +499,10 @@ function EntryWatchTab() {
                     <td className="px-3 py-2 text-right font-mono text-slate-600">{i.activeLots ?? i.lots ?? '—'}</td>
                     <td className="px-3 py-2 text-right font-mono text-emerald-700">{px(activeTp, i.symbol)}</td>
                     <td className="px-3 py-2"><DirTag d={i.direction} /></td><td className="px-3 py-2"><ExecPill item={i} /></td><td className="px-3 py-2"><SourceChips popupSent={i.popupSent} emailSent={i.emailSent} /></td>
+                    <td className="px-3 py-2 text-center"><TrackButton id={i.id} source="strategy-lab" trackedIds={trackedIds} onTrack={onTrack} /></td>
                   </tr>
                 );
-              }) : <tr><td colSpan={13} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No tracked signals match the current filters.'}</td></tr>}
+              }) : <tr><td colSpan={14} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No tracked signals match the current filters.'}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -446,14 +512,217 @@ function EntryWatchTab() {
   );
 }
 
-type Tab = 'live' | 'entry';
+// ── Executed Orders — the pending orders the USER actually placed ─────────────
+function OrderStatePill({ item }: { item: ExecutedOrderItem }) {
+  const map: Record<string, { cls: string; label: string }> = {
+    PENDING: { cls: 'bg-amber-50 text-amber-700 border border-amber-200', label: 'PENDING' },
+    FILLED: { cls: 'bg-emerald-600 text-white', label: 'FILLED' },
+    EXPIRED: { cls: 'bg-rose-100 text-rose-700 border border-rose-200', label: 'EXPIRED' },
+    SETTLED: { cls: 'bg-slate-100 text-slate-500', label: 'SETTLED' },
+  };
+  const m = map[item.orderState] || map.PENDING;
+  return <span className={`inline-flex rounded-md px-2 py-0.5 text-[10px] font-black ${m.cls}`}>{m.label}</span>;
+}
+
+function ExecutedStrength({ item }: { item: ExecutedOrderItem }) {
+  if (item.strengthTrend === 'GONE') {
+    return <div className="leading-tight"><span className="inline-flex rounded bg-slate-200 px-1.5 py-0.5 text-[11px] font-black text-slate-500">no longer confirms</span><div className="mt-0.5 text-[9px] font-semibold text-slate-400">fired {item.loggedScore ?? '—'} {item.grade || ''}</div></div>;
+  }
+  if (item.currentScore == null) return <div className="leading-tight">{scorePill(item.loggedScore, item.grade)}<div className="mt-0.5 text-[9px] font-semibold text-slate-400">at signal time</div></div>;
+  const arrow = item.strengthTrend === 'STRONGER' ? <TrendingUp size={11} className="text-emerald-600" /> : item.strengthTrend === 'WEAKER' ? <TrendingDown size={11} className="text-amber-600" /> : null;
+  return (
+    <div className="leading-tight">
+      <div className="flex items-center gap-1">{scorePill(item.currentScore, item.currentGrade)}{arrow}</div>
+      <div className="mt-0.5 text-[9px] font-semibold text-slate-400">{item.strengthTrend === 'WEAKER' ? `weakening · fired ${item.loggedScore}` : item.strengthTrend === 'STRONGER' ? `strengthening · fired ${item.loggedScore}` : `holding · fired ${item.loggedScore ?? '—'}`}</div>
+    </div>
+  );
+}
+
+function ExecutedOrdersTab({ onUntracked }: { onUntracked: (id: string) => void }) {
+  const [data, setData] = useState<ExecutedOrdersResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
+  const [symFilter, setSymFilter] = usePersisted('exec.symbol', 'ALL');
+  const [stratFilter, setStratFilter] = usePersisted('exec.strategy', 'ALL');
+  const [stateFilter, setStateFilter] = usePersisted('exec.state', 'ALL');
+  const [refreshMs, setRefreshMs] = usePersisted('exec.refreshMs', 2000); // 1–3s poll, user-selectable
+  const [refreshing, setRefreshing] = useState(false);
+  const inFlight = useRef(false);
+  const lastLoadAt = useRef(0);
+
+  const load = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setRefreshing(true);
+    try { setData(await fetchExecutedOrders()); setError(null); lastLoadAt.current = Date.now(); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Failed to load executed orders'); }
+    finally { inFlight.current = false; setLoading(false); setRefreshing(false); }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    if (!refreshMs) return;
+    const t = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') void load();
+    }, refreshMs);
+    return () => window.clearInterval(t);
+  }, [load, refreshMs]);
+
+  // Heartbeat-driven refresh: the moment a live candle/status event lands on the MT5
+  // stream, re-pull the executed view (throttled ≥900ms) — updates arrive with the
+  // feed's own cadence instead of waiting out the poll interval.
+  useEffect(() => {
+    if (typeof EventSource === 'undefined') return;
+    const source = new EventSource('/api/mt5/signals/stream');
+    const onBeat = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (Date.now() - lastLoadAt.current < 900) return;
+      void load();
+    };
+    source.addEventListener('candle', onBeat);
+    source.addEventListener('status', onBeat);
+    return () => source.close();
+  }, [load]);
+
+  const untrack = async (id: string) => {
+    setRemoved((prev) => new Set(prev).add(id));
+    try { await untrackSignalOrder(id); onUntracked(id); }
+    catch { setRemoved((prev) => { const n = new Set(prev); n.delete(id); return n; }); }
+  };
+
+  const allItems = (data?.items || []).filter((i) => !removed.has(i.id));
+  const items = allItems
+    .filter((i) => symFilter === 'ALL' || i.symbol === symFilter)
+    .filter((i) => stratFilter === 'ALL' || i.strategyName === stratFilter)
+    .filter((i) => stateFilter === 'ALL' || i.orderState === stateFilter);
+  const symbolOpts = [...new Set(allItems.map((i) => i.symbol))].sort();
+  const stratOpts = [...new Set(allItems.map((i) => i.strategyName))].sort();
+  const cancels = items.filter((i) => i.tone === 'CANCEL');
+  const fillSoon = items.filter((i) => i.tone === 'FILL_SOON');
+  const toneCls: Record<string, string> = {
+    CANCEL: 'text-rose-700', FILL_SOON: 'text-amber-700', MANAGE: 'text-emerald-700', HOLD: 'text-slate-600', DONE: 'text-slate-400',
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white p-3 shadow-card">
+        <RowFilter label="Symbol" value={symFilter} options={symbolOpts} onChange={setSymFilter} />
+        <RowFilter label="Strategy" value={stratFilter} options={stratOpts} onChange={setStratFilter} />
+        <RowFilter label="State" value={stateFilter} options={['PENDING', 'FILLED', 'EXPIRED', 'SETTLED']} onChange={setStateFilter} />
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-[10px] font-semibold text-slate-400">{items.length}/{allItems.length} orders{data ? ` · updated ${new Date(data.generatedAt).toLocaleTimeString()}` : ''} · live on feed heartbeat</span>
+          <select value={refreshMs} onChange={(e) => setRefreshMs(Number(e.target.value))} className="h-9 rounded-lg border border-slate-200 bg-white px-2 text-xs font-bold text-slate-700" title="Poll interval (heartbeat refresh always on)">
+            <option value={1000}>Every 1s</option><option value={2000}>Every 2s</option><option value={3000}>Every 3s</option><option value={0}>Heartbeat only</option>
+          </select>
+          <button type="button" onClick={() => void load()} disabled={refreshing} className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-black text-white hover:bg-violet-700 disabled:opacity-50">
+            {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} Refresh
+          </button>
+        </div>
+      </div>
+
+      {cancels.length > 0 && (
+        <div className="rounded-2xl border border-rose-300 bg-rose-50 p-4">
+          <div className="flex items-center gap-2 font-black text-rose-700"><AlertTriangle size={18} /> {cancels.length} tracked order{cancels.length > 1 ? 's' : ''} should likely be CANCELLED</div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {cancels.map((i) => <span key={i.id} className="rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-[12px] font-bold text-rose-700">{i.symbol} {i.timeframe} {i.direction} — {i.orderState === 'EXPIRED' ? 'expired, don’t chase' : `score ${i.loggedScore} → ${i.currentScore ?? '×'}`}</span>)}
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="rounded-2xl border border-indigo-200 bg-indigo-50/50 p-3 shadow-card"><div className="text-[11px] font-bold uppercase text-indigo-500">Tracked orders</div><div className="text-2xl font-black text-indigo-700">{items.length}</div></div>
+        <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-3 shadow-card"><div className="text-[11px] font-bold uppercase text-amber-500">Filling soon</div><div className="text-2xl font-black text-amber-700">{fillSoon.length}</div></div>
+        <div className="rounded-2xl border border-rose-200 bg-rose-50/50 p-3 shadow-card"><div className="text-[11px] font-bold uppercase text-rose-500">Cancel candidates</div><div className="text-2xl font-black text-rose-700">{cancels.length}</div></div>
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50/50 p-3 shadow-card"><div className="text-[11px] font-bold uppercase text-emerald-600">Filled</div><div className="text-2xl font-black text-emerald-700">{items.filter((i) => i.orderState === 'FILLED').length}</div></div>
+      </div>
+
+      {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</div>}
+
+      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[1180px] text-left text-sm">
+            <thead className="border-b border-slate-100 bg-slate-50/80 text-[10px] uppercase tracking-[0.15em] text-slate-500">
+              <tr>
+                <th className="px-3 py-2">Order</th><th className="px-3 py-2">Dir</th><th className="px-3 py-2">State</th>
+                <th className="px-3 py-2">Strength now</th>
+                <th className="px-3 py-2 text-right">Entry / SL / TP1</th><th className="px-3 py-2 text-right">Current</th>
+                <th className="px-3 py-2 text-right">To entry</th>
+                <th className="px-3 py-2">Suggestion</th>
+                <th className="px-3 py-2 text-center">Alerts</th><th className="px-3 py-2 text-center">Untrack</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-700">
+              {items.length ? items.map((i) => (
+                <tr key={i.id} className={`hover:bg-slate-50/70 ${i.tone === 'CANCEL' ? 'bg-rose-50/40' : i.tone === 'FILL_SOON' ? 'bg-amber-50/40' : ''}`}>
+                  <td className="px-3 py-2">
+                    <div className="font-black text-slate-900">{i.symbol} <span className="text-[10px] font-bold text-slate-400">{i.timeframe}</span></div>
+                    <div className="text-[10px] font-semibold text-violet-600">{i.strategyName}</div>
+                    <div className="text-[9px] font-semibold text-slate-400">signal {fmtTime(i.signalTime)} · tracked {fmtTime(i.trackedAt)}</div>
+                  </td>
+                  <td className="px-3 py-2"><DirTag d={i.direction} /></td>
+                  <td className="px-3 py-2"><OrderStatePill item={i} /></td>
+                  <td className="px-3 py-2"><ExecutedStrength item={i} /></td>
+                  <td className="px-3 py-2 text-right font-mono text-[11px] text-slate-500">{px(i.entryPrice, i.symbol)} / <span className="text-rose-600">{px(i.stopLoss, i.symbol)}</span> / <span className="text-emerald-700">{px(i.takeProfit1, i.symbol)}</span></td>
+                  <td className="px-3 py-2 text-right font-mono font-bold text-slate-900">{px(i.currentPrice, i.symbol)}</td>
+                  <td className="px-3 py-2 text-right font-mono">
+                    {i.pipsToEntry == null ? <span className="text-slate-300">—</span>
+                      : i.pipsToEntry <= 0 ? <span className="font-bold text-emerald-600">{i.pipsToEntry}p ✓</span>
+                      : <span className={i.pipsToEntry <= (data?.config.nearEntryPips ?? 5) ? 'font-black text-amber-600' : 'text-slate-600'}>{i.pipsToEntry}p</span>}
+                  </td>
+                  <td className={`px-3 py-2 text-[12px] font-semibold ${toneCls[i.tone] || 'text-slate-600'}`}>
+                    {i.suggestion}
+                    {i.liveNewEntry && i.tone === 'CANCEL' && <div className="mt-0.5 text-[10px] font-bold text-blue-600">new entry {px(i.liveNewEntry.entry, i.symbol)} · SL {px(i.liveNewEntry.stopLoss, i.symbol)} · RR {i.liveNewEntry.riskRewardRatio ?? '—'}</div>}
+                  </td>
+                  <td className="px-3 py-2 text-center">
+                    <div className="flex items-center justify-center gap-1" title={`One-time emails: near-entry ${i.nearEntryNotified ? 'sent' : 'armed'} · strength-loss ${i.weakNotified ? 'sent' : 'armed'}`}>
+                      <BellRing size={12} className={i.nearEntryNotified ? 'text-amber-500' : 'text-slate-300'} />
+                      <AlertTriangle size={12} className={i.weakNotified ? 'text-rose-500' : 'text-slate-300'} />
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 text-center">
+                    <button type="button" onClick={() => void untrack(i.id)} title="Remove from Executed Orders" className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-bold text-slate-600 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-700">
+                      <Check size={12} /> Done
+                    </button>
+                  </td>
+                </tr>
+              )) : (
+                <tr><td colSpan={10} className="px-3 py-10 text-center text-sm font-medium text-slate-400">{loading ? 'Loading…' : 'No tracked orders yet — press “Track” on a Live Trades or Entry Watch row after placing the pending order at your broker.'}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <p className="px-1 text-[11px] font-medium text-slate-400">
+        Each tracked order gets exactly two one-time emails: when price comes within {data?.config.nearEntryPips ?? 5} pips of your entry, and if the setup dramatically loses strength (score −{data?.config.weakDropPts ?? 12} or no longer confirms → consider cancelling). Expired setups say so — never chase them.
+      </p>
+    </div>
+  );
+}
+
+type Tab = 'executed' | 'live' | 'entry';
 
 export default function SignalTracker() {
-  const [tab, setTab] = useState<Tab>('entry');
+  const [tab, setTab] = usePersisted<Tab>('tab', 'executed');
   const [data, setData] = useState<SignalTrackerResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [doneIds, setDoneIds] = useState<Set<string>>(new Set());
+  const [trackedIds, setTrackedIds] = useState<Set<string>>(new Set());
+
+  // Hydrate which ids are already tracked so Track buttons show state after reload.
+  useEffect(() => {
+    fetchExecutedOrders().then((r) => setTrackedIds(new Set(r.items.map((i) => i.id)))).catch(() => {});
+  }, []);
+
+  const onTrack = useCallback(async (id: string, source: string) => {
+    setTrackedIds((prev) => new Set(prev).add(id)); // optimistic
+    try { await trackSignalOrder(id, source); }
+    catch { setTrackedIds((prev) => { const n = new Set(prev); n.delete(id); return n; }); }
+  }, []);
+  const onUntracked = useCallback((id: string) => {
+    setTrackedIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -505,6 +774,13 @@ export default function SignalTracker() {
       <div className="flex items-center gap-1 border-b border-slate-200">
         <button
           type="button"
+          onClick={() => setTab('executed')}
+          className={`-mb-px flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-bold transition ${tab === 'executed' ? 'border-violet-500 text-violet-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
+        >
+          <ClipboardCheck size={15} /> Executed Orders {trackedIds.size > 0 && <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[9px] font-black text-violet-600">{trackedIds.size}</span>}
+        </button>
+        <button
+          type="button"
           onClick={() => setTab('live')}
           className={`-mb-px flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-bold transition ${tab === 'live' ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
         >
@@ -521,9 +797,11 @@ export default function SignalTracker() {
 
       {error && tab === 'live' && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</div>}
 
-      {tab === 'live'
-        ? <LiveTradesTab data={data} loading={loading} markDone={(id) => void markDone(id)} doneIds={doneIds} />
-        : <EntryWatchTab />}
+      {tab === 'executed'
+        ? <ExecutedOrdersTab onUntracked={onUntracked} />
+        : tab === 'live'
+          ? <LiveTradesTab data={data} loading={loading} markDone={(id) => void markDone(id)} doneIds={doneIds} />
+          : <EntryWatchTab trackedIds={trackedIds} onTrack={(id, s) => void onTrack(id, s)} />}
     </div>
   );
 }

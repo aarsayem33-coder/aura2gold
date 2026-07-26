@@ -4,8 +4,8 @@ import {
   Activity, Droplets, Layers, Zap, ShieldCheck, Ban, Clock,
 } from 'lucide-react';
 import Mt5CandlestickChart from '../components/Mt5CandlestickChart';
-import { fetchLiveMarketTracker, fetchMt5Candles, useMt5Stream } from '../mt5Api';
-import type { LiveMarketTrackerResponse, LmtOrderBlock, LmtKeyLevel, LmtSweepGrade, Mt5Candle } from '../types';
+import { fetchLiveMarketTracker, fetchKeyLevelProximity, fetchMt5Candles, useMt5Stream } from '../mt5Api';
+import type { LiveMarketTrackerResponse, LmtOrderBlock, LmtKeyLevel, LmtSweepGrade, Mt5Candle, KeyLevelProximityResponse, KeyLevelPlanLeg } from '../types';
 
 const TF_OPTIONS = ['M1', 'M5', 'M15', 'M30', 'H1'];
 
@@ -273,11 +273,71 @@ function mergeCandlesByTime(prev: Mt5Candle[], incoming: Mt5Candle[], cap = 600)
   return merged.length > cap ? merged.slice(merged.length - cap) : merged;
 }
 
+// ── Key-level proximity panel: every streamed symbol's approaching PDH/PDL + session H/L ──
+function ProximityPlanLine({ leg, symbol, tone }: { leg: KeyLevelPlanLeg | null; symbol: string; tone: 'fade' | 'cont' }) {
+  if (!leg) return null;
+  const wrap = tone === 'fade' ? 'bg-rose-50 text-rose-900' : 'bg-sky-50 text-sky-900';
+  const head = tone === 'fade' ? 'Sweep & reject' : 'Break & hold';
+  return (
+    <div className={`rounded-md px-2 py-1 text-[10px] font-semibold ${wrap}`}>
+      <span className="font-black">{head}: {leg.direction}</span> @ {px(leg.entry, symbol)} · SL {px(leg.stopLoss, symbol)} · TP {px(leg.takeProfit1, symbol)}/{px(leg.takeProfit2, symbol)}/{px(leg.takeProfit3, symbol)} · <span className="font-black">{leg.riskRewardRatio}R</span>
+    </div>
+  );
+}
+function KeyLevelProximityPanel({ prox }: { prox: KeyLevelProximityResponse | null }) {
+  if (!prox) return null;
+  const rows = prox.symbols || [];
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-5 py-3">
+        <div className="flex items-center gap-2">
+          <Layers size={16} className="text-amber-600" />
+          <h3 className="text-sm font-bold text-slate-900">Approaching key levels</h3>
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-500">{prox.sensitivity}</span>
+        </div>
+        <p className="text-[11px] font-semibold text-slate-400">PDH/PDL + session highs & lows within reach — every streamed symbol</p>
+      </div>
+      {!rows.length && <p className="px-5 py-6 text-center text-xs font-medium text-slate-400">No symbol is near a key level right now.</p>}
+      <div className="divide-y divide-slate-100">
+        {rows.map((row) => (
+          <div key={row.symbol} className="px-5 py-3">
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-sm font-black text-slate-800">{row.symbol}</span>
+              <span className="font-mono text-xs text-slate-500">{px(row.price, row.symbol)}</span>
+              <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-black ${row.feedState === 'LIVE' ? 'bg-emerald-100 text-emerald-700' : row.feedState === 'STALE' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>{row.feedState}</span>
+            </div>
+            <div className="space-y-2">
+              {row.levels.map((lv) => (
+                <div key={`${lv.type}-${lv.price}`} className={`rounded-xl border px-3 py-2 ${lv.tier === 'IMMINENT' ? 'border-amber-300 bg-amber-50/60' : 'border-slate-200 bg-slate-50/60'}`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-black ${lv.tier === 'IMMINENT' ? 'bg-amber-500 text-white' : 'bg-slate-400 text-white'}`}>{lv.tier === 'IMMINENT' ? 'AT LEVEL' : 'APPROACHING'}</span>
+                    <span className="text-xs font-bold text-slate-700">{lv.label}</span>
+                    <span className="font-mono text-[11px] text-slate-500">{px(lv.price, row.symbol)}</span>
+                    <span className="text-[11px] font-black text-slate-600">{lv.distancePips}p</span>
+                    <span className="text-[10px] font-semibold text-slate-400">{lv.distanceAtr}× ATR</span>
+                  </div>
+                  {lv.plan && (
+                    <div className="mt-1.5 grid gap-1 sm:grid-cols-2">
+                      <ProximityPlanLine leg={lv.plan.fade} symbol={row.symbol} tone="fade" />
+                      <ProximityPlanLine leg={lv.plan.continuation} symbol={row.symbol} tone="cont" />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function LiveMarketTracker() {
   const { status, candles: streamCandles } = useMt5Stream();
   const [symbol, setSymbol] = useState<string>('');
   const [timeframe, setTimeframe] = useState<string>('M5');
   const [data, setData] = useState<LiveMarketTrackerResponse | null>(null);
+  const [prox, setProx] = useState<KeyLevelProximityResponse | null>(null);
   const [candles, setCandles] = useState<Mt5Candle[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -317,6 +377,7 @@ export default function LiveMarketTracker() {
         setCandles((prev) => (key === candlesKeyRef.current ? mergeCandlesByTime(prev, fresh) : fresh));
         candlesKeyRef.current = key;
       } catch { /* chart is best-effort */ }
+      try { setProx(await fetchKeyLevelProximity()); } catch { /* proximity panel is best-effort */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load tracker');
     } finally {
@@ -398,6 +459,7 @@ export default function LiveMarketTracker() {
         <>
           <FeedBanner t={data} />
           <VerdictCard t={data} />
+          <KeyLevelProximityPanel prox={prox} />
           {data.sweepGrade && <SweepGradeCard sg={data.sweepGrade} symbol={data.symbol} />}
 
           <div className="grid gap-4 lg:grid-cols-2">

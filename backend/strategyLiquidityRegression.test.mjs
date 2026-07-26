@@ -121,7 +121,15 @@ test('forex-only registry contract and ICT timeframe expansion are preserved', (
     assert.equal(STRATEGIES[id].measureFixedTime, false, id);
   }
   assert.deepEqual(strategyTimeframes('ict-breaker'), ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1']);
-  assert.equal(STRATEGIES['ict-breaker'].entryOrderType, 'LIMIT');
+  // MARKET = enter-at-alert, the accounting the live winner was measured and traded
+  // under. The brief LIMIT+4-bar reclassification (2026-07-13) expired 76% of its
+  // signals unfilled while the same signals scored 90.8% measured at-alert.
+  assert.equal(STRATEGIES['ict-breaker'].entryOrderType, 'MARKET');
+  // Patient-limit strategies declare their own fill windows instead of inheriting
+  // the 4-bar default (sniper: none/72h horizon; deep-pullback FVG entries: 32 bars).
+  assert.equal(STRATEGIES['special-forex-sniper'].entryValidBars, 0);
+  assert.equal(STRATEGIES['smc-fvg'].entryValidBars, 32);
+  assert.equal(STRATEGIES['ict-plus'].entryValidBars, 32);
 });
 
 test('evaluateStrategy logs useful context and contains strategy exceptions', () => {

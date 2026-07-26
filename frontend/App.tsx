@@ -12,6 +12,8 @@ import FuturePredictions from './pages/FuturePredictions.tsx';
 import DayTradingBrief from './pages/DayTradingBrief.tsx';
 import DayTradingDesk from './pages/DayTradingDesk.tsx';
 import LiveMarketTracker from './pages/LiveMarketTracker.tsx';
+import ChallengeTracker from './pages/ChallengeTracker.tsx';
+import AutoTrading from './pages/AutoTrading.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
 import BreakoutTracker from './pages/BreakoutTracker.tsx';
 import StrategyLab from './pages/StrategyLab.tsx';
@@ -93,6 +95,8 @@ export default function App() {
           <Route path="day-trading-desk" element={<DayTradingDesk />} />
           <Route path="live-market-tracker" element={<LiveMarketTracker />} />
           <Route path="signal-tracker" element={<SignalTracker />} />
+          <Route path="challenge" element={<ChallengeTracker />} />
+          <Route path="auto-trading" element={<AutoTrading />} />
           <Route path="breakout" element={<BreakoutTracker />} />
           <Route path="strategy-lab" element={<StrategyLab />} />
           <Route path="strategy-lab/reports" element={<StrategyLabReports />} />

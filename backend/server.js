@@ -24,6 +24,7 @@ import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
 import { findOrderFillIndex } from './orderFill.js';
+import { assessEntryReadiness, buildEntryReadyEmail } from './entryReadyAlert.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -760,6 +761,50 @@ async function initializeDatabase() {
         )
       `);
 
+      // Executed Orders — signals the USER says they placed as pending orders at the
+      // broker (Track button on the Signal Tracker). The system watches these with
+      // priority: live strength re-scans, fill/expiry state, and TWO one-time emails
+      // per order (near-entry approach, dramatic strength loss → cancel). Tiny table.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_tracked_orders (
+          id VARCHAR(191) PRIMARY KEY,
+          source VARCHAR(24) NOT NULL DEFAULT 'strategy-lab',
+          tracked_at DATETIME(3) NOT NULL,
+          status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+          near_entry_notified TINYINT(1) NOT NULL DEFAULT 0,
+          weak_notified TINYINT(1) NOT NULL DEFAULT 0
+        )
+      `);
+
+      // Auto-trade decisions & executions. One row per signal the auto-trader considered
+      // and acted on (or would have): SHADOW = logged only, CAP_ALERT = good setup after
+      // the daily cap. Step-2 statuses (PROPOSED/APPROVED/QUEUED/SENT/FILLED/CLOSED/ERROR)
+      // and execution columns are provisioned now so the EA bridge needs no migration.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_auto_trades (
+          id VARCHAR(200) PRIMARY KEY,
+          strategy VARCHAR(48) NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          direction VARCHAR(8) NOT NULL,
+          order_type VARCHAR(8) NOT NULL DEFAULT 'MARKET',
+          entry_price DOUBLE NULL, stop_loss DOUBLE NULL,
+          take_profit_1 DOUBLE NULL, take_profit_2 DOUBLE NULL, take_profit_3 DOUBLE NULL,
+          lots DOUBLE NULL, risk_amount DOUBLE NULL, risk_mode VARCHAR(12) NULL,
+          score INT NULL, grade VARCHAR(4) NULL, rr DOUBLE NULL, session VARCHAR(12) NULL,
+          mode VARCHAR(8) NOT NULL, status VARCHAR(16) NOT NULL,
+          reason VARCHAR(255) NULL,
+          ticket BIGINT NULL, fill_price DOUBLE NULL, close_price DOUBLE NULL,
+          profit DOUBLE NULL, closed_at DATETIME(3) NULL,
+          created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NULL
+        )
+      `);
+      // Step-2 bridge columns (idempotent adds for pre-existing tables).
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'expires_at', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'sent_at', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'position_id', 'BIGINT NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'account', 'VARCHAR(32) NULL');
+
       // Strategy Lab — isolated single-strategy signals (NOT the main system). One row
       // per strategy|symbol|timeframe|bar. Each signal is scored two ways: forex (TP/SL
       // replay) and fixed-time (direction at next-candle expiry). Compact + pruned.
@@ -805,6 +850,9 @@ async function initializeDatabase() {
       // surfaced as a live popup and/or sent by email when it was first logged.
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'popup_sent', 'TINYINT NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'email_sent', 'TINYINT NULL');
+      // At-entry delivery state: 0/NULL = unsent, -1 = atomically claimed, 1 = sent.
+      // A hard crash leaves the claim in place, preferring a missed alert over a duplicate.
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'entry_ready_email_sent', 'TINYINT NULL');
       // AS-TRADED fixed-time outcome (realistic): reference = the LIVE price captured when the
       // signal fired (at_ref_price), expiry = signal_time + one TF candle. Settled close-to-the-
       // expiry-instant. Distinct from the idealized ft_outcome (signal-bar close → next-bar close).
@@ -6042,6 +6090,13 @@ function digitsFor(symbol) {
 }
 function px(v, symbol) { return (v === null || v === undefined) ? 'n/a' : Number(v).toFixed(digitsFor(symbol)); }
 function px2(v) { return (v === null || v === undefined || !Number.isFinite(Number(v))) ? 'n/a' : `$${Number(v).toFixed(2)}`; }
+function brokerPointSizeFor(symbol) {
+  const s = String(symbol || '').toUpperCase();
+  const caps = symbolCapsFor(s);
+  if (caps?.digits != null) return 10 ** -caps.digits;
+  if (/XAU|GOLD|XAG|JPY/.test(s)) return 0.001;
+  return 0.00001;
+}
 
 function setupLabel(grade) {
   const text = String(grade || '').trim();
@@ -7402,9 +7457,79 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   // address receives. Missing entry / empty lists = everything. Delivery-only.
   //   emailRecipientRules: { [email]: { symbols?: string[], timeframes?: string[] } }
   emailRecipientRules: {},
+  // At-entry alert: ONE email when an A/A+ resting LIMIT/STOP entry fills and remains
+  // actionable after M1 lifecycle, freshness, chase, and HTF checks. Filters narrow
+  // WHICH signals may send it; empty lists = all. Detection/logging are unaffected.
+  entryReadyAlerts: { enabled: false, minGrade: 'A', strategies: [], symbols: [], timeframes: [] },
+  // Key-level proximity alert: email when price approaches an obvious liquidity level
+  // (PDH/PDL, session highs/lows). The trigger band is VOLATILITY-ADAPTIVE (a fraction of
+  // H1 ATR, so it means the same thing on gold, FX, and indices), two-tier: an early
+  // 'APPROACHING' ping then an 'IMMINENT' one at the level. sensitivity = Tight/Normal/Wide
+  // scales the band. symbols/levelTypes empty = all. Delivery-only; nothing else affected.
+  //   levelTypes ⊆ ['PDH_PDL','ASIAN','LONDON','NY']
+  keyLevelProximityAlerts: { enabled: false, sensitivity: 'NORMAL', symbols: [], levelTypes: [] },
+  // Account & position-sizing. `balance` (USD) drives lot sizing on every emailed signal.
+  // mode: NORMAL (size by normalRiskPct) | CHALLENGE (prop-firm rules) | BOTH (show both).
+  // challenge = Hola Prime 1-Step preset (editable). Sizing/labels only — never changes
+  // which signals fire. Educational risk math, not financial advice.
+  accountRisk: {
+    balance: 5000,
+    mode: 'NORMAL',
+    normalRiskPct: 1,
+    challenge: {
+      preset: 'HOLA_1STEP',
+      phase: 'EVAL',                 // EVAL | FUNDED
+      initialBalance: 5000,
+      profitTargetPct: 10,           // Hola 1-Step: 10% of initial
+      dailyLossPct: 3,               // 3% of previous day's close
+      maxDrawdownPct: 6,             // 6% of initial, STATIC
+      drawdownType: 'STATIC',        // STATIC | TRAILING
+      maxRiskPerTradePct: 2,         // funded cap: 2% of initial
+      riskPerTradePct: 0.5,          // conservative sizing default (well under the cap)
+      minTradingDays: 2,
+      consistencyPct: 40,            // no single day > 40% of total profit (on-demand payout)
+      onlyAPlus: true,               // Phase 2 gate — stored now, enforced later
+      minRR: 2,
+    },
+  },
+  // Auto-trading controller. mode: OFF | SHADOW (log+email what WOULD trade, no orders) |
+  // ASK (queue for one-tap approval) | AUTO (execute immediately). ASK/AUTO require the
+  // EA trade bridge (Step 2) — until it reports ready they behave as SHADOW.
+  // strategies EMPTY = NONE MAY TRADE (explicit opt-in — trading is not an email filter);
+  // symbols/timeframes/sessions empty = all. Lot size comes from accountRisk.
+  autoTrade: {
+    mode: 'OFF',
+    strategies: [],
+    symbols: [],
+    timeframes: [],
+    sessions: [],                  // ⊆ SYDNEY/TOKYO/LONDON/OVERLAP/NEWYORK
+    maxTradesPerDay: 3,
+    maxConcurrent: 2,
+    onePerSymbol: true,
+    minGrade: 'A',
+    minRR: 2,
+    // How the ticket (lots / SL / TP) is built for each auto-trade:
+    //   AUTO   — the strategy's own SL/TP + lot size from Account & Sizing (default).
+    //   MANUAL — your fixed lots + your SL/TP DISTANCES in pips (absolute prices are
+    //            meaningless here: every signal has a different entry). Blank = keep the
+    //            strategy's value for that field.
+    //   RISK   — you set only the risk %; the system derives the lot size from the
+    //            strategy's structural SL and lays TP1/TP2/TP3 at R multiples.
+    // Every override is validated against the strategy's own analysis; violations are
+    // reported as warnings and hard geometry errors block the trade.
+    execution: {
+      mode: 'AUTO',
+      lots: 0.01,
+      slPips: null, tp1Pips: null, tp2Pips: null, tp3Pips: null,
+      riskPct: 0.5,
+      slOverridePips: null,
+      tpR: [1, 2, 3],
+      allowWarnedTrades: false,   // true = trade anyway when only WARNINGS (never on errors)
+    },
+  },
   // Strategy Controller (master per-strategy switch — gates EVERYTHING user-facing:
-  // popups, emails, SSE, the recent-signals table and reports). Missing entry = fully
-  // enabled. Optional per-strategy refinements gate DELIVERY (alerts): minScore, a
+  // popups, emails, SSE, the recent-signals table and reports). Missing entry uses the
+  // registry default (normally enabled). Optional refinements gate DELIVERY: minScore, a
   // direction/"setup" filter, and which timeframes may alert. DB logging always continues
   // (Mute), so the win-rate ranking keeps measuring even muted strategies.
   //   strategyControls: { [id]: { enabled, minScore?, direction?: ANY|LONG|SHORT, timeframes?: [] } }
@@ -7529,6 +7654,107 @@ function saveEmailAlertSettings(nextSettings) {
     }
     sanitized.emailRecipientRules = out;
   }
+  // At-entry alert controller — replace whole object on save.
+  if (nextSettings && nextSettings.entryReadyAlerts && typeof nextSettings.entryReadyAlerts === 'object') {
+    const src = nextSettings.entryReadyAlerts;
+    const KNOWN_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+    const validIds = new Set(listStrategies().map((m) => m.id));
+    sanitized.entryReadyAlerts = {
+      enabled: src.enabled !== false,
+      minGrade: src.minGrade === 'A+' ? 'A+' : 'A',
+      strategies: Array.isArray(src.strategies) ? [...new Set(src.strategies.map(String).filter((id) => validIds.has(id)))].slice(0, 40) : [],
+      symbols: Array.isArray(src.symbols) ? [...new Set(src.symbols.map((x) => String(x || '').trim().toUpperCase()).filter((x) => /^[A-Z0-9._#-]{2,20}$/.test(x)))].slice(0, 30) : [],
+      timeframes: Array.isArray(src.timeframes) ? [...new Set(src.timeframes.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_TFS.includes(x)) : [],
+    };
+  }
+  // Key-level proximity alert controller — replace whole object on save.
+  if (nextSettings && nextSettings.keyLevelProximityAlerts && typeof nextSettings.keyLevelProximityAlerts === 'object') {
+    const src = nextSettings.keyLevelProximityAlerts;
+    const KNOWN_LEVEL_GROUPS = ['PDH_PDL', 'ASIAN', 'LONDON', 'NY'];
+    const sens = String(src.sensitivity || 'NORMAL').toUpperCase();
+    sanitized.keyLevelProximityAlerts = {
+      enabled: src.enabled === true,
+      sensitivity: ['TIGHT', 'NORMAL', 'WIDE'].includes(sens) ? sens : 'NORMAL',
+      symbols: Array.isArray(src.symbols) ? [...new Set(src.symbols.map((x) => String(x || '').trim().toUpperCase()).filter((x) => /^[A-Z0-9._#-]{2,20}$/.test(x)))].slice(0, 30) : [],
+      levelTypes: Array.isArray(src.levelTypes) ? [...new Set(src.levelTypes.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_LEVEL_GROUPS.includes(x)) : [],
+    };
+  }
+  // Account & sizing controller — replace whole object on save.
+  if (nextSettings && nextSettings.accountRisk && typeof nextSettings.accountRisk === 'object') {
+    const src = nextSettings.accountRisk;
+    const base = DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+    const clampNum = (v, lo, hi, dflt) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
+    const mode = String(src.mode || 'NORMAL').toUpperCase();
+    const ch = (src.challenge && typeof src.challenge === 'object') ? src.challenge : {};
+    const cb = base.challenge;
+    sanitized.accountRisk = {
+      balance: clampNum(src.balance, 1, 100000000, base.balance),
+      mode: ['NORMAL', 'CHALLENGE', 'BOTH'].includes(mode) ? mode : 'NORMAL',
+      normalRiskPct: clampNum(src.normalRiskPct, 0.05, 10, base.normalRiskPct),
+      challenge: {
+        preset: String(ch.preset || cb.preset).slice(0, 32).toUpperCase(),
+        phase: ['EVAL', 'FUNDED'].includes(String(ch.phase || '').toUpperCase()) ? String(ch.phase).toUpperCase() : cb.phase,
+        initialBalance: clampNum(ch.initialBalance, 1, 100000000, cb.initialBalance),
+        profitTargetPct: clampNum(ch.profitTargetPct, 1, 100, cb.profitTargetPct),
+        dailyLossPct: clampNum(ch.dailyLossPct, 0.5, 50, cb.dailyLossPct),
+        maxDrawdownPct: clampNum(ch.maxDrawdownPct, 1, 100, cb.maxDrawdownPct),
+        drawdownType: ['STATIC', 'TRAILING'].includes(String(ch.drawdownType || '').toUpperCase()) ? String(ch.drawdownType).toUpperCase() : cb.drawdownType,
+        maxRiskPerTradePct: clampNum(ch.maxRiskPerTradePct, 0.1, 20, cb.maxRiskPerTradePct),
+        riskPerTradePct: clampNum(ch.riskPerTradePct, 0.05, 10, cb.riskPerTradePct),
+        minTradingDays: Math.round(clampNum(ch.minTradingDays, 0, 60, cb.minTradingDays)),
+        consistencyPct: clampNum(ch.consistencyPct, 0, 100, cb.consistencyPct),
+        onlyAPlus: ch.onlyAPlus !== false,
+        minRR: clampNum(ch.minRR, 0, 10, cb.minRR),
+      },
+    };
+  }
+  // Auto-trading controller — replace whole object on save.
+  if (nextSettings && nextSettings.autoTrade && typeof nextSettings.autoTrade === 'object') {
+    const src = nextSettings.autoTrade;
+    const base = DEFAULT_EMAIL_ALERT_SETTINGS.autoTrade;
+    const KNOWN_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+    const KNOWN_SESSIONS = ['SYDNEY', 'TOKYO', 'LONDON', 'OVERLAP', 'NEWYORK'];
+    const validIds = new Set(listStrategies().map((m) => m.id));
+    const mode = String(src.mode || 'OFF').toUpperCase();
+    const clampInt = (v, lo, hi, dflt) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : dflt; };
+    sanitized.autoTrade = {
+      mode: ['OFF', 'SHADOW', 'ASK', 'AUTO'].includes(mode) ? mode : 'OFF',
+      strategies: Array.isArray(src.strategies) ? [...new Set(src.strategies.map(String).filter((id) => validIds.has(id)))].slice(0, 40) : [],
+      symbols: Array.isArray(src.symbols) ? [...new Set(src.symbols.map((x) => String(x || '').trim().toUpperCase()).filter((x) => /^[A-Z0-9._#-]{2,20}$/.test(x)))].slice(0, 30) : [],
+      timeframes: Array.isArray(src.timeframes) ? [...new Set(src.timeframes.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_TFS.includes(x)) : [],
+      sessions: Array.isArray(src.sessions) ? [...new Set(src.sessions.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_SESSIONS.includes(x)) : [],
+      maxTradesPerDay: clampInt(src.maxTradesPerDay, 1, 20, base.maxTradesPerDay),
+      maxConcurrent: clampInt(src.maxConcurrent, 1, 5, base.maxConcurrent),
+      onePerSymbol: src.onePerSymbol !== false,
+      minGrade: ['A', 'A+'].includes(String(src.minGrade || '').toUpperCase()) ? String(src.minGrade).toUpperCase() : 'A',
+      minRR: (() => { const n = Number(src.minRR); return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : base.minRR; })(),
+      execution: (() => {
+        const e = (src.execution && typeof src.execution === 'object') ? src.execution : {};
+        const be = base.execution;
+        const em = String(e.mode || be.mode).toUpperCase();
+        // null/'' = "use the strategy's value"; a number = an explicit override.
+        const optNum = (v, lo, hi) => {
+          if (v === null || v === undefined || v === '') return null;
+          const n = Number(v);
+          return Number.isFinite(n) && n >= lo && n <= hi ? n : null;
+        };
+        const clamp = (v, lo, hi, dflt) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
+        const tpR = Array.isArray(e.tpR) ? e.tpR.map((v) => clamp(v, 0.2, 20, 0)).filter((v) => v > 0).slice(0, 3) : [];
+        return {
+          mode: ['AUTO', 'MANUAL', 'RISK'].includes(em) ? em : 'AUTO',
+          lots: clamp(e.lots, 0.01, 100, be.lots),
+          slPips: optNum(e.slPips, 0.1, 100000),
+          tp1Pips: optNum(e.tp1Pips, 0.1, 100000),
+          tp2Pips: optNum(e.tp2Pips, 0.1, 100000),
+          tp3Pips: optNum(e.tp3Pips, 0.1, 100000),
+          riskPct: clamp(e.riskPct, 0.05, 10, be.riskPct),
+          slOverridePips: optNum(e.slOverridePips, 0.1, 100000),
+          tpR: tpR.length ? tpR.sort((a, b) => a - b) : be.tpR,
+          allowWarnedTrades: e.allowWarnedTrades === true,
+        };
+      })(),
+    };
+  }
   // Strategy Controller — replace the whole map on save (frontend sends the full object).
   if (nextSettings && nextSettings.strategyControls && typeof nextSettings.strategyControls === 'object') {
     const out = {};
@@ -7616,16 +7842,16 @@ function strategyLabFttEmailAllowed(strategy, score, grade, symbol, direction) {
 // Strategy Controller (Settings → Strategy Controller). The master per-strategy switch that
 // gates DELIVERY of any signal — popups, emails, SSE. OFF = silent everywhere. When ON, the
 // optional refinements (minScore, direction/"setup", timeframes) further gate the alert.
-// Missing entry = fully enabled so the live setup is unchanged until the user toggles.
+// Missing entry = registry default (enabled unless a measurement-only rollout opts out).
 function strategyDelivers(stratId, { score, direction, timeframe } = {}) {
   const ctrl = (loadEmailAlertSettings().strategyControls || {})[stratId];
-  if (!ctrl) return true;
-  if (ctrl.enabled === false) return false;
-  if (Number.isFinite(Number(ctrl.minScore)) && (Number(score) || 0) < Number(ctrl.minScore)) return false;
-  const dir = String(ctrl.direction || 'ANY').toUpperCase();
+  const defaultEnabled = STRATEGY_LAB_REGISTRY[stratId]?.defaultEnabled !== false;
+  if ((ctrl?.enabled ?? defaultEnabled) === false) return false;
+  if (Number.isFinite(Number(ctrl?.minScore)) && (Number(score) || 0) < Number(ctrl.minScore)) return false;
+  const dir = String(ctrl?.direction || 'ANY').toUpperCase();
   if (dir === 'LONG' && direction !== 'BUY') return false;
   if (dir === 'SHORT' && direction !== 'SELL') return false;
-  if (Array.isArray(ctrl.timeframes) && ctrl.timeframes.length && timeframe && !ctrl.timeframes.includes(String(timeframe).toUpperCase())) return false;
+  if (Array.isArray(ctrl?.timeframes) && ctrl.timeframes.length && timeframe && !ctrl.timeframes.includes(String(timeframe).toUpperCase())) return false;
   return true;
 }
 // Strategies whose signals belong in the aggregated recent-signals table + reports (enabled
@@ -7633,7 +7859,7 @@ function strategyDelivers(stratId, { score, direction, timeframe } = {}) {
 // dashboard's own grid filters. DB logging always continues, so muted strategies keep ranking.
 function enabledStrategyIds() {
   const controls = loadEmailAlertSettings().strategyControls || {};
-  return listStrategies().map((m) => m.id).filter((id) => controls[id]?.enabled !== false);
+  return listStrategies().filter((m) => (controls[m.id]?.enabled ?? (m.defaultEnabled !== false)) !== false).map((m) => m.id);
 }
 // True when the Strategy Controller master switch is explicitly OFF for this strategy.
 // Disabled strategies must vanish from every USER-FACING surface (live page, dropdowns,
@@ -7642,7 +7868,8 @@ function enabledStrategyIds() {
 // callers can still see them by passing includeMuted=1.
 function strategyMuted(stratId) {
   const ctrl = (loadEmailAlertSettings().strategyControls || {})[stratId];
-  return ctrl ? ctrl.enabled === false : false;
+  const defaultEnabled = STRATEGY_LAB_REGISTRY[stratId]?.defaultEnabled !== false;
+  return (ctrl?.enabled ?? defaultEnabled) === false;
 }
 
 async function persistEmailedPostNewsForexReport(sig, referenceId) {
@@ -8197,6 +8424,956 @@ async function processSignalTracker() {
     if (now - v.at > 6 * 3600 * 1000) signalTrackerAlertState.delete(k);
   }
 }
+
+// ── Executed Orders — user-tracked pending orders (Track button) ──────────────
+// The user places some emailed signals as PENDING orders at the broker and marks
+// them tracked. These get priority care: continuous strength re-scans, honest fill/
+// expiry state, an explicit suggestion (hold / fills-soon / CANCEL — don't chase /
+// manage), and exactly TWO one-time emails per order: "≈N pips from entry" and
+// "setup lost strength — consider cancelling".
+const TRACKED_NEAR_ENTRY_PIPS = Math.max(1, Number(process.env.TRACKED_NEAR_ENTRY_PIPS || 5));
+const TRACKED_WEAK_DROP_PTS = Math.max(5, Number(process.env.TRACKED_WEAK_DROP_PTS || 12));
+
+async function buildExecutedOrdersView() {
+  const pool = await initializeDatabase();
+  const empty = { items: [], generatedAt: new Date().toISOString(), config: { nearEntryPips: TRACKED_NEAR_ENTRY_PIPS, weakDropPts: TRACKED_WEAK_DROP_PTS } };
+  if (!pool) return empty;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  let tracked;
+  try {
+    [tracked] = await pool.query("SELECT * FROM mt5_tracked_orders WHERE status='ACTIVE' ORDER BY tracked_at DESC LIMIT 60");
+  } catch { return empty; }
+  if (!tracked.length) return empty;
+
+  const items = [];
+  const enabledStrats = new Set(enabledStrategyIds());
+  for (const t of tracked) {
+    try {
+      const trackedId = String(t.id);
+      // Resolve the underlying signal row. Lab ids look like `strategy:symbol:tf:barms`.
+      const labStrategy = trackedId.includes(':') ? trackedId.split(':')[0] : null;
+      const isLab = labStrategy && STRATEGY_LAB_REGISTRY[labStrategy];
+      // Strategy Controller contract: strategies turned OFF vanish from every visible
+      // surface — tracked orders from a disabled strategy hide until it's re-enabled.
+      if (isLab && !enabledStrats.has(labStrategy)) continue;
+      let row = null, source = t.source || (isLab ? 'strategy-lab' : 'system');
+      if (isLab) {
+        const [rows] = await pool.execute('SELECT * FROM mt5_strategy_signals WHERE id=? LIMIT 1', [trackedId]);
+        row = rows[0] || null;
+      } else {
+        const [sysRows] = await pool.execute('SELECT * FROM mt5_system_signal_log WHERE id=? LIMIT 1', [trackedId]);
+        row = sysRows[0] || null;
+        if (!row) {
+          const [emRows] = await pool.execute('SELECT * FROM mt5_signal_email_reports WHERE id=? LIMIT 1', [trackedId]);
+          row = emRows[0] || null;
+          if (row) source = 'email';
+        }
+      }
+      if (!row) continue;
+
+      const symbol = String(row.symbol).toUpperCase();
+      const tf = String(row.timeframe || 'M15').toUpperCase();
+      const dir = String(row.direction).toUpperCase();
+      const buy = /BUY/.test(dir);
+      const pip = pipSizeForSymbol(symbol) || 0.0001;
+      const entry = num(row.entry_price), stop = num(row.stop_loss);
+      let current = null;
+      try { const c = getRecentCandles(symbol, tf, 2); if (c && c.length) current = Number(c[c.length - 1].close); } catch { /* feed gap */ }
+      // Signed pips still needed to reach the entry (matches Entry Watch semantics):
+      // >0 = price must still come in; ≤0 = entry reached/passed.
+      const pipsToEntry = (current != null && entry != null)
+        ? Math.round(((buy ? current - entry : entry - current) / pip) * 10) / 10
+        : null;
+
+      // Order state — lab rows get the full honest lifecycle; system/email rows a
+      // generic M1 touch check from the signal time.
+      let orderState = 'PENDING', stateMessage = '';
+      if (isLab) {
+        const timing = strategyLabTiming(row);
+        orderState = timing.status === 'FILLED' ? 'FILLED'
+          : timing.status === 'EXPIRED' ? 'EXPIRED'
+          : timing.status === 'SETTLED' ? 'SETTLED'
+          : timing.status === 'TRADABLE' ? 'FILLED'
+          : 'PENDING';
+        stateMessage = timing.message || '';
+      } else {
+        const sigMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+        if (Number.isFinite(sigMs) && entry != null) {
+          const m1From = Math.ceil(sigMs / 60000) * 60000;
+          const fine = (getRecentCandles(symbol, 'M1', 1000) || []).filter((c) => (Date.parse(c.time) || 0) >= m1From);
+          let touched = false, stopped = false;
+          for (const c of fine) {
+            const hi = Number(c.high), lo = Number(c.low);
+            if (!touched && lo <= entry && entry <= hi) touched = true;
+            if (!touched && stop != null && (buy ? lo <= stop : hi >= stop)) { stopped = true; break; }
+          }
+          orderState = stopped ? 'EXPIRED' : touched ? 'FILLED' : 'PENDING';
+        }
+        const outcome = String(row.outcome || 'PENDING').toUpperCase();
+        if (outcome !== 'PENDING') orderState = 'SETTLED';
+      }
+
+      // Live strength re-scan (lab signals): how strong is this setup RIGHT NOW.
+      let currentScore = null, currentGrade = null, strengthTrend = null, liveNewEntry = null;
+      const loggedScore = num(row.score);
+      if (isLab) {
+        try {
+          const ctx = buildStrategyContext(symbol, tf);
+          const live = ctx ? evaluateStrategy(labStrategy, ctx) : null;
+          if (live && live.decision === dir) {
+            currentScore = live.score ?? null; currentGrade = live.grade ?? null;
+            strengthTrend = loggedScore == null || currentScore == null ? 'SAME'
+              : currentScore >= loggedScore + 3 ? 'STRONGER'
+              : currentScore <= loggedScore - 3 ? 'WEAKER' : 'SAME';
+            if (live.entry != null && entry != null && Math.abs(live.entry - entry) / pip >= 1) {
+              liveNewEntry = { entry: live.entry, stopLoss: live.stopLoss ?? null, takeProfit1: live.takeProfit1 ?? null, riskRewardRatio: live.riskRewardRatio ?? null };
+            }
+          } else {
+            strengthTrend = 'GONE';
+          }
+        } catch { strengthTrend = null; }
+      }
+      const scoreDrop = loggedScore != null && currentScore != null ? Math.max(0, Math.round(loggedScore - currentScore)) : (strengthTrend === 'GONE' && loggedScore != null ? loggedScore : 0);
+      const weakNow = orderState === 'PENDING' && (strengthTrend === 'GONE' || scoreDrop >= TRACKED_WEAK_DROP_PTS);
+      const nearNow = orderState === 'PENDING' && pipsToEntry != null && pipsToEntry > 0 && pipsToEntry <= TRACKED_NEAR_ENTRY_PIPS;
+
+      // Suggestion — the one line the user acts on.
+      let suggestion, tone;
+      if (orderState === 'SETTLED') { suggestion = `Played out (${String(row.outcome || '').replace('_', ' ')}) — untrack this order.`; tone = 'DONE'; }
+      else if (orderState === 'EXPIRED') {
+        suggestion = 'EXPIRED — do not chase. CANCEL the pending order.' + (liveNewEntry ? ` Fresh ${dir} re-fires at ${px(liveNewEntry.entry, symbol)} — consider re-placing there instead.` : '');
+        tone = 'CANCEL';
+      } else if (orderState === 'FILLED') { suggestion = 'Order FILLED — the trade is live; manage it from the Live Trades tab.'; tone = 'MANAGE'; }
+      else if (weakNow) {
+        suggestion = strengthTrend === 'GONE'
+          ? 'Setup no longer confirms live — consider CANCELLING the pending order.'
+          : `Setup lost strength (score ${loggedScore} → ${currentScore}) — consider CANCELLING the pending order.`;
+        tone = 'CANCEL';
+      } else if (nearNow) { suggestion = `Price is ${pipsToEntry}p from your entry — the order should fill soon. Confirm SL/TP are set.`; tone = 'FILL_SOON'; }
+      else {
+        suggestion = strengthTrend === 'WEAKER'
+          ? `Order valid but weakening (score ${loggedScore} → ${currentScore}) — watch it.`
+          : 'Order valid — setup still confirms. Hold the pending order.';
+        tone = 'HOLD';
+      }
+
+      items.push({
+        id: trackedId, source, strategy: isLab ? labStrategy : null,
+        strategyName: isLab ? (STRATEGY_LAB_REGISTRY[labStrategy]?.name || labStrategy) : (source === 'email' ? 'Emailed signal' : 'System signal'),
+        symbol, timeframe: tf, direction: dir, grade: row.grade || null, loggedScore,
+        signalTime: row.signal_time ? new Date(row.signal_time).toISOString() : null,
+        trackedAt: t.tracked_at ? new Date(t.tracked_at).toISOString() : null,
+        entryPrice: entry, stopLoss: stop,
+        takeProfit1: num(row.take_profit_1), takeProfit2: num(row.take_profit_2), takeProfit3: num(row.take_profit_3),
+        currentPrice: current, pipsToEntry,
+        orderState, stateMessage,
+        currentScore, currentGrade, strengthTrend, scoreDrop,
+        suggestion, tone, liveNewEntry,
+        nearEntryNotified: !!t.near_entry_notified, weakNotified: !!t.weak_notified,
+        _nearNow: nearNow, _weakNow: weakNow,
+      });
+    } catch { /* per-order resilience */ }
+  }
+  const toneRank = { CANCEL: 0, FILL_SOON: 1, MANAGE: 2, HOLD: 3, DONE: 4 };
+  items.sort((a, b) => (toneRank[a.tone] ?? 9) - (toneRank[b.tone] ?? 9));
+  return { items, generatedAt: new Date().toISOString(), config: { nearEntryPips: TRACKED_NEAR_ENTRY_PIPS, weakDropPts: TRACKED_WEAK_DROP_PTS } };
+}
+
+// One-time email alerts for tracked orders: near-entry approach + strength loss.
+// Each fires AT MOST ONCE per order (flag persisted) — the user asked for exactly one.
+async function processTrackedOrderAlerts() {
+  let view;
+  try { view = await buildExecutedOrdersView(); } catch { return; }
+  if (!view.items.length) return;
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  for (const it of view.items) {
+    try {
+      if (it._nearNow && !it.nearEntryNotified) {
+        const to = signalEmailToFor(it.symbol, it.timeframe);
+        if (to) {
+          const subject = `[ORDER NEAR ENTRY] ${it.symbol} ${it.timeframe} ${it.direction} — ${it.pipsToEntry}p to your entry`.slice(0, 180);
+          const text = [
+            'TRACKED PENDING ORDER — APPROACHING ENTRY',
+            `${it.direction} ${it.symbol} ${it.timeframe} (${it.strategyName})`,
+            `Your entry ${px(it.entryPrice, it.symbol)} — price ${px(it.currentPrice, it.symbol)} is ${it.pipsToEntry} pips away.`,
+            `Setup strength now: ${it.currentScore != null ? `${it.currentScore} ${it.currentGrade || ''}` : 'n/a'} (was ${it.loggedScore ?? '—'} ${it.grade || ''}).`,
+            'The order should fill soon — confirm your SL/TP are attached. One-time notice for this order.',
+          ].join('\n');
+          await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:Arial;white-space:pre-wrap">${text}</pre>`, signalId: `tracked:${it.id}:near` });
+          await pool.execute('UPDATE mt5_tracked_orders SET near_entry_notified=1 WHERE id=?', [it.id]);
+          console.log(`[TrackedOrders] Near-entry email: ${it.direction} ${it.symbol} ${it.timeframe} (${it.pipsToEntry}p)`);
+        }
+      }
+      if (it._weakNow && !it.weakNotified) {
+        const to = signalEmailToFor(it.symbol, it.timeframe);
+        if (to) {
+          const subject = `[CANCEL ORDER?] ${it.symbol} ${it.timeframe} ${it.direction} — setup lost strength`.slice(0, 180);
+          const text = [
+            'TRACKED PENDING ORDER — STRENGTH LOST',
+            `${it.direction} ${it.symbol} ${it.timeframe} (${it.strategyName})`,
+            it.strengthTrend === 'GONE'
+              ? `The setup no longer confirms on a live re-scan (was ${it.loggedScore ?? '—'} ${it.grade || ''}).`
+              : `Score dropped ${it.scoreDrop} points: ${it.loggedScore} → ${it.currentScore}.`,
+            `Suggestion: ${it.suggestion}`,
+            'One-time notice for this order — the Executed Orders tab keeps the live read.',
+          ].join('\n');
+          await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:Arial;white-space:pre-wrap">${text}</pre>`, signalId: `tracked:${it.id}:weak` });
+          await pool.execute('UPDATE mt5_tracked_orders SET weak_notified=1 WHERE id=?', [it.id]);
+          console.log(`[TrackedOrders] Weak email: ${it.direction} ${it.symbol} ${it.timeframe} (drop ${it.scoreDrop})`);
+        }
+      }
+    } catch (e) { console.error('[TrackedOrders] alert failed:', e.message); }
+  }
+}
+
+// ── At-entry alerts: "any A/A+ signal just hit its entry → email me" ──────────
+// Watches recent PENDING lab signals; the moment a resting LIMIT/STOP entry FILLS,
+// M1 lifecycle checks must also prove the setup is still actionable (no stop before/
+// after fill, no TP1 already hit, no failed trigger, no chase). Delivery-log lookup
+// makes the one-email rule durable across restarts.
+// The Notification Settings controller (entryReadyAlerts) narrows which strategies /
+// symbols / timeframes may send it, and per-recipient routing still applies.
+const ENTRY_READY_MAX_FILL_AGE_MS = Math.max(60000, Number(process.env.ENTRY_READY_MAX_FILL_AGE_MIN || 10) * 60000);
+const entryReadyNotified = new Map(); // hot-path cache; mt5_delivery_logs is the durable dedup source
+
+async function processEntryReadyAlerts() {
+  const cfg = loadEmailAlertSettings().entryReadyAlerts || {};
+  if (cfg.enabled === false || !SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  let rows;
+  try {
+    [rows] = await pool.query(
+      "SELECT * FROM mt5_strategy_signals WHERE outcome='PENDING' AND COALESCE(entry_ready_email_sent,0)=0 AND entry_price IS NOT NULL AND stop_loss IS NOT NULL AND take_profit_1 IS NOT NULL AND COALESCE(latest_grade, grade) IN ('A','A+') AND signal_time >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 48 HOUR) ORDER BY signal_time DESC LIMIT 200",
+    );
+  } catch { return; }
+  const wantStrats = new Set(cfg.strategies || []);
+  const wantSyms = new Set((cfg.symbols || []).map((s) => String(s).toUpperCase()));
+  const wantTfs = new Set((cfg.timeframes || []).map((s) => String(s).toUpperCase()));
+  const now = Date.now();
+
+  for (const row of rows) {
+    try {
+      const id = String(row.id);
+      if (entryReadyNotified.has(id)) continue;
+      const strategy = String(row.strategy || '');
+      const effectiveGrade = String(row.latest_grade || row.grade || '').toUpperCase();
+      const effectiveScore = Number(row.latest_score ?? row.score) || 0;
+      if (!strategyDelivers(strategy, { score: effectiveScore, direction: row.direction, timeframe: row.timeframe })) continue;
+      if ((cfg.minGrade === 'A+') && effectiveGrade !== 'A+') continue;
+      const symbol = String(row.symbol).toUpperCase(), tf = String(row.timeframe).toUpperCase();
+      if (wantStrats.size && !wantStrats.has(strategy)) continue;        // user's controller filters
+      if (wantSyms.size && !wantSyms.has(symbol)) continue;
+      if (wantTfs.size && !wantTfs.has(tf)) continue;
+      if (String(row.entry_state || '').toUpperCase() === 'EXPIRED') continue;
+      const entry = row.entry_price === null || row.entry_price === undefined || String(row.entry_price).trim() === '' ? NaN : Number(row.entry_price);
+      if (!Number.isFinite(entry)) { entryReadyNotified.set(id, now); continue; }
+      const sigMs = row.signal_time ? new Date(row.signal_time).getTime() : NaN;
+      if (!Number.isFinite(sigMs)) continue;
+
+      // Fill check on M1 evidence from the first complete minute after the alert.
+      const m1From = Math.ceil(sigMs / 60000) * 60000;
+      const fine = (getRecentCandles(symbol, 'M1', 1000) || [])
+        .map((c) => ({ ...c, timeMs: Date.parse(c.time) }))
+        .filter((c) => Number.isFinite(c.timeMs) && c.timeMs >= m1From);
+      if (!fine.length) continue;
+      const buy = /BUY/.test(String(row.direction).toUpperCase());
+      const orderType = strategySignalOrderType(row);
+      if (!['LIMIT', 'STOP'].includes(orderType)) { entryReadyNotified.set(id, now); continue; }
+      let validUntilMs = strategySignalValidUntilMs(row, tf);
+      if (!Number.isFinite(validUntilMs)) validUntilMs = sigMs + STRATEGY_LAB_ENTRY_VALID_BARS * timeframeMinutes(tf) * 60000;
+      const readiness = assessEntryReadiness(fine, {
+        isBuy: buy,
+        entry,
+        stop: row.stop_loss,
+        tp1: row.take_profit_1,
+        orderType,
+        validUntilMs,
+        nowMs: now,
+        maxFillAgeMs: ENTRY_READY_MAX_FILL_AGE_MS,
+        spreadPointSize: brokerPointSizeFor(symbol),
+      });
+      if (!readiness.ready) {
+        if (readiness.terminal) entryReadyNotified.set(id, now);
+        continue;
+      }
+
+      // Re-read higher-timeframe context at the fill. A clear H4 reversal against the
+      // trade means the original setup no longer meets the at-entry safety conditions.
+      const liveContext = buildStrategyContext(symbol, tf);
+      if (!liveContext) continue;
+      const expectedH4 = buy ? 'BULLISH' : 'BEARISH';
+      const liveH4 = String(liveContext.h4Trend || 'NEUTRAL').toUpperCase();
+      if (['BULLISH', 'BEARISH'].includes(liveH4) && liveH4 !== expectedH4) {
+        entryReadyNotified.set(id, now);
+        continue;
+      }
+
+      const to = signalEmailToFor(symbol, tf);
+      if (!to) { entryReadyNotified.set(id, now); continue; }
+      const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
+      const sizing = strategyLabSizing(symbol, row.entry_price, row.stop_loss, { tp1: row.take_profit_1, tp2: row.take_profit_2, tp3: row.take_profit_3 });
+      const deliverySignalId = `entryready:${id}`;
+      const [priorDeliveries] = await pool.query(
+        "SELECT id FROM mt5_delivery_logs WHERE signal_id=? AND status='Success' LIMIT 1",
+        [deliverySignalId],
+      );
+      if (priorDeliveries.length) {
+        await pool.execute('UPDATE mt5_strategy_signals SET entry_ready_email_sent=1 WHERE id=?', [id]);
+        entryReadyNotified.set(id, now);
+        continue;
+      }
+
+      // Atomic claim prevents two backend processes from sending the same actionable
+      // entry. Normal SMTP failures release it; a hard crash keeps it claimed so the
+      // system favors at-most-once delivery over a duplicate trade instruction.
+      const [claim] = await pool.execute(
+        'UPDATE mt5_strategy_signals SET entry_ready_email_sent=-1 WHERE id=? AND COALESCE(entry_ready_email_sent,0)=0',
+        [id],
+      );
+      if (claim.affectedRows !== 1) { entryReadyNotified.set(id, now); continue; }
+
+      let smtpAccepted = false;
+      try {
+        await pool.execute(
+          "UPDATE mt5_strategy_signals SET entry_state='FILLED', entry_filled_at=COALESCE(entry_filled_at, ?) WHERE id=? AND COALESCE(entry_state,'WAIT') <> 'EXPIRED'",
+          [toMysqlDate(new Date(readiness.fillMs)), id],
+        );
+        const session = strategyLabSession(new Date(readiness.fillMs).toISOString());
+        const email = buildEntryReadyEmail({
+          row: { ...row, effective_grade: effectiveGrade, effective_score: effectiveScore, valid_until: new Date(validUntilMs).toISOString() },
+          strategyName,
+          orderType,
+          assessment: readiness,
+          sizing,
+          h4Trend: liveContext.h4Trend,
+          h1Trend: liveContext.h1Trend,
+          session,
+          sentMs: now,
+        });
+        await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: deliverySignalId });
+        smtpAccepted = true;
+        await pool.execute('UPDATE mt5_strategy_signals SET entry_ready_email_sent=1 WHERE id=?', [id]);
+      } catch (error) {
+        // Release only when SMTP itself failed. If SMTP accepted the message but the
+        // final DB write failed, keep -1 claimed so a retry cannot duplicate the email.
+        if (!smtpAccepted) await pool.execute('UPDATE mt5_strategy_signals SET entry_ready_email_sent=0 WHERE id=? AND entry_ready_email_sent=-1', [id]).catch(() => {});
+        throw error;
+      }
+      entryReadyNotified.set(id, now);
+      console.log(`[EntryReady] Emailed ${effectiveGrade} ${row.direction} ${symbol} ${tf} (${strategyName}) - validated entry fill`);
+    } catch (error) { console.error('[EntryReady] alert failed:', error.message); }
+  }
+  for (const [k, at] of entryReadyNotified) {
+    if (now - at > 48 * 3600 * 1000) entryReadyNotified.delete(k);
+  }
+}
+
+// ── Key-level proximity alerts ────────────────────────────────────────────────
+// Emails you once (per level, per tier, per day) when price approaches an obvious
+// pool. Dedup lives in mt5_delivery_logs (signalId), so it survives restarts and
+// double backends; the in-memory Set is just a hot-path guard within one scan.
+const keyLevelNotified = new Map();
+function keyLevelProximitySubject(symbol, lv) {
+  const dir = lv.plan?.fade?.direction || (lv.side === 'above' ? 'SELL' : 'BUY');
+  const tierTag = lv.tier === 'IMMINENT' ? 'AT LEVEL' : 'APPROACHING';
+  return `[${tierTag}] ${symbol} ${lv.distancePips}p from ${lv.label} — watch ${dir}`;
+}
+function buildKeyLevelProximityEmail(symbol, view, lv) {
+  const p = lv.plan || {};
+  const line = (plan, head) => {
+    if (!plan) return '';
+    return `${head}: ${plan.direction} @ ${px(plan.entry, symbol)} · SL ${px(plan.stopLoss, symbol)} (${plan.stopPips}p) · TP1 ${px(plan.takeProfit1, symbol)} · TP2 ${px(plan.takeProfit2, symbol)} · TP3 ${px(plan.takeProfit3, symbol)} (${plan.targetLabel}) · ${plan.riskRewardRatio}R`;
+  };
+  const fadeLine = line(p.fade, 'If it sweeps & rejects (fade)');
+  const contLine = line(p.continuation, 'If it breaks & holds (continuation)');
+  const tierWord = lv.tier === 'IMMINENT' ? 'is AT' : 'is approaching';
+  const text = [
+    `${symbol} ${tierWord} ${lv.label} (${px(lv.price, symbol)}).`,
+    `Price ${px(view.price, symbol)} · ${lv.distancePips} pips away · ${lv.distanceAtr}× ATR · ${view.feedState}.`,
+    '',
+    'This level is both a magnet and a reaction zone. Two plans:',
+    fadeLine,
+    contLine,
+    '',
+    'Wait for the candle to confirm (sweep + rejection, or break + hold) before entering. Educational, not financial advice.',
+  ].filter((x) => x !== undefined).join('\n');
+  const html = `<div style="font-family:system-ui,Arial,sans-serif;max-width:560px">
+    <h2 style="margin:0 0 4px">${symbol} ${tierWord} <span style="color:#b45309">${lv.label}</span></h2>
+    <p style="margin:0 0 10px;color:#334155">Level <b>${px(lv.price, symbol)}</b> · price ${px(view.price, symbol)} · <b>${lv.distancePips} pips</b> (${lv.distanceAtr}× ATR) · ${view.feedState}</p>
+    <p style="margin:0 0 6px;color:#334155">This level is both a magnet and a reaction zone — two plans:</p>
+    ${p.fade ? `<p style="margin:0 0 6px;padding:8px;background:#fef2f2;border-radius:8px"><b>Sweep &amp; reject (fade):</b> ${p.fade.direction} @ ${px(p.fade.entry, symbol)} · SL ${px(p.fade.stopLoss, symbol)} · TP1 ${px(p.fade.takeProfit1, symbol)} / TP2 ${px(p.fade.takeProfit2, symbol)} / TP3 ${px(p.fade.takeProfit3, symbol)} (${p.fade.targetLabel}) · <b>${p.fade.riskRewardRatio}R</b></p>` : ''}
+    ${p.continuation ? `<p style="margin:0 0 6px;padding:8px;background:#eff6ff;border-radius:8px"><b>Break &amp; hold (continuation):</b> ${p.continuation.direction} @ ${px(p.continuation.entry, symbol)} · SL ${px(p.continuation.stopLoss, symbol)} · TP1 ${px(p.continuation.takeProfit1, symbol)} / TP2 ${px(p.continuation.takeProfit2, symbol)} / TP3 ${px(p.continuation.takeProfit3, symbol)} (${p.continuation.targetLabel}) · <b>${p.continuation.riskRewardRatio}R</b></p>` : ''}
+    <p style="margin:8px 0 0;color:#64748b;font-size:12px">Wait for the confirmation candle before entering. Educational, not financial advice.</p>
+  </div>`;
+  return { subject: keyLevelProximitySubject(symbol, lv), text, html };
+}
+async function processKeyLevelProximityAlerts() {
+  const cfg = loadEmailAlertSettings().keyLevelProximityAlerts || {};
+  if (cfg.enabled !== true || !SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+  if (!liveSignalsAllowed()) return;                               // no alerts on stale/closed market
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  const wantSyms = new Set((cfg.symbols || []).map((s) => String(s).toUpperCase()));
+  const wantGroups = new Set(cfg.levelTypes || []);
+  const symbols = getCuratedSymbols(getMt5Status().symbols || []);
+  const now = Date.now();
+  const dayKey = new Date(now).toISOString().slice(0, 10);
+  for (const symbol of symbols) {
+    try {
+      const sym = String(symbol).toUpperCase();
+      if (wantSyms.size && !wantSyms.has(sym)) continue;
+      const view = buildKeyLevelProximity(symbol, cfg.sensitivity);
+      if (!view || view.feedState !== 'LIVE') continue;
+      for (const lv of view.levels) {
+        if (wantGroups.size && !wantGroups.has(lv.group)) continue;
+        // One email per level (rounded price) per tier per day. IMMINENT and APPROACHING
+        // are distinct events, so a level can ping once on approach and once at the level.
+        const deliverySignalId = `keylevel:${sym}:${lv.type}:${lmtRound5(lv.price)}:${lv.tier}:${dayKey}`;
+        if (keyLevelNotified.has(deliverySignalId)) continue;
+        const [prior] = await pool.query(
+          "SELECT id FROM mt5_delivery_logs WHERE signal_id=? AND status='Success' LIMIT 1",
+          [deliverySignalId],
+        );
+        if (prior.length) { keyLevelNotified.set(deliverySignalId, now); continue; }
+        const to = signalEmailToFor(sym, null);
+        if (!to) { keyLevelNotified.set(deliverySignalId, now); continue; }
+        const email = buildKeyLevelProximityEmail(sym, view, lv);
+        await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: deliverySignalId });
+        keyLevelNotified.set(deliverySignalId, now);
+        console.log(`[KeyLevel] Emailed ${sym} ${lv.tier} ${lv.label} (${lv.distancePips}p)`);
+      }
+    } catch (error) { console.error('[KeyLevel] alert failed:', error.message); }
+  }
+  for (const [k, at] of keyLevelNotified) {
+    if (now - at > 36 * 3600 * 1000) keyLevelNotified.delete(k);
+  }
+}
+
+// GET /api/key-level-proximity — all streamed symbols' approaching key levels + plans.
+app.get('/api/key-level-proximity', (req, res) => {
+  try {
+    const cfg = loadEmailAlertSettings().keyLevelProximityAlerts || {};
+    const sensitivity = req.query.sensitivity ? String(req.query.sensitivity).toUpperCase() : (cfg.sensitivity || 'NORMAL');
+    const symbols = getCuratedSymbols(getMt5Status().symbols || []);
+    const rows = [];
+    for (const s of symbols) {
+      try {
+        const view = buildKeyLevelProximity(s, sensitivity);
+        if (view && view.levels.length) rows.push(view);
+      } catch { /* per-symbol resilience */ }
+    }
+    rows.sort((a, b) => (a.nearest?.distanceAtr ?? 99) - (b.nearest?.distanceAtr ?? 99));
+    res.json({ sensitivity: String(sensitivity).toUpperCase(), generatedAt: new Date().toISOString(), symbols: rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Auto-trading endpoints (Step 1) ──
+// GET /api/auto-trade — live status: config, effective mode, bridge health, today's
+// count vs cap, and the recent decision log (shadow trades, cap alerts, guard skips).
+app.get('/api/auto-trade', async (req, res) => {
+  try {
+    const cfg = autoTradeConfig();
+    const pool = await initializeDatabase();
+    let todayCount = 0, decisions = [];
+    if (pool) {
+      todayCount = await autoTradesToday(pool);
+      const [rows] = await pool.query('SELECT * FROM mt5_auto_trades ORDER BY created_at DESC LIMIT 50');
+      decisions = rows.map((r) => ({
+        id: r.id, strategy: r.strategy, strategyName: STRATEGY_LAB_REGISTRY[r.strategy]?.name || r.strategy,
+        symbol: r.symbol, timeframe: r.timeframe, direction: r.direction, orderType: r.order_type,
+        entry: r.entry_price, stopLoss: r.stop_loss, takeProfit1: r.take_profit_1, takeProfit2: r.take_profit_2, takeProfit3: r.take_profit_3,
+        lots: r.lots, riskAmount: r.risk_amount, riskMode: r.risk_mode,
+        score: r.score, grade: r.grade, rr: r.rr, session: r.session,
+        mode: r.mode, status: r.status, reason: r.reason,
+        ticket: r.ticket, fillPrice: r.fill_price, closePrice: r.close_price, profit: r.profit,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        closedAt: r.closed_at ? new Date(r.closed_at).toISOString() : null,
+      }));
+    }
+    const reg = loadAutoTradeAccounts();
+    res.json({
+      config: cfg,
+      effectiveMode: autoTradeEffectiveMode(cfg),
+      bridgeReady: autoTradeBridgeReady(),
+      bridge: {
+        ready: autoTradeBridgeReady(),
+        lastSeenSec: tradeBridge.lastSeenAt ? Math.round((Date.now() - tradeBridge.lastSeenAt) / 1000) : null,
+        account: tradeBridge.account, broker: tradeBridge.broker, server: tradeBridge.server,
+        demo: tradeBridge.demo, balance: tradeBridge.balance, equity: tradeBridge.equity,
+        openPositions: tradeBridge.positions?.length || 0, openOrders: tradeBridge.orders?.length || 0,
+        armedMatch: autoTradeArmedMatch(),
+      },
+      accounts: Object.values(reg.accounts || {}),
+      armed: reg.armed,
+      todayCount, remainingToday: Math.max(0, cfg.maxTradesPerDay - todayCount),
+      session: strategyLabSession(new Date().toISOString()),
+      decisions,
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/auto-trade/validate — dry-run the execution settings against a REAL recent
+// signal (or a supplied sample) so the UI can show the exact warnings before saving.
+app.post('/api/auto-trade/validate', async (req, res) => {
+  try {
+    const cfg = { ...autoTradeConfig(), ...(req.body?.config && typeof req.body.config === 'object' ? req.body.config : {}) };
+    const pool = await initializeDatabase();
+    let sample = null, sampleSource = null;
+    // Prefer the most recent real signal from an allowed strategy — the warnings then
+    // reference the actual structural stop the engine chose.
+    if (pool) {
+      const ids = (cfg.strategies || []).length ? cfg.strategies : Object.keys(STRATEGY_LAB_REGISTRY);
+      const [rows] = await pool.query(
+        `SELECT * FROM mt5_strategy_signals WHERE strategy IN (${ids.map(() => '?').join(',')})
+           AND entry_price IS NOT NULL AND stop_loss IS NOT NULL AND take_profit_1 IS NOT NULL
+         ORDER BY signal_time DESC LIMIT 1`, ids,
+      );
+      if (rows.length) {
+        const r = rows[0];
+        sample = {
+          decision: r.direction, entry: Number(r.entry_price), stopLoss: Number(r.stop_loss),
+          takeProfit1: Number(r.take_profit_1), takeProfit2: r.take_profit_2 === null ? null : Number(r.take_profit_2),
+          takeProfit3: r.take_profit_3 === null ? null : Number(r.take_profit_3),
+          grade: r.grade, riskRewardRatio: Number(r.rr ?? r.risk_reward),
+        };
+        sampleSource = { strategy: r.strategy, strategyName: STRATEGY_LAB_REGISTRY[r.strategy]?.name || r.strategy, symbol: r.symbol, timeframe: r.timeframe, signalTime: r.signal_time ? new Date(r.signal_time).toISOString() : null };
+      }
+    }
+    if (!sample) return res.json({ ok: true, hasSample: false, note: 'No recent signal to validate against yet — checks will run when the first signal fires.' });
+
+    const symbol = sampleSource.symbol, tf = sampleSource.timeframe;
+    const ms = computeModeSizing(symbol, sample.entry, sample.stopLoss, { tp1: sample.takeProfit1, tp2: sample.takeProfit2, tp3: sample.takeProfit3 });
+    const leg = ms?.challenge || ms?.normal;
+    if (!leg) return res.json({ ok: true, hasSample: false, note: 'Could not size the sample signal.' });
+    const ticket = buildAutoTradeTicket({
+      symbol, timeframe: tf, sig: sample, cfg,
+      baseLots: leg.lots, baseRiskAmount: leg.riskAmount, riskRefBalance: leg.refBalance,
+    });
+    res.json({
+      ok: true, hasSample: true, sample: sampleSource,
+      strategyTicket: { entry: sample.entry, stopLoss: sample.stopLoss, takeProfit1: sample.takeProfit1, takeProfit3: sample.takeProfit3, lots: leg.lots, riskAmount: leg.riskAmount },
+      resultTicket: { entry: sample.entry, stopLoss: ticket.sl, takeProfit1: ticket.tp1, takeProfit2: ticket.tp2, takeProfit3: ticket.tp3, lots: ticket.lots, riskAmount: ticket.riskAmount, rr: ticket.rr, stopPips: ticket.stopPips },
+      mode: ticket.mode, changed: ticket.changed, errors: ticket.errors, warnings: ticket.warnings,
+      wouldTrade: ticket.errors.length === 0 && (ticket.mode === 'AUTO' || ticket.warnings.length === 0 || ticket.allowWarnedTrades),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/auto-trade/report?from=&to= — full auto-trade performance report:
+// summary, per-day (calendar), per-strategy/symbol/timeframe/session/direction/hour
+// breakdowns, and every trade with pips, R-multiple and duration. Read-only.
+app.get('/api/auto-trade/report', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from || '')) ? String(req.query.from) : null;
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to || '')) ? String(req.query.to) : null;
+    const where = ['1=1'];
+    const args = [];
+    if (from) { where.push('created_at >= ?'); args.push(`${from} 00:00:00`); }
+    if (to) { where.push('created_at < DATE_ADD(?, INTERVAL 1 DAY)'); args.push(`${to} 00:00:00`); }
+    const [rows] = await pool.query(`SELECT * FROM mt5_auto_trades WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 5000`, args);
+
+    const r2 = (v) => Math.round(Number(v) * 100) / 100;
+    // Realized trades only count toward P&L stats; everything else is lifecycle noise.
+    const isClosed = (t) => String(t.status) === 'CLOSED' && Number.isFinite(Number(t.profit));
+    const isOpen = (t) => ['FILLED', 'PLACED', 'SENT'].includes(String(t.status));
+
+    const trades = rows.map((t) => {
+      const pip = pipSizeForSymbol(t.symbol) || 0.0001;
+      const buy = /BUY/.test(String(t.direction).toUpperCase());
+      const entryUsed = Number.isFinite(Number(t.fill_price)) ? Number(t.fill_price) : Number(t.entry_price);
+      const closed = isClosed(t);
+      const pips = closed && Number.isFinite(Number(t.close_price)) && Number.isFinite(entryUsed)
+        ? r2(((Number(t.close_price) - entryUsed) / pip) * (buy ? 1 : -1)) : null;
+      const stopPips = Number.isFinite(entryUsed) && Number.isFinite(Number(t.stop_loss))
+        ? r2(Math.abs(entryUsed - Number(t.stop_loss)) / pip) : null;
+      const rMultiple = closed && Number.isFinite(Number(t.risk_amount)) && Number(t.risk_amount) > 0
+        ? r2(Number(t.profit) / Number(t.risk_amount)) : null;
+      const openedMs = t.sent_at ? new Date(t.sent_at).getTime() : (t.created_at ? new Date(t.created_at).getTime() : NaN);
+      const closedMs = t.closed_at ? new Date(t.closed_at).getTime() : NaN;
+      const durationMin = Number.isFinite(openedMs) && Number.isFinite(closedMs) ? Math.max(0, Math.round((closedMs - openedMs) / 60000)) : null;
+      return {
+        id: t.id, strategy: t.strategy, strategyName: STRATEGY_LAB_REGISTRY[t.strategy]?.name || t.strategy,
+        symbol: t.symbol, timeframe: t.timeframe, direction: t.direction, orderType: t.order_type,
+        entry: t.entry_price, fillPrice: t.fill_price, stopLoss: t.stop_loss,
+        takeProfit1: t.take_profit_1, takeProfit2: t.take_profit_2, takeProfit3: t.take_profit_3,
+        closePrice: t.close_price, lots: t.lots, riskAmount: t.risk_amount, riskMode: t.risk_mode,
+        score: t.score, grade: t.grade, rr: t.rr, session: t.session, mode: t.mode, status: t.status,
+        reason: t.reason, ticket: t.ticket, account: t.account,
+        profit: closed ? r2(t.profit) : null, pips, stopPips, rMultiple, durationMin,
+        createdAt: t.created_at ? new Date(t.created_at).toISOString() : null,
+        closedAt: t.closed_at ? new Date(t.closed_at).toISOString() : null,
+      };
+    });
+
+    const done = trades.filter((t) => t.profit !== null);
+    const wins = done.filter((t) => t.profit > 0);
+    const losses = done.filter((t) => t.profit < 0);
+    const breakeven = done.filter((t) => t.profit === 0);
+    const grossProfit = r2(wins.reduce((a, t) => a + t.profit, 0));
+    const grossLoss = r2(Math.abs(losses.reduce((a, t) => a + t.profit, 0)));
+    const netProfit = r2(grossProfit - grossLoss);
+    const totalPips = r2(done.reduce((a, t) => a + (t.pips ?? 0), 0));
+    const rVals = done.map((t) => t.rMultiple).filter((v) => Number.isFinite(v));
+
+    // Streaks over chronological order (rows come newest-first).
+    const chrono = [...done].reverse();
+    let maxWin = 0, maxLoss = 0, curWin = 0, curLoss = 0;
+    for (const t of chrono) {
+      if (t.profit > 0) { curWin += 1; curLoss = 0; maxWin = Math.max(maxWin, curWin); }
+      else if (t.profit < 0) { curLoss += 1; curWin = 0; maxLoss = Math.max(maxLoss, curLoss); }
+    }
+
+    // Per-day (calendar source) — keyed on the CLOSE date, since that's when P&L is realized.
+    const dayMap = new Map();
+    for (const t of done) {
+      const key = (t.closedAt || t.createdAt || '').slice(0, 10);
+      if (!key) continue;
+      const d = dayMap.get(key) || { date: key, trades: 0, wins: 0, losses: 0, profit: 0, pips: 0 };
+      d.trades += 1;
+      if (t.profit > 0) d.wins += 1; else if (t.profit < 0) d.losses += 1;
+      d.profit = r2(d.profit + t.profit);
+      d.pips = r2(d.pips + (t.pips ?? 0));
+      dayMap.set(key, d);
+    }
+    const byDay = [...dayMap.values()].sort((a, b) => a.date.localeCompare(b.date));
+    const profitDays = byDay.filter((d) => d.profit > 0).length;
+
+    const groupBy = (keyFn) => {
+      const m = new Map();
+      for (const t of done) {
+        const k = keyFn(t) || '—';
+        const g = m.get(k) || { key: k, trades: 0, wins: 0, losses: 0, profit: 0, pips: 0 };
+        g.trades += 1;
+        if (t.profit > 0) g.wins += 1; else if (t.profit < 0) g.losses += 1;
+        g.profit = r2(g.profit + t.profit);
+        g.pips = r2(g.pips + (t.pips ?? 0));
+        m.set(k, g);
+      }
+      return [...m.values()].map((g) => ({
+        ...g,
+        winRate: g.wins + g.losses ? Math.round((g.wins / (g.wins + g.losses)) * 1000) / 10 : null,
+      })).sort((a, b) => b.profit - a.profit);
+    };
+
+    res.json({
+      window: { from, to },
+      summary: {
+        totalRows: trades.length,
+        trades: done.length, wins: wins.length, losses: losses.length, breakeven: breakeven.length,
+        winRate: wins.length + losses.length ? Math.round((wins.length / (wins.length + losses.length)) * 1000) / 10 : null,
+        netProfit, grossProfit, grossLoss,
+        profitFactor: grossLoss > 0 ? Math.round((grossProfit / grossLoss) * 100) / 100 : (grossProfit > 0 ? null : 0),
+        totalPips, avgPips: done.length ? r2(totalPips / done.length) : null,
+        avgWin: wins.length ? r2(grossProfit / wins.length) : null,
+        avgLoss: losses.length ? r2(grossLoss / losses.length) : null,
+        expectancy: done.length ? r2(netProfit / done.length) : null,
+        avgR: rVals.length ? Math.round((rVals.reduce((a, v) => a + v, 0) / rVals.length) * 100) / 100 : null,
+        bestTrade: done.length ? r2(Math.max(...done.map((t) => t.profit))) : null,
+        worstTrade: done.length ? r2(Math.min(...done.map((t) => t.profit))) : null,
+        avgDurationMin: done.filter((t) => t.durationMin != null).length
+          ? Math.round(done.filter((t) => t.durationMin != null).reduce((a, t) => a + t.durationMin, 0) / done.filter((t) => t.durationMin != null).length) : null,
+        maxWinStreak: maxWin, maxLossStreak: maxLoss,
+        openTrades: trades.filter(isOpen).length,
+        pendingApproval: trades.filter((t) => t.status === 'PROPOSED').length,
+        errors: trades.filter((t) => t.status === 'ERROR').length,
+        shadowCount: trades.filter((t) => t.status === 'SHADOW').length,
+        tradingDays: byDay.length, profitDays,
+        bestDay: byDay.length ? byDay.reduce((a, b) => (b.profit > a.profit ? b : a)) : null,
+        worstDay: byDay.length ? byDay.reduce((a, b) => (b.profit < a.profit ? b : a)) : null,
+        avgPerDay: byDay.length ? r2(netProfit / byDay.length) : null,
+      },
+      byDay,
+      byStrategy: groupBy((t) => t.strategyName),
+      bySymbol: groupBy((t) => t.symbol),
+      byTimeframe: groupBy((t) => t.timeframe),
+      bySession: groupBy((t) => t.session),
+      byDirection: groupBy((t) => t.direction),
+      byGrade: groupBy((t) => t.grade),
+      byHour: groupBy((t) => (t.createdAt ? `${String((new Date(t.createdAt).getUTCHours() + 6) % 24).padStart(2, '0')}:00 BD` : '—')),
+      trades,
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Approve / reject a PROPOSED (ASK-mode) trade. Approval re-checks expiry, cap and
+// concurrency at click time — the market has moved since the email went out.
+app.post('/api/auto-trade/:id/approve', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE id=? AND status='PROPOSED' LIMIT 1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found or no longer awaiting approval' });
+    const row = rows[0];
+    if (row.expires_at && Date.now() > new Date(row.expires_at).getTime()) {
+      await pool.execute("UPDATE mt5_auto_trades SET status='EXPIRED', reason='approval window elapsed', updated_at=? WHERE id=?", [toMysqlDate(), row.id]);
+      return res.status(410).json({ error: 'approval window elapsed — the setup is stale' });
+    }
+    const cfg = autoTradeConfig();
+    const conc = autoTradeConcurrencyBlock(cfg, row.symbol);
+    if (conc) {
+      await pool.execute("UPDATE mt5_auto_trades SET status='GUARD_SKIP', reason=?, updated_at=? WHERE id=?", [conc.slice(0, 255), toMysqlDate(), row.id]);
+      return res.status(409).json({ error: conc });
+    }
+    await pool.execute(
+      "UPDATE mt5_auto_trades SET status='QUEUED', reason='approved — awaiting EA pickup', expires_at=?, updated_at=? WHERE id=? AND status='PROPOSED'",
+      [toMysqlDate(new Date(Date.now() + 5 * 60 * 1000)), toMysqlDate(), row.id],
+    );
+    res.json({ ok: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+app.post('/api/auto-trade/:id/reject', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const [r] = await pool.execute("UPDATE mt5_auto_trades SET status='REJECTED', reason='rejected by user', updated_at=? WHERE id=? AND status IN ('PROPOSED','QUEUED')", [toMysqlDate(), req.params.id]);
+    res.json({ ok: r.affectedRows === 1 });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Broker switcher: arm ONE detected account for trading (or disarm with account:null).
+// Commands only dispatch while the EA-reported login matches the armed login.
+app.post('/api/auto-trade/arm', (req, res) => {
+  try {
+    const reg = loadAutoTradeAccounts();
+    const account = req.body?.account === null || req.body?.account === '' ? null : String(req.body?.account || '').trim();
+    if (account && !reg.accounts[account]) return res.status(404).json({ error: `account ${account} has not been detected from the EA yet` });
+    reg.armed = account;
+    saveAutoTradeAccounts(reg);
+    res.json({ ok: true, armed: reg.armed });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// ── EA trade bridge ──────────────────────────────────────────────────────────
+// POST /api/mt5/trade-bridge — the EA polls here every few seconds with its live
+// account + magic-filtered positions/orders. The response is PLAIN TEXT (trivial to
+// parse in MQL5): one `CMD|id|symbol|dir|type|lots|sl|tp|entry|expiresMs` per line.
+app.post('/api/mt5/trade-bridge', async (req, res) => {
+  try {
+    const b = req.body || {};
+    tradeBridge.lastSeenAt = Date.now();
+    tradeBridge.account = b.account != null ? String(b.account) : tradeBridge.account;
+    tradeBridge.broker = b.broker || tradeBridge.broker;
+    tradeBridge.server = b.server || tradeBridge.server;
+    tradeBridge.demo = b.demo === true || b.demo === 'true' || b.demo === 1;
+    tradeBridge.balance = Number.isFinite(Number(b.balance)) ? Number(b.balance) : tradeBridge.balance;
+    tradeBridge.equity = Number.isFinite(Number(b.equity)) ? Number(b.equity) : tradeBridge.equity;
+    tradeBridge.positions = Array.isArray(b.positions) ? b.positions : [];
+    tradeBridge.orders = Array.isArray(b.orders) ? b.orders : [];
+    registerBridgeAccount(b);
+
+    const pool = await initializeDatabase();
+    const lines = ['OK'];
+    if (pool) {
+      // Reconcile PLACED pendings against the EA's live report: order filled → FILLED;
+      // order vanished without a position → expired/cancelled at the broker.
+      const [placed] = await pool.query("SELECT * FROM mt5_auto_trades WHERE status='PLACED' AND ticket IS NOT NULL LIMIT 50");
+      for (const row of placed) {
+        const t = Number(row.ticket);
+        const pos = tradeBridge.positions.find((p) => Number(p.id) === t || Number(p.ticket) === t);
+        const stillPending = tradeBridge.orders.some((o) => Number(o.ticket) === t);
+        if (pos) {
+          await pool.execute("UPDATE mt5_auto_trades SET status='FILLED', position_id=?, fill_price=COALESCE(fill_price, ?), updated_at=? WHERE id=?",
+            [Number(pos.id) || t, Number(pos.openPrice) || null, toMysqlDate(), row.id]);
+          void autoTradeLifecycleEmail(row, 'FILLED', { price: Number(pos.openPrice) || row.entry_price });
+        } else if (!stillPending) {
+          await pool.execute("UPDATE mt5_auto_trades SET status='EXPIRED', reason='pending order expired/cancelled at broker', updated_at=? WHERE id=?", [toMysqlDate(), row.id]);
+        }
+      }
+      // Expire overdue PROPOSED/QUEUED.
+      await pool.execute("UPDATE mt5_auto_trades SET status='EXPIRED', reason=CONCAT('window elapsed (was ', status, ')'), updated_at=? WHERE status IN ('PROPOSED','QUEUED') AND expires_at IS NOT NULL AND expires_at < UTC_TIMESTAMP()", [toMysqlDate()]);
+      // Dead-letter SENT commands the EA never answered (crash between pickup & result).
+      await pool.execute("UPDATE mt5_auto_trades SET status='ERROR', reason='EA picked the command up but never reported a result', updated_at=? WHERE status='SENT' AND sent_at IS NOT NULL AND sent_at < UTC_TIMESTAMP() - INTERVAL 3 MINUTE", [toMysqlDate()]);
+
+      // Dispatch: only with the armed-account interlock satisfied and ASK/AUTO active.
+      const cfg = autoTradeConfig();
+      const live = autoTradeEffectiveMode(cfg);
+      if ((live === 'ASK' || live === 'AUTO') && autoTradeArmedMatch()) {
+        const [queued] = await pool.query("SELECT * FROM mt5_auto_trades WHERE status='QUEUED' AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) ORDER BY created_at ASC LIMIT 3");
+        for (const row of queued) {
+          const conc = autoTradeConcurrencyBlock(cfg, row.symbol);
+          if (conc) { await pool.execute("UPDATE mt5_auto_trades SET status='GUARD_SKIP', reason=?, updated_at=? WHERE id=?", [conc.slice(0, 255), toMysqlDate(), row.id]); continue; }
+          await pool.execute("UPDATE mt5_auto_trades SET status='SENT', sent_at=?, account=?, updated_at=? WHERE id=? AND status='QUEUED'", [toMysqlDate(), tradeBridge.account, toMysqlDate(), row.id]);
+          const expMs = row.expires_at ? new Date(row.expires_at).getTime() : Date.now() + 5 * 60 * 1000;
+          lines.push(['CMD', row.id, row.symbol, row.direction, row.order_type, row.lots, row.stop_loss ?? 0, row.take_profit_1 ?? 0, row.entry_price ?? 0, expMs].join('|'));
+        }
+      }
+    }
+    res.type('text/plain').send(lines.join('\n'));
+  } catch (error) {
+    res.status(500).type('text/plain').send(`ERR|${error.message}`);
+  }
+});
+
+// Lifecycle emails for real executions. Fire-and-forget; failures only log.
+async function autoTradeLifecycleEmail(row, phase, extra = {}) {
+  try {
+    if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+    const to = signalEmailToFor(row.symbol, row.timeframe);
+    if (!to) return;
+    const strategyName = STRATEGY_LAB_REGISTRY[row.strategy]?.name || row.strategy;
+    const base = `${row.direction} ${row.symbol} ${row.timeframe} · ${row.lots} lots · SL ${px(row.stop_loss, row.symbol)} · TP ${px(row.take_profit_1, row.symbol)}`;
+    let subject, bodyLines;
+    if (phase === 'PLACED') {
+      subject = `[AUTO-TRADE ✅ ORDER PLACED] ${row.direction} ${row.symbol} ${row.timeframe} @ ${px(row.entry_price, row.symbol)} | ${strategyName}`;
+      bodyLines = [`A ${row.order_type} order was placed on MT5 (ticket ${extra.ticket ?? row.ticket ?? '?'}):`, base, `Waiting for price to reach the entry. Expires with the trade window.`];
+    } else if (phase === 'FILLED') {
+      subject = `[AUTO-TRADE ✅ TRADE OPEN] ${row.direction} ${row.symbol} ${row.timeframe} @ ${px(extra.price ?? row.fill_price ?? row.entry_price, row.symbol)} | ${strategyName}`;
+      bodyLines = [`The trade is OPEN on MT5 (ticket ${extra.ticket ?? row.ticket ?? row.position_id ?? '?'}):`, base, `Risk ${px2(row.risk_amount)} (${row.risk_mode}). You'll get the result email when it closes.`];
+    } else if (phase === 'CLOSED') {
+      const won = Number(extra.profit) >= 0;
+      subject = `[AUTO-TRADE ${won ? '🏆 WIN' : '🔻 LOSS'} ${px2(extra.profit)}] ${row.direction} ${row.symbol} ${row.timeframe} | ${strategyName}`;
+      bodyLines = [`The trade closed at ${px(extra.closePrice, row.symbol)} for ${won ? 'a profit' : 'a loss'} of ${px2(extra.profit)}.`, base, row.risk_mode === 'CHALLENGE' ? 'Result was logged into the Challenge Tracker automatically.' : ''];
+    } else if (phase === 'ERROR') {
+      subject = `[AUTO-TRADE ⚠ FAILED] ${row.direction} ${row.symbol} ${row.timeframe} | ${strategyName}`;
+      bodyLines = [`MT5 rejected the order: ${extra.message || 'unknown error'} (retcode ${extra.retcode ?? '?'})`, base, 'No position was opened. Check the terminal (AutoTrading enabled? margin? symbol visible?).'];
+    } else return;
+    const text = [...bodyLines.filter(Boolean), '', `Strategy: ${strategyName} · score ${row.score} (${row.grade}) · account ${row.account || tradeBridge.account || '?'}`, 'Auto Trading page has the full log. Not financial advice.'].join('\n');
+    await sendNotificationEmail({ to, subject: subject.slice(0, 180), text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: `${row.id}:${phase}` });
+    console.log(`[AutoTrade] ${phase} email ${row.symbol} ${row.timeframe}`);
+  } catch (e) { console.error('[AutoTrade] lifecycle email failed:', e.message); }
+}
+
+// POST /api/mt5/trade-result — the EA's execution report for one command.
+app.post('/api/mt5/trade-result', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE id=? LIMIT 1", [String(b.id || '')]);
+    if (!rows.length) return res.status(404).json({ error: 'unknown command id' });
+    const row = rows[0];
+    const ok = b.ok === true || b.ok === 'true' || b.ok === 1;
+    if (!ok) {
+      await pool.execute("UPDATE mt5_auto_trades SET status='ERROR', reason=?, updated_at=? WHERE id=?",
+        [`MT5 error ${b.retcode ?? '?'}: ${String(b.message || '').slice(0, 200)}`, toMysqlDate(), row.id]);
+      void autoTradeLifecycleEmail(row, 'ERROR', { retcode: b.retcode, message: b.message });
+      return res.json({ ok: true });
+    }
+    const ticket = Number(b.ticket) || null;
+    const price = Number(b.price) || null;
+    if (String(row.order_type).toUpperCase() === 'MARKET') {
+      await pool.execute("UPDATE mt5_auto_trades SET status='FILLED', ticket=?, position_id=?, fill_price=?, updated_at=? WHERE id=?",
+        [ticket, ticket, price, toMysqlDate(), row.id]);
+      void autoTradeLifecycleEmail({ ...row, ticket }, 'FILLED', { ticket, price });
+    } else {
+      await pool.execute("UPDATE mt5_auto_trades SET status='PLACED', ticket=?, updated_at=? WHERE id=?", [ticket, toMysqlDate(), row.id]);
+      void autoTradeLifecycleEmail({ ...row, ticket }, 'PLACED', { ticket });
+    }
+    res.json({ ok: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/mt5/trade-closed — the EA detected one of our positions closed; it looks up
+// the deal history and reports the realized P&L. Feeds the result email + challenge tracker.
+app.post('/api/mt5/trade-closed', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const posId = Number(b.positionId);
+    if (!Number.isFinite(posId)) return res.status(400).json({ error: 'positionId required' });
+    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE (position_id=? OR ticket=?) AND status IN ('FILLED','PLACED','SENT') LIMIT 1", [posId, posId]);
+    if (!rows.length) return res.json({ ok: true, matched: false });
+    const row = rows[0];
+    const profit = Number(b.profit);
+    const closePrice = Number(b.closePrice) || null;
+    await pool.execute("UPDATE mt5_auto_trades SET status='CLOSED', profit=?, close_price=?, closed_at=?, updated_at=? WHERE id=?",
+      [Number.isFinite(profit) ? profit : null, closePrice, toMysqlDate(), toMysqlDate(), row.id]);
+    if (Number.isFinite(profit) && String(row.risk_mode).toUpperCase() === 'CHALLENGE') {
+      applyChallengeTradeResult(profit, `auto-trade ${row.direction} ${row.symbol} ${row.timeframe}`);
+    }
+    void autoTradeLifecycleEmail(row, 'CLOSED', { profit, closePrice });
+    res.json({ ok: true, matched: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// ── Challenge sim-tracker (Phase 2) endpoints ──
+// GET the live dashboard (progress + distance to every rule line).
+app.get('/api/challenge', (req, res) => {
+  try { res.json(computeChallengeDashboard()); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+// Log a trade result you took (P&L in USD, + for win / − for loss). Updates the running
+// simulated balance, today's P&L and the per-day totals (for consistency + trading days).
+app.post('/api/challenge/trade', (req, res) => {
+  try {
+    const pnl = Number(req.body?.pnl);
+    if (!Number.isFinite(pnl)) return res.status(400).json({ error: 'pnl (number) required' });
+    const note = String(req.body?.note || '').slice(0, 120);
+    const state = rolloverChallengeState(loadChallengeState());
+    state.currentBalance = Math.round((Number(state.currentBalance) + pnl) * 100) / 100;
+    state.peakBalance = Math.max(Number(state.peakBalance) || 0, state.currentBalance);
+    state.dayPnl = state.dayPnl || {};
+    state.dayPnl[state.currentDay] = Math.round(((Number(state.dayPnl[state.currentDay]) || 0) + pnl) * 100) / 100;
+    state.tradeLog = [...(state.tradeLog || []), { ts: new Date().toISOString(), pnl: Math.round(pnl * 100) / 100, note, balanceAfter: state.currentBalance }].slice(-200);
+    saveChallengeState(state);
+    res.json(computeChallengeDashboard());
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+// Manually correct the current balance to match your real account (the honest override).
+app.post('/api/challenge/balance', (req, res) => {
+  try {
+    const balance = Number(req.body?.balance);
+    if (!Number.isFinite(balance) || balance <= 0) return res.status(400).json({ error: 'balance (positive number) required' });
+    const state = rolloverChallengeState(loadChallengeState());
+    const prev = Number(state.currentBalance);
+    state.currentBalance = Math.round(balance * 100) / 100;
+    state.peakBalance = Math.max(Number(state.peakBalance) || 0, state.currentBalance);
+    state.tradeLog = [...(state.tradeLog || []), { ts: new Date().toISOString(), pnl: Math.round((state.currentBalance - prev) * 100) / 100, note: 'manual balance correction', balanceAfter: state.currentBalance }].slice(-200);
+    saveChallengeState(state);
+    res.json(computeChallengeDashboard());
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+// Start a fresh challenge from the configured (or supplied) initial balance.
+app.post('/api/challenge/reset', (req, res) => {
+  try {
+    const initialBalance = Number(req.body?.initialBalance);
+    saveChallengeState(freshChallengeState(Number.isFinite(initialBalance) && initialBalance > 0 ? initialBalance : undefined));
+    res.json(computeChallengeDashboard());
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/executed-orders — the user's tracked pending orders, live. (Own path:
+// /api/signal-tracker/:id is registered earlier and would swallow "executed".)
+app.get('/api/executed-orders', async (req, res) => {
+  try {
+    const view = await buildExecutedOrdersView();
+    res.json({ ...view, items: view.items.map(({ _nearNow, _weakNow, ...it }) => it) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/signal-tracker/:id/track — user placed this signal as a pending order.
+app.post('/api/signal-tracker/:id/track', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'Database unavailable.' });
+    const id = String(req.params.id || '').slice(0, 191);
+    if (!id) return res.status(400).json({ error: 'Missing id.' });
+    const source = String(req.query.source || req.body?.source || 'strategy-lab').slice(0, 24);
+    await pool.execute(
+      "INSERT INTO mt5_tracked_orders (id, source, tracked_at, status) VALUES (?,?,?, 'ACTIVE') ON DUPLICATE KEY UPDATE status='ACTIVE', tracked_at=VALUES(tracked_at)",
+      [id, source, toMysqlDate(new Date())],
+    );
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/signal-tracker/:id/untrack — remove from Executed Orders.
+app.post('/api/signal-tracker/:id/untrack', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'Database unavailable.' });
+    const id = String(req.params.id || '').slice(0, 191);
+    await pool.execute("UPDATE mt5_tracked_orders SET status='DONE' WHERE id=?", [id]);
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── System Signal Log (Phase: executable-signal record) ──────────────────────
 // Persist every NEW executable A/A+ forex setup the scanner finds, deduped to one
@@ -11120,6 +12297,112 @@ function lmtVerdict({ fresh, marketOpen, desk, obAnalysis, pressure }) {
   return { verdict, canEnter: verdict === 'ARMED_IF_CONFIRMED', direction: dir, checklist, reasons };
 }
 
+// ─── Key-level proximity: is price approaching an obvious liquidity level? ──────
+// The trigger band is a fraction of H1 ATR (volatility-adaptive), so "close" means the
+// same thing on gold, FX majors, and indices — and it widens on a fast day, tightens on
+// a quiet one. Two tiers: an early APPROACHING heads-up, then an IMMINENT ping at the
+// level. Only the obvious pools (strength ≥ 4: PDH/PDL + session highs/lows).
+const KEY_LEVEL_SENSITIVITY = {
+  TIGHT: { approach: 0.6, imminent: 0.25 },
+  NORMAL: { approach: 0.8, imminent: 0.3 },
+  WIDE: { approach: 1.2, imminent: 0.45 },
+};
+// Which controller group a raw level type belongs to (for the symbol/level filters).
+function keyLevelGroup(type) {
+  const t = String(type || '').toUpperCase();
+  if (t === 'PDH' || t === 'PDL') return 'PDH_PDL';
+  if (t.startsWith('ASIAN_')) return 'ASIAN';
+  if (t.startsWith('LONDON_')) return 'LONDON';
+  if (t.startsWith('NY_')) return 'NY';
+  return null;                                   // rounds / swings — not part of this alert
+}
+
+// Conditional two-plan read for a level price is approaching (the LIL SWEEP-PRO+ playbook):
+// the level is both a magnet and a reaction zone. Primary = FADE on a sweep-and-reject back
+// off the level; alternative = CONTINUATION on a break-and-hold through it. Real entry/SL/TP
+// off the current liquidity map; null plan when there's no unswept target with positive RR.
+function keyLevelProximityPlan(level, price, atr, keyLevels, symbol) {
+  if (!Number.isFinite(atr) || atr <= 0) return null;
+  const lvl = Number(level.price);
+  const above = level.side === 'above';
+  const buf = 0.4 * atr;                          // stop buffer beyond the level
+  const brk = 0.2 * atr;                          // break-trigger distance through the level
+  const pip = pipSizeForSymbol(symbol) || 0.0001;
+  const ladder = (dir, entry, stop, targetPool) => {
+    const risk = Math.abs(entry - stop);
+    if (!(risk > 0) || !targetPool) return null;
+    const target = Number(targetPool.price);
+    const reward = dir === 'BUY' ? target - entry : entry - target;
+    if (!(reward > 0)) return null;
+    const rr = reward / risk;
+    if (!(rr >= 1.5)) return null;                // don't suggest a sub-1.5R chase
+    const tp = (mult) => dir === 'BUY' ? entry + mult * risk : entry - mult * risk;
+    return {
+      direction: dir, entry: lmtRound5(entry), stopLoss: lmtRound5(stop),
+      takeProfit1: lmtRound5(tp(1)), takeProfit2: lmtRound5(tp(2)), takeProfit3: lmtRound5(target),
+      riskRewardRatio: Math.round(rr * 100) / 100,
+      targetLabel: targetPool.label || targetPool.type,
+      stopPips: Math.round((risk / pip) * 10) / 10,
+    };
+  };
+  // FADE: reject off the level back toward the opposing pool.
+  const fade = above
+    ? ladder('SELL', lvl, lvl + buf, (keyLevels.targetCandidatesBelow || []).find((p) => Number(p.price) < lvl))
+    : ladder('BUY', lvl, lvl - buf, (keyLevels.targetCandidatesAbove || []).find((p) => Number(p.price) > lvl));
+  // CONTINUATION: break-and-hold through the level toward the next pool beyond it.
+  const cont = above
+    ? ladder('BUY', lvl + brk, lvl - buf, (keyLevels.targetCandidatesAbove || []).find((p) => Number(p.price) > lvl + brk))
+    : ladder('SELL', lvl - brk, lvl + buf, (keyLevels.targetCandidatesBelow || []).find((p) => Number(p.price) < lvl - brk));
+  if (!fade && !cont) return null;
+  return { fade, continuation: cont };
+}
+
+// One symbol's approaching key levels (strength ≥ 4), each with its tier + two-plan read.
+function buildKeyLevelProximity(symbol, sensitivity = 'NORMAL') {
+  const raw = getRecentCandles(symbol, 'M15', 260);
+  if (!raw || raw.length < 40) return null;
+  const analysis = closedBarsOnly(raw, 'M15');
+  if (!analysis || analysis.length < 40) return null;
+  const price = Number(raw[raw.length - 1].close);
+  if (!Number.isFinite(price)) return null;
+  const fresh = candleFreshness(raw[raw.length - 1], 'M15');
+  const marketOpen = liveSignalsAllowed();
+  // H1 ATR is the volatility yardstick; fall back to a scaled M15 ATR if H1 is thin.
+  const h1 = getRecentCandles(symbol, 'H1', 80);
+  const yardAtr = (h1 && h1.length >= 20 ? lmtAtr14(closedBarsOnly(h1, 'H1')) : null) || (lmtAtr14(analysis) * 2) || 0;
+  const stopAtr = lmtAtr14(analysis) || yardAtr / 2;
+  if (!(yardAtr > 0)) return null;
+  const band = KEY_LEVEL_SENSITIVITY[String(sensitivity).toUpperCase()] || KEY_LEVEL_SENSITIVITY.NORMAL;
+  const keyLevels = detectKeyLiquidityLevels(analysis, { symbol, dailyCandles: getRecentCandles(symbol, 'D1', 8) });
+  const pip = pipSizeForSymbol(symbol) || 0.0001;
+
+  const near = [];
+  for (const lv of keyLevels.levels || []) {
+    const group = keyLevelGroup(lv.type);
+    if (!group || Number(lv.strength) < 4 || lv.swept) continue;   // obvious, still-unswept pools only
+    const distAtr = Math.abs(Number(lv.price) - price) / yardAtr;
+    const tier = distAtr <= band.imminent ? 'IMMINENT' : distAtr <= band.approach ? 'APPROACHING' : null;
+    if (!tier) continue;
+    near.push({
+      type: lv.type, group, label: lv.label, side: lv.side, price: lv.price,
+      strength: lv.strength,
+      distancePips: Math.round((Math.abs(Number(lv.price) - price) / pip) * 10) / 10,
+      distanceAtr: Math.round(distAtr * 100) / 100,
+      tier,
+      plan: keyLevelProximityPlan(lv, price, stopAtr, keyLevels, symbol),
+    });
+  }
+  near.sort((a, b) => a.distanceAtr - b.distanceAtr);
+  return {
+    symbol, price: lmtRound5(price), atr: lmtRound5(yardAtr),
+    feedState: !marketOpen ? 'MARKET_CLOSED' : fresh.dataFresh ? 'LIVE' : 'STALE',
+    dataFresh: fresh.dataFresh, staleSeconds: fresh.staleSeconds,
+    sensitivity: String(sensitivity).toUpperCase(),
+    levels: near,
+    nearest: near[0] || null,
+  };
+}
+
 function buildLiveMarketTracker(symbol, tf) {
   const candles = getRecentCandles(symbol, tf, 250);
   if (!candles || candles.length < 30) return null;
@@ -11283,6 +12566,520 @@ function strategyLabSizing(symbol, entry, stop, targets = {}) {
     lossAtStop: Math.round(stopPips * pipValue * lots * 100) / 100,
     profitAtTp1: profitAt(targets.tp1), profitAtTp2: profitAt(targets.tp2), profitAtTp3: profitAt(targets.tp3),
   };
+}
+
+// Mode-aware position sizing off the USER's configured account balance (default $5000)
+// and the selected mode(s). NORMAL = normalRiskPct of balance. CHALLENGE = riskPerTradePct
+// of the challenge initial balance (Hola-style conservative default 0.5%). BOTH = both legs.
+// Pure sizing math — never gates a signal. Educational, not financial advice.
+function computeModeSizing(symbol, entry, stop, targets = {}) {
+  const e = Number(entry), s = Number(stop);
+  if (!Number.isFinite(e) || !Number.isFinite(s) || e === s) return null;
+  const pipSize = forexSizingPipSize(symbol);
+  const pipValue = forexSizingPipValuePerLot(symbol);
+  const stopPips = Math.round((Math.abs(e - s) / pipSize) * 10) / 10;
+  if (!(stopPips > 0) || !(pipValue > 0)) return null;
+  const cfg = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+  const mode = ['NORMAL', 'CHALLENGE', 'BOTH'].includes(String(cfg.mode).toUpperCase()) ? String(cfg.mode).toUpperCase() : 'NORMAL';
+  const balance = finitePositive(cfg.balance) ?? 5000;
+  const leg = (riskPct, refBalance) => {
+    const riskAmount = Math.round(refBalance * (riskPct / 100) * 100) / 100;
+    const lots = Math.max(0.01, Math.round((riskAmount / (stopPips * pipValue)) * 100) / 100);
+    const profitAt = (tp) => { const t = Number(tp); return Number.isFinite(t) ? Math.round((Math.abs(t - e) / pipSize) * pipValue * lots * 100) / 100 : null; };
+    return {
+      riskPct, refBalance, riskAmount, lots, stopPips, pipValuePerLot: pipValue,
+      lossAtStop: Math.round(stopPips * pipValue * lots * 100) / 100,
+      profitAtTp1: profitAt(targets.tp1), profitAtTp2: profitAt(targets.tp2), profitAtTp3: profitAt(targets.tp3),
+    };
+  };
+  const out = { mode, balance };
+  if (mode === 'NORMAL' || mode === 'BOTH') out.normal = leg(finitePositive(cfg.normalRiskPct) ?? 1, balance);
+  if (mode === 'CHALLENGE' || mode === 'BOTH') {
+    const ch = cfg.challenge || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk.challenge;
+    out.challenge = leg(finitePositive(ch.riskPerTradePct) ?? 0.5, finitePositive(ch.initialBalance) ?? balance);
+    out.challengeRules = ch;
+  }
+  return out;
+}
+function modeLabel(mode) {
+  return mode === 'CHALLENGE' ? 'CHALLENGE' : mode === 'BOTH' ? 'NORMAL+CHALLENGE' : 'NORMAL';
+}
+// Email fragments (subject tag + text lines + html block) describing the sizing for the
+// active mode(s). Returns null when no valid sizing (falls back to the legacy volume line).
+function modeSizingEmailParts(ms, symbol, sig = {}) {
+  if (!ms) return null;
+  const rows = [];
+  const textLines = [];
+  if (ms.normal) {
+    const n = ms.normal;
+    textLines.push(`Position size — NORMAL: ${n.lots} lots (${n.riskPct}% of ${px2(ms.balance)} = ${px2(n.riskAmount)} risk · ${n.stopPips} pip stop · max loss ${px2(n.lossAtStop)})`);
+    rows.push(`<tr><td style="padding:2px 10px 2px 0;color:#64748b">Size · <b>NORMAL</b></td><td><b>${n.lots} lots</b> <span style="color:#94a3b8">${n.riskPct}% of ${px2(ms.balance)} = ${px2(n.riskAmount)} · max loss ${px2(n.lossAtStop)}</span></td></tr>`);
+  }
+  let challengeEligible = true;
+  if (ms.challenge) {
+    const c = ms.challenge, r = ms.challengeRules || {};
+    // Phase 2 live guard: check this trade against the running challenge rule lines.
+    const guard = challengeSignalGuard(c.lossAtStop, sig.grade, sig.riskRewardRatio);
+    challengeEligible = guard.eligible;
+    const verdict = !guard.eligible ? '⛔ SKIP for challenge' : guard.warnings.length ? '⚠ caution' : '✅ within challenge rules';
+    textLines.push(`Position size — CHALLENGE (${r.preset || 'prop'} ${r.phase || ''}): ${c.lots} lots (${c.riskPct}% of ${px2(c.refBalance)} = ${px2(c.riskAmount)} risk · max loss ${px2(c.lossAtStop)}) — ${verdict}`);
+    textLines.push(`  Rules: target ${r.profitTargetPct}% · daily loss ${r.dailyLossPct}% · max DD ${r.maxDrawdownPct}% ${r.drawdownType} · per-trade cap ${r.maxRiskPerTradePct}% · min ${r.minTradingDays} days`);
+    textLines.push(`  Challenge account: ${px2(guard.roomToDailyLoss)} daily-loss room · ${px2(guard.roomToMaxDrawdown)} drawdown room · safe risk ${px2(guard.safePerTradeRisk)}`);
+    if (guard.warnings.length) textLines.push(`  ⚠ ${guard.warnings.join('; ')}`);
+    const verdictColor = !guard.eligible ? '#b91c1c' : guard.warnings.length ? '#b45309' : '#047857';
+    rows.push(`<tr><td style="padding:2px 10px 2px 0;color:#64748b">Size · <b>CHALLENGE</b></td><td><b>${c.lots} lots</b> <span style="color:#94a3b8">${c.riskPct}% of ${px2(c.refBalance)} = ${px2(c.riskAmount)} · max loss ${px2(c.lossAtStop)}</span> <b style="color:${verdictColor}">${verdict}</b></td></tr>`);
+    rows.push(`<tr><td style="padding:2px 10px 2px 0;color:#64748b">Challenge room</td><td style="font-size:11px;color:#94a3b8">daily-loss ${px2(guard.roomToDailyLoss)} · drawdown ${px2(guard.roomToMaxDrawdown)} · safe risk ${px2(guard.safePerTradeRisk)}${guard.warnings.length ? ` · <span style="color:${verdictColor}">${guard.warnings.join('; ')}</span>` : ''}</td></tr>`);
+    rows.push(`<tr><td style="padding:2px 10px 2px 0;color:#64748b">Prop rules</td><td style="font-size:11px;color:#94a3b8">${r.preset || 'prop'} ${r.phase || ''} · target ${r.profitTargetPct}% · daily ${r.dailyLossPct}% · DD ${r.maxDrawdownPct}% ${r.drawdownType} · cap ${r.maxRiskPerTradePct}% · ${r.minTradingDays}d</td></tr>`);
+  }
+  return { subjectTag: modeLabel(ms.mode), textLines, htmlRows: rows.join(''), challengeEligible };
+}
+
+// ─── Challenge sim-tracker (Phase 2): a running SIMULATED prop-challenge account ──────
+// Not connected to the real broker/prop account — it accumulates the trade results YOU log
+// (and lets you correct the balance anytime), then computes live distance to every Hola-style
+// rule line. Educational risk tracking, not financial advice.
+const CHALLENGE_STATE_FILE = path.join(__dirname, '.cache', 'challenge_state.json');
+let challengeStateCache = null;
+function challengeRules() {
+  const cfg = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+  return { ...DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk.challenge, ...(cfg.challenge || {}) };
+}
+function freshChallengeState(initialBalance) {
+  const bal = finitePositive(initialBalance) ?? finitePositive(challengeRules().initialBalance) ?? 5000;
+  return {
+    startedAt: new Date().toISOString(),
+    initialBalance: bal, currentBalance: bal, dayStartBalance: bal, peakBalance: bal,
+    currentDay: new Date().toISOString().slice(0, 10),
+    dayPnl: {},                 // { 'YYYY-MM-DD': netPnlThatDay }
+    tradeLog: [],               // [{ ts, pnl, note, balanceAfter }]
+  };
+}
+function loadChallengeState() {
+  if (challengeStateCache) return challengeStateCache;
+  try {
+    if (fs.existsSync(CHALLENGE_STATE_FILE)) {
+      challengeStateCache = { ...freshChallengeState(), ...(JSON.parse(fs.readFileSync(CHALLENGE_STATE_FILE, 'utf8')) || {}) };
+      return challengeStateCache;
+    }
+  } catch { /* fall through to fresh */ }
+  challengeStateCache = freshChallengeState();
+  return challengeStateCache;
+}
+function saveChallengeState(state) {
+  challengeStateCache = state;
+  try { fs.mkdirSync(path.dirname(CHALLENGE_STATE_FILE), { recursive: true }); fs.writeFileSync(CHALLENGE_STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.error('[Challenge] save failed:', e.message); }
+}
+// Daily rollover: at each new UTC day the daily-loss reference resets to the new day's
+// opening balance (Hola: "3% of previous day's closing balance").
+function rolloverChallengeState(state) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (state.currentDay !== today) {
+    state.dayStartBalance = state.currentBalance;
+    state.currentDay = today;
+    saveChallengeState(state);
+  }
+  return state;
+}
+function computeChallengeDashboard() {
+  const state = rolloverChallengeState(loadChallengeState());
+  const r = challengeRules();
+  const initial = finitePositive(state.initialBalance) ?? finitePositive(r.initialBalance) ?? 5000;
+  const current = Number(state.currentBalance);
+  const dayStart = Number(state.dayStartBalance);
+  const peak = Math.max(Number(state.peakBalance) || current, current);
+  const target = initial * (1 + r.profitTargetPct / 100);
+  const dailyFloor = dayStart * (1 - r.dailyLossPct / 100);
+  const ddFloor = r.drawdownType === 'TRAILING' ? peak * (1 - r.maxDrawdownPct / 100) : initial * (1 - r.maxDrawdownPct / 100);
+  const totalProfit = current - initial;
+  const todayPnl = Number(state.dayPnl?.[state.currentDay] || 0);
+  const tradingDays = Object.keys(state.dayPnl || {}).filter((d) => Number(state.dayPnl[d]) !== 0).length;
+  const largestWinDay = Math.max(0, ...Object.values(state.dayPnl || {}).map(Number).filter((v) => v > 0));
+  const consistencyUsedPct = totalProfit > 0 ? Math.round((largestWinDay / totalProfit) * 1000) / 10 : 0;
+  const consistencyOk = !(r.consistencyPct > 0) || consistencyUsedPct <= r.consistencyPct;
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const roomDaily = r2(current - dailyFloor);
+  const roomDD = r2(current - ddFloor);
+  const buffer = initial * 0.005;                       // 0.5% "getting close" cushion
+  let status = 'IN_PROGRESS';
+  if (current <= ddFloor) status = 'BREACH_MAX_DD';
+  else if (current <= dailyFloor) status = 'BREACH_DAILY';
+  else if (current >= target && tradingDays >= r.minTradingDays && consistencyOk) status = 'TARGET_MET';
+  else if (roomDaily <= buffer || roomDD <= buffer) status = 'AT_RISK';
+  // Largest loss (per trade) that keeps you safely inside both floors this instant.
+  const safePerTradeRisk = r2(Math.max(0, Math.min(roomDaily - buffer, roomDD - buffer, initial * (r.maxRiskPerTradePct / 100))));
+  return {
+    rules: r, status,
+    initialBalance: r2(initial), currentBalance: r2(current), dayStartBalance: r2(dayStart), peakBalance: r2(peak),
+    target: r2(target), progressPct: Math.round(((current - initial) / (target - initial)) * 1000) / 10,
+    dailyFloor: r2(dailyFloor), roomToDailyLoss: roomDaily, roomToDailyLossPct: Math.round((roomDaily / initial) * 1000) / 10,
+    ddFloor: r2(ddFloor), roomToMaxDrawdown: roomDD, roomToMaxDrawdownPct: Math.round((roomDD / initial) * 1000) / 10,
+    totalProfit: r2(totalProfit), todayPnl: r2(todayPnl), tradingDays, minTradingDays: r.minTradingDays,
+    largestWinDay: r2(largestWinDay), consistencyUsedPct, consistencyLimitPct: r.consistencyPct, consistencyOk,
+    safePerTradeRisk, startedAt: state.startedAt, recentTrades: (state.tradeLog || []).slice(-15).reverse(),
+  };
+}
+// Apply a real trade result to the simulated challenge account (auto-fed by the
+// auto-trader's close reports; same math as POST /api/challenge/trade).
+function applyChallengeTradeResult(pnl, note) {
+  const v = Number(pnl);
+  if (!Number.isFinite(v)) return;
+  const state = rolloverChallengeState(loadChallengeState());
+  state.currentBalance = Math.round((Number(state.currentBalance) + v) * 100) / 100;
+  state.peakBalance = Math.max(Number(state.peakBalance) || 0, state.currentBalance);
+  state.dayPnl = state.dayPnl || {};
+  state.dayPnl[state.currentDay] = Math.round(((Number(state.dayPnl[state.currentDay]) || 0) + v) * 100) / 100;
+  state.tradeLog = [...(state.tradeLog || []), { ts: new Date().toISOString(), pnl: Math.round(v * 100) / 100, note: String(note || '').slice(0, 120), balanceAfter: state.currentBalance }].slice(-200);
+  saveChallengeState(state);
+}
+
+// Advisory guard for a challenge-mode signal: is a full stop safe against the live rule
+// lines, and does the setup clear the challenge quality bar? Never blocks — it annotates.
+function challengeSignalGuard(lossAtStop, grade, rr) {
+  const d = computeChallengeDashboard();
+  const r = d.rules;
+  const warnings = [];
+  let eligible = true;
+  if (d.status === 'BREACH_MAX_DD' || d.status === 'BREACH_DAILY') { warnings.push(`Challenge already ${d.status === 'BREACH_MAX_DD' ? 'past max drawdown' : 'past today\'s loss limit'} — do not trade`); eligible = false; }
+  if (r.onlyAPlus && !['A', 'A+'].includes(String(grade || '').toUpperCase())) { warnings.push('below A grade — skip for the challenge'); eligible = false; }
+  if (Number.isFinite(Number(rr)) && Number(rr) < r.minRR) { warnings.push(`RR below challenge min ${r.minRR}`); eligible = false; }
+  if (Number.isFinite(lossAtStop) && lossAtStop > 0) {
+    if (lossAtStop > d.roomToDailyLoss) warnings.push(`a full stop (${px2(lossAtStop)}) exceeds today's remaining loss room (${px2(d.roomToDailyLoss)})`);
+    else if (lossAtStop > d.safePerTradeRisk) warnings.push(`a full stop (${px2(lossAtStop)}) is above the safe per-trade risk (${px2(d.safePerTradeRisk)})`);
+    if (lossAtStop > d.roomToMaxDrawdown) warnings.push(`a full stop would breach max drawdown (room ${px2(d.roomToMaxDrawdown)})`);
+  }
+  return { eligible, warnings, status: d.status, roomToDailyLoss: d.roomToDailyLoss, roomToMaxDrawdown: d.roomToMaxDrawdown, safePerTradeRisk: d.safePerTradeRisk };
+}
+
+// ─── Auto-trading decision engine (Step 1: SHADOW — decides + logs + emails, ─────────
+// NEVER places an order). ASK/AUTO run as SHADOW until the EA trade bridge (Step 2)
+// reports ready. Every decision is written to mt5_auto_trades so the rollout can be
+// audited against "what would it have done".
+// Live EA trade-bridge state — updated on every EA poll (POST /api/mt5/trade-bridge).
+// bridgeReady = the EA polled recently. Trading additionally requires the detected
+// account to MATCH the user-armed account (the broker switcher's safety interlock):
+// log into a different account in MT5 and dispatch pauses automatically.
+const AUTO_TRADE_BRIDGE_STALE_MS = 90 * 1000;
+const AUTO_TRADE_APPROVAL_MS = Math.max(60, Number(process.env.AUTO_TRADE_APPROVAL_MIN || 10) * 60) * 1000;
+const tradeBridge = { lastSeenAt: 0, account: null, broker: null, server: null, demo: null, balance: null, equity: null, positions: [], orders: [] };
+const AUTO_TRADE_ACCOUNTS_FILE = path.join(__dirname, '.cache', 'auto_trade_accounts.json');
+let autoTradeAccountsCache = null;
+function loadAutoTradeAccounts() {
+  if (autoTradeAccountsCache) return autoTradeAccountsCache;
+  try {
+    if (fs.existsSync(AUTO_TRADE_ACCOUNTS_FILE)) {
+      autoTradeAccountsCache = JSON.parse(fs.readFileSync(AUTO_TRADE_ACCOUNTS_FILE, 'utf8')) || {};
+    }
+  } catch { /* fresh */ }
+  if (!autoTradeAccountsCache || typeof autoTradeAccountsCache !== 'object') autoTradeAccountsCache = {};
+  autoTradeAccountsCache.accounts = autoTradeAccountsCache.accounts || {};
+  autoTradeAccountsCache.armed = autoTradeAccountsCache.armed || null;
+  return autoTradeAccountsCache;
+}
+function saveAutoTradeAccounts(state) {
+  autoTradeAccountsCache = state;
+  try { fs.mkdirSync(path.dirname(AUTO_TRADE_ACCOUNTS_FILE), { recursive: true }); fs.writeFileSync(AUTO_TRADE_ACCOUNTS_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.error('[AutoTrade] accounts save failed:', e.message); }
+}
+function registerBridgeAccount(info) {
+  const login = String(info.account || '').trim();
+  if (!login) return;
+  const reg = loadAutoTradeAccounts();
+  reg.accounts[login] = {
+    login, broker: info.broker || null, server: info.server || null,
+    demo: info.demo === true || info.demo === 'true' || info.demo === 1,
+    currency: info.currency || null,
+    lastSeenAt: new Date().toISOString(),
+    label: reg.accounts[login]?.label || null,
+  };
+  saveAutoTradeAccounts(reg);
+}
+function autoTradeBridgeReady() {
+  return Date.now() - tradeBridge.lastSeenAt < AUTO_TRADE_BRIDGE_STALE_MS;
+}
+function autoTradeArmedMatch() {
+  const reg = loadAutoTradeAccounts();
+  return Boolean(reg.armed && tradeBridge.account && String(reg.armed) === String(tradeBridge.account));
+}
+function autoTradeConfig() {
+  const cfg = loadEmailAlertSettings().autoTrade || DEFAULT_EMAIL_ALERT_SETTINGS.autoTrade;
+  return { ...DEFAULT_EMAIL_ALERT_SETTINGS.autoTrade, ...cfg };
+}
+// ASK/AUTO require a live bridge AND the armed account interlock; otherwise SHADOW.
+function autoTradeEffectiveMode(cfg = autoTradeConfig()) {
+  if (cfg.mode === 'OFF') return 'OFF';
+  if ((cfg.mode === 'ASK' || cfg.mode === 'AUTO') && (!autoTradeBridgeReady() || !autoTradeArmedMatch())) return 'SHADOW';
+  return cfg.mode;
+}
+// Live concurrency guard from the EA's own position/order report (magic-filtered EA-side).
+function autoTradeConcurrencyBlock(cfg, symbol) {
+  if (!autoTradeBridgeReady()) return null;      // shadow paths don't need it
+  const openCount = (tradeBridge.positions?.length || 0) + (tradeBridge.orders?.length || 0);
+  if (openCount >= cfg.maxConcurrent) return `max concurrent (${cfg.maxConcurrent}) reached — ${openCount} open`;
+  if (cfg.onePerSymbol) {
+    const sym = String(symbol).toUpperCase();
+    const has = [...(tradeBridge.positions || []), ...(tradeBridge.orders || [])].some((p) => String(p.symbol || '').toUpperCase() === sym);
+    if (has) return `already a position/order on ${sym} (one-per-symbol)`;
+  }
+  return null;
+}
+// Build the FINAL ticket (lots / SL / TP1-3) for an auto-trade under the chosen execution
+// mode, and validate every override against what the strategy actually analysed.
+//   errors[]   — broken geometry; the trade is never sent.
+//   warnings[] — it would trade, but the override fights the setup (SL off the structural
+//                level, RR crushed, stop inside the noise floor, size over the risk cap…).
+// Returns { lots, sl, tp1, tp2, tp3, rr, riskAmount, errors, warnings, changed }.
+function buildAutoTradeTicket({ symbol, timeframe, sig, cfg, baseLots, baseRiskAmount, riskRefBalance }) {
+  const ex = { ...DEFAULT_EMAIL_ALERT_SETTINGS.autoTrade.execution, ...(cfg.execution || {}) };
+  const pip = pipSizeForSymbol(symbol) || 0.0001;
+  const buy = /BUY/.test(String(sig.decision).toUpperCase());
+  const entry = Number(sig.entry);
+  const sSl = Number(sig.stopLoss);
+  const sTp1 = Number(sig.takeProfit1), sTp2 = Number(sig.takeProfit2), sTp3 = Number(sig.takeProfit3);
+  const errors = [], warnings = [];
+  const sgn = buy ? 1 : -1;
+  const px2p = (a, b) => Math.abs(a - b) / pip;                    // price distance → pips
+  const fromPips = (p, dir) => entry + dir * p * pip * sgn;        // pips → price (dir +1 = profit side)
+
+  let lots = baseLots, riskAmount = baseRiskAmount;
+  let sl = sSl, tp1 = sTp1, tp2 = sTp2, tp3 = sTp3;
+  const changed = [];
+
+  // ATR noise floor + spread: a stop inside this gets taken out by ordinary wiggle.
+  let atr = null;
+  try { const c = closedBarsOnly(getRecentCandles(symbol, timeframe, 120), timeframe); if (c && c.length >= 20) atr = lmtAtr14(c); } catch { /* advisory */ }
+  const spreadPips = (() => { const ps = brokerPointSizeFor(symbol); return Number.isFinite(ps) && ps > 0 ? (ps / pip) * 2 : 2; })();
+  const strategyStopPips = Number.isFinite(sSl) ? px2p(entry, sSl) : null;
+
+  if (ex.mode === 'MANUAL') {
+    lots = Number(ex.lots) || baseLots;
+    if (ex.slPips !== null && ex.slPips !== undefined) { sl = fromPips(ex.slPips, -1); changed.push(`SL ${ex.slPips}p`); }
+    if (ex.tp1Pips !== null && ex.tp1Pips !== undefined) { tp1 = fromPips(ex.tp1Pips, +1); changed.push(`TP1 ${ex.tp1Pips}p`); }
+    if (ex.tp2Pips !== null && ex.tp2Pips !== undefined) { tp2 = fromPips(ex.tp2Pips, +1); changed.push(`TP2 ${ex.tp2Pips}p`); }
+    if (ex.tp3Pips !== null && ex.tp3Pips !== undefined) { tp3 = fromPips(ex.tp3Pips, +1); changed.push(`TP3 ${ex.tp3Pips}p`); }
+    const stopPips = px2p(entry, sl);
+    const pipValue = forexSizingPipValuePerLot(symbol);
+    riskAmount = Math.round(stopPips * pipValue * lots * 100) / 100;
+    changed.push(`${lots} lots`);
+  } else if (ex.mode === 'RISK') {
+    // Structural SL stays unless explicitly overridden; lots sized to the risk budget;
+    // targets laid at R multiples off that stop — the "perfect setup" geometry.
+    if (ex.slOverridePips !== null && ex.slOverridePips !== undefined) { sl = fromPips(ex.slOverridePips, -1); changed.push(`SL ${ex.slOverridePips}p`); }
+    const stopPips = px2p(entry, sl);
+    const pipValue = forexSizingPipValuePerLot(symbol);
+    const budget = Math.round((riskRefBalance * (Number(ex.riskPct) / 100)) * 100) / 100;
+    if (stopPips > 0 && pipValue > 0) {
+      lots = Math.max(0.01, Math.round((budget / (stopPips * pipValue)) * 100) / 100);
+      riskAmount = Math.round(stopPips * pipValue * lots * 100) / 100;
+    }
+    const r = Array.isArray(ex.tpR) && ex.tpR.length ? ex.tpR : [1, 2, 3];
+    tp1 = fromPips(stopPips * (r[0] ?? 1), +1);
+    tp2 = fromPips(stopPips * (r[1] ?? 2), +1);
+    tp3 = fromPips(stopPips * (r[2] ?? 3), +1);
+    changed.push(`risk ${ex.riskPct}% → ${lots} lots`, `TP at ${r.join('R/')}R`);
+  }
+
+  // ── Geometry (hard errors — never send a broken ticket) ──
+  if (!Number.isFinite(entry) || !Number.isFinite(sl)) errors.push('entry or stop-loss is not a valid price');
+  else if (buy ? sl >= entry : sl <= entry) errors.push(`stop-loss ${px(sl, symbol)} is on the WRONG SIDE of entry ${px(entry, symbol)} for a ${sig.decision}`);
+  const tps = [tp1, tp2, tp3].filter((t) => Number.isFinite(t) && t > 0);
+  for (const t of tps) {
+    if (buy ? t <= entry : t >= entry) { errors.push(`take-profit ${px(t, symbol)} is on the WRONG SIDE of entry for a ${sig.decision}`); break; }
+  }
+  const ordered = buy ? tps.every((t, i) => i === 0 || t >= tps[i - 1]) : tps.every((t, i) => i === 0 || t <= tps[i - 1]);
+  if (!ordered) errors.push('take-profits are out of order (TP1 must be nearest, TP3 furthest)');
+  if (!(lots > 0)) errors.push('lot size must be greater than zero');
+
+  const stopPips = Number.isFinite(sl) ? px2p(entry, sl) : null;
+  const rr = (stopPips > 0 && Number.isFinite(tp1)) ? Math.round((px2p(entry, tp1) / stopPips) * 100) / 100 : null;
+
+  // ── Quality warnings (trade is possible, but the override fights the analysis) ──
+  if (ex.mode !== 'AUTO' && stopPips > 0) {
+    if (stopPips <= spreadPips * 1.5) warnings.push(`stop is ${num1(stopPips)} pips — barely above the ~${num1(spreadPips)} pip spread; it will be stopped by the spread alone`);
+    else if (atr && stopPips * pip < atr * 0.5) warnings.push(`stop is ${num1(stopPips)} pips (< 0.5× ATR) — inside normal noise for ${timeframe}; expect random stop-outs`);
+    if (Number.isFinite(strategyStopPips) && strategyStopPips > 0) {
+      const ratio = stopPips / strategyStopPips;
+      if (ratio < 0.6) warnings.push(`your stop (${num1(stopPips)}p) is much TIGHTER than the strategy's structural stop (${num1(strategyStopPips)}p at ${px(sSl, symbol)}) — that level was placed beyond the invalidation wick, yours sits inside it`);
+      else if (ratio > 1.8) warnings.push(`your stop (${num1(stopPips)}p) is far WIDER than the setup needs (${num1(strategyStopPips)}p) — you risk more for the same target and the R:R collapses`);
+      else if (Math.abs(ratio - 1) > 0.25) warnings.push(`your stop (${num1(stopPips)}p) differs from the strategy's structural stop (${num1(strategyStopPips)}p at ${px(sSl, symbol)})`);
+    }
+    if (Number.isFinite(sTp3) && Number.isFinite(tp3) && (buy ? tp3 > sTp3 : tp3 < sTp3)) {
+      warnings.push(`TP3 ${px(tp3, symbol)} sits BEYOND the liquidity draw the setup targets (${px(sTp3, symbol)}) — lower hit probability`);
+    }
+  }
+  if (rr !== null && Number.isFinite(cfg.minRR) && rr < cfg.minRR) {
+    warnings.push(`R:R is 1:${rr} — below your ${cfg.minRR} minimum for auto-trading`);
+  }
+
+  // ── Risk-size warnings vs the account rules ──
+  const acct = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+  const balance = finitePositive(acct.balance) ?? 5000;
+  const riskPctOfBalance = balance > 0 ? (riskAmount / balance) * 100 : null;
+  if (riskPctOfBalance !== null && riskPctOfBalance > 5) {
+    warnings.push(`this trade risks ${px2(riskAmount)} = ${num1(riskPctOfBalance)}% of your ${px2(balance)} balance — well past a sane per-trade risk`);
+  }
+  if (String(acct.mode).toUpperCase() !== 'NORMAL') {
+    const ch = acct.challenge || {};
+    const cap = Number(ch.maxRiskPerTradePct);
+    const chBal = finitePositive(ch.initialBalance) ?? balance;
+    if (Number.isFinite(cap) && chBal > 0 && riskAmount > chBal * (cap / 100)) {
+      warnings.push(`risk ${px2(riskAmount)} exceeds the prop per-trade cap of ${cap}% (${px2(chBal * (cap / 100))})`);
+    }
+    try {
+      const guard = challengeSignalGuard(riskAmount, sig.grade, rr);
+      for (const w of guard.warnings) warnings.push(w);
+    } catch { /* advisory */ }
+  }
+
+  return { lots, sl, tp1, tp2, tp3, rr, riskAmount, stopPips, errors, warnings, changed, mode: ex.mode, allowWarnedTrades: ex.allowWarnedTrades };
+}
+function num1(v) { return Number.isFinite(Number(v)) ? Math.round(Number(v) * 10) / 10 : '?'; }
+
+async function autoTradesToday(pool) {
+  const [rows] = await pool.query(
+    "SELECT COUNT(*) n FROM mt5_auto_trades WHERE status IN ('SHADOW','PROPOSED','APPROVED','QUEUED','SENT','FILLED','CLOSED') AND created_at >= UTC_DATE()",
+  );
+  return Number(rows[0]?.n) || 0;
+}
+async function considerAutoTrade(strategy, symbol, tf, sig) {
+  try {
+    const cfg = autoTradeConfig();
+    const mode = autoTradeEffectiveMode(cfg);
+    if (mode === 'OFF') return;
+    // Trading needs a full forex ticket. (Fixed-time-only calls have no SL/TP to place.)
+    const entry = Number(sig.entry), sl = Number(sig.stopLoss), tp1 = Number(sig.takeProfit1);
+    if (![entry, sl, tp1].every(Number.isFinite)) return;
+    // Explicit opt-in: NO strategies selected = nothing trades. This is deliberate —
+    // an "empty = all" default on real orders would be a loaded gun.
+    if (!cfg.strategies.length || !cfg.strategies.includes(strategy)) return;
+    if (cfg.symbols.length && !cfg.symbols.includes(String(symbol).toUpperCase())) return;
+    if (cfg.timeframes.length && !cfg.timeframes.includes(String(tf).toUpperCase())) return;
+    const session = strategyLabSession(new Date().toISOString());
+    if (cfg.sessions.length && !cfg.sessions.includes(session.key)) return;
+    const gradeRankOf = (g) => (g === 'A+' ? 2 : g === 'A' ? 1 : 0);
+    if (gradeRankOf(String(sig.grade || '').toUpperCase()) < gradeRankOf(cfg.minGrade)) return;
+    const rr = Number(sig.riskRewardRatio);
+    if (Number.isFinite(rr) && rr < cfg.minRR) return;
+
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const barMs = Date.parse(sig?.meta?.alertBarIso || sig.barIso || '') || Date.now();
+    const id = `autotrade:${strategy}:${symbol}:${tf}:${barMs}`;
+    const [dupe] = await pool.query('SELECT id FROM mt5_auto_trades WHERE id=? LIMIT 1', [id]);
+    if (dupe.length) return;                                     // one decision per signal bar
+
+    // Sizing from the user's Account & Sizing settings — challenge leg when the user is
+    // in CHALLENGE/BOTH mode (its guard also applies), else the normal leg.
+    const ms = computeModeSizing(symbol, entry, sl, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+    const leg = ms?.challenge || ms?.normal;
+    if (!leg) return;
+    const riskMode = ms.challenge ? 'CHALLENGE' : 'NORMAL';
+    if (ms.challenge) {
+      const guard = challengeSignalGuard(leg.lossAtStop, sig.grade, sig.riskRewardRatio);
+      if (!guard.eligible || guard.warnings.length) {
+        await pool.execute(
+          `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [id, strategy, symbol, tf, sig.decision, strategySignalOrderType({ ...(sig.meta || {}), strategy }), entry, sl, tp1, sig.takeProfit2 ?? null, sig.takeProfit3 ?? null,
+           leg.lots, leg.riskAmount, riskMode, Math.round(sig.score ?? 0), sig.grade ?? null, Number.isFinite(rr) ? rr : null, session.key,
+           mode, 'GUARD_SKIP', `challenge guard: ${guard.warnings.join('; ')}`.slice(0, 255), toMysqlDate()],
+        );
+        return;
+      }
+    }
+
+    // Execution mode: AUTO keeps the strategy's ticket; MANUAL/RISK rebuild it and are
+    // validated against the strategy's own analysis (broken geometry never trades).
+    const ticket = buildAutoTradeTicket({
+      symbol, timeframe: tf, sig, cfg,
+      baseLots: leg.lots, baseRiskAmount: leg.riskAmount,
+      riskRefBalance: leg.refBalance,
+    });
+    const useLots = ticket.lots, useSl = ticket.sl, useTp1 = ticket.tp1;
+    const useTp2 = ticket.tp2 ?? sig.takeProfit2 ?? null, useTp3 = ticket.tp3 ?? sig.takeProfit3 ?? null;
+    const useRr = ticket.rr ?? (Number.isFinite(rr) ? rr : null);
+    const orderType = strategySignalOrderType({ ...(sig.meta || {}), strategy });
+
+    // Hard geometry errors, or warnings while "trade anyway" is off → log and stop.
+    const blockedByWarnings = ticket.warnings.length > 0 && !ticket.allowWarnedTrades && ticket.mode !== 'AUTO';
+    if (ticket.errors.length || blockedByWarnings) {
+      const label = ticket.errors.length ? 'INVALID' : 'GUARD_SKIP';
+      const why = ticket.errors.length
+        ? `ticket invalid (${ticket.mode}): ${ticket.errors.join('; ')}`
+        : `${ticket.mode} override warnings: ${ticket.warnings.join('; ')}`;
+      await pool.execute(
+        `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [id, strategy, symbol, tf, sig.decision, orderType, entry, useSl, useTp1, useTp2, useTp3,
+         useLots, ticket.riskAmount, riskMode, Math.round(sig.score ?? 0), sig.grade ?? null, useRr, session.key,
+         mode, label, why.slice(0, 255), toMysqlDate()],
+      );
+      console.log(`[AutoTrade] ${label} ${symbol} ${tf} — ${why}`);
+      return;
+    }
+
+    const todayCount = await autoTradesToday(pool);
+    const capped = todayCount >= cfg.maxTradesPerDay;
+    // Live concurrency guard (ASK/AUTO only — needs the EA's position report).
+    const concBlock = (mode === 'ASK' || mode === 'AUTO') ? autoTradeConcurrencyBlock(cfg, symbol) : null;
+    const status = capped ? 'CAP_ALERT'
+      : concBlock ? 'GUARD_SKIP'
+        : mode === 'ASK' ? 'PROPOSED'
+          : mode === 'AUTO' ? 'QUEUED'
+            : 'SHADOW';
+    const reason = capped ? `daily cap ${cfg.maxTradesPerDay} reached (${todayCount} today)`
+      : concBlock || (mode === 'ASK' ? 'awaiting your approval' : mode === 'AUTO' ? 'queued for the EA bridge' : 'passed all auto-trade gates');
+    const expiresAt = status === 'PROPOSED' ? new Date(Date.now() + AUTO_TRADE_APPROVAL_MS)
+      : status === 'QUEUED' ? new Date(Date.now() + 5 * 60 * 1000) : null; // a QUEUED order the EA never picks up dies in 5 min
+    await pool.execute(
+      `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, expires_at, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, strategy, symbol, tf, sig.decision, orderType, entry, useSl, useTp1, useTp2, useTp3,
+       useLots, ticket.riskAmount, riskMode, Math.round(sig.score ?? 0), sig.grade ?? null, useRr, session.key,
+       mode, status, `${reason}${ticket.changed.length ? ` · ${ticket.mode}: ${ticket.changed.join(', ')}` : ''}${ticket.warnings.length ? ` · ⚠ ${ticket.warnings.join('; ')}` : ''}`.slice(0, 255), expiresAt ? toMysqlDate(expiresAt) : null, toMysqlDate()],
+    );
+
+    if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+    const to = signalEmailToFor(symbol, tf);
+    if (!to) return;
+    const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
+    const ticketTxt = `${sig.decision} ${symbol} ${tf} · ${orderType} @ ${px(entry, symbol)} · SL ${px(useSl, symbol)} · TP1 ${px(useTp1, symbol)}${Number.isFinite(Number(useTp3)) ? ` · TP3 ${px(useTp3, symbol)}` : ''} · ${useLots} lots (${px2(ticket.riskAmount)} risk · ${ticket.mode === 'AUTO' ? `${riskMode} ${leg.riskPct}%` : `${ticket.mode} mode`})${ticket.changed.length ? `\n  Overrides — ${ticket.changed.join(', ')}` : ''}${ticket.warnings.length ? `\n  ⚠ WARNINGS: ${ticket.warnings.join('; ')}` : ''}`;
+    if (status === 'CAP_ALERT') {
+      const subject = `[AUTO-TRADE · CAP REACHED] Good ${sig.grade} setup on ${symbol} ${tf} — worth a manual look`.slice(0, 180);
+      const text = [
+        `The auto-trader hit its daily limit (${cfg.maxTradesPerDay}), but this setup passed every other gate:`,
+        ticketTxt,
+        `Strategy: ${strategyName} · score ${Math.round(sig.score ?? 0)} (${sig.grade}) · session ${session.key}`,
+        '', 'No order was (or would have been) placed. If you like it, take it manually. Advisory — not financial advice.',
+      ].join('\n');
+      await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: id });
+      console.log(`[AutoTrade] CAP alert ${symbol} ${tf} (${strategyName})`);
+    } else if (status === 'PROPOSED') {
+      const mins = Math.round(AUTO_TRADE_APPROVAL_MS / 60000);
+      const subject = `[AUTO-TRADE · APPROVAL NEEDED] ${sig.decision} ${symbol} ${tf} | ${Math.round(sig.score ?? 0)} ${sig.grade} | ${strategyName} — ${mins} min to approve`.slice(0, 180);
+      const text = [
+        `ASK MODE — this trade is prepared and waiting for YOUR approval on the Auto Trading page:`,
+        ticketTxt,
+        `Strategy: ${strategyName} · score ${Math.round(sig.score ?? 0)} (${sig.grade}) · RR 1:${sig.riskRewardRatio ?? 'n/a'} · session ${session.key}`,
+        `Expires in ${mins} minutes — a stale setup will never fill late.`,
+        `Today: trade ${todayCount + 1} of ${cfg.maxTradesPerDay}.`,
+        '', 'Open the dashboard → Auto Trading → Approve or Reject. Not financial advice.',
+      ].join('\n');
+      await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: id });
+      console.log(`[AutoTrade] PROPOSED ${sig.decision} ${symbol} ${tf} (${strategyName}) — awaiting approval`);
+    } else if (status === 'QUEUED') {
+      console.log(`[AutoTrade] QUEUED ${sig.decision} ${symbol} ${tf} (${strategyName}, ${leg.lots} lots) — awaiting EA pickup`);
+    } else if (status === 'SHADOW') {
+      const subject = `[AUTO-TRADE · SHADOW] Would place: ${sig.decision} ${symbol} ${tf} | ${Math.round(sig.score ?? 0)} ${sig.grade} | ${strategyName}`.slice(0, 180);
+      const text = [
+        `SHADOW MODE — no order was placed. With the EA bridge live and an account armed, this trade would have been sent to MT5:`,
+        ticketTxt,
+        `Strategy: ${strategyName} · score ${Math.round(sig.score ?? 0)} (${sig.grade}) · RR 1:${sig.riskRewardRatio ?? 'n/a'} · session ${session.key}`,
+        `Today: trade ${todayCount + 1} of ${cfg.maxTradesPerDay}.`,
+        '', 'Review shadow decisions on the Auto Trading page. Advisory — not financial advice.',
+      ].join('\n');
+      await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: id });
+      console.log(`[AutoTrade] SHADOW ${sig.decision} ${symbol} ${tf} (${strategyName}, ${leg.lots} lots)`);
+    }
+  } catch (error) { console.error('[AutoTrade] decision failed:', error.message); }
 }
 
 // Entry-timing / tradability for a logged signal. These are limit-style entries, so a
@@ -11594,7 +13391,7 @@ function strategySignalTiming(sig, timeframe, madeMs = Date.now(), sentMs = Date
 // (entry/SL/TP1-3 with pips + $ at the suggested lots), the raid PSYCHOLOGY (which obvious
 // level was swept, displacement, session narrative), and a numbered execution playbook.
 // Display-only: changes nothing about scoring, gating, or delivery rules.
-function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing }) {
+function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing, sizingParts = null }) {
   const m = sig.meta || {};
   const buy = /BUY/.test(String(sig.decision));
   const pip = pipSizeForSymbol(symbol) || 0.1;
@@ -11621,7 +13418,7 @@ function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing
 
   const kindTag = kind && kind !== 'NEW' ? ` · ${kind}` : '';
   const subjectAction = t.status === 'TRADABLE' ? 'ENTER NOW' : t.status === 'EXPIRED' ? 'SKIP' : 'WAIT FOR PB';
-  const subject = `GOLD | ${Math.round(sig.score)} ${sig.grade} SETUP | ${sig.decision} ${timeframe} | ${subjectAction}${kindTag}`.slice(0, 180);
+  const subject = `GOLD | ${Math.round(sig.score)} ${sig.grade} SETUP | ${sig.decision} ${timeframe} | ${subjectAction}${sizingParts ? ` | ${sizingParts.subjectTag}` : ''}${kindTag}`.slice(0, 180);
 
   const psychology = [
     `The raid: gold is the retail magnet — stops cluster at OBVIOUS levels. ${raided.label || raided.type || 'A key level'} (${raided.strength ?? '?'}/5 obviousness) was swept, trapping breakout traders, then price closed back inside. That trap is the trade.`,
@@ -11648,7 +13445,8 @@ function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing
     'TRADE PLAN',
     `  Entry ${px(sig.entry, symbol)}   SL ${px(sig.stopLoss, symbol)} (${slPips}p)`,
     `  TP1 ${px(sig.takeProfit1, symbol)} (+${tp1Pips}p · 1R)   TP2 ${px(sig.takeProfit2, symbol)} (+${tp2Pips}p · 2R)   TP3 ${px(sig.takeProfit3, symbol)} (+${tp3Pips}p · draw)`,
-    lots != null ? `  Volume ${lots} lots (${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})` : '',
+    ...(sizingParts ? sizingParts.textLines.map((l) => `  ${l}`)
+      : [lots != null ? `  Volume ${lots} lots (${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})` : '']),
     '',
     'WHY THIS TRADE (the psychology)',
     ...psychology.map((p) => `  • ${p}`),
@@ -11680,7 +13478,7 @@ function buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing
         ${row('TP2 · 2R', `<span style="color:#047857">${px(sig.takeProfit2, symbol)}</span> <span style="color:#a8a29e">+${tp2Pips} pips${sizing?.profitAtTp2 != null ? ` · ${px2(sizing.profitAtTp2)}` : ''} — close 25%</span>`)}
         ${row('TP3 · draw', `<span style="color:#047857">${px(sig.takeProfit3, symbol)}</span> <span style="color:#a8a29e">+${tp3Pips} pips${sizing?.profitAtTp3 != null ? ` · ${px2(sizing.profitAtTp3)}` : ''} — runner to the opposing liquidity</span>`)}
         ${row('R : R', `1 : ${sig.riskRewardRatio ?? 'n/a'}`)}
-        ${lots != null ? row('Volume', `${lots} lots <span style="color:#a8a29e">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)} on ${px2(sizing.equity)})</span>`) : ''}
+        ${sizingParts ? sizingParts.htmlRows.replace(/#64748b/g, '#78716c') : (lots != null ? row('Volume', `${lots} lots <span style="color:#a8a29e">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)} on ${px2(sizing.equity)})</span>`) : '')}
       </table>
       <div style="margin-top:12px;padding:10px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px">
         <p style="margin:0 0 6px;font-size:10px;font-weight:800;letter-spacing:.14em;color:#b45309;text-transform:uppercase">Why this trade — the psychology</p>
@@ -11715,9 +13513,12 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
   const labTo = signalEmailToFor(symbol, timeframe);
   if (!labTo) return;
   const timing = strategySignalTiming(sig, timeframe, madeMs, Date.now());
+  // Mode-aware sizing off the user's account balance + selected mode(s) — labels the email.
+  const modeSizing = computeModeSizing(symbol, sig.entry, sig.stopLoss, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+  const sizingParts = modeSizingEmailParts(modeSizing, symbol, sig);
   // Gold Desk gets its purpose-designed email (GOLD | score grade SETUP | direction).
   if (strategy === 'xau-session-raid') {
-    const g = buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing });
+    const g = buildGoldDeskEmail({ sig, symbol, timeframe, kind, sizing, lots, timing, sizingParts });
     try {
       await sendNotificationEmail({ to: labTo, subject: g.subject, text: g.text, html: g.html, signalId: `stratlab:${id}` });
       console.log(`[GoldDesk] Emailed ${sig.grade} ${sig.decision} ${symbol} ${timeframe} (score ${Math.round(sig.score)})`);
@@ -11734,8 +13535,9 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
   const liveT = strategyLabLiveTiming(symbol, sig.decision, liveNow, sig.entry, sig.stopLoss, sig.meta || null);
   const actionTag = liveT.status === 'TRADABLE' ? 'ENTER NOW' : liveT.status === 'EXPIRED' ? 'SKIP' : 'WAIT FOR PB';
   const stratTag = strategy === 'lil-sweep-pro-plus' && sig.meta?.plan ? `${strategyName} ${sig.meta.plan}` : strategyName;
-  const subject = `${symbol} ${timeframe} | ${sig.decision} | ${Math.round(sig.score)} ${sig.grade || ''} SETUP · RR 1:${sig.riskRewardRatio ?? 'n/a'} | ${stratTag} | ${actionTag}${kind && kind !== 'NEW' ? ` · ${kind}` : ''}`.slice(0, 180);
-  const lotLine = lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a';
+  const subject = `${symbol} ${timeframe} | ${sig.decision} | ${Math.round(sig.score)} ${sig.grade || ''} SETUP · RR 1:${sig.riskRewardRatio ?? 'n/a'} | ${stratTag} | ${actionTag}${sizingParts ? ` | ${sizingParts.subjectTag}` : ''}${kind && kind !== 'NEW' ? ` · ${kind}` : ''}`.slice(0, 180);
+  const lotLine = sizingParts ? sizingParts.textLines.join('\n')
+    : (lots !== null ? `Volume ${lots} lots (${sizing.riskPercent}% of ${px2(sizing.equity)} = ${px2(sizing.riskAmount)} risk, ${sizing.stopPips} pip stop)` : 'Volume n/a');
   const text = [
     `AURA GOLD — STRATEGY LAB SIGNAL (${strategyName})${kind !== 'NEW' ? ` — ${kind}` : ''}`,
     `${sig.decision} ${symbol} ${timeframe} | score ${Math.round(sig.score)}/100 (${sig.grade}) | RR 1:${sig.riskRewardRatio ?? 'n/a'}`,
@@ -11763,7 +13565,7 @@ async function emitStrategyLabSignal({ id, strategy, symbol, timeframe, sig, pop
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP1 (1R)</td><td style="color:#047857">${px(sig.takeProfit1, symbol)}${sizing?.profitAtTp1 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp1)}</span>` : ''}</td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP2 (2R)</td><td style="color:#047857">${px(sig.takeProfit2, symbol)}${sizing?.profitAtTp2 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp2)}</span>` : ''}</td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">TP3 (target)</td><td style="color:#047857">${px(sig.takeProfit3, symbol)}${sizing?.profitAtTp3 != null ? ` <span style="color:#94a3b8">+${px2(sizing.profitAtTp3)}</span>` : ''}</td></tr>
-      <tr><td style="padding:2px 10px 2px 0;color:#64748b">Volume</td><td><b>${lots !== null ? `${lots} lots` : 'n/a'}</b>${lots !== null ? ` <span style="color:#94a3b8">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})</span>` : ''}</td></tr>
+      ${sizingParts ? sizingParts.htmlRows : `<tr><td style="padding:2px 10px 2px 0;color:#64748b">Volume</td><td><b>${lots !== null ? `${lots} lots` : 'n/a'}</b>${lots !== null ? ` <span style="color:#94a3b8">(${sizing.riskPercent}% risk = ${px2(sizing.riskAmount)}, max loss ${px2(sizing.lossAtStop)})</span>` : ''}</td></tr>`}
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">R:R</td><td>1:${sig.riskRewardRatio ?? 'n/a'}</td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Candle formed</td><td><b>${timing.formed}</b> <span style="color:#94a3b8">(${timeframe})</span></td></tr>
       <tr><td style="padding:2px 10px 2px 0;color:#64748b">Signal made</td><td>${timing.made} <span style="color:#94a3b8">· candle→signal ${timing.candleToSignal}</span></td></tr>
@@ -12093,6 +13895,9 @@ async function maybeNotifyStrategy(strategy, symbol, tf, sig, ctx, madeMs = Date
   if (wantPopup || wantEmail) {
     void emitStrategyLabSignal({ id, strategy, symbol, timeframe: tf, sig, popup: wantPopup, email: wantEmail, kind, madeMs });
   }
+  // Auto-trading decision (Step 1: SHADOW). Only on the FIRST alert for a setup — an
+  // IMPROVED/RE-ENTRY/CONFIRMED re-notification must never spawn a second trade.
+  if (kind === 'NEW') void considerAutoTrade(strategy, symbol, tf, sig);
   // Fixed-time notification only when the call is still tradable (expiry candle open) —
   // never alert a next-candle bet whose candle has already closed (stale-on-arrival).
   // meta.forexOnly (e.g. lil-sweep-pro-plus trigger entries) = TP/SL framing only, no FTT alert.
@@ -12181,8 +13986,14 @@ async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, n
   const entryState = String(meta.entryState || (entryOrderType === 'MARKET' ? 'FILLED' : 'WAIT')).toUpperCase();
   const measureFixedTime = strategySignalMeasuresFixedTime({ ...meta, strategy: stratId });
   const signalMs = nowDate.getTime();
-  const validBars = Math.max(1, Number(meta.validBars) || STRATEGY_LAB_ENTRY_VALID_BARS);
-  const validUntil = Number.isFinite(signalMs) ? new Date(signalMs + validBars * timeframeMinutes(tf) * 60000) : null;
+  // Fill deadline priority: engine meta.validBars → registry entryValidBars → global
+  // default. 0 (declared) = patient limit, NO deadline — valid_until stays NULL and the
+  // 72h replay horizon is the only bound. The one-size 4-bar default expired real fills
+  // on deep-pullback strategies (breaker/FVG limits fill out to 32+ bars).
+  const declaredValidBars = [meta.validBars, STRATEGY_LAB_REGISTRY[stratId]?.entryValidBars]
+    .map(Number).find((v) => Number.isFinite(v) && v >= 0);
+  const validBars = declaredValidBars !== undefined ? declaredValidBars : STRATEGY_LAB_ENTRY_VALID_BARS;
+  const validUntil = validBars > 0 && Number.isFinite(signalMs) ? new Date(signalMs + validBars * timeframeMinutes(tf) * 60000) : null;
   const filledAt = meta.fillAtSignal || entryState === 'FILLED' ? nowDate : null;
   const setupEventMs = Date.parse(meta.setupEventIso || '');
   const alertBarMs = Date.parse(meta.alertBarIso || sig.barIso || '');
@@ -12961,10 +14772,11 @@ app.get('/api/strategy-lab/confluence', async (req, res) => {
 // GET /api/strategy-lab/strategies — registry metadata.
 app.get('/api/strategy-lab/strategies', (req, res) => {
   const controls = loadEmailAlertSettings().strategyControls || {};
-  // Attach each strategy's controller state (default = enabled) so the Settings page and
+  // Attach each strategy's controller state (default = enabled unless registry opts into
+  // measurement-only rollout) so the Settings page and
   // dashboard can render the on/off switch + refinements and grey muted strategies.
   const strategies = listStrategies().map((m) => {
-    const saved = controls[m.id] || { enabled: true };
+    const saved = controls[m.id] || { enabled: m.defaultEnabled !== false };
     const control = Array.isArray(saved.timeframes)
       ? { ...saved, timeframes: saved.timeframes.filter((tf) => strategyTimeframes(m.id).includes(tf)) }
       : saved;
@@ -13261,9 +15073,14 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
     const minScore = Number.isFinite(minRaw) ? Math.max(0, Math.min(100, minRaw)) : ENTRY_WATCH_MIN_SCORE;
     const maxScore = Number.isFinite(maxRaw) ? Math.max(minScore, Math.min(100, maxRaw)) : 100;
     const rawStrategies = csv(req.query.strategies);
-    const requestedStrategies = [...new Set(rawStrategies.filter((id) => ENTRY_WATCH_STRATEGIES.includes(id)))].slice(0, ENTRY_WATCH_STRATEGIES.length);
+    // Strategy Controller contract: OFF strategies vanish from every user-facing
+    // surface — Entry Watch must not show (or accept requests for) disabled ones.
+    const enabledSet = new Set(enabledStrategyIds());
+    const watchable = ENTRY_WATCH_STRATEGIES.filter((id) => enabledSet.has(id));
+    const requestedStrategies = [...new Set(rawStrategies.filter((id) => watchable.includes(id)))].slice(0, watchable.length);
     if (rawStrategies.length && !requestedStrategies.length) return res.status(400).json({ error: 'No valid strategies requested.' });
-    const strategies = requestedStrategies.length ? requestedStrategies : ENTRY_WATCH_STRATEGIES;
+    const strategies = requestedStrategies.length ? requestedStrategies : watchable;
+    if (!strategies.length) return res.json({ items: [], strategies: [], minScore, maxScore, windowHours: ENTRY_WATCH_WINDOW_HOURS, generatedAt: new Date().toISOString() });
     const allowedSymbols = new Set(getCuratedSymbols(getMt5Status().symbols).map((v) => String(v).toUpperCase()));
     const rawSymbols = csv(req.query.symbols, (v) => v.toUpperCase());
     const rawTimeframes = csv(req.query.timeframes, (v) => v.toUpperCase());
@@ -13458,12 +15275,50 @@ app.get('/api/strategy-lab/entry-watch', async (req, res) => {
     const payload = {
       ok: true, minScore, maxScore, windowHours: ENTRY_WATCH_WINDOW_HOURS,
       filters: { strategies, symbols, timeframes },
-      strategies: ENTRY_WATCH_STRATEGIES, items: visibleItems, generatedAt: new Date().toISOString(),
+      strategies: watchable, items: visibleItems, generatedAt: new Date().toISOString(),
     };
     entryWatchResponseCache.set(cacheKey, { at: Date.now(), payload });
     if (entryWatchResponseCache.size > 50) entryWatchResponseCache.delete(entryWatchResponseCache.keys().next().value);
     res.json(payload);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Test utility for the production at-entry template. It sends unmistakably labeled
+// sample values and never logs a strategy signal or changes measurements.
+app.post('/api/strategy-lab/test-entry-email', async (req, res) => {
+  try {
+    if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return res.status(400).json({ error: 'Signal email delivery is disabled or has no recipient.' });
+    const symbol = 'XAUUSDM', timeframe = 'M15', strategyName = 'H4 Liquidity Pin Entry';
+    const now = Date.now();
+    const row = {
+      symbol, timeframe, direction: 'BUY', grade: 'A+', score: 88,
+      entry_price: 4002.00, stop_loss: 3999.00,
+      take_profit_1: 4005.00, take_profit_2: 4008.00, take_profit_3: 4011.00,
+      risk_reward: 3,
+      reason: 'TEST SAMPLE: H4 bullish bias, sell-side liquidity swept below a key level, a strong M15 rejection pin closed back above it, and the BUY stop trigger filled while price remained inside the approved entry zone.',
+      signal_time: new Date(now - 15 * 60000).toISOString(),
+      valid_until: new Date(now + 15 * 60000).toISOString(),
+    };
+    const assessment = {
+      currentPrice: 4002.18, zoneLow: 4001.76, zoneHigh: 4003.05,
+      fillAgeMs: 60000, fillMs: now - 60000, spreadPrice: 0.12,
+    };
+    const sizing = strategyLabSizing(symbol, row.entry_price, row.stop_loss, {
+      tp1: row.take_profit_1, tp2: row.take_profit_2, tp3: row.take_profit_3,
+    });
+    const email = buildEntryReadyEmail({
+      row, strategyName, orderType: 'STOP', assessment, sizing,
+      h4Trend: 'BULLISH', h1Trend: 'BULLISH',
+      session: strategyLabSession(new Date(assessment.fillMs).toISOString()),
+      sentMs: now, isTest: true,
+    });
+    const to = signalEmailToFor(symbol, timeframe);
+    if (!to) return res.status(400).json({ error: 'No configured recipient accepts XAUUSDM M15.' });
+    await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: `test:entryready:${now}` });
+    res.json({ ok: true, sentTo: to, subject: email.subject });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // TEMP test utility: render the REAL strategy-lab advisory emails (forex + fixed-time)
@@ -14217,6 +16072,21 @@ async function processAllRemindersAndSavedProjections() {
     await processSignalTracker();
   } catch (err) {
     console.error('[Scheduler] Error in processSignalTracker:', err.message);
+  }
+  try {
+    await processTrackedOrderAlerts();
+  } catch (err) {
+    console.error('[Scheduler] Error in processTrackedOrderAlerts:', err.message);
+  }
+  try {
+    await processEntryReadyAlerts();
+  } catch (err) {
+    console.error('[Scheduler] Error in processEntryReadyAlerts:', err.message);
+  }
+  try {
+    await processKeyLevelProximityAlerts();
+  } catch (err) {
+    console.error('[Scheduler] Error in processKeyLevelProximityAlerts:', err.message);
   }
   try {
     await processStrategyLabOutcomes();

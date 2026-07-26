@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search } from 'lucide-react';
+import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import AutoTradeReport from './AutoTradeReport';
 import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence } from '../mt5Api';
 import type {
   StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyCorrectedForexBucket, StrategyFtBucket, StrategyAtBucket,
@@ -169,7 +170,7 @@ export default function StrategyLabReports() {
   const [range, setRange] = useState<RangeKey>('last7');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
-  const [tab, setTab] = useState<'forex' | 'ftt' | 'at' | 'confluence'>('forex');
+  const [tab, setTab] = useState<'forex' | 'ftt' | 'at' | 'confluence' | 'autotrade'>('forex');
   const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
@@ -266,6 +267,7 @@ export default function StrategyLabReports() {
       <button type="button" onClick={() => setTab('ftt')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'ftt' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}>Fixed-Time</button>
       <button type="button" onClick={() => setTab('at')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'at' ? 'bg-teal-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`} title="As-traded: realistic result — entered at the live price when the signal fired, expiry at +duration.">As-traded</button>
       <button type="button" onClick={() => setTab('confluence')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'confluence' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}><Layers size={12} />Confluence</button>
+      <button type="button" onClick={() => setTab('autotrade')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'autotrade' ? 'bg-emerald-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`} title="Real auto-trades placed through the EA bridge: profit, pips, R, and a day-by-day calendar."><Bot size={12} />Auto Trades</button>
     </div>
   );
 
@@ -300,8 +302,9 @@ export default function StrategyLabReports() {
       </div>
 
       {tab === 'confluence' && <ConfluenceTab strategies={strategies} rangeParams={reportParams} rangeLabel={perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label || ''} />}
+      {tab === 'autotrade' && <AutoTradeReport from={reportParams.from} to={reportParams.to} />}
 
-      {tab !== 'confluence' && (<>
+      {tab !== 'confluence' && tab !== 'autotrade' && (<>
       {/* SEARCH — filters the strategy leaderboard, combos & per-session strategy lists */}
       <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-card">
         <Search size={16} className="shrink-0 text-slate-400" />

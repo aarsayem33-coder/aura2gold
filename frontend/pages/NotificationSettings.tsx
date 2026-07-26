@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mail, Send, CheckCircle2, XCircle, Bell, Volume2, Route, SlidersHorizontal, FlaskConical, Filter, ScrollText, MonitorSmartphone, ChevronDown } from 'lucide-react';
+import { Mail, Send, CheckCircle2, XCircle, Bell, Volume2, Route, SlidersHorizontal, FlaskConical, Filter, ScrollText, MonitorSmartphone, ChevronDown, Wallet } from 'lucide-react';
 import { fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, useMt5Stream } from '../mt5Api';
 import { formatBdDateTime } from '../utils/time';
 import { playAlertSound, requestNotificationPermission, showBrowserNotification } from '../utils/notifications';
@@ -29,6 +29,16 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   strategyLabRules: {},
   emailRecipients: [],
   emailRecipientRules: {},
+  entryReadyAlerts: { enabled: false, minGrade: 'A', strategies: [], symbols: [], timeframes: [] },
+  keyLevelProximityAlerts: { enabled: false, sensitivity: 'NORMAL', symbols: [], levelTypes: [] },
+  accountRisk: {
+    balance: 5000, mode: 'NORMAL', normalRiskPct: 1,
+    challenge: {
+      preset: 'HOLA_1STEP', phase: 'EVAL', initialBalance: 5000, profitTargetPct: 10,
+      dailyLossPct: 3, maxDrawdownPct: 6, drawdownType: 'STATIC', maxRiskPerTradePct: 2,
+      riskPerTradePct: 0.5, minTradingDays: 2, consistencyPct: 40, onlyAPlus: true, minRR: 2,
+    },
+  },
   forexMinGrade: 'A_SETUP',
   forexMinQuality: 'A_SIGNAL',
   fixedTimeMinTier: 'QUALITY_SIGNAL',
@@ -89,7 +99,7 @@ export default function NotificationSettings() {
   const [openRecipient, setOpenRecipient] = useState<string | null>(null); // which recipient's routing filters are expanded
   const [testStatus, setTestStatus] = useState<string | null>(null);
   // ── Redesigned UI state: tab navigation, per-strategy filter accordion, dirty tracking ──
-  const [activeTab, setActiveTab] = useState<'routing' | 'strategies' | 'lab' | 'filters' | 'device' | 'log'>('routing');
+  const [activeTab, setActiveTab] = useState<'routing' | 'strategies' | 'lab' | 'filters' | 'account' | 'device' | 'log'>('routing');
   const [expandedFilter, setExpandedFilter] = useState<string | null>(null);
   // Snapshot of the last LOADED/SAVED settings — the single sticky Save bar appears only
   // when the current settings differ (all sections save through the same endpoint).
@@ -269,11 +279,15 @@ export default function NotificationSettings() {
   };
 
   // ── Strategy Controller (master per-strategy switch + refinements) ──
-  const ctrlOf = (id: string) => (emailSettings.strategyControls || {})[id] || { enabled: true };
+  const ctrlOf = (id: string) => (emailSettings.strategyControls || {})[id]
+    || labStrategies.find((strategy) => strategy.id === id)?.control
+    || { enabled: labStrategies.find((strategy) => strategy.id === id)?.defaultEnabled !== false };
   const updateStrategyControl = (id: string, patch: Partial<NonNullable<EmailAlertSettings['strategyControls']>[string]>) => {
     setEmailSettings((current) => {
       const controls = { ...(current.strategyControls || {}) };
-      controls[id] = { ...(controls[id] || { enabled: true }), ...patch };
+      const fallback = labStrategies.find((strategy) => strategy.id === id)?.control
+        || { enabled: labStrategies.find((strategy) => strategy.id === id)?.defaultEnabled !== false };
+      controls[id] = { ...fallback, ...(controls[id] || {}), ...patch };
       return { ...current, strategyControls: controls };
     });
     setEmailSettingsStatus(null);
@@ -337,6 +351,42 @@ export default function NotificationSettings() {
   const toggleRecipientTf = (e: string, tf: string) => {
     const cur = recipientRuleOf(e).timeframes || [];
     updateRecipientRule(e, { timeframes: cur.includes(tf) ? cur.filter((x) => x !== tf) : [...cur, tf] });
+  };
+
+  // ── At-entry alert (email when an A/A+ signal's entry fills) ──
+  const era = emailSettings.entryReadyAlerts || { enabled: false, minGrade: 'A' as const, strategies: [], symbols: [], timeframes: [] };
+  const setEra = (patch: Partial<NonNullable<typeof emailSettings.entryReadyAlerts>>) => {
+    setEmailSettings((current) => ({ ...current, entryReadyAlerts: { enabled: false, minGrade: 'A', strategies: [], symbols: [], timeframes: [], ...(current.entryReadyAlerts || {}), ...patch } }));
+    setEmailSettingsStatus(null);
+  };
+  const toggleEraList = (key: 'strategies' | 'symbols' | 'timeframes', val: string) => {
+    const cur = (era[key] || []) as string[];
+    setEra({ [key]: cur.includes(val) ? cur.filter((x) => x !== val) : [...cur, val] } as Partial<NonNullable<typeof emailSettings.entryReadyAlerts>>);
+  };
+
+  // ── Key-level proximity alert (email when price nears an obvious pool) ──
+  const klp = emailSettings.keyLevelProximityAlerts || { enabled: false, sensitivity: 'NORMAL' as const, symbols: [], levelTypes: [] };
+  const setKlp = (patch: Partial<NonNullable<typeof emailSettings.keyLevelProximityAlerts>>) => {
+    setEmailSettings((current) => ({ ...current, keyLevelProximityAlerts: { enabled: false, sensitivity: 'NORMAL', symbols: [], levelTypes: [], ...(current.keyLevelProximityAlerts || {}), ...patch } }));
+    setEmailSettingsStatus(null);
+  };
+  const toggleKlpList = (key: 'symbols' | 'levelTypes', val: string) => {
+    const cur = (klp[key] || []) as string[];
+    setKlp({ [key]: cur.includes(val) ? cur.filter((x) => x !== val) : [...cur, val] } as Partial<NonNullable<typeof emailSettings.keyLevelProximityAlerts>>);
+  };
+
+  // ── Account & position-sizing (balance + Normal/Challenge modes) ──
+  const ar = emailSettings.accountRisk || defaultEmailAlertSettings.accountRisk!;
+  const setAr = (patch: Partial<NonNullable<typeof emailSettings.accountRisk>>) => {
+    setEmailSettings((current) => ({ ...current, accountRisk: { ...defaultEmailAlertSettings.accountRisk!, ...(current.accountRisk || {}), ...patch } }));
+    setEmailSettingsStatus(null);
+  };
+  const setChallenge = (patch: Partial<NonNullable<typeof emailSettings.accountRisk>['challenge']>) => {
+    setEmailSettings((current) => {
+      const base = current.accountRisk || defaultEmailAlertSettings.accountRisk!;
+      return { ...current, accountRisk: { ...base, challenge: { ...base.challenge, ...patch } } };
+    });
+    setEmailSettingsStatus(null);
   };
 
   const handleSaveEmailSettings = async () => {
@@ -438,6 +488,7 @@ export default function NotificationSettings() {
     { key: 'strategies', label: 'Strategies', icon: <SlidersHorizontal size={14} />, badge: labStrategies.length ? `${strategiesOn}/${labStrategies.length}` : undefined },
     { key: 'lab', label: 'Lab Rules', icon: <FlaskConical size={14} /> },
     { key: 'filters', label: 'Filters', icon: <Filter size={14} />, badge: filteredCount ? `${filteredCount}` : undefined },
+    { key: 'account', label: 'Account & Sizing', icon: <Wallet size={14} />, badge: ar.mode === 'BOTH' ? 'N+C' : ar.mode === 'CHALLENGE' ? 'CHAL' : 'NORM' },
     { key: 'device', label: 'Device & Test', icon: <MonitorSmartphone size={14} /> },
     { key: 'log', label: 'Delivery Log', icon: <ScrollText size={14} />, badge: logs.length ? `${logs.length}` : undefined },
   ];
@@ -696,6 +747,152 @@ export default function NotificationSettings() {
         </div>
       )}
 
+      {/* ── AT-ENTRY ALERT (one email when an A/A+ signal's entry fills) ── */}
+      {activeTab === 'filters' && (
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+          <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">At-entry alert</h3>
+              <p className="text-xs font-medium text-slate-500">A decision-ready email when an A/A+ LIMIT or STOP entry fills and still passes every safety check. Empty selections = all enabled strategies / symbols / timeframes.</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setEra({ enabled: !era.enabled })}
+              className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${era.enabled ? 'bg-emerald-500' : 'bg-slate-200'}`}
+              title={era.enabled ? 'At-entry alerts ON' : 'At-entry alerts OFF'}
+            >
+              <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${era.enabled ? 'left-[22px]' : 'left-0.5'}`} />
+            </button>
+          </div>
+          {era.enabled && (
+            <div className="space-y-3 px-5 py-4">
+              <div className="grid gap-2 sm:grid-cols-3">
+                {[
+                  ['M1 verified', 'Fresh fill inside the order window'],
+                  ['Lifecycle clean', 'No stop touch and TP1 not already hit'],
+                  ['No chasing', 'Price must remain inside the live entry zone'],
+                ].map(([title, note]) => (
+                  <div key={title} className="rounded-xl border border-emerald-100 bg-emerald-50/70 px-3 py-2">
+                    <p className="text-[10px] font-black uppercase tracking-wider text-emerald-700">{title}</p>
+                    <p className="mt-0.5 text-[10px] font-semibold leading-relaxed text-emerald-900/70">{note}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[10px] font-semibold leading-relaxed text-amber-900">
+                Automatically ignored when H4 has reversed against the trade, the trigger failed, the stop was touched, TP1 already traded, the fill is stale, or price moved too far from entry. MARKET-at-signal setups do not create a later at-entry email.
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-semibold text-slate-500">Minimum grade</span>
+                {(['A', 'A+'] as const).map((g) => (
+                  <button key={g} type="button" onClick={() => setEra({ minGrade: g })} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors ${era.minGrade === g ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{g === 'A' ? 'A and A+' : 'A+ only'}</button>
+                ))}
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">
+                  Strategies {(era.strategies || []).length ? <span className="text-emerald-600">— {(era.strategies || []).length} selected</span> : <span className="text-slate-400">— none selected = all enabled strategies</span>}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {labStrategies.map((s) => {
+                    const on = (era.strategies || []).includes(s.id);
+                    const muted = s.control?.enabled === false;
+                    return <button key={s.id} type="button" onClick={() => toggleEraList('strategies', s.id)} title={muted ? 'Muted in Strategy Controller; kept visible so it can be removed from this filter.' : undefined} className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : muted ? 'border-slate-200 bg-slate-100 text-slate-400' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{s.name}{muted ? ' (muted)' : ''}</button>;
+                  })}
+                </div>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">
+                  Symbols {(era.symbols || []).length ? <span className="text-emerald-600">— {(era.symbols || []).length} selected</span> : <span className="text-slate-400">— none selected = all symbols</span>}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {labSymbols.map((sym) => {
+                    const on = (era.symbols || []).includes(sym.toUpperCase());
+                    return <button key={sym} type="button" onClick={() => toggleEraList('symbols', sym.toUpperCase())} className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{sym}</button>;
+                  })}
+                  {!labSymbols.length && <p className="text-xs font-medium text-slate-400">No symbols available (MT5 feed offline) — leave empty for all.</p>}
+                </div>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">
+                  Timeframes {(era.timeframes || []).length ? <span className="text-emerald-600">— {(era.timeframes || []).join(', ')}</span> : <span className="text-slate-400">— none selected = all timeframes</span>}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'].map((tf) => {
+                    const on = (era.timeframes || []).includes(tf);
+                    return <button key={tf} type="button" onClick={() => toggleEraList('timeframes', tf)} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{tf}</button>;
+                  })}
+                </div>
+              </div>
+              <p className="text-[10px] font-medium text-slate-400">Remember to Save. One durable email per signal, only while the fill is fresh (≤10 min). The email includes the entry zone, full trade ticket, sizing, conditions passed, setup reason, H4/H1 context, BDT timing, execution steps, and explicit ignore rules.</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── KEY-LEVEL PROXIMITY ALERT ── */}
+      {activeTab === 'filters' && (
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+          <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Key-level proximity alert</h3>
+              <p className="text-xs font-medium text-slate-500">Email when price nears an obvious pool — PDH/PDL and session highs/lows. Volatility-adaptive band (same meaning on gold, FX, indices), two-tier: a heads-up on approach, then a ping at the level. Empty selections = all symbols / all level types.</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setKlp({ enabled: !klp.enabled })}
+              className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${klp.enabled ? 'bg-emerald-500' : 'bg-slate-200'}`}
+              title={klp.enabled ? 'Proximity alerts ON' : 'Proximity alerts OFF'}
+            >
+              <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${klp.enabled ? 'left-[22px]' : 'left-0.5'}`} />
+            </button>
+          </div>
+          {klp.enabled && (
+            <div className="space-y-3 px-5 py-4">
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">Trigger distance (how close before it emails)</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {([
+                    ['TIGHT', 'Tight', 'Only when price is right at the level'],
+                    ['NORMAL', 'Normal', 'Balanced — recommended'],
+                    ['WIDE', 'Wide', 'Earlier heads-up, more emails'],
+                  ] as const).map(([val, label, note]) => (
+                    <button key={val} type="button" onClick={() => setKlp({ sensitivity: val })} title={note} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors ${klp.sensitivity === val ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{label}</button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">
+                  Level types {(klp.levelTypes || []).length ? <span className="text-emerald-600">— {(klp.levelTypes || []).length} selected</span> : <span className="text-slate-400">— none selected = all</span>}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {([
+                    ['PDH_PDL', 'Prev day H/L'],
+                    ['ASIAN', 'Asian H/L'],
+                    ['LONDON', 'London H/L'],
+                    ['NY', 'New York H/L'],
+                  ] as const).map(([val, label]) => {
+                    const on = (klp.levelTypes || []).includes(val);
+                    return <button key={val} type="button" onClick={() => toggleKlpList('levelTypes', val)} className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{label}</button>;
+                  })}
+                </div>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-semibold text-slate-500">
+                  Symbols {(klp.symbols || []).length ? <span className="text-emerald-600">— {(klp.symbols || []).length} selected</span> : <span className="text-slate-400">— none selected = all symbols</span>}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {labSymbols.map((sym) => {
+                    const on = (klp.symbols || []).includes(sym.toUpperCase());
+                    return <button key={sym} type="button" onClick={() => toggleKlpList('symbols', sym.toUpperCase())} className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition-colors ${on ? 'border-emerald-500 bg-emerald-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-emerald-300'}`}>{sym}</button>;
+                  })}
+                  {!labSymbols.length && <p className="text-xs font-medium text-slate-400">No symbols available (MT5 feed offline) — leave empty for all.</p>}
+                </div>
+              </div>
+              <p className="text-[10px] font-medium text-slate-400">Remember to Save. One email per level, per tier, per day — the email carries the two-plan read (sweep-and-reject fade vs break-and-hold continuation) with entry, SL, TP1/2/3 and R:R. Only fires while the feed is live. See all approaching levels live on the Live Market Tracker page.</p>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── PER-STRATEGY FILTERS (accordion) ── */}
       {activeTab === 'filters' && (
         <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
@@ -769,6 +966,97 @@ export default function NotificationSettings() {
               );
             })}
           </div>
+        </div>
+      )}
+
+      {/* ── ACCOUNT & SIZING ── */}
+      {activeTab === 'account' && (
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+            <div className="border-b border-slate-100 px-5 py-3">
+              <h3 className="text-sm font-bold text-slate-900">Account &amp; position sizing</h3>
+              <p className="text-xs font-medium text-slate-500">Sets the lot size shown on every emailed signal, and labels the email with the mode. Pure risk math — it never changes which signals fire. Not connected to your real broker/prop account; it sizes off the balance you enter here.</p>
+            </div>
+            <div className="space-y-4 px-5 py-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Account balance (USD)</label>
+                <div className="flex items-center gap-1">
+                  <span className="text-sm font-bold text-slate-400">$</span>
+                  <input type="number" min={1} value={ar.balance} onChange={(e) => setAr({ balance: Number(e.target.value) })} className="w-32 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                </div>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-500">Signal mode</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {([
+                    ['NORMAL', 'Normal', 'Your own account — size by a fixed risk %'],
+                    ['CHALLENGE', 'Challenge', 'Prop-firm rules (Hola Prime) — conservative sizing to pass'],
+                    ['BOTH', 'Both', 'Show both sizings in one email'],
+                  ] as const).map(([val, label, note]) => (
+                    <button key={val} type="button" onClick={() => setAr({ mode: val })} title={note} className={`rounded-lg border px-3 py-1.5 text-xs font-bold transition-colors ${ar.mode === val ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-indigo-300'}`}>{label}</button>
+                  ))}
+                </div>
+              </div>
+              {(ar.mode === 'NORMAL' || ar.mode === 'BOTH') && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50/60 px-4 py-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Normal risk per trade</label>
+                    <input type="number" step={0.1} min={0.05} max={10} value={ar.normalRiskPct} onChange={(e) => setAr({ normalRiskPct: Number(e.target.value) })} className="w-20 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                    <span className="text-sm font-bold text-slate-500">% of ${ar.balance.toLocaleString()} = ${Math.round(ar.balance * ar.normalRiskPct / 100).toLocaleString()} risk/trade</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {(ar.mode === 'CHALLENGE' || ar.mode === 'BOTH') && (
+            <div className="rounded-2xl border border-amber-200 bg-white shadow-card">
+              <div className="flex items-center justify-between border-b border-amber-100 px-5 py-3">
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">Challenge mode — prop-firm rules</h3>
+                  <p className="text-xs font-medium text-slate-500">Pre-filled with Hola Prime 1-Step. Edit to match your exact plan. Sizing uses your conservative per-trade risk, well under the hard cap.</p>
+                </div>
+                <button type="button" onClick={() => setChallenge({ preset: 'HOLA_1STEP', phase: 'EVAL', initialBalance: ar.balance, profitTargetPct: 10, dailyLossPct: 3, maxDrawdownPct: 6, drawdownType: 'STATIC', maxRiskPerTradePct: 2, riskPerTradePct: 0.5, minTradingDays: 2, consistencyPct: 40, minRR: 2 })} className="shrink-0 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1 text-[11px] font-bold text-amber-800 hover:bg-amber-100">Reset to Hola 1-Step</button>
+              </div>
+              <div className="px-5 py-4">
+                <div className="mb-3 flex flex-wrap gap-1.5">
+                  {(['EVAL', 'FUNDED'] as const).map((ph) => (
+                    <button key={ph} type="button" onClick={() => setChallenge({ phase: ph })} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors ${ar.challenge.phase === ph ? 'border-amber-500 bg-amber-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300'}`}>{ph === 'EVAL' ? 'Evaluation' : 'Funded'}</button>
+                  ))}
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {([
+                    ['Your per-trade risk %', 'riskPerTradePct', 0.05, 10, 0.05, 'What you actually risk. 0.5% keeps you far from every breach line.'],
+                    ['Initial balance $', 'initialBalance', 1, 100000000, 1, 'The challenge account size.'],
+                    ['Profit target %', 'profitTargetPct', 1, 100, 0.5, 'Hola 1-Step: 10% of initial.'],
+                    ['Max daily loss %', 'dailyLossPct', 0.5, 50, 0.5, '3% of previous day close.'],
+                    ['Max drawdown %', 'maxDrawdownPct', 1, 100, 0.5, '6% of initial, static floor.'],
+                    ['Per-trade cap %', 'maxRiskPerTradePct', 0.1, 20, 0.1, 'Funded hard cap: 2% of initial.'],
+                    ['Min trading days', 'minTradingDays', 0, 60, 1, 'Hola 1-Step: 2 days.'],
+                    ['Consistency %', 'consistencyPct', 0, 100, 1, 'No single day > this % of total profit.'],
+                    ['Min R:R', 'minRR', 0, 10, 0.1, 'Phase 2 quality gate (stored now).'],
+                  ] as const).map(([label, key, min, max, step, note]) => (
+                    <div key={key}>
+                      <label className="block text-[11px] font-semibold text-slate-500" title={note}>{label}</label>
+                      <input type="number" min={min} max={max} step={step} value={(ar.challenge as Record<string, number>)[key]} onChange={(e) => setChallenge({ [key]: Number(e.target.value) } as Partial<NonNullable<typeof emailSettings.accountRisk>['challenge']>)} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                    </div>
+                  ))}
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-500">Drawdown type</label>
+                    <div className="mt-0.5 flex gap-1.5">
+                      {(['STATIC', 'TRAILING'] as const).map((dt) => (
+                        <button key={dt} type="button" onClick={() => setChallenge({ drawdownType: dt })} className={`flex-1 rounded-lg border px-2 py-1.5 text-[11px] font-bold transition-colors ${ar.challenge.drawdownType === dt ? 'border-amber-500 bg-amber-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300'}`}>{dt === 'STATIC' ? 'Static' : 'Trailing'}</button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-3 text-[11px] font-semibold leading-relaxed text-emerald-900">
+                  Sizing preview: risking {ar.challenge.riskPerTradePct}% of ${Number(ar.challenge.initialBalance).toLocaleString()} = <b>${Math.round(ar.challenge.initialBalance * ar.challenge.riskPerTradePct / 100).toLocaleString()}</b> per trade. Daily-loss room ≈ ${Math.round(ar.challenge.initialBalance * ar.challenge.dailyLossPct / 100).toLocaleString()} · static DD floor ≈ ${Math.round(ar.challenge.initialBalance * (1 - ar.challenge.maxDrawdownPct / 100)).toLocaleString()} · target ≈ ${Math.round(ar.challenge.initialBalance * (1 + ar.challenge.profitTargetPct / 100)).toLocaleString()}. The live progress dashboard + breach guard come next (Phase 2).
+                </div>
+                <p className="mt-2 text-[10px] font-medium text-slate-400">Remember to Save. Educational risk math — not financial advice. Verify the numbers against your current Hola Prime plan; rules change and vary by plan.</p>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

@@ -401,13 +401,32 @@ export interface EmailAlertSettings {
   strategyLabFttMinGrade: 'ANY' | 'B' | 'A' | 'A+';
   strategyLabFttStrategies: Record<string, boolean>;
   // Strategy Controller — master per-strategy switch (gates table, reports, popups, emails,
-  // SSE). Missing entry = enabled. Optional refinements gate alert delivery.
+  // SSE). Missing entry uses the strategy registry default. Optional refinements gate alerts.
   strategyControls?: Record<string, StrategyControl>;
   // Signal email recipients (user-managed, up to 10). Empty = backend env default address.
   emailRecipients?: string[];
   // Per-recipient routing (keyed by address): which symbols/timeframes THAT address
   // receives. Missing entry / empty lists = everything. Delivery-only.
   emailRecipientRules?: Record<string, { symbols?: string[]; timeframes?: string[] }>;
+  // At-entry alert: one email when an A/A+ LIMIT/STOP fill remains actionable. Empty lists = all.
+  entryReadyAlerts?: { enabled: boolean; minGrade: 'A' | 'A+'; strategies: string[]; symbols: string[]; timeframes: string[] };
+  // Key-level proximity alert: email when price nears an obvious pool (PDH/PDL, session H/L).
+  // Volatility-adaptive band (sensitivity). Empty lists = all symbols / all level groups.
+  keyLevelProximityAlerts?: { enabled: boolean; sensitivity: 'TIGHT' | 'NORMAL' | 'WIDE'; symbols: string[]; levelTypes: string[] };
+  // Auto-trading controller (strategies empty = NONE may trade; others empty = all).
+  autoTrade?: AutoTradeConfig;
+  // Account & position-sizing. Drives lot size on emailed signals + the mode label.
+  accountRisk?: {
+    balance: number;
+    mode: 'NORMAL' | 'CHALLENGE' | 'BOTH';
+    normalRiskPct: number;
+    challenge: {
+      preset: string; phase: 'EVAL' | 'FUNDED'; initialBalance: number;
+      profitTargetPct: number; dailyLossPct: number; maxDrawdownPct: number;
+      drawdownType: 'STATIC' | 'TRAILING'; maxRiskPerTradePct: number; riskPerTradePct: number;
+      minTradingDays: number; consistencyPct: number; onlyAPlus: boolean; minRR: number;
+    };
+  };
   // Per-strategy EMAIL refinements (score / grade / symbols / direction). DELIVERY-only — cuts
   // email noise per strategy without touching signal generation, logging, popups, or ranking.
   // Applies to BOTH the forex and fixed-time strategy-lab email framings. symbols empty/absent =
@@ -792,6 +811,7 @@ export interface StrategyMeta {
   description: string;
   timeframes: string[];
   forexOnly?: boolean;
+  defaultEnabled?: boolean;
   control?: StrategyControl; // controller state from /strategies (default = enabled)
 }
 export interface StrategyTiming {
@@ -1023,6 +1043,45 @@ export interface StrategyFttLiveResponse {
 }
 
 export type SignalTrackerStatus = 'OPEN' | 'TP1_HIT' | 'TP2_HIT' | 'TP3_HIT' | 'STOPPED' | 'DANGER' | 'CLOSE_NOW' | 'EXPIRED';
+
+// Executed Orders — signals the user placed as pending orders at the broker and
+// marked tracked. Priority-watched: live strength, fill/expiry state, suggestion.
+export interface ExecutedOrderItem {
+  id: string;
+  source: string;
+  strategy: string | null;
+  strategyName: string;
+  symbol: string;
+  timeframe: string;
+  direction: string;
+  grade: string | null;
+  loggedScore: number | null;
+  signalTime: string | null;
+  trackedAt: string | null;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  takeProfit3: number | null;
+  currentPrice: number | null;
+  pipsToEntry: number | null;
+  orderState: 'PENDING' | 'FILLED' | 'EXPIRED' | 'SETTLED';
+  stateMessage: string;
+  currentScore: number | null;
+  currentGrade: string | null;
+  strengthTrend: 'STRONGER' | 'SAME' | 'WEAKER' | 'GONE' | null;
+  scoreDrop: number;
+  suggestion: string;
+  tone: 'HOLD' | 'FILL_SOON' | 'CANCEL' | 'MANAGE' | 'DONE';
+  liveNewEntry: { entry: number; stopLoss: number | null; takeProfit1: number | null; riskRewardRatio: number | null } | null;
+  nearEntryNotified: boolean;
+  weakNotified: boolean;
+}
+export interface ExecutedOrdersResponse {
+  items: ExecutedOrderItem[];
+  generatedAt: string;
+  config: { nearEntryPips: number; weakDropPts: number };
+}
 
 export interface SignalTrackerItem {
   id: string;
@@ -1406,6 +1465,121 @@ export interface LmtSweepGrade {
   riskRewardRatio: number;
   reason: string; barIso: string;
   meta: { sweptLevel: { type: string; price: number; strength: number }; components: Record<string, unknown>; checklist: string[] };
+}
+export interface KeyLevelPlanLeg {
+  direction: 'BUY' | 'SELL';
+  entry: number; stopLoss: number; takeProfit1: number; takeProfit2: number; takeProfit3: number;
+  riskRewardRatio: number; targetLabel: string; stopPips: number;
+}
+export interface KeyLevelProximityLevel {
+  type: string; group: string; label: string; side: 'above' | 'below'; price: number; strength: number;
+  distancePips: number; distanceAtr: number; tier: 'IMMINENT' | 'APPROACHING';
+  plan: { fade: KeyLevelPlanLeg | null; continuation: KeyLevelPlanLeg | null } | null;
+}
+export interface KeyLevelProximitySymbol {
+  symbol: string; price: number; atr: number;
+  feedState: 'LIVE' | 'STALE' | 'MARKET_CLOSED';
+  dataFresh: boolean; staleSeconds: number | null; sensitivity: string;
+  levels: KeyLevelProximityLevel[];
+  nearest: KeyLevelProximityLevel | null;
+}
+export interface KeyLevelProximityResponse {
+  sensitivity: string; generatedAt: string; symbols: KeyLevelProximitySymbol[];
+}
+export interface AutoTradeExecution {
+  mode: 'AUTO' | 'MANUAL' | 'RISK';
+  lots: number;
+  slPips: number | null; tp1Pips: number | null; tp2Pips: number | null; tp3Pips: number | null;
+  riskPct: number; slOverridePips: number | null; tpR: number[];
+  allowWarnedTrades: boolean;
+}
+export interface AutoTradeConfig {
+  mode: 'OFF' | 'SHADOW' | 'ASK' | 'AUTO';
+  strategies: string[]; symbols: string[]; timeframes: string[]; sessions: string[];
+  maxTradesPerDay: number; maxConcurrent: number; onePerSymbol: boolean;
+  minGrade: 'A' | 'A+'; minRR: number;
+  execution: AutoTradeExecution;
+}
+export interface AutoTradeValidation {
+  ok: boolean; hasSample: boolean; note?: string;
+  sample?: { strategy: string; strategyName: string; symbol: string; timeframe: string; signalTime: string | null };
+  strategyTicket?: { entry: number; stopLoss: number; takeProfit1: number; takeProfit3: number | null; lots: number; riskAmount: number };
+  resultTicket?: { entry: number; stopLoss: number; takeProfit1: number; takeProfit2: number | null; takeProfit3: number | null; lots: number; riskAmount: number; rr: number | null; stopPips: number | null };
+  mode?: string; changed?: string[]; errors?: string[]; warnings?: string[]; wouldTrade?: boolean;
+}
+export interface AutoTradeDecision {
+  id: string; strategy: string; strategyName: string; symbol: string; timeframe: string;
+  direction: string; orderType: string;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  lots: number | null; riskAmount: number | null; riskMode: string | null;
+  score: number | null; grade: string | null; rr: number | null; session: string | null;
+  mode: string; status: string; reason: string | null;
+  ticket: number | null; fillPrice: number | null; closePrice: number | null; profit: number | null;
+  createdAt: string | null; closedAt: string | null;
+}
+export interface AutoTradeBridge {
+  ready: boolean; lastSeenSec: number | null;
+  account: string | null; broker: string | null; server: string | null;
+  demo: boolean | null; balance: number | null; equity: number | null;
+  openPositions: number; openOrders: number; armedMatch: boolean;
+}
+export interface AutoTradeAccount {
+  login: string; broker: string | null; server: string | null;
+  demo: boolean; currency: string | null; lastSeenAt: string; label: string | null;
+}
+export interface AutoTradeStatus {
+  config: AutoTradeConfig; effectiveMode: 'OFF' | 'SHADOW' | 'ASK' | 'AUTO';
+  bridgeReady: boolean; bridge: AutoTradeBridge;
+  accounts: AutoTradeAccount[]; armed: string | null;
+  todayCount: number; remainingToday: number;
+  session: { key: string; label?: string; bdTime?: string | null };
+  decisions: AutoTradeDecision[];
+}
+export interface AutoTradeReportRow {
+  id: string; strategy: string; strategyName: string; symbol: string; timeframe: string;
+  direction: string; orderType: string;
+  entry: number | null; fillPrice: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  closePrice: number | null; lots: number | null; riskAmount: number | null; riskMode: string | null;
+  score: number | null; grade: string | null; rr: number | null; session: string | null;
+  mode: string; status: string; reason: string | null; ticket: number | null; account: string | null;
+  profit: number | null; pips: number | null; stopPips: number | null;
+  rMultiple: number | null; durationMin: number | null;
+  createdAt: string | null; closedAt: string | null;
+}
+export interface AutoTradeDayRow { date: string; trades: number; wins: number; losses: number; profit: number; pips: number }
+export interface AutoTradeGroupRow { key: string; trades: number; wins: number; losses: number; profit: number; pips: number; winRate: number | null }
+export interface AutoTradeReport {
+  window: { from: string | null; to: string | null };
+  summary: {
+    totalRows: number; trades: number; wins: number; losses: number; breakeven: number;
+    winRate: number | null; netProfit: number; grossProfit: number; grossLoss: number;
+    profitFactor: number | null; totalPips: number; avgPips: number | null;
+    avgWin: number | null; avgLoss: number | null; expectancy: number | null; avgR: number | null;
+    bestTrade: number | null; worstTrade: number | null; avgDurationMin: number | null;
+    maxWinStreak: number; maxLossStreak: number;
+    openTrades: number; pendingApproval: number; errors: number; shadowCount: number;
+    tradingDays: number; profitDays: number;
+    bestDay: AutoTradeDayRow | null; worstDay: AutoTradeDayRow | null; avgPerDay: number | null;
+  };
+  byDay: AutoTradeDayRow[];
+  byStrategy: AutoTradeGroupRow[]; bySymbol: AutoTradeGroupRow[]; byTimeframe: AutoTradeGroupRow[];
+  bySession: AutoTradeGroupRow[]; byDirection: AutoTradeGroupRow[]; byGrade: AutoTradeGroupRow[];
+  byHour: AutoTradeGroupRow[];
+  trades: AutoTradeReportRow[];
+}
+export interface ChallengeTrade { ts: string; pnl: number; note: string; balanceAfter: number }
+export interface ChallengeDashboard {
+  status: 'IN_PROGRESS' | 'AT_RISK' | 'TARGET_MET' | 'BREACH_DAILY' | 'BREACH_MAX_DD';
+  rules: { preset: string; phase: string; profitTargetPct: number; dailyLossPct: number; maxDrawdownPct: number; drawdownType: string; maxRiskPerTradePct: number; riskPerTradePct: number; minTradingDays: number; consistencyPct: number };
+  initialBalance: number; currentBalance: number; dayStartBalance: number; peakBalance: number;
+  target: number; progressPct: number;
+  dailyFloor: number; roomToDailyLoss: number; roomToDailyLossPct: number;
+  ddFloor: number; roomToMaxDrawdown: number; roomToMaxDrawdownPct: number;
+  totalProfit: number; todayPnl: number; tradingDays: number; minTradingDays: number;
+  largestWinDay: number; consistencyUsedPct: number; consistencyLimitPct: number; consistencyOk: boolean;
+  safePerTradeRisk: number; startedAt: string; recentTrades: ChallengeTrade[];
 }
 export interface LiveMarketTrackerResponse {
   ok: boolean;
