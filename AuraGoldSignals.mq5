@@ -64,6 +64,7 @@ datetime last_heartbeat   = 0;
 datetime last_trade_poll  = 0;
 long     g_known_positions[];       // magic-filtered position ids seen last poll (close detection)
 bool     g_known_positions_primed = false;
+int      g_spec_tick      = 0;      // 0 = include broker contract specs on this poll
 datetime last_snapshot    = 0;
 datetime last_live_candle = 0;
 datetime last_sma_alert   = 0;
@@ -1957,6 +1958,43 @@ string TradeBridgePositionsJson()
    return js;
 }
 
+// Per-symbol CONTRACT SPECS straight from the broker. The backend was guessing pip
+// value from a hardcoded table and had no idea about minimum stop distance, which
+// produced both mis-sized trades and outright "Invalid stops" rejections. These are the
+// authoritative numbers; sent periodically (they change rarely) to keep the poll small.
+string TradeBridgeSpecsJson()
+{
+   if(!g_realtime_resolved) ResolveRealtimeSymbols();
+   int count = ArraySize(g_realtime_symbols);
+   string js = "[";
+   bool first = true;
+   for(int i = 0; i < count; i++)
+   {
+      string s = g_realtime_symbols[i];
+      if(!SymbolSelect(s, true)) continue;
+      double point     = SymbolInfoDouble(s, SYMBOL_POINT);
+      double tickValue = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize  = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE);
+      if(point <= 0 || tickSize <= 0) continue;
+      if(!first) js += ",";
+      js += "{\"symbol\":\"" + EscapeString(s) + "\"" +
+            ",\"digits\":"       + IntegerToString((long)SymbolInfoInteger(s, SYMBOL_DIGITS)) +
+            ",\"point\":"        + DoubleToString(point, 10) +
+            ",\"tickValue\":"    + DoubleToString(tickValue, 6) +
+            ",\"tickSize\":"     + DoubleToString(tickSize, 10) +
+            ",\"contractSize\":" + DoubleToString(SymbolInfoDouble(s, SYMBOL_TRADE_CONTRACT_SIZE), 2) +
+            ",\"stopsLevel\":"   + IntegerToString((long)SymbolInfoInteger(s, SYMBOL_TRADE_STOPS_LEVEL)) +
+            ",\"freezeLevel\":"  + IntegerToString((long)SymbolInfoInteger(s, SYMBOL_TRADE_FREEZE_LEVEL)) +
+            ",\"spread\":"       + IntegerToString((long)SymbolInfoInteger(s, SYMBOL_SPREAD)) +
+            ",\"volMin\":"       + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MIN), 4) +
+            ",\"volMax\":"       + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MAX), 2) +
+            ",\"volStep\":"      + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_STEP), 4) + "}";
+      first = false;
+   }
+   js += "]";
+   return js;
+}
+
 // Build the JSON array of OUR pending orders (magic-filtered).
 string TradeBridgeOrdersJson()
 {
@@ -2157,10 +2195,15 @@ void TradeBridgePoll()
                  ",\"server\":\"" + EscapeString(AccountInfoString(ACCOUNT_SERVER)) + "\"" +
                  ",\"demo\":" + (is_demo ? "true" : "false") +
                  ",\"currency\":\"" + EscapeString(AccountInfoString(ACCOUNT_CURRENCY)) + "\"" +
+                 ",\"leverage\":" + IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE)) +
+                 ",\"marginFree\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) +
                  ",\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) +
                  ",\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
                  ",\"positions\":" + TradeBridgePositionsJson() +
-                 ",\"orders\":" + TradeBridgeOrdersJson() + "}";
+                 ",\"orders\":" + TradeBridgeOrdersJson() +
+                 // Specs change rarely; refresh every ~20 polls (~1 min) to keep polls small.
+                 (g_spec_tick <= 0 ? ",\"specs\":" + TradeBridgeSpecsJson() : "") + "}";
+   g_spec_tick = (g_spec_tick + 1) % 20;
 
    string url = InpServerUrl + "/api/mt5/trade-bridge";
    string headers = "Content-Type: application/json\r\n";

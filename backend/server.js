@@ -26,6 +26,7 @@ import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllow
 import { findOrderFillIndex } from './orderFill.js';
 import { assessEntryReadiness, buildEntryReadyEmail } from './entryReadyAlert.js';
 import { autoTradeCombosAllow, normalizeAutoTradeCombo } from './autoTradeFilters.js';
+import { valuePerPricePerLot as specValuePerPricePerLot, minStopDistance as specMinStopDistance, spreadPrice as specSpreadPrice } from './brokerSpecs.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -4152,20 +4153,25 @@ app.get('/api/ai/decisions/latest', (req, res) => {
   res.json({ decisions: [...latest.values()], latest: sortedDecisions[0] || null, status: getMt5Status() });
 });
 
+// ONE definition of a pip, shared with pipSizeForSymbol(). These used to disagree on
+// gold (sizing said 0.01, every display said 0.1), so risk was computed correctly but
+// every gold "pips" figure shown to the user was 10x out.
 function forexSizingPipSize(symbol) {
-  const s = String(symbol || '').toUpperCase();
-  const caps = symbolCapsFor(s);
-  if (caps?.pipSize) return caps.pipSize;              // index: risk measured in points
-  if (s.includes('XAU') || s.includes('GOLD')) return 0.01;
-  if (s.includes('JPY')) return 0.01;
-  return 0.0001;
+  return pipSizeForSymbol(symbol);
 }
 
+// Money per PIP per 1.00 lot. Prefers the broker's own tick value (reported by the EA)
+// and only falls back to the static table when the bridge has not reported that symbol.
+// The gold fallback is 10 (not 1) because a gold pip is 0.1 of price, not 0.01 — paired
+// with the unified pip size above this leaves the risk maths identical while making the
+// displayed pip counts correct.
 function forexSizingPipValuePerLot(symbol) {
+  const perPrice = brokerValuePerPricePerLot(symbol);
+  if (perPrice !== null) return perPrice * forexSizingPipSize(symbol);   // broker truth
   const s = String(symbol || '').toUpperCase();
   const caps = symbolCapsFor(s);
-  if (caps?.pipValuePerLot) return caps.pipValuePerLot; // index: ~$1/point/lot (Exness USTEC)
-  if (s.includes('XAU') || s.includes('GOLD')) return 1;
+  if (caps?.pipValuePerLot) return caps.pipValuePerLot;
+  if (s.includes('XAU') || s.includes('GOLD')) return 10;
   if (s.includes('JPY')) return 9;
   return 10;
 }
@@ -8935,6 +8941,8 @@ app.get('/api/auto-trade', async (req, res) => {
         account: tradeBridge.account, broker: tradeBridge.broker, server: tradeBridge.server,
         demo: tradeBridge.demo, balance: tradeBridge.balance, equity: tradeBridge.equity,
         openPositions: tradeBridge.positions?.length || 0, openOrders: tradeBridge.orders?.length || 0,
+        leverage: tradeBridge.leverage, marginFree: tradeBridge.marginFree,
+        specSymbols: brokerSpecs.size,
         armedMatch: autoTradeArmedMatch(),
       },
       accounts: Object.values(reg.accounts || {}),
@@ -9289,8 +9297,17 @@ app.post('/api/mt5/trade-bridge', async (req, res) => {
     tradeBridge.demo = b.demo === true || b.demo === 'true' || b.demo === 1;
     tradeBridge.balance = Number.isFinite(Number(b.balance)) ? Number(b.balance) : tradeBridge.balance;
     tradeBridge.equity = Number.isFinite(Number(b.equity)) ? Number(b.equity) : tradeBridge.equity;
+    tradeBridge.leverage = Number.isFinite(Number(b.leverage)) ? Number(b.leverage) : tradeBridge.leverage;
+    tradeBridge.marginFree = Number.isFinite(Number(b.marginFree)) ? Number(b.marginFree) : tradeBridge.marginFree;
     tradeBridge.positions = Array.isArray(b.positions) ? b.positions : [];
     tradeBridge.orders = Array.isArray(b.orders) ? b.orders : [];
+    // Contract specs arrive periodically (they rarely change) — keep the last report.
+    if (Array.isArray(b.specs)) {
+      for (const sp of b.specs) {
+        const sym = String(sp?.symbol || '').toUpperCase();
+        if (sym) brokerSpecs.set(sym, { ...sp, symbol: sym, reportedAt: Date.now() });
+      }
+    }
     registerBridgeAccount(b);
 
     const pool = await initializeDatabase();
@@ -13060,7 +13077,20 @@ function challengeSignalGuard(lossAtStop, grade, rr) {
 // log into a different account in MT5 and dispatch pauses automatically.
 const AUTO_TRADE_BRIDGE_STALE_MS = 90 * 1000;
 const AUTO_TRADE_APPROVAL_MS = Math.max(60, Number(process.env.AUTO_TRADE_APPROVAL_MIN || 10) * 60) * 1000;
-const tradeBridge = { lastSeenAt: 0, account: null, broker: null, server: null, demo: null, balance: null, equity: null, positions: [], orders: [] };
+const tradeBridge = { lastSeenAt: 0, account: null, broker: null, server: null, demo: null, balance: null, equity: null, leverage: null, marginFree: null, positions: [], orders: [] };
+// Authoritative per-symbol contract specs reported by the EA (tick value, tick size,
+// contract size, minimum stop distance, spread, volume steps). Before this the backend
+// guessed pip value from a hardcoded table and knew nothing about the broker's minimum
+// stop distance — which mis-sized trades and produced "Invalid stops" rejections.
+const brokerSpecs = new Map();     // SYMBOL(uppercase) -> spec object
+function brokerSpecFor(symbol) {
+  return brokerSpecs.get(String(symbol || '').toUpperCase()) || null;
+}
+// Money risked per 1.00 lot for a 1-unit-of-PRICE move, straight from the broker:
+//   tickValue is the money per tickSize of price movement.
+function brokerValuePerPricePerLot(symbol) { return specValuePerPricePerLot(brokerSpecFor(symbol)); }
+function brokerMinStopDistance(symbol) { return specMinStopDistance(brokerSpecFor(symbol)); }
+function brokerSpreadPrice(symbol) { return specSpreadPrice(brokerSpecFor(symbol)); }
 const AUTO_TRADE_ACCOUNTS_FILE = path.join(__dirname, '.cache', 'auto_trade_accounts.json');
 let autoTradeAccountsCache = null;
 function loadAutoTradeAccounts() {
@@ -13189,7 +13219,38 @@ function buildAutoTradeTicket({ symbol, timeframe, sig, cfg, baseLots, baseRiskA
   if (!(lots > 0)) errors.push('lot size must be greater than zero');
 
   const stopPips = Number.isFinite(sl) ? px2p(entry, sl) : null;
-  const rr = (stopPips > 0 && Number.isFinite(tp1)) ? Math.round((px2p(entry, tp1) / stopPips) * 100) / 100 : null;
+  // R:R must be judged against the REAL target. The TP ladder defines TP1 as exactly 1R,
+  // so measuring against TP1 reported "R:R is 1:1" on every single ticket — a meaningless
+  // warning that buried the real ones. TP3 is the draw the setup actually aims for.
+  const finalTp = [tp3, tp2, tp1].find((t) => Number.isFinite(Number(t)) && Number(t) > 0);
+  const rr = (stopPips > 0 && Number.isFinite(finalTp)) ? Math.round((px2p(entry, finalTp) / stopPips) * 100) / 100 : null;
+  const rrToTp1 = (stopPips > 0 && Number.isFinite(tp1)) ? Math.round((px2p(entry, tp1) / stopPips) * 100) / 100 : null;
+
+  // ── Broker reality checks (only when the EA has reported that symbol's specs) ──
+  const minStopDist = brokerMinStopDistance(symbol);
+  const spreadPrice = brokerSpreadPrice(symbol);
+  const stopDist = Number.isFinite(sl) ? Math.abs(entry - sl) : null;
+  if (minStopDist !== null && stopDist !== null && minStopDist > 0) {
+    // The broker refuses stops/targets closer than this; sending one returns "Invalid
+    // stops" (MT5 10016) and no position is opened at all.
+    if (stopDist < minStopDist) {
+      errors.push(`stop is ${num1(stopDist / pip)} pips from entry but ${symbol} requires at least ${num1(minStopDist / pip)} — the broker would reject this order`);
+    }
+    for (const t of tps) {
+      if (Math.abs(Number(t) - entry) < minStopDist) {
+        errors.push(`a take-profit sits inside the broker's ${num1(minStopDist / pip)} pip minimum distance — the order would be rejected`);
+        break;
+      }
+    }
+  }
+  if (spreadPrice !== null && spreadPrice > 0 && stopDist !== null) {
+    const spreads = stopDist / spreadPrice;
+    if (spreads < 3) {
+      errors.push(`stop is only ${spreads.toFixed(1)}x the current ${symbol} spread — it would be taken out by the spread itself`);
+    } else if (spreads < 8) {
+      warnings.push(`stop is ${spreads.toFixed(1)}x the current spread (${num1(spreadPrice / pip)} pips) — thin cushion for normal noise`);
+    }
+  }
 
   // ── Quality warnings (trade is possible, but the override fights the analysis) ──
   if (ex.mode !== 'AUTO' && stopPips > 0) {
@@ -13206,7 +13267,7 @@ function buildAutoTradeTicket({ symbol, timeframe, sig, cfg, baseLots, baseRiskA
     }
   }
   if (rr !== null && Number.isFinite(cfg.minRR) && rr < cfg.minRR) {
-    warnings.push(`R:R is 1:${rr} — below your ${cfg.minRR} minimum for auto-trading`);
+    warnings.push(`R:R to the target is 1:${rr} — below your ${cfg.minRR} minimum for auto-trading`);
   }
 
   // ── Risk-size warnings vs the account rules ──
@@ -13229,7 +13290,7 @@ function buildAutoTradeTicket({ symbol, timeframe, sig, cfg, baseLots, baseRiskA
     } catch { /* advisory */ }
   }
 
-  return { lots, sl, tp1, tp2, tp3, rr, riskAmount, stopPips, errors, warnings, changed, mode: ex.mode, allowWarnedTrades: ex.allowWarnedTrades };
+  return { lots, sl, tp1, tp2, tp3, rr, rrToTp1, riskAmount, stopPips, errors, warnings, changed, mode: ex.mode, allowWarnedTrades: ex.allowWarnedTrades, usedBrokerSpecs: brokerSpecFor(symbol) !== null };
 }
 function num1(v) { return Number.isFinite(Number(v)) ? Math.round(Number(v) * 10) / 10 : '?'; }
 
