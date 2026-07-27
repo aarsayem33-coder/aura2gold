@@ -8916,6 +8916,41 @@ app.get('/api/auto-trade', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// GET /api/auto-trade/email-preview?kind=WIN[&format=text] — render any auto-trade email
+// with sample data so the templates can be reviewed in a browser. Read-only, sends nothing.
+app.get('/api/auto-trade/email-preview', (req, res) => {
+  try {
+    const kind = String(req.query.kind || 'FILLED').toUpperCase();
+    if (!AUTO_EMAIL_KINDS[kind]) return res.status(400).json({ error: `kind must be one of ${Object.keys(AUTO_EMAIL_KINDS).join(', ')}` });
+    const base = {
+      kind, symbol: 'XAUUSDm', timeframe: 'M15', direction: 'BUY', orderType: 'MARKET',
+      entry: 4080.15, stopLoss: 4074.9, tp1: 4085.4, tp2: 4090.65, tp3: 4098.2,
+      lots: 0.5, riskAmount: 26.25, riskMode: 'CHALLENGE 0.5%', execMode: 'AUTO',
+      score: 88, grade: 'A+', rr: 3.44, session: 'LONDON',
+      strategyName: 'ICT Breaker', account: '555001', ticketNo: 700123,
+      subject: `[AUTO-TRADE · ${kind}] BUY XAUUSDm M15 — ICT Breaker (preview)`,
+      note: 'Sample data — this is a template preview, not a real trade.',
+    };
+    const extras = {
+      SHADOW: { footer: 'Trade 1 of 3 today.' },
+      CAP_ALERT: { cta: 'Nothing automatic will happen — take it manually if you like it' },
+      PROPOSED: { cta: 'Open Auto Trading → Approve or Reject · expires in 10 minutes' },
+      PLACED: { orderType: 'LIMIT' },
+      FILLED: {},
+      WIN: { profit: 52.5, pips: 52.5, rMultiple: 2, closePrice: 4085.4, heldLabel: '1h 12m' },
+      LOSS: { profit: -26.25, pips: -52.5, rMultiple: -1, closePrice: 4074.9, heldLabel: '38m' },
+      ERROR: { warnings: ['stop is 2 pips — barely above the ~2 pip spread; it will be stopped by the spread alone'] },
+    };
+    const email = buildAutoTradeEmail({ ...base, ...(extras[kind] || {}) });
+    if (String(req.query.format).toLowerCase() === 'text') return res.type('text/plain').send(`SUBJECT: ${email.subject}\n\n${email.text}`);
+    res.type('html').send(`<!doctype html><meta charset="utf-8"><title>${kind} preview</title><body style="margin:0;padding:24px;background:#f1f5f9">
+      <p style="font-family:system-ui;font-size:12px;color:#475569;max-width:600px;margin:0 auto 12px">
+        <b>Subject:</b> ${email.subject}<br/>
+        <b>Preview:</b> ${Object.keys(AUTO_EMAIL_KINDS).map((k) => `<a href="?kind=${k}" style="margin-right:8px">${k}</a>`).join('')} · <a href="?kind=${kind}&format=text">plain text</a>
+      </p>${email.html}</body>`);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // POST /api/auto-trade/validate — dry-run the execution settings against a REAL recent
 // signal (or a supplied sample) so the UI can show the exact warnings before saving.
 app.post('/api/auto-trade/validate', async (req, res) => {
@@ -9210,6 +9245,146 @@ app.post('/api/mt5/trade-bridge', async (req, res) => {
   }
 });
 
+// ─── Auto-trader email design system ──────────────────────────────────────────
+// One builder for every auto-trade email (shadow, cap, approval, placed, filled,
+// closed, error) so they read as one product: dark header + status band, a real
+// trade-ticket table with pip distances, a warnings block, and a result panel.
+// Table-based + inline styles only — that is what mail clients actually render.
+const AUTO_EMAIL_KINDS = {
+  SHADOW:    { badge: 'SIMULATION',      accent: '#6366f1', soft: '#eef2ff', title: 'Would have traded', icon: '👁' },
+  CAP_ALERT: { badge: 'DAILY CAP HIT',   accent: '#d97706', soft: '#fffbeb', title: 'Setup found after your limit', icon: '🔔' },
+  PROPOSED:  { badge: 'APPROVAL NEEDED', accent: '#0284c7', soft: '#f0f9ff', title: 'Waiting for your approval', icon: '⏳' },
+  PLACED:    { badge: 'ORDER PLACED',    accent: '#0d9488', soft: '#f0fdfa', title: 'Pending order is live on MT5', icon: '📋' },
+  FILLED:    { badge: 'TRADE OPEN',      accent: '#059669', soft: '#ecfdf5', title: 'Position opened on MT5', icon: '🚀' },
+  WIN:       { badge: 'CLOSED · WIN',    accent: '#059669', soft: '#ecfdf5', title: 'Trade closed in profit', icon: '🏆' },
+  LOSS:      { badge: 'CLOSED · LOSS',   accent: '#e11d48', soft: '#fff1f2', title: 'Trade closed at a loss', icon: '🔻' },
+  ERROR:     { badge: 'EXECUTION FAILED', accent: '#e11d48', soft: '#fff1f2', title: 'MT5 rejected the order', icon: '⚠' },
+};
+function buildAutoTradeEmail(o) {
+  const k = AUTO_EMAIL_KINDS[o.kind] || AUTO_EMAIL_KINDS.SHADOW;
+  const sym = o.symbol;
+  const pip = pipSizeForSymbol(sym) || 0.0001;
+  const buy = /BUY/.test(String(o.direction).toUpperCase());
+  const dirColor = buy ? '#047857' : '#be123c';
+  const pipsBetween = (a, b) => (Number.isFinite(Number(a)) && Number.isFinite(Number(b))
+    ? `${Math.round((Math.abs(Number(a) - Number(b)) / pip) * 10) / 10}p` : null);
+  const esc = (s) => String(s ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+  // Signed money that reads naturally: +$52.50 / -$26.25 (never "$-26.25").
+  const money = (v) => (Number.isFinite(Number(v))
+    ? `${Number(v) < 0 ? '-' : '+'}$${Math.abs(Number(v)).toFixed(2)}` : '—');
+
+  // ── Trade ticket rows (price + distance in pips + money where known) ──
+  const line = (label, value, note, color) =>
+    `<tr>
+       <td style="padding:5px 12px 5px 0;color:#64748b;font-size:12px;white-space:nowrap">${label}</td>
+       <td style="padding:5px 0;font-size:13px;font-weight:700;color:${color || '#0f172a'}">${value}${note ? ` <span style="color:#94a3b8;font-weight:600">${note}</span>` : ''}</td>
+     </tr>`;
+  const rows = [];
+  rows.push(line('Entry', px(o.entry, sym), o.orderType ? `· ${o.orderType}` : null));
+  if (Number.isFinite(Number(o.stopLoss))) rows.push(line('Stop loss', px(o.stopLoss, sym), pipsBetween(o.entry, o.stopLoss), '#be123c'));
+  for (const [lbl, v] of [['Take profit 1', o.tp1], ['Take profit 2', o.tp2], ['Take profit 3', o.tp3]]) {
+    if (Number.isFinite(Number(v))) rows.push(line(lbl, px(v, sym), pipsBetween(o.entry, v), '#047857'));
+  }
+  if (o.lots != null) rows.push(line('Volume', `${o.lots} lots`, o.riskAmount != null ? `· ${px2(o.riskAmount)} at risk` : null));
+  if (o.rr != null) rows.push(line('Risk : reward', `1 : ${o.rr}`, null));
+
+  // ── Meta chips (strategy / grade / session / mode / account / ticket) ──
+  const chips = [
+    o.strategyName && `${esc(o.strategyName)}`,
+    (o.score != null && o.grade) ? `Score ${Math.round(o.score)} · ${o.grade}` : null,
+    o.session && `${o.session} session`,
+    o.execMode && o.execMode !== 'AUTO' ? `${o.execMode} sizing` : (o.riskMode ? `${o.riskMode} sizing` : null),
+    o.ticketNo ? `Ticket ${o.ticketNo}` : null,
+    o.account ? `Acct ${o.account}` : null,
+  ].filter(Boolean).map((c) => `<span style="display:inline-block;background:#f1f5f9;color:#475569;border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;margin:0 4px 4px 0">${c}</span>`).join('');
+
+  // ── Result panel (closed trades) ──
+  const resultPanel = o.kind === 'WIN' || o.kind === 'LOSS' ? `
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px;background:${k.soft};border:1px solid ${k.accent}33;border-radius:8px">
+      <tr><td style="padding:12px 14px">
+        <p style="margin:0;font-size:10px;font-weight:800;letter-spacing:.14em;color:${k.accent};text-transform:uppercase">Result</p>
+        <p style="margin:4px 0 0;font-size:26px;font-weight:800;color:${k.accent};line-height:1.1">${money(o.profit)}</p>
+        <p style="margin:4px 0 0;font-size:12px;font-weight:600;color:#475569">
+          ${o.pips != null ? `${o.pips > 0 ? '+' : ''}${o.pips} pips` : ''}${o.rMultiple != null ? ` &nbsp;·&nbsp; ${o.rMultiple > 0 ? '+' : ''}${o.rMultiple}R` : ''}${o.closePrice != null ? ` &nbsp;·&nbsp; exit ${px(o.closePrice, sym)}` : ''}${o.heldLabel ? ` &nbsp;·&nbsp; held ${o.heldLabel}` : ''}
+        </p>
+      </td></tr>
+    </table>` : '';
+
+  // ── Warnings (override fights the strategy's analysis) ──
+  const warnPanel = (o.warnings || []).length ? `
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px">
+      <tr><td style="padding:10px 14px">
+        <p style="margin:0 0 4px;font-size:10px;font-weight:800;letter-spacing:.12em;color:#b45309;text-transform:uppercase">⚠ Check before you rely on this</p>
+        <ul style="margin:0;padding-left:16px;font-size:12px;color:#78350f">${o.warnings.map((w) => `<li style="margin:2px 0">${esc(w)}</li>`).join('')}</ul>
+      </td></tr>
+    </table>` : '';
+
+  const overridePanel = (o.changed || []).length ? `
+    <p style="margin:0 0 12px;font-size:11px;color:#64748b">Manual overrides applied: <b style="color:#334155">${esc(o.changed.join(' · '))}</b></p>` : '';
+
+  const notePanel = o.note ? `
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px;background:${k.soft};border-left:3px solid ${k.accent};border-radius:4px">
+      <tr><td style="padding:10px 14px;font-size:12.5px;font-weight:600;color:#334155">${esc(o.note)}</td></tr>
+    </table>` : '';
+
+  const html = `<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;background:#ffffff">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:linear-gradient(135deg,#0f172a,#1e293b)">
+    <tr><td style="padding:16px 20px">
+      <p style="margin:0;font-size:10px;font-weight:800;letter-spacing:.18em;color:${k.accent};text-transform:uppercase">Aura Auto-Trader · ${k.badge}</p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:6px"><tr>
+        <td style="font-size:21px;font-weight:800;color:#ffffff">${k.icon} ${o.direction} ${esc(sym)}
+          <span style="font-size:13px;font-weight:600;color:#94a3b8">${esc(o.timeframe || '')}</span></td>
+        <td align="right">${o.grade ? `<span style="background:${k.accent};color:#fff;border-radius:6px;padding:3px 10px;font-size:13px;font-weight:800">${o.grade}</span>` : ''}</td>
+      </tr></table>
+      <p style="margin:6px 0 0;font-size:12.5px;font-weight:600;color:#cbd5e1">${k.title}</p>
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:16px 20px">
+    ${notePanel}
+    ${resultPanel}
+    ${o.cta ? `<table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px"><tr><td align="center" style="background:${k.accent};border-radius:8px;padding:11px 16px">
+        <span style="font-size:13.5px;font-weight:800;color:#ffffff">${esc(o.cta)}</span></td></tr></table>` : ''}
+    <p style="margin:0 0 6px;font-size:10px;font-weight:800;letter-spacing:.12em;color:#94a3b8;text-transform:uppercase">Trade ticket</p>
+    <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-bottom:12px">${rows.join('')}</table>
+    ${overridePanel}
+    ${warnPanel}
+    <div style="margin-top:4px">${chips}</div>
+    ${o.footer ? `<p style="margin:12px 0 0;font-size:11.5px;color:#64748b;line-height:1.5">${esc(o.footer)}</p>` : ''}
+    <p style="margin:12px 0 0;padding-top:10px;border-top:1px solid #f1f5f9;font-size:10.5px;color:#94a3b8">
+      Full history on the <b>Auto Trading</b> page · results in <b>Strategy Lab → Reports → Auto Trades</b>.<br/>Automated trade notification — educational, not financial advice.</p>
+  </td></tr></table>
+</div>`;
+
+  // Plain-text twin (never let a text-only client get a wall of markup).
+  const textRows = [
+    `Entry        ${px(o.entry, sym)}${o.orderType ? ` (${o.orderType})` : ''}`,
+    Number.isFinite(Number(o.stopLoss)) ? `Stop loss    ${px(o.stopLoss, sym)}  ${pipsBetween(o.entry, o.stopLoss) || ''}` : null,
+    Number.isFinite(Number(o.tp1)) ? `TP1          ${px(o.tp1, sym)}  ${pipsBetween(o.entry, o.tp1) || ''}` : null,
+    Number.isFinite(Number(o.tp2)) ? `TP2          ${px(o.tp2, sym)}  ${pipsBetween(o.entry, o.tp2) || ''}` : null,
+    Number.isFinite(Number(o.tp3)) ? `TP3          ${px(o.tp3, sym)}  ${pipsBetween(o.entry, o.tp3) || ''}` : null,
+    o.lots != null ? `Volume       ${o.lots} lots${o.riskAmount != null ? ` (${px2(o.riskAmount)} at risk)` : ''}` : null,
+    o.rr != null ? `Risk:reward  1:${o.rr}` : null,
+  ].filter(Boolean);
+  const text = [
+    `AURA AUTO-TRADER — ${k.badge}`,
+    `${o.direction} ${sym} ${o.timeframe || ''} — ${k.title}`,
+    o.note ? `\n${o.note}` : '',
+    (o.kind === 'WIN' || o.kind === 'LOSS')
+      ? `\nRESULT: ${money(o.profit)}${o.pips != null ? ` · ${o.pips > 0 ? '+' : ''}${o.pips} pips` : ''}${o.rMultiple != null ? ` · ${o.rMultiple}R` : ''}${o.closePrice != null ? ` · exit ${px(o.closePrice, sym)}` : ''}` : '',
+    o.cta ? `\n>> ${o.cta}` : '',
+    '', 'TRADE TICKET', ...textRows.map((r) => `  ${r}`),
+    (o.changed || []).length ? `\nOverrides: ${o.changed.join(' · ')}` : '',
+    (o.warnings || []).length ? `\n⚠ WARNINGS:\n${o.warnings.map((w) => `  - ${w}`).join('\n')}` : '',
+    '',
+    [o.strategyName, (o.score != null && o.grade) ? `score ${Math.round(o.score)} (${o.grade})` : null, o.session ? `${o.session} session` : null,
+     o.ticketNo ? `ticket ${o.ticketNo}` : null, o.account ? `account ${o.account}` : null].filter(Boolean).join(' · '),
+    o.footer || '',
+    '', 'Full history on the Auto Trading page. Educational — not financial advice.',
+  ].filter((l) => l !== null && l !== undefined).join('\n').replace(/\n{3,}/g, '\n\n');
+
+  return { subject: String(o.subject).slice(0, 180), text, html };
+}
+
 // Lifecycle emails for real executions. Fire-and-forget; failures only log.
 async function autoTradeLifecycleEmail(row, phase, extra = {}) {
   try {
@@ -9217,24 +9392,58 @@ async function autoTradeLifecycleEmail(row, phase, extra = {}) {
     const to = signalEmailToFor(row.symbol, row.timeframe);
     if (!to) return;
     const strategyName = STRATEGY_LAB_REGISTRY[row.strategy]?.name || row.strategy;
-    const base = `${row.direction} ${row.symbol} ${row.timeframe} · ${row.lots} lots · SL ${px(row.stop_loss, row.symbol)} · TP ${px(row.take_profit_1, row.symbol)}`;
-    let subject, bodyLines;
+    const sym = row.symbol;
+    const pip = pipSizeForSymbol(sym) || 0.0001;
+    const buy = /BUY/.test(String(row.direction).toUpperCase());
+    const base = {
+      symbol: sym, timeframe: row.timeframe, direction: row.direction, orderType: row.order_type,
+      entry: row.entry_price, stopLoss: row.stop_loss,
+      tp1: row.take_profit_1, tp2: row.take_profit_2, tp3: row.take_profit_3,
+      lots: row.lots, riskAmount: row.risk_amount, riskMode: row.risk_mode,
+      score: row.score, grade: row.grade, rr: row.rr, session: row.session,
+      strategyName, account: row.account || tradeBridge.account || null,
+      ticketNo: extra.ticket ?? row.ticket ?? row.position_id ?? null,
+    };
+    let opts;
     if (phase === 'PLACED') {
-      subject = `[AUTO-TRADE ✅ ORDER PLACED] ${row.direction} ${row.symbol} ${row.timeframe} @ ${px(row.entry_price, row.symbol)} | ${strategyName}`;
-      bodyLines = [`A ${row.order_type} order was placed on MT5 (ticket ${extra.ticket ?? row.ticket ?? '?'}):`, base, `Waiting for price to reach the entry. Expires with the trade window.`];
+      opts = { ...base, kind: 'PLACED',
+        subject: `[AUTO-TRADE · ORDER PLACED] ${row.direction} ${sym} ${row.timeframe} @ ${px(row.entry_price, sym)} — ${strategyName}`,
+        note: `Your ${row.order_type} order is resting on MT5. It fills only if price reaches the entry inside the trade window — otherwise it expires untouched and no position is opened.`,
+        footer: 'You will get a second email the moment it fills, and a result email when it closes.' };
     } else if (phase === 'FILLED') {
-      subject = `[AUTO-TRADE ✅ TRADE OPEN] ${row.direction} ${row.symbol} ${row.timeframe} @ ${px(extra.price ?? row.fill_price ?? row.entry_price, row.symbol)} | ${strategyName}`;
-      bodyLines = [`The trade is OPEN on MT5 (ticket ${extra.ticket ?? row.ticket ?? row.position_id ?? '?'}):`, base, `Risk ${px2(row.risk_amount)} (${row.risk_mode}). You'll get the result email when it closes.`];
+      const fill = extra.price ?? row.fill_price ?? row.entry_price;
+      opts = { ...base, kind: 'FILLED', entry: fill,
+        subject: `[AUTO-TRADE · TRADE OPEN] ${row.direction} ${sym} ${row.timeframe} @ ${px(fill, sym)} — ${strategyName}`,
+        note: `The position is live on MT5 with the stop and targets already attached. Risking ${px2(row.risk_amount)} on this trade.`,
+        footer: 'No action needed — the stop and take-profit are managed by the broker. The result email follows on close.' };
     } else if (phase === 'CLOSED') {
-      const won = Number(extra.profit) >= 0;
-      subject = `[AUTO-TRADE ${won ? '🏆 WIN' : '🔻 LOSS'} ${px2(extra.profit)}] ${row.direction} ${row.symbol} ${row.timeframe} | ${strategyName}`;
-      bodyLines = [`The trade closed at ${px(extra.closePrice, row.symbol)} for ${won ? 'a profit' : 'a loss'} of ${px2(extra.profit)}.`, base, row.risk_mode === 'CHALLENGE' ? 'Result was logged into the Challenge Tracker automatically.' : ''];
+      const profit = Number(extra.profit);
+      const won = profit >= 0;
+      const entryUsed = Number(row.fill_price ?? row.entry_price);
+      const pips = Number.isFinite(entryUsed) && Number.isFinite(Number(extra.closePrice))
+        ? Math.round(((Number(extra.closePrice) - entryUsed) / pip) * (buy ? 1 : -1) * 10) / 10 : null;
+      const rMultiple = Number.isFinite(profit) && Number(row.risk_amount) > 0
+        ? Math.round((profit / Number(row.risk_amount)) * 100) / 100 : null;
+      const openedMs = row.sent_at ? new Date(row.sent_at).getTime() : (row.created_at ? new Date(row.created_at).getTime() : NaN);
+      const heldMin = Number.isFinite(openedMs) ? Math.max(0, Math.round((Date.now() - openedMs) / 60000)) : null;
+      opts = { ...base, kind: won ? 'WIN' : 'LOSS', entry: entryUsed,
+        profit, pips, rMultiple, closePrice: extra.closePrice,
+        heldLabel: heldMin === null ? null : heldMin < 60 ? `${heldMin}m` : `${Math.floor(heldMin / 60)}h ${heldMin % 60}m`,
+        subject: `[AUTO-TRADE · ${won ? 'WIN' : 'LOSS'} ${profit < 0 ? '-' : '+'}$${Math.abs(profit).toFixed(2)}] ${row.direction} ${sym} ${row.timeframe} — ${strategyName}`,
+        note: won
+          ? `Closed in profit at ${px(extra.closePrice, sym)}.`
+          : `Closed at a loss at ${px(extra.closePrice, sym)} — the stop did its job and capped the damage at the planned risk.`,
+        footer: String(row.risk_mode).toUpperCase() === 'CHALLENGE'
+          ? 'This result was posted to your Challenge Tracker automatically — the daily-loss and drawdown room are already updated.'
+          : 'Running totals are on the Auto Trades report tab.' };
     } else if (phase === 'ERROR') {
-      subject = `[AUTO-TRADE ⚠ FAILED] ${row.direction} ${row.symbol} ${row.timeframe} | ${strategyName}`;
-      bodyLines = [`MT5 rejected the order: ${extra.message || 'unknown error'} (retcode ${extra.retcode ?? '?'})`, base, 'No position was opened. Check the terminal (AutoTrading enabled? margin? symbol visible?).'];
+      opts = { ...base, kind: 'ERROR',
+        subject: `[AUTO-TRADE · FAILED] ${row.direction} ${sym} ${row.timeframe} — ${strategyName}`,
+        note: `MT5 rejected the order: ${extra.message || 'unknown error'}${extra.retcode ? ` (retcode ${extra.retcode})` : ''}. No position was opened and nothing was risked.`,
+        footer: 'Common causes: AutoTrading disabled in the terminal, insufficient margin, the symbol not visible in Market Watch, or the broker rejecting the volume/stop distance.' };
     } else return;
-    const text = [...bodyLines.filter(Boolean), '', `Strategy: ${strategyName} · score ${row.score} (${row.grade}) · account ${row.account || tradeBridge.account || '?'}`, 'Auto Trading page has the full log. Not financial advice.'].join('\n');
-    await sendNotificationEmail({ to, subject: subject.slice(0, 180), text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: `${row.id}:${phase}` });
+    const email = buildAutoTradeEmail(opts);
+    await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: `${row.id}:${phase}` });
     console.log(`[AutoTrade] ${phase} email ${row.symbol} ${row.timeframe}`);
   } catch (e) { console.error('[AutoTrade] lifecycle email failed:', e.message); }
 }
@@ -13041,43 +13250,40 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
     const to = signalEmailToFor(symbol, tf);
     if (!to) return;
     const strategyName = STRATEGY_LAB_REGISTRY[strategy]?.name || strategy;
-    const ticketTxt = `${sig.decision} ${symbol} ${tf} · ${orderType} @ ${px(entry, symbol)} · SL ${px(useSl, symbol)} · TP1 ${px(useTp1, symbol)}${Number.isFinite(Number(useTp3)) ? ` · TP3 ${px(useTp3, symbol)}` : ''} · ${useLots} lots (${px2(ticket.riskAmount)} risk · ${ticket.mode === 'AUTO' ? `${riskMode} ${leg.riskPct}%` : `${ticket.mode} mode`})${ticket.changed.length ? `\n  Overrides — ${ticket.changed.join(', ')}` : ''}${ticket.warnings.length ? `\n  ⚠ WARNINGS: ${ticket.warnings.join('; ')}` : ''}`;
+    const ticketBase = {
+      symbol, timeframe: tf, direction: sig.decision, orderType,
+      entry, stopLoss: useSl, tp1: useTp1, tp2: useTp2, tp3: useTp3,
+      lots: useLots, riskAmount: ticket.riskAmount,
+      riskMode: `${riskMode} ${leg.riskPct}%`, execMode: ticket.mode,
+      score: sig.score, grade: sig.grade, rr: useRr, session: session.key,
+      strategyName, warnings: ticket.warnings, changed: ticket.changed,
+    };
     if (status === 'CAP_ALERT') {
-      const subject = `[AUTO-TRADE · CAP REACHED] Good ${sig.grade} setup on ${symbol} ${tf} — worth a manual look`.slice(0, 180);
-      const text = [
-        `The auto-trader hit its daily limit (${cfg.maxTradesPerDay}), but this setup passed every other gate:`,
-        ticketTxt,
-        `Strategy: ${strategyName} · score ${Math.round(sig.score ?? 0)} (${sig.grade}) · session ${session.key}`,
-        '', 'No order was (or would have been) placed. If you like it, take it manually. Advisory — not financial advice.',
-      ].join('\n');
-      await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: id });
+      const email = buildAutoTradeEmail({ ...ticketBase, kind: 'CAP_ALERT',
+        subject: `[AUTO-TRADE · CAP REACHED] ${sig.grade} setup on ${symbol} ${tf} — worth a manual look`,
+        note: `The auto-trader has already used its ${cfg.maxTradesPerDay} trades for today, but this setup cleared every other gate. No order was placed.`,
+        cta: 'Nothing automatic will happen — take it manually if you like it',
+        footer: `Daily cap keeps a bad session from compounding. Raise it on the Auto Trading page if ${cfg.maxTradesPerDay} is too tight for how you trade.` });
+      await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: id });
       console.log(`[AutoTrade] CAP alert ${symbol} ${tf} (${strategyName})`);
     } else if (status === 'PROPOSED') {
       const mins = Math.round(AUTO_TRADE_APPROVAL_MS / 60000);
-      const subject = `[AUTO-TRADE · APPROVAL NEEDED] ${sig.decision} ${symbol} ${tf} | ${Math.round(sig.score ?? 0)} ${sig.grade} | ${strategyName} — ${mins} min to approve`.slice(0, 180);
-      const text = [
-        `ASK MODE — this trade is prepared and waiting for YOUR approval on the Auto Trading page:`,
-        ticketTxt,
-        `Strategy: ${strategyName} · score ${Math.round(sig.score ?? 0)} (${sig.grade}) · RR 1:${sig.riskRewardRatio ?? 'n/a'} · session ${session.key}`,
-        `Expires in ${mins} minutes — a stale setup will never fill late.`,
-        `Today: trade ${todayCount + 1} of ${cfg.maxTradesPerDay}.`,
-        '', 'Open the dashboard → Auto Trading → Approve or Reject. Not financial advice.',
-      ].join('\n');
-      await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: id });
+      const email = buildAutoTradeEmail({ ...ticketBase, kind: 'PROPOSED',
+        subject: `[AUTO-TRADE · APPROVE] ${sig.decision} ${symbol} ${tf} · ${Math.round(sig.score ?? 0)} ${sig.grade} · ${strategyName} — ${mins} min`,
+        note: `This ticket is built and waiting on you. Nothing is sent to MT5 until you approve it.`,
+        cta: `Open Auto Trading → Approve or Reject · expires in ${mins} minutes`,
+        footer: `The window is deliberately short: a setup that goes stale must never fill late. Trade ${todayCount + 1} of ${cfg.maxTradesPerDay} today.` });
+      await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: id });
       console.log(`[AutoTrade] PROPOSED ${sig.decision} ${symbol} ${tf} (${strategyName}) — awaiting approval`);
     } else if (status === 'QUEUED') {
-      console.log(`[AutoTrade] QUEUED ${sig.decision} ${symbol} ${tf} (${strategyName}, ${leg.lots} lots) — awaiting EA pickup`);
+      console.log(`[AutoTrade] QUEUED ${sig.decision} ${symbol} ${tf} (${strategyName}, ${useLots} lots) — awaiting EA pickup`);
     } else if (status === 'SHADOW') {
-      const subject = `[AUTO-TRADE · SHADOW] Would place: ${sig.decision} ${symbol} ${tf} | ${Math.round(sig.score ?? 0)} ${sig.grade} | ${strategyName}`.slice(0, 180);
-      const text = [
-        `SHADOW MODE — no order was placed. With the EA bridge live and an account armed, this trade would have been sent to MT5:`,
-        ticketTxt,
-        `Strategy: ${strategyName} · score ${Math.round(sig.score ?? 0)} (${sig.grade}) · RR 1:${sig.riskRewardRatio ?? 'n/a'} · session ${session.key}`,
-        `Today: trade ${todayCount + 1} of ${cfg.maxTradesPerDay}.`,
-        '', 'Review shadow decisions on the Auto Trading page. Advisory — not financial advice.',
-      ].join('\n');
-      await sendNotificationEmail({ to, subject, text, html: `<pre style="font-family:inherit;white-space:pre-wrap">${text}</pre>`, signalId: id });
-      console.log(`[AutoTrade] SHADOW ${sig.decision} ${symbol} ${tf} (${strategyName}, ${leg.lots} lots)`);
+      const email = buildAutoTradeEmail({ ...ticketBase, kind: 'SHADOW',
+        subject: `[AUTO-TRADE · SHADOW] ${sig.decision} ${symbol} ${tf} · ${Math.round(sig.score ?? 0)} ${sig.grade} · ${strategyName}`,
+        note: 'Shadow mode — no order was placed and nothing was risked. This is exactly the ticket that would have gone to MT5 with the bridge live and an account armed.',
+        footer: `Trade ${todayCount + 1} of ${cfg.maxTradesPerDay} today. Watch these for a few sessions: if the picks match what you would have taken yourself, you are ready for ASK mode.` });
+      await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: id });
+      console.log(`[AutoTrade] SHADOW ${sig.decision} ${symbol} ${tf} (${strategyName}, ${useLots} lots)`);
     }
   } catch (error) { console.error('[AutoTrade] decision failed:', error.message); }
 }
