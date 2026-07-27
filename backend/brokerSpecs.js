@@ -50,6 +50,46 @@ export function normalizeLots(spec, lots) {
   return Math.round(v * 100) / 100;
 }
 
+/** Margin the broker will hold for this position, from the terminal's own calculation. */
+export function marginRequired(spec, lots) {
+  const per = Number(spec?.marginPerLot);
+  const v = Number(lots);
+  if (!(per > 0) || !(v > 0)) return null;
+  return Math.round(per * v * 100) / 100;
+}
+
+/**
+ * Can the account actually open this position?
+ *   BLOCKED  margin exceeds free margin -> the broker rejects it outright
+ *   BLOCKED  margin would consume more than `maxUsePct` of free margin (default 80%)
+ *   WARN     margin uses more than `warnUsePct` (default 30%) — little room left
+ * Returns ok:true and null figures when the broker has not reported margin data, so an
+ * unknown symbol is never blocked on a guess.
+ */
+export function assessMargin(spec, lots, freeMargin, { maxUsePct = 80, warnUsePct = 30 } = {}) {
+  const out = { ok: true, blocked: false, reason: null, required: null, usePct: null };
+  const required = marginRequired(spec, lots);
+  const free = Number(freeMargin);
+  if (required === null || !(free > 0)) return out;          // unknown -> do not guess
+  out.required = required;
+  out.usePct = Math.round((required / free) * 1000) / 10;
+  if (required > free) {
+    out.ok = false; out.blocked = true;
+    out.reason = 'not enough free margin to open this position';
+    return out;
+  }
+  if (out.usePct > maxUsePct) {
+    out.ok = false; out.blocked = true;
+    out.reason = `would tie up ${out.usePct}% of free margin`;
+    return out;
+  }
+  if (out.usePct > warnUsePct) {
+    out.ok = false;
+    out.reason = `uses ${out.usePct}% of free margin`;
+  }
+  return out;
+}
+
 /**
  * Is this stop placeable and sane at the broker?
  *   BLOCKED  stop closer than the broker's minimum distance -> MT5 rejects with 10016

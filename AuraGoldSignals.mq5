@@ -1831,7 +1831,48 @@ string MatchBrokerSymbol(string standard_pair)
    StringReplace(clean_pair, "/", ""); // remove any slashes
    StringToUpper(clean_pair);
 
-   int total = SymbolsTotal(false); // first look in Market Watch
+   // Resolution order matters. A plain substring search returns whatever the broker
+   // happens to list first, which is how "USTEC" once resolved to USTEC_x100m — the
+   // x100 contract at $100/point instead of USTECm at $1/point, mis-sizing a trade by
+   // 100x. So: exact name wins, then the SHORTEST prefix match (USTECm beats
+   // USTEC_x100m), and only then a loose substring, again shortest-first.
+   string best = "";
+   int    best_len = 0;
+
+   // Pass 1 + 2: exact match, Market Watch first then the full symbol tree.
+   for(int pass = 0; pass < 2; pass++)
+   {
+      bool selected_only = (pass == 0);
+      int total_x = SymbolsTotal(selected_only);
+      for(int i = 0; i < total_x; i++)
+      {
+         string symbol = SymbolName(i, selected_only);
+         string sym_upper = symbol;
+         StringToUpper(sym_upper);
+         if(sym_upper == clean_pair) return symbol;      // exact name, unambiguous
+      }
+   }
+
+   // Pass 3: prefix match ("XAUUSD" -> "XAUUSDm"), shortest suffix wins.
+   for(int pass = 0; pass < 2; pass++)
+   {
+      bool selected_only = (pass == 0);
+      int total_x = SymbolsTotal(selected_only);
+      for(int i = 0; i < total_x; i++)
+      {
+         string symbol = SymbolName(i, selected_only);
+         string sym_upper = symbol;
+         StringToUpper(sym_upper);
+         if(StringFind(sym_upper, clean_pair) == 0)
+         {
+            int len = StringLen(sym_upper);
+            if(best == "" || len < best_len) { best = symbol; best_len = len; }
+         }
+      }
+      if(best != "") return best;                        // prefer Market Watch resolution
+   }
+
+   int total = SymbolsTotal(false); // fall back to a loose substring, shortest wins
    for(int i = 0; i < total; i++)
    {
       string symbol = SymbolName(i, false);
@@ -1839,9 +1880,11 @@ string MatchBrokerSymbol(string standard_pair)
       StringToUpper(sym_upper);
       if(StringFind(sym_upper, clean_pair) >= 0)
       {
-         return symbol;
+         int len = StringLen(sym_upper);
+         if(best == "" || len < best_len) { best = symbol; best_len = len; }
       }
    }
+   if(best != "") return best;
 
    total = SymbolsTotal(true); // look in all broker symbols
    for(int i = 0; i < total; i++)
@@ -1976,6 +2019,12 @@ string TradeBridgeSpecsJson()
       double tickValue = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE);
       double tickSize  = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE);
       if(point <= 0 || tickSize <= 0) continue;
+      // Margin for exactly 1.00 lot, computed by the terminal itself — this already
+      // accounts for leverage, instrument type and any per-symbol margin rate, so the
+      // backend never has to reimplement broker margin rules.
+      double marginPerLot = 0.0;
+      double askPx = SymbolInfoDouble(s, SYMBOL_ASK);
+      if(askPx > 0 && !OrderCalcMargin(ORDER_TYPE_BUY, s, 1.0, askPx, marginPerLot)) marginPerLot = 0.0;
       if(!first) js += ",";
       js += "{\"symbol\":\"" + EscapeString(s) + "\"" +
             ",\"digits\":"       + IntegerToString((long)SymbolInfoInteger(s, SYMBOL_DIGITS)) +
@@ -1988,7 +2037,8 @@ string TradeBridgeSpecsJson()
             ",\"spread\":"       + IntegerToString((long)SymbolInfoInteger(s, SYMBOL_SPREAD)) +
             ",\"volMin\":"       + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MIN), 4) +
             ",\"volMax\":"       + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MAX), 2) +
-            ",\"volStep\":"      + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_STEP), 4) + "}";
+            ",\"volStep\":"      + DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_STEP), 4) +
+            ",\"marginPerLot\":" + DoubleToString(marginPerLot, 2) + "}";
       first = false;
    }
    js += "]";

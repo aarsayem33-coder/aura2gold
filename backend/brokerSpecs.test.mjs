@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   valuePerPricePerLot, valuePerPipPerLot, minStopDistance, spreadPrice,
-  normalizeLots, assessStopDistance,
+  normalizeLots, assessStopDistance, marginRequired, assessMargin,
 } from './brokerSpecs.js';
 
 // Real Exness specs as MT5 reports them.
@@ -87,4 +87,58 @@ test('unknown specs never fabricate a value', () => {
   assert.equal(valuePerPricePerLot(null), null);
   assert.equal(valuePerPricePerLot({ tickValue: 0, tickSize: 0 }), null);
   assert.equal(spreadPrice({}), null);
+});
+
+// ── margin pre-check (added before switching brokers) ──
+// Exness demo, 1:200 leverage: 1 lot of gold at ~4090 needs ~$2045 margin.
+const GOLD_M = { ...GOLD, marginPerLot: 2045 };
+const GBP_M = { ...GBP, marginPerLot: 668 };
+
+test('margin required scales with lot size', () => {
+  assert.equal(marginRequired(GOLD_M, 0.16), 327.2);
+  assert.equal(marginRequired(GOLD_M, 1), 2045);
+  assert.equal(marginRequired({}, 1), null, 'no broker data -> null, never a guess');
+});
+
+test('a position bigger than free margin is blocked before sending', () => {
+  const a = assessMargin(GOLD_M, 3, 4000);        // needs $6135 of $4000
+  assert.equal(a.blocked, true);
+  assert.match(a.reason, /not enough free margin/);
+});
+
+test('a position that would tie up most of the account is blocked', () => {
+  const a = assessMargin(GOLD_M, 1.7, 4000);      // ~$3476 = 87% of free margin
+  assert.equal(a.blocked, true);
+  assert.match(a.reason, /tie up/);
+  assert.ok(a.usePct > 80);
+});
+
+test('a moderate position warns but still trades', () => {
+  const a = assessMargin(GOLD_M, 1, 4000);        // $2045 = 51%
+  assert.equal(a.blocked, false, 'must not block a legitimate trade');
+  assert.equal(a.ok, false, 'but should flag the exposure');
+  assert.match(a.reason, /uses 51.1% of free margin/);
+});
+
+test('a normal risk-sized position passes cleanly', () => {
+  const a = assessMargin(GOLD_M, 0.16, 4000);     // $327 = 8%
+  assert.equal(a.ok, true);
+  assert.equal(a.blocked, false);
+  assert.equal(a.reason, null);
+  assert.equal(a.usePct, 8.2);
+});
+
+test('low-leverage accounts are caught: same trade, 1:30 broker', () => {
+  // The same 0.16 lots of gold needs ~6.7x more margin at 1:30 than at 1:200.
+  const GOLD_EU = { ...GOLD, marginPerLot: 13633 };
+  const ok200 = assessMargin(GOLD_M, 0.16, 1000);
+  const eu30 = assessMargin(GOLD_EU, 0.16, 1000);
+  assert.equal(ok200.blocked, false, '1:200 account can afford it');
+  assert.equal(eu30.blocked, true, '1:30 account cannot — caught before the order is sent');
+});
+
+test('margin is never blocked when the broker has not reported it yet', () => {
+  const a = assessMargin(GBP, 0.5, 4000);         // GBP spec has no marginPerLot
+  assert.equal(a.ok, true);
+  assert.equal(a.required, null);
 });

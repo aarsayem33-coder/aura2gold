@@ -26,7 +26,7 @@ import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllow
 import { findOrderFillIndex } from './orderFill.js';
 import { assessEntryReadiness, buildEntryReadyEmail } from './entryReadyAlert.js';
 import { autoTradeCombosAllow, normalizeAutoTradeCombo } from './autoTradeFilters.js';
-import { valuePerPricePerLot as specValuePerPricePerLot, minStopDistance as specMinStopDistance, spreadPrice as specSpreadPrice } from './brokerSpecs.js';
+import { valuePerPricePerLot as specValuePerPricePerLot, minStopDistance as specMinStopDistance, spreadPrice as specSpreadPrice, assessMargin as specAssessMargin } from './brokerSpecs.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -13250,6 +13250,15 @@ function buildAutoTradeTicket({ symbol, timeframe, sig, cfg, baseLots, baseRiskA
     } else if (spreads < 8) {
       warnings.push(`stop is ${spreads.toFixed(1)}x the current spread (${num1(spreadPrice / pip)} pips) — thin cushion for normal noise`);
     }
+  }
+  // Can the account actually afford it? Margin comes from the terminal's own
+  // OrderCalcMargin, so leverage and per-symbol margin rates are already baked in —
+  // this is what catches a low-leverage broker rejecting a size that was fine at 1:200.
+  const marginCheck = specAssessMargin(brokerSpecFor(symbol), lots, tradeBridge.marginFree);
+  if (marginCheck.blocked) {
+    errors.push(`${marginCheck.reason} — needs ${px2(marginCheck.required)} margin against ${px2(tradeBridge.marginFree)} free`);
+  } else if (!marginCheck.ok && marginCheck.reason) {
+    warnings.push(`margin ${marginCheck.reason} (${px2(marginCheck.required)} of ${px2(tradeBridge.marginFree)})`);
   }
 
   // ── Quality warnings (trade is possible, but the override fights the analysis) ──
