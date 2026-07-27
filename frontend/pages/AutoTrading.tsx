@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Bot, RefreshCw, Loader2, ShieldAlert, Eye, Power, Zap, HelpCircle, Save, CheckCircle2, Landmark, ShieldCheck, XCircle } from 'lucide-react';
+import { Bot, RefreshCw, Loader2, ShieldAlert, Eye, Power, Zap, HelpCircle, Save, CheckCircle2, Landmark, ShieldCheck, XCircle, Plus } from 'lucide-react';
 import { fetchAutoTradeStatus, fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, approveAutoTrade, rejectAutoTrade, armAutoTradeAccount, validateAutoTrade } from '../mt5Api';
 import type { AutoTradeStatus, AutoTradeConfig, AutoTradeExecution, AutoTradeValidation, EmailAlertSettings, StrategyMeta } from '../types';
 
@@ -41,6 +41,9 @@ export default function AutoTrading() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [, setTick] = useState(0);   // 1s re-render tick for approval countdowns
   const [valid, setValid] = useState<AutoTradeValidation | null>(null);
+  const [cbStrategy, setCbStrategy] = useState('');
+  const [cbSymbol, setCbSymbol] = useState('*');
+  const [cbTimeframe, setCbTimeframe] = useState('*');
 
   const DEFAULT_EXEC: AutoTradeExecution = {
     mode: 'AUTO', lots: 0.01, slPips: null, tp1Pips: null, tp2Pips: null, tp3Pips: null,
@@ -49,8 +52,10 @@ export default function AutoTrading() {
   const cfg: AutoTradeConfig = settings?.autoTrade || status?.config || {
     mode: 'OFF', strategies: [], symbols: [], timeframes: [], sessions: [],
     maxTradesPerDay: 3, maxConcurrent: 2, onePerSymbol: true, minGrade: 'A', minRR: 2,
-    execution: DEFAULT_EXEC,
+    combos: [], execution: DEFAULT_EXEC,
   };
+  const combos = cfg.combos || [];
+  const precision = combos.length > 0;
   const exec: AutoTradeExecution = { ...DEFAULT_EXEC, ...(cfg.execution || {}) };
 
   const load = useCallback(async () => {
@@ -69,7 +74,7 @@ export default function AutoTrading() {
 
   // Live dry-run: validate the execution settings against the most recent real signal so
   // the warnings appear as you type, not after a bad trade.
-  const execKey = JSON.stringify(exec) + (cfg.strategies || []).join(',') + cfg.minRR;
+  const execKey = JSON.stringify(exec) + (cfg.strategies || []).join(',') + combos.join(',') + cfg.minRR;
   useEffect(() => {
     if (!settings) return;
     const t = setTimeout(() => {
@@ -104,6 +109,13 @@ export default function AutoTrading() {
     setDirty(true); setSaved(false);
   };
   const patchExec = (p: Partial<AutoTradeExecution>) => patch({ execution: { ...exec, ...p } });
+  const addCombo = () => {
+    if (!cbStrategy) return;
+    const key = `${cbStrategy}|${cbSymbol}|${cbTimeframe}`;
+    if (combos.includes(key)) return;
+    patch({ combos: [...combos, key] });
+  };
+  const removeCombo = (key: string) => patch({ combos: combos.filter((c) => c !== key) });
   const toggleList = (key: 'strategies' | 'symbols' | 'timeframes' | 'sessions', val: string) => {
     const list = cfg[key] || [];
     patch({ [key]: list.includes(val) ? list.filter((x) => x !== val) : [...list, val] } as Partial<AutoTradeConfig>);
@@ -335,10 +347,85 @@ export default function AutoTrading() {
         </div>
       </div>
 
+      {/* Precision combos — exact strategy × symbol × timeframe */}
+      <div className={`rounded-2xl border bg-white shadow-card ${precision ? 'border-indigo-300' : 'border-slate-200'}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-5 py-3">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900">Exact combinations <span className="font-semibold text-slate-400">(strategy × symbol × timeframe)</span></h3>
+            <p className="text-xs font-medium text-slate-500">Pick the precise pairings you trust — e.g. <b>Forex Confluence × GBPUSDm × M15</b> without allowing that strategy anywhere else. Add one or more and this list becomes the only thing that trades.</p>
+          </div>
+          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-black ${precision ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
+            {precision ? `PRECISION · ${combos.length}` : 'NOT IN USE'}
+          </span>
+        </div>
+        <div className="space-y-3 px-5 py-4">
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="min-w-[190px] flex-1">
+              <label className="block text-[11px] font-semibold text-slate-500">Strategy</label>
+              <select value={cbStrategy} onChange={(e) => { setCbStrategy(e.target.value); setCbTimeframe('*'); }} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800">
+                <option value="">Choose a strategy…</option>
+                {strategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div className="min-w-[130px]">
+              <label className="block text-[11px] font-semibold text-slate-500">Symbol</label>
+              <select value={cbSymbol} onChange={(e) => setCbSymbol(e.target.value)} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800">
+                <option value="*">Any symbol</option>
+                {symbols.map((s) => <option key={s} value={s.toUpperCase()}>{s}</option>)}
+              </select>
+            </div>
+            <div className="min-w-[120px]">
+              <label className="block text-[11px] font-semibold text-slate-500">Timeframe</label>
+              <select value={cbTimeframe} onChange={(e) => setCbTimeframe(e.target.value)} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800">
+                <option value="*">Any timeframe</option>
+                {(strategies.find((s) => s.id === cbStrategy)?.timeframes || TFS).map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <button type="button" onClick={addCombo} disabled={!cbStrategy}
+              className="inline-flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-40">
+              <Plus size={15} />Add
+            </button>
+          </div>
+          {cbStrategy && <p className="text-[10px] font-medium text-slate-400">Timeframes listed are the ones {strategies.find((s) => s.id === cbStrategy)?.name} actually scans — anything else would never fire.</p>}
+
+          {precision ? (
+            <div className="space-y-1.5">
+              {Object.entries(combos.reduce<Record<string, string[]>>((acc, c) => {
+                const [sid] = c.split('|');
+                (acc[sid] ||= []).push(c);
+                return acc;
+              }, {})).map(([sid, list]) => (
+                <div key={sid} className="rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2">
+                  <p className="text-[11px] font-black text-slate-700">{strategies.find((s) => s.id === sid)?.name || sid}</p>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    {list.map((c) => {
+                      const [, sym, tf] = c.split('|');
+                      return (
+                        <span key={c} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-white px-2 py-1 text-[11px] font-bold text-slate-700">
+                          {sym === '*' ? 'any symbol' : sym} <span className="text-slate-300">×</span> {tf === '*' ? 'any TF' : tf}
+                          <button type="button" onClick={() => removeCombo(c)} className="text-slate-300 hover:text-rose-600"><XCircle size={13} /></button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              <p className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] font-semibold text-indigo-900">
+                Precision mode is active — <b>only</b> these {combos.length} combination{combos.length === 1 ? '' : 's'} can trade. The broad lists below are ignored while this list has entries. Remove them all to go back to the broad rules.
+              </p>
+            </div>
+          ) : (
+            <p className="rounded-lg border border-dashed border-slate-200 px-3 py-3 text-center text-[11px] font-medium text-slate-400">
+              No exact combinations yet — the broad lists below are in charge. Add one above to switch to precision mode.
+            </p>
+          )}
+        </div>
+      </div>
+
       {/* Controller */}
-      <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+      <div className={`rounded-2xl border bg-white shadow-card ${precision ? 'border-slate-200 opacity-60' : 'border-slate-200'}`}>
         <div className="border-b border-slate-100 px-5 py-3">
-          <h3 className="text-sm font-bold text-slate-900">What the system is allowed to trade</h3>
+          <h3 className="text-sm font-bold text-slate-900">What the system is allowed to trade {precision && <span className="ml-1 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-black text-slate-600">OVERRIDDEN BY PRECISION LIST</span>}</h3>
           <p className="text-xs font-medium text-slate-500">Strategies are explicit opt-in — none selected = nothing trades. Symbols / timeframes / sessions empty = all. Lot size comes from Account &amp; Sizing.</p>
         </div>
         <div className="space-y-4 px-5 py-4">

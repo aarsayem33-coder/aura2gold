@@ -1498,6 +1498,8 @@ export interface AutoTradeConfig {
   strategies: string[]; symbols: string[]; timeframes: string[]; sessions: string[];
   maxTradesPerDay: number; maxConcurrent: number; onePerSymbol: boolean;
   minGrade: 'A' | 'A+'; minRR: number;
+  /** Exact 'strategyId|SYMBOL|TF' triples ('*' = any). Non-empty = sole authority. */
+  combos: string[];
   execution: AutoTradeExecution;
 }
 export interface AutoTradeValidation {

@@ -25,6 +25,7 @@ import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STR
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
 import { findOrderFillIndex } from './orderFill.js';
 import { assessEntryReadiness, buildEntryReadyEmail } from './entryReadyAlert.js';
+import { autoTradeCombosAllow, normalizeAutoTradeCombo } from './autoTradeFilters.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -7508,6 +7509,12 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
     onePerSymbol: true,
     minGrade: 'A',
     minRR: 2,
+    // PRECISION MODE — exact strategy × symbol × timeframe triples, e.g.
+    //   'forex-confluence|GBPUSDM|M15'  ·  'forex-confluence|XAUUSDM|M30'
+    // SYMBOL and/or TIMEFRAME may be '*' to mean "any". When this list is NON-EMPTY it
+    // is the sole authority: only these exact combinations trade and the broad
+    // strategies/symbols/timeframes lists are ignored. Empty = the broad lists apply.
+    combos: [],
     // How the ticket (lots / SL / TP) is built for each auto-trade:
     //   AUTO   — the strategy's own SL/TP + lot size from Account & Sizing (default).
     //   MANUAL — your fixed lots + your SL/TP DISTANCES in pips (absolute prices are
@@ -7728,6 +7735,11 @@ function saveEmailAlertSettings(nextSettings) {
       onePerSymbol: src.onePerSymbol !== false,
       minGrade: ['A', 'A+'].includes(String(src.minGrade || '').toUpperCase()) ? String(src.minGrade).toUpperCase() : 'A',
       minRR: (() => { const n = Number(src.minRR); return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : base.minRR; })(),
+      combos: Array.isArray(src.combos)
+        ? [...new Set(src.combos
+          .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))
+          .filter(Boolean))].slice(0, 200)
+        : [],
       execution: (() => {
         const e = (src.execution && typeof src.execution === 'object') ? src.execution : {};
         const be = base.execution;
@@ -8961,7 +8973,10 @@ app.post('/api/auto-trade/validate', async (req, res) => {
     // Prefer the most recent real signal from an allowed strategy — the warnings then
     // reference the actual structural stop the engine chose.
     if (pool) {
-      const ids = (cfg.strategies || []).length ? cfg.strategies : Object.keys(STRATEGY_LAB_REGISTRY);
+      // Prefer a signal from whatever the user actually allows (precision list first).
+      const comboIds = [...new Set((cfg.combos || []).map((c) => String(c).split('|')[0]))];
+      const ids = comboIds.length ? comboIds
+        : ((cfg.strategies || []).length ? cfg.strategies : Object.keys(STRATEGY_LAB_REGISTRY));
       const [rows] = await pool.query(
         `SELECT * FROM mt5_strategy_signals WHERE strategy IN (${ids.map(() => '?').join(',')})
            AND entry_price IS NOT NULL AND stop_loss IS NOT NULL AND take_profit_1 IS NOT NULL
@@ -13156,11 +13171,11 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
     // Trading needs a full forex ticket. (Fixed-time-only calls have no SL/TP to place.)
     const entry = Number(sig.entry), sl = Number(sig.stopLoss), tp1 = Number(sig.takeProfit1);
     if (![entry, sl, tp1].every(Number.isFinite)) return;
-    // Explicit opt-in: NO strategies selected = nothing trades. This is deliberate —
-    // an "empty = all" default on real orders would be a loaded gun.
-    if (!cfg.strategies.length || !cfg.strategies.includes(strategy)) return;
-    if (cfg.symbols.length && !cfg.symbols.includes(String(symbol).toUpperCase())) return;
-    if (cfg.timeframes.length && !cfg.timeframes.includes(String(tf).toUpperCase())) return;
+    // PRECISION MODE takes over when any exact triple is configured: only those
+    // strategy × symbol × timeframe combinations trade ('*' = any in that position).
+    // Otherwise fall back to the broad lists, where NO strategies selected = nothing
+    // trades — an "empty = all" default on real orders would be a loaded gun.
+    if (!autoTradeCombosAllow(cfg, strategy, symbol, tf)) return;
     const session = strategyLabSession(new Date().toISOString());
     if (cfg.sessions.length && !cfg.sessions.includes(session.key)) return;
     const gradeRankOf = (g) => (g === 'A+' ? 2 : g === 'A' ? 1 : 0);
