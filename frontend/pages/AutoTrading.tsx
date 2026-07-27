@@ -44,6 +44,7 @@ export default function AutoTrading() {
   const [cbStrategy, setCbStrategy] = useState('');
   const [cbSymbol, setCbSymbol] = useState('*');
   const [cbTimeframe, setCbTimeframe] = useState('*');
+  const [presetName, setPresetName] = useState('');
 
   const DEFAULT_EXEC: AutoTradeExecution = {
     mode: 'AUTO', lots: 0.01, slPips: null, tp1Pips: null, tp2Pips: null, tp3Pips: null,
@@ -52,9 +53,10 @@ export default function AutoTrading() {
   const cfg: AutoTradeConfig = settings?.autoTrade || status?.config || {
     mode: 'OFF', strategies: [], symbols: [], timeframes: [], sessions: [],
     maxTradesPerDay: 3, maxConcurrent: 2, onePerSymbol: true, minGrade: 'A', minRR: 2,
-    combos: [], execution: DEFAULT_EXEC,
+    combos: [], comboPresets: {}, execution: DEFAULT_EXEC,
   };
   const combos = cfg.combos || [];
+  const presets = cfg.comboPresets || {};
   const precision = combos.length > 0;
   const exec: AutoTradeExecution = { ...DEFAULT_EXEC, ...(cfg.execution || {}) };
 
@@ -116,6 +118,18 @@ export default function AutoTrading() {
     patch({ combos: [...combos, key] });
   };
   const removeCombo = (key: string) => patch({ combos: combos.filter((c) => c !== key) });
+  const savePreset = () => {
+    const name = presetName.trim();
+    if (!name || !combos.length) return;
+    patch({ comboPresets: { ...presets, [name]: [...combos] } });
+    setPresetName('');
+  };
+  const loadPreset = (name: string) => { if (presets[name]) patch({ combos: [...presets[name]] }); };
+  const deletePreset = (name: string) => {
+    const next = { ...presets };
+    delete next[name];
+    patch({ comboPresets: next });
+  };
   const toggleList = (key: 'strategies' | 'symbols' | 'timeframes' | 'sessions', val: string) => {
     const list = cfg[key] || [];
     patch({ [key]: list.includes(val) ? list.filter((x) => x !== val) : [...list, val] } as Partial<AutoTradeConfig>);
@@ -388,6 +402,39 @@ export default function AutoTrading() {
           </div>
           {cbStrategy && <p className="text-[10px] font-medium text-slate-400">Timeframes listed are the ones {strategies.find((s) => s.id === cbStrategy)?.name} actually scans — anything else would never fire.</p>}
 
+          {/* Saved sets — build a list once, recall it any time */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5">
+            <p className="mb-1.5 text-[10px] font-black uppercase tracking-wider text-slate-500">Saved sets</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <input value={presetName} onChange={(e) => setPresetName(e.target.value)} placeholder="Name this set…" maxLength={40}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); savePreset(); } }}
+                className="min-w-[150px] flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-semibold text-slate-800" />
+              <button type="button" onClick={savePreset} disabled={!presetName.trim() || !combos.length}
+                title={!combos.length ? 'Add at least one combination first' : 'Save the current list under this name'}
+                className="inline-flex items-center gap-1 rounded-lg border border-indigo-300 bg-white px-2.5 py-1.5 text-xs font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40">
+                <Save size={13} />Save set
+              </button>
+            </div>
+            {Object.keys(presets).length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {Object.entries(presets).map(([name, list]) => {
+                  const active = list.length === combos.length && list.every((c) => combos.includes(c));
+                  return (
+                    <span key={name} className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] font-bold ${active ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-white text-slate-700'}`}>
+                      <button type="button" onClick={() => loadPreset(name)} title={`Load: ${list.length} combination${list.length === 1 ? '' : 's'}`} className="hover:underline">
+                        {name} <span className="font-semibold text-slate-400">({list.length})</span>
+                      </button>
+                      <button type="button" onClick={() => deletePreset(name)} title="Delete this set" className="text-slate-300 hover:text-rose-600"><XCircle size={13} /></button>
+                    </span>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-1.5 text-[10px] font-medium text-slate-400">None yet — build a list above, name it, and hit Save set to reuse it later.</p>
+            )}
+            <p className="mt-1.5 text-[10px] font-medium text-slate-400">Loading a set replaces only the combinations; your limits, sessions and sizing stay as they are. Remember to Save controller afterwards.</p>
+          </div>
+
           {precision ? (
             <div className="space-y-1.5">
               {Object.entries(combos.reduce<Record<string, string[]>>((acc, c) => {
@@ -422,11 +469,11 @@ export default function AutoTrading() {
         </div>
       </div>
 
-      {/* Controller */}
+      {/* Broad selection — the ONLY part the precision list replaces */}
       <div className={`rounded-2xl border bg-white shadow-card ${precision ? 'border-slate-200 opacity-60' : 'border-slate-200'}`}>
         <div className="border-b border-slate-100 px-5 py-3">
-          <h3 className="text-sm font-bold text-slate-900">What the system is allowed to trade {precision && <span className="ml-1 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-black text-slate-600">OVERRIDDEN BY PRECISION LIST</span>}</h3>
-          <p className="text-xs font-medium text-slate-500">Strategies are explicit opt-in — none selected = nothing trades. Symbols / timeframes / sessions empty = all. Lot size comes from Account &amp; Sizing.</p>
+          <h3 className="text-sm font-bold text-slate-900">Broad selection {precision && <span className="ml-1 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-black text-slate-600">REPLACED BY YOUR EXACT COMBINATIONS</span>}</h3>
+          <p className="text-xs font-medium text-slate-500">Strategies are explicit opt-in — none selected = nothing trades. Symbols / timeframes empty = all. {precision ? 'Your exact combinations above decide what trades instead of these three lists — the limits below still apply.' : 'Lot size comes from Account & Sizing.'}</p>
         </div>
         <div className="space-y-4 px-5 py-4">
           <div>
@@ -459,6 +506,16 @@ export default function AutoTrading() {
               </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Limits & guards — these apply in BOTH modes, so they are never dimmed */}
+      <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+        <div className="border-b border-slate-100 px-5 py-3">
+          <h3 className="text-sm font-bold text-slate-900">Limits &amp; guards <span className="ml-1 rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-black text-emerald-700">ALWAYS APPLY</span></h3>
+          <p className="text-xs font-medium text-slate-500">These run on top of whichever selection is active — exact combinations or the broad lists. Sessions empty = all.</p>
+        </div>
+        <div className="space-y-4 px-5 py-4">
           <div>
             <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-500">Trading sessions {cfg.sessions.length ? <span className="text-emerald-600">— {cfg.sessions.length}</span> : <span className="text-slate-400">— all</span>}</p>
             <div className="flex flex-wrap gap-1.5">

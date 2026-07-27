@@ -7515,6 +7515,9 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
     // is the sole authority: only these exact combinations trade and the broad
     // strategies/symbols/timeframes lists are ignored. Empty = the broad lists apply.
     combos: [],
+    // Named, reusable sets of the above, e.g. { "Gold scalps": ["ict-breaker|XAUUSDM|M5"] }.
+    // Saving/loading a preset only swaps `combos` — every other setting is untouched.
+    comboPresets: {},
     // How the ticket (lots / SL / TP) is built for each auto-trade:
     //   AUTO   — the strategy's own SL/TP + lot size from Account & Sizing (default).
     //   MANUAL — your fixed lots + your SL/TP DISTANCES in pips (absolute prices are
@@ -7740,6 +7743,19 @@ function saveEmailAlertSettings(nextSettings) {
           .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))
           .filter(Boolean))].slice(0, 200)
         : [],
+      comboPresets: (() => {
+        const out = {};
+        const src2 = (src.comboPresets && typeof src.comboPresets === 'object') ? src.comboPresets : {};
+        for (const [rawName, list] of Object.entries(src2).slice(0, 30)) {
+          const name = String(rawName).trim().slice(0, 40);
+          if (!name || !Array.isArray(list)) continue;
+          const cleaned = [...new Set(list
+            .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))
+            .filter(Boolean))].slice(0, 200);
+          if (cleaned.length) out[name] = cleaned;
+        }
+        return out;
+      })(),
       execution: (() => {
         const e = (src.execution && typeof src.execution === 'object') ? src.execution : {};
         const be = base.execution;

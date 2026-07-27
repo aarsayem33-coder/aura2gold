@@ -1500,6 +1500,8 @@ export interface AutoTradeConfig {
   minGrade: 'A' | 'A+'; minRR: number;
   /** Exact 'strategyId|SYMBOL|TF' triples ('*' = any). Non-empty = sole authority. */
   combos: string[];
+  /** Named reusable combination sets; loading one only swaps `combos`. */
+  comboPresets: Record<string, string[]>;
   execution: AutoTradeExecution;
 }
 export interface AutoTradeValidation {
