@@ -527,9 +527,9 @@ export default function AutoTrading() {
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
             <div><label className="block text-[11px] font-semibold text-slate-500">Max trades / day</label>
-              <input type="number" min={1} max={20} value={cfg.maxTradesPerDay} onChange={(e) => patch({ maxTradesPerDay: Number(e.target.value) })} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
+              <input type="number" min={1} max={500} value={cfg.maxTradesPerDay} onChange={(e) => patch({ maxTradesPerDay: Number(e.target.value) })} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
             <div><label className="block text-[11px] font-semibold text-slate-500">Max concurrent</label>
-              <input type="number" min={1} max={5} value={cfg.maxConcurrent} onChange={(e) => patch({ maxConcurrent: Number(e.target.value) })} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
+              <input type="number" min={1} max={100} value={cfg.maxConcurrent} onChange={(e) => patch({ maxConcurrent: Number(e.target.value) })} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
             <div><label className="block text-[11px] font-semibold text-slate-500">One per symbol</label>
               <button type="button" onClick={() => patch({ onePerSymbol: !cfg.onePerSymbol })} className={`mt-0.5 w-full rounded-lg border px-2.5 py-1.5 text-sm font-bold ${cfg.onePerSymbol ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-300 bg-white text-slate-600'}`}>{cfg.onePerSymbol ? 'YES' : 'NO'}</button></div>
             <div><label className="block text-[11px] font-semibold text-slate-500">Min grade</label>
@@ -539,6 +539,23 @@ export default function AutoTrading() {
             <div><label className="block text-[11px] font-semibold text-slate-500">Min R:R</label>
               <input type="number" min={0} max={10} step={0.1} value={cfg.minRR} onChange={(e) => patch({ minRR: Number(e.target.value) })} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
           </div>
+          {/* Concurrency multiplies risk: N open trades can all stop out together. Show
+              the real number rather than capping what the user is allowed to choose. */}
+          {(() => {
+            const riskPct = exec.mode === 'RISK' ? exec.riskPct
+              : (settings?.accountRisk?.mode === 'CHALLENGE' || settings?.accountRisk?.mode === 'BOTH')
+                ? settings?.accountRisk?.challenge?.riskPerTradePct ?? 0.5
+                : settings?.accountRisk?.normalRiskPct ?? 1;
+            const worst = Math.round(riskPct * cfg.maxConcurrent * 100) / 100;
+            const hot = worst >= 6;
+            return (
+              <p className={`rounded-lg px-3 py-2 text-[11px] font-semibold ${hot ? 'bg-amber-50 text-amber-900' : 'bg-slate-50 text-slate-500'}`}>
+                {hot && <ShieldAlert size={12} className="mr-1 inline" />}
+                {cfg.maxConcurrent} concurrent × {riskPct}% risk = <b>{worst}% of the account at risk at once</b> if every open trade stops out together.
+                {hot ? ' That is past a typical prop daily-loss limit — size down or lower concurrency.' : ' Trades on correlated pairs tend to lose together, so treat this as one position.'}
+              </p>
+            );
+          })()}
           <div className="flex items-center gap-3">
             <button disabled={!dirty || saving} onClick={save} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-40">
               {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}Save controller

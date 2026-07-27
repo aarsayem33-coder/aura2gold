@@ -7733,8 +7733,11 @@ function saveEmailAlertSettings(nextSettings) {
       symbols: Array.isArray(src.symbols) ? [...new Set(src.symbols.map((x) => String(x || '').trim().toUpperCase()).filter((x) => /^[A-Z0-9._#-]{2,20}$/.test(x)))].slice(0, 30) : [],
       timeframes: Array.isArray(src.timeframes) ? [...new Set(src.timeframes.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_TFS.includes(x)) : [],
       sessions: Array.isArray(src.sessions) ? [...new Set(src.sessions.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_SESSIONS.includes(x)) : [],
-      maxTradesPerDay: clampInt(src.maxTradesPerDay, 1, 20, base.maxTradesPerDay),
-      maxConcurrent: clampInt(src.maxConcurrent, 1, 5, base.maxConcurrent),
+      // Upper bounds are only a typo guard (a stray keypress must not authorise 9999
+      // trades) — they are deliberately far above any sane setting so the user, not the
+      // sanitizer, decides how many trades and how much simultaneous exposure to run.
+      maxTradesPerDay: clampInt(src.maxTradesPerDay, 1, 500, base.maxTradesPerDay),
+      maxConcurrent: clampInt(src.maxConcurrent, 1, 100, base.maxConcurrent),
       onePerSymbol: src.onePerSymbol !== false,
       minGrade: ['A', 'A+'].includes(String(src.minGrade || '').toUpperCase()) ? String(src.minGrade).toUpperCase() : 'A',
       minRR: (() => { const n = Number(src.minRR); return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : base.minRR; })(),
