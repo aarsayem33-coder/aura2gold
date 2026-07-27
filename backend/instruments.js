@@ -26,14 +26,37 @@ export const SYMBOL_CAPS = {
     pipUnit: 'points',
     roundStep: { step: 50, major: 100 },
   },
+  // Exness ALSO lists a x100 contract (USTEC_x100m) alongside the standard USTECm.
+  // Same index, 100x the contract size: ~$100 per point per lot, not $1. This MUST be
+  // its own entry — a 2026-07-26 auto-trade sized 0.44 lots for a $10 risk budget on
+  // the x100 symbol and lost $944 when the stop hit (0.44 x 21.49 pts x $100 = $945.56,
+  // i.e. ~100x the intended risk) because the generic USTEC prefix matched first.
+  // The $100/point figure is measured from that fill, not assumed.
+  USTEC_X100: {
+    assetClass: 'INDEX',
+    label: 'Nasdaq 100 (x100 contract)',
+    newsCurrency: 'USD',
+    signalTimeframes: ['M5', 'M15', 'M30', 'H1', 'H4'],
+    fixedTime: false,
+    forecasts: false,
+    digits: 2,
+    pipSize: 1.0,
+    pipValuePerLot: 100,
+    contractSize: 100,
+    pipUnit: 'points',
+    roundStep: { step: 50, major: 100 },
+  },
 };
 
+// Longest matching prefix wins, so a more specific contract variant (USTEC_X100) is
+// never shadowed by its generic base (USTEC). Order in SYMBOL_CAPS is then irrelevant.
 export function symbolCapsFor(symbol) {
   const s = String(symbol || '').toUpperCase();
+  let best = null, bestLen = -1;
   for (const [base, caps] of Object.entries(SYMBOL_CAPS)) {
-    if (s.startsWith(base)) return caps;
+    if (s.startsWith(base) && base.length > bestLen) { best = caps; bestLen = base.length; }
   }
-  return null;
+  return best;
 }
 
 // Signal-generation gates. No caps entry (forex) = everything allowed.

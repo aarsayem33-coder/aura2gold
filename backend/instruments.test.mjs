@@ -78,5 +78,43 @@ test('key liquidity levels detect round numbers at index scale', () => {
   assert(onGrid.some((l) => l.price % 100 === 0), 'expected at least one major (100-point) round');
 });
 
+
+// ── x100 contract variant must never be shadowed by the generic USTEC prefix ──
+// Regression: a 2026-07-26 auto-trade sized 0.44 lots for a $10 risk budget on
+// USTEC_x100m and lost $944 (~100x) because USTEC_X100M matched the $1/point entry.
+test('USTEC_x100 resolves to the 100x contract, not the standard one', () => {
+  const std = symbolCapsFor('USTECm');
+  const x100 = symbolCapsFor('USTEC_x100m');
+  assert(std.pipValuePerLot === 1, 'standard USTECm stays $1 per point per lot');
+  assert(x100.pipValuePerLot === 100, 'x100 contract must be $100 per point per lot');
+  assert(x100.contractSize === 100, 'x100 contract size');
+  assert(x100.label === 'Nasdaq 100 (x100 contract)', 'x100 has its own label');
+});
+
+// Same sizing formula the engine uses (risk / (stopPoints * pointValue), min 0.01 lot).
+test('x100 sizing collapses to the minimum lot, and that minimum still over-risks', () => {
+  const stopPoints = 22.6, budget = 10;
+  const sized = (caps) => Math.max(0.01, Math.round((budget / (stopPoints * caps.pipValuePerLot)) * 100) / 100);
+  const stdLots = sized(symbolCapsFor('USTECm'));
+  const x100Lots = sized(symbolCapsFor('USTEC_x100m'));
+  assert(stdLots === 0.44, 'standard contract reproduces the 0.44 lots that were actually sent');
+  assert(x100Lots === 0.01, 'x100 contract collapses to the broker minimum');
+  // The honest consequence: even 0.01 lots on the x100 contract risks ~$22.60, i.e.
+  // MORE than the $10 budget. Small accounts should trade USTECm, not USTEC_x100m.
+  const x100Risk = x100Lots * stopPoints * symbolCapsFor('USTEC_x100m').pipValuePerLot;
+  assert(x100Risk > budget, 'minimum lot on the x100 contract exceeds a $10 budget');
+  assert(Math.round(x100Risk * 100) / 100 === 22.6, 'that minimum risks $22.60');
+});
+
+test('both USTEC variants keep the shared index gates (order-independent match)', () => {
+  for (const sym of ['USTECm', 'USTEC_x100m']) {
+    assert(symbolAllowsFixedTime(sym) === false, `${sym} no fixed-time`);
+    assert(symbolAllowsForecast(sym) === false, `${sym} no forecasts`);
+    assert(symbolAllowsSignalTf(sym, 'M1') === false, `${sym} no M1 signals`);
+    assert(symbolAllowsSignalTf(sym, 'M15') === true, `${sym} M15 allowed`);
+    assert(indexNewsCurrencyFor(sym) === 'USD', `${sym} USD news`);
+  }
+});
+
 console.log(`\n${passed} passed${failed ? `, ${failed} FAILED` : ''}`);
 process.exit(failed ? 1 : 0);
