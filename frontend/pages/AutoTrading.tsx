@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Bot, RefreshCw, Loader2, ShieldAlert, Eye, Power, Zap, HelpCircle, Save, CheckCircle2, Landmark, ShieldCheck, XCircle, Plus } from 'lucide-react';
-import { fetchAutoTradeStatus, fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, approveAutoTrade, rejectAutoTrade, armAutoTradeAccount, validateAutoTrade } from '../mt5Api';
-import type { AutoTradeStatus, AutoTradeConfig, AutoTradeExecution, AutoTradeValidation, EmailAlertSettings, StrategyMeta } from '../types';
+import { fetchAutoTradeStatus, fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, approveAutoTrade, rejectAutoTrade, armAutoTradeAccount, validateAutoTrade, fetchAutoTradeComboSets, saveAutoTradeComboSet, deleteAutoTradeComboSet } from '../mt5Api';
+import type { AutoTradeStatus, AutoTradeConfig, AutoTradeExecution, AutoTradeComboSet, AutoTradeValidation, EmailAlertSettings, StrategyMeta } from '../types';
 
 const usd = (v: number | null | undefined) => (v === null || v === undefined || Number.isNaN(Number(v)) ? '—' : `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
 const px = (v: number | null | undefined, symbol: string) => {
@@ -45,6 +45,8 @@ export default function AutoTrading() {
   const [cbSymbol, setCbSymbol] = useState('*');
   const [cbTimeframe, setCbTimeframe] = useState('*');
   const [presetName, setPresetName] = useState('');
+  const [sets, setSets] = useState<AutoTradeComboSet[]>([]);
+  const [setBusy, setSetBusy] = useState<string | null>(null);
 
   const DEFAULT_EXEC: AutoTradeExecution = {
     mode: 'AUTO', lots: 0.01, slPips: null, tp1Pips: null, tp2Pips: null, tp3Pips: null,
@@ -53,10 +55,9 @@ export default function AutoTrading() {
   const cfg: AutoTradeConfig = settings?.autoTrade || status?.config || {
     mode: 'OFF', strategies: [], symbols: [], timeframes: [], sessions: [],
     maxTradesPerDay: 3, maxConcurrent: 2, onePerSymbol: true, minGrade: 'A', minRR: 2,
-    combos: [], comboPresets: {}, execution: DEFAULT_EXEC,
+    combos: [], execution: DEFAULT_EXEC,
   };
   const combos = cfg.combos || [];
-  const presets = cfg.comboPresets || {};
   const precision = combos.length > 0;
   const exec: AutoTradeExecution = { ...DEFAULT_EXEC, ...(cfg.execution || {}) };
 
@@ -69,6 +70,7 @@ export default function AutoTrading() {
     load();
     fetchEmailAlertSettings().then((r) => setSettings(r.settings)).catch(() => {});
     fetchStrategies().then((r) => { setStrategies(r.strategies.filter((s) => s.control?.enabled !== false)); setSymbols(r.symbols || []); }).catch(() => {});
+    void loadSets();
     const id = setInterval(load, 5000);
     const tickId = setInterval(() => setTick((t) => t + 1), 1000);
     return () => { clearInterval(id); clearInterval(tickId); };
@@ -118,17 +120,29 @@ export default function AutoTrading() {
     patch({ combos: [...combos, key] });
   };
   const removeCombo = (key: string) => patch({ combos: combos.filter((c) => c !== key) });
-  const savePreset = () => {
+  // Sets live in their own DB table, so saving/deleting one is immediate and does not
+  // depend on (or disturb) the controller's own save.
+  const loadSets = useCallback(async () => {
+    try { setSets((await fetchAutoTradeComboSets()).sets); } catch { /* library is best-effort */ }
+  }, []);
+  const savePreset = async () => {
     const name = presetName.trim();
     if (!name || !combos.length) return;
-    patch({ comboPresets: { ...presets, [name]: [...combos] } });
-    setPresetName('');
+    setSetBusy(name);
+    try { await saveAutoTradeComboSet(name, combos); setPresetName(''); await loadSets(); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Could not save the set'); }
+    finally { setSetBusy(null); }
   };
-  const loadPreset = (name: string) => { if (presets[name]) patch({ combos: [...presets[name]] }); };
-  const deletePreset = (name: string) => {
-    const next = { ...presets };
-    delete next[name];
-    patch({ comboPresets: next });
+  const loadPreset = (name: string) => {
+    const found = sets.find((s) => s.name === name);
+    if (found) patch({ combos: [...found.combos] });
+  };
+  const deletePreset = async (name: string) => {
+    if (!window.confirm(`Delete the saved set "${name}"? Your current combinations are not affected.`)) return;
+    setSetBusy(name);
+    try { await deleteAutoTradeComboSet(name); await loadSets(); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Could not delete the set'); }
+    finally { setSetBusy(null); }
   };
   const toggleList = (key: 'strategies' | 'symbols' | 'timeframes' | 'sessions', val: string) => {
     const list = cfg[key] || [];
@@ -409,30 +423,32 @@ export default function AutoTrading() {
               <input value={presetName} onChange={(e) => setPresetName(e.target.value)} placeholder="Name this set…" maxLength={40}
                 onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); savePreset(); } }}
                 className="min-w-[150px] flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-semibold text-slate-800" />
-              <button type="button" onClick={savePreset} disabled={!presetName.trim() || !combos.length}
+              <button type="button" onClick={savePreset} disabled={!presetName.trim() || !combos.length || setBusy !== null}
                 title={!combos.length ? 'Add at least one combination first' : 'Save the current list under this name'}
                 className="inline-flex items-center gap-1 rounded-lg border border-indigo-300 bg-white px-2.5 py-1.5 text-xs font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40">
-                <Save size={13} />Save set
+                {setBusy && setBusy === presetName.trim() ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}Save set
               </button>
             </div>
-            {Object.keys(presets).length > 0 ? (
+            {sets.length > 0 ? (
               <div className="mt-2 flex flex-wrap gap-1.5">
-                {Object.entries(presets).map(([name, list]) => {
-                  const active = list.length === combos.length && list.every((c) => combos.includes(c));
+                {sets.map((s) => {
+                  const active = s.combos.length === combos.length && s.combos.every((c) => combos.includes(c));
                   return (
-                    <span key={name} className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] font-bold ${active ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-white text-slate-700'}`}>
-                      <button type="button" onClick={() => loadPreset(name)} title={`Load: ${list.length} combination${list.length === 1 ? '' : 's'}`} className="hover:underline">
-                        {name} <span className="font-semibold text-slate-400">({list.length})</span>
+                    <span key={s.name} className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] font-bold ${active ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-white text-slate-700'}`}>
+                      <button type="button" onClick={() => loadPreset(s.name)} title={`Load ${s.combos.length} combination${s.combos.length === 1 ? '' : 's'}${s.updatedAt ? ` · saved ${new Date(s.updatedAt).toLocaleString()}` : ''}`} className="hover:underline">
+                        {s.name} <span className="font-semibold text-slate-400">({s.combos.length})</span>
                       </button>
-                      <button type="button" onClick={() => deletePreset(name)} title="Delete this set" className="text-slate-300 hover:text-rose-600"><XCircle size={13} /></button>
+                      <button type="button" disabled={setBusy !== null} onClick={() => deletePreset(s.name)} title="Delete this saved set" className="text-slate-300 hover:text-rose-600 disabled:opacity-40">
+                        {setBusy === s.name ? <Loader2 size={13} className="animate-spin" /> : <XCircle size={13} />}
+                      </button>
                     </span>
                   );
                 })}
               </div>
             ) : (
-              <p className="mt-1.5 text-[10px] font-medium text-slate-400">None yet — build a list above, name it, and hit Save set to reuse it later.</p>
+              <p className="mt-1.5 text-[10px] font-medium text-slate-400">None saved yet — build a list above, name it, and hit Save set to reuse it any time.</p>
             )}
-            <p className="mt-1.5 text-[10px] font-medium text-slate-400">Loading a set replaces only the combinations; your limits, sessions and sizing stay as they are. Remember to Save controller afterwards.</p>
+            <p className="mt-1.5 text-[10px] font-medium text-slate-400">Sets are stored on the server, so they survive restarts and are here whenever you come back. Saving or deleting a set takes effect immediately. <b>Loading</b> one only fills the combinations above — press Save controller to put it live.</p>
           </div>
 
           {precision ? (

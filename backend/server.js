@@ -806,6 +806,18 @@ async function initializeDatabase() {
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'position_id', 'BIGINT NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'account', 'VARCHAR(32) NULL');
 
+      // Saved auto-trade combination sets — a reusable LIBRARY of strategy x symbol x
+      // timeframe lists, kept in the DB (not the settings blob) so they persist on their
+      // own, survive settings edits, and can be fetched/loaded at any time.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_auto_trade_combo_sets (
+          name VARCHAR(64) PRIMARY KEY,
+          combos TEXT NOT NULL,
+          created_at DATETIME(3) NOT NULL,
+          updated_at DATETIME(3) NULL
+        )
+      `);
+
       // Strategy Lab — isolated single-strategy signals (NOT the main system). One row
       // per strategy|symbol|timeframe|bar. Each signal is scored two ways: forex (TP/SL
       // replay) and fixed-time (direction at next-candle expiry). Compact + pruned.
@@ -7515,9 +7527,9 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
     // is the sole authority: only these exact combinations trade and the broad
     // strategies/symbols/timeframes lists are ignored. Empty = the broad lists apply.
     combos: [],
-    // Named, reusable sets of the above, e.g. { "Gold scalps": ["ict-breaker|XAUUSDM|M5"] }.
-    // Saving/loading a preset only swaps `combos` — every other setting is untouched.
-    comboPresets: {},
+    // Named reusable sets of the above live in their own DB table
+    // (mt5_auto_trade_combo_sets) so they persist independently of these settings —
+    // see /api/auto-trade/combo-sets.
     // How the ticket (lots / SL / TP) is built for each auto-trade:
     //   AUTO   — the strategy's own SL/TP + lot size from Account & Sizing (default).
     //   MANUAL — your fixed lots + your SL/TP DISTANCES in pips (absolute prices are
@@ -7746,19 +7758,6 @@ function saveEmailAlertSettings(nextSettings) {
           .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))
           .filter(Boolean))].slice(0, 200)
         : [],
-      comboPresets: (() => {
-        const out = {};
-        const src2 = (src.comboPresets && typeof src.comboPresets === 'object') ? src.comboPresets : {};
-        for (const [rawName, list] of Object.entries(src2).slice(0, 30)) {
-          const name = String(rawName).trim().slice(0, 40);
-          if (!name || !Array.isArray(list)) continue;
-          const cleaned = [...new Set(list
-            .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))
-            .filter(Boolean))].slice(0, 200);
-          if (cleaned.length) out[name] = cleaned;
-        }
-        return out;
-      })(),
       execution: (() => {
         const e = (src.execution && typeof src.execution === 'object') ? src.execution : {};
         const be = base.execution;
@@ -9167,6 +9166,64 @@ app.get('/api/auto-trade/report', async (req, res) => {
       byHour: groupBy((t) => (t.createdAt ? `${String((new Date(t.createdAt).getUTCHours() + 6) % 24).padStart(2, '0')}:00 BD` : '—')),
       trades,
     });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// ── Saved combination sets (DB-backed library) ───────────────────────────────
+// GET list · POST save (create or overwrite by name) · DELETE one. Independent of the
+// settings blob: saving a set never touches live trading config, and loading one is a
+// deliberate client action followed by the normal controller save.
+app.get('/api/auto-trade/combo-sets', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.json({ sets: [] });
+    const [rows] = await pool.query('SELECT name, combos, created_at, updated_at FROM mt5_auto_trade_combo_sets ORDER BY name ASC');
+    res.json({
+      sets: rows.map((r) => {
+        let combos = [];
+        try { combos = JSON.parse(r.combos) || []; } catch { combos = []; }
+        return {
+          name: r.name, combos,
+          createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+          updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+        };
+      }),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/auto-trade/combo-sets', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const name = String(req.body?.name || '').trim().slice(0, 64);
+    if (!name) return res.status(400).json({ error: 'a set name is required' });
+    const validIds = new Set(listStrategies().map((m) => m.id));
+    const KNOWN_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+    const combos = Array.isArray(req.body?.combos)
+      ? [...new Set(req.body.combos
+        .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))
+        .filter(Boolean))].slice(0, 200)
+      : [];
+    if (!combos.length) return res.status(400).json({ error: 'a set needs at least one valid combination' });
+    const now = toMysqlDate();
+    await pool.execute(
+      `INSERT INTO mt5_auto_trade_combo_sets (name, combos, created_at, updated_at) VALUES (?,?,?,?)
+       ON DUPLICATE KEY UPDATE combos=VALUES(combos), updated_at=VALUES(updated_at)`,
+      [name, JSON.stringify(combos), now, now],
+    );
+    console.log(`[AutoTrade] saved combination set "${name}" (${combos.length} combos)`);
+    res.json({ ok: true, name, combos });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.delete('/api/auto-trade/combo-sets/:name', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const [r] = await pool.execute('DELETE FROM mt5_auto_trade_combo_sets WHERE name=?', [String(req.params.name)]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'set not found' });
+    res.json({ ok: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 

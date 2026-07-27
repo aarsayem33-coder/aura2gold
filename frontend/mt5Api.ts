@@ -60,6 +60,7 @@ import type {
   AutoTradeStatus,
   AutoTradeReport,
   AutoTradeConfig,
+  AutoTradeComboSet,
   AutoTradeValidation,
   SignalTrackerResponse,
   StrategyMeta,
@@ -439,6 +440,18 @@ export async function fetchAutoTradeReport(params: { from?: string; to?: string 
   const qs = q.toString();
   return fetchJson<AutoTradeReport>(`/api/auto-trade/report${qs ? `?${qs}` : ''}`);
 }
+export async function fetchAutoTradeComboSets(): Promise<{ sets: AutoTradeComboSet[] }> {
+  return fetchJson('/api/auto-trade/combo-sets');
+}
+export async function saveAutoTradeComboSet(name: string, combos: string[]): Promise<{ ok: boolean; name: string; combos: string[] }> {
+  return fetchJson('/api/auto-trade/combo-sets', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, combos }),
+  });
+}
+export async function deleteAutoTradeComboSet(name: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/auto-trade/combo-sets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+}
+
 export async function validateAutoTrade(config: Partial<AutoTradeConfig>): Promise<AutoTradeValidation> {
   return fetchJson<AutoTradeValidation>('/api/auto-trade/validate', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ config }),

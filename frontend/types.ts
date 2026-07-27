@@ -1500,9 +1500,12 @@ export interface AutoTradeConfig {
   minGrade: 'A' | 'A+'; minRR: number;
   /** Exact 'strategyId|SYMBOL|TF' triples ('*' = any). Non-empty = sole authority. */
   combos: string[];
-  /** Named reusable combination sets; loading one only swaps `combos`. */
-  comboPresets: Record<string, string[]>;
   execution: AutoTradeExecution;
+}
+/** A saved, reusable combination list. Stored server-side in its own DB table. */
+export interface AutoTradeComboSet {
+  name: string; combos: string[];
+  createdAt: string | null; updatedAt: string | null;
 }
 export interface AutoTradeValidation {
   ok: boolean; hasSample: boolean; note?: string;
