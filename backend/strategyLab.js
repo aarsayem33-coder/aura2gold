@@ -131,6 +131,103 @@ function ictBreaker(ctx) {
   };
 }
 
+// ── ICT Breaker PRO — the measured winner profile of ict-breaker ─────────────
+// A SELECTIVE overlay, not a new setup: it calls ictBreaker() read-only and only lets
+// through the setups matching the profile that actually produced the big winners.
+// ict-breaker itself is untouched and keeps emitting every one of its own signals.
+//
+// Derived from a 2026-07-27 study of 1,040 settled ict-breaker signals (497 with enough
+// stored candle history to rebuild the context). Method note, because it changed the
+// answer: R = profit/stop, so ANY feature that shrinks the stop inflates R for free.
+// Ranked on R alone, "stop < 1xATR" looked like the best bucket (3.64R) — but those
+// trades travelled only 2.68xATR, while the "worst" wide-stop bucket (1.21R) actually
+// travelled 4.98xATR. Every candidate was therefore re-checked against a
+// stop-INDEPENDENT measure (distance travelled in ATR). Only features where win rate
+// AND distance travelled both improved, with stop size flat, were kept:
+//
+//   reclaim body >= 60% of range   conviction close, not a doji
+//   candle range >= 1.0x ATR       a real displacement bar, not drift
+//   breaker age <= 1 bar           the level is still live
+//   stage != 2 on the signal TF    stage 2 was the worst context by a distance
+//                                  (73% win, 1.88xATR travel vs ~90% / 3.2 elsewhere)
+//
+// Chosen on 22 Jun–17 Jul, then validated on 17–27 Jul which the rules never saw:
+//   baseline  88.0% win · 2.43R · 3.99xATR travel · 67% reached 2R
+//   filtered  92.0% win · 2.91R · 4.82xATR travel · 76% reached 2R   (keeps 1 in 3)
+//
+// Room-to-draw >= 4xATR is a SCORE BONUS, not a gate: it showed 100% on discovery
+// (n=38) but only 21 validation trades — too thin to hard-gate on.
+// Timeframes are restricted to those the study could actually validate; M1 and much of
+// M5 lacked the stored history to rebuild, so they are deliberately not claimed.
+function ictBreakPro(ctx) {
+  const base = ictBreaker(ctx);                 // read-only reuse; ictBreaker is pure
+  if (!base) return null;
+
+  const { candles, config = {}, symbol = '', dailyCandles = null } = ctx;
+  const minBodyRatio = config.minBodyRatio ?? 0.6;
+  const minRangeAtr = config.minRangeAtr ?? 1.0;
+  const maxBreakerAge = config.maxBreakerAge ?? 1;
+  const avoidStage = config.avoidStage ?? 2;
+  const roomBonusAtr = config.roomBonusAtr ?? 4;
+
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const atr = atr14(candles);
+  if (!(atr > 0)) return null;
+  const last = candles[candles.length - 1];
+  const high = n(last.high), low = n(last.low), open = n(last.open), close = n(last.close);
+  const range = high - low;
+  if (!(range > 0)) return null;
+
+  // 1) conviction close  2) real displacement bar
+  const bodyRatio = Math.abs(close - open) / range;
+  if (bodyRatio < minBodyRatio) return null;
+  const rangeAtr = range / atr;
+  if (rangeAtr < minRangeAtr) return null;
+
+  // 3) the breaker must still be live
+  const breaker = detectBreaker(candles, { maxAgeBars: 50 });
+  if (!breaker || breaker.ageBars > maxBreakerAge) return null;
+
+  // 4) skip the stage that measured worst. Computed on the SIGNAL timeframe's own
+  //    candles — that is exactly what the study measured, so keep it that way rather
+  //    than silently switching to daily bars and inheriting a different result.
+  const stage = computeStage(candles);
+  if (stage && stage.stage === avoidStage) return null;
+
+  // Bonus (not a gate): how much room to the opposing draw, measured in ATR so it is
+  // independent of the stop.
+  let roomAtr = null;
+  try {
+    const kl = detectKeyLiquidityLevels(candles, { symbol, dailyCandles });
+    const buy = base.decision === 'BUY';
+    const target = buy ? kl.nearestAbove : kl.nearestBelow;
+    if (target && Number.isFinite(n(target.price))) roomAtr = Math.abs(n(target.price) - n(base.entry)) / atr;
+  } catch { /* bonus only */ }
+
+  let score = base.score;
+  if (roomAtr !== null && roomAtr >= roomBonusAtr) score += 6;   // far draw = room to run
+  if (bodyRatio >= 0.75) score += 3;                             // very decisive close
+  if (rangeAtr >= 2) score += 3;                                 // outsized conviction bar
+  score = Math.max(40, Math.min(97, Math.round(score)));
+
+  return {
+    ...base,                                    // identical entry / stop / TP ladder
+    score,
+    grade: score >= 85 ? 'A+' : score >= 75 ? 'A' : score >= 65 ? 'B' : 'C',
+    reason: `PRO ${base.reason} | body ${Math.round(bodyRatio * 100)}% · range ${r2(rangeAtr)}×ATR · breaker ${breaker.ageBars}b${roomAtr !== null ? ` · room ${r2(roomAtr)}×ATR` : ''}${stage ? ` · stage ${stage.stage}` : ''}`,
+    meta: {
+      ...(base.meta || {}),
+      pro: true,
+      bodyRatio: r2(bodyRatio),
+      rangeAtr: r2(rangeAtr),
+      breakerAgeBars: breaker.ageBars,
+      roomAtr: roomAtr === null ? null : r2(roomAtr),
+      stage: stage?.stage ?? null,
+      baseScore: base.score,
+    },
+  };
+}
+
 // ── Strategy 2: Market Mechanics 3-Step (Brett — "SIMPLE 3-Step Trick") ──────
 // The literal Direction → Location → Execution framework, mechanically encoded:
 //   1. DIRECTION  — trade WITH the higher-timeframe (H4) trend only. No bias, no trade.
@@ -3873,6 +3970,23 @@ export const STRATEGIES = {
     timeframes: ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'],
     config: { minRR: 2, maxAgeBars: 3 },
     evaluate: ictBreaker,
+  },
+  'ict-break-pro': {
+    id: 'ict-break-pro',
+    name: 'ICT Breaker Pro',
+    // MARKET, inherited from ict-breaker: identical entry, stop and TP ladder. The only
+    // difference is WHICH setups are allowed through.
+    entryOrderType: 'MARKET',
+    source: 'ict-breaker, filtered to its measured winner profile (study of 1,040 settled signals, 2026-07-27)',
+    description: 'A selective overlay on ICT Breaker — same sweep → breaker → displacement setup, same entry/stop/targets, but only the setups matching the profile that actually produced the big winners. Four filters, each kept only because win rate AND distance travelled (measured in ATR, independent of the stop) both improved: the reclaim candle closes with a body of at least 60% of its range (conviction, not a doji), that candle spans at least 1× ATR (a real displacement bar), the breaker is at most 1 bar old (the level is still live), and the signal timeframe is not in stage 2 — the single worst context measured (73% win and 1.88× ATR travel, versus roughly 90% and 3.2× elsewhere). Room to the opposing draw adds score but never gates, because that finding rested on only 21 validation trades. Validated out-of-sample on 10 held-out days: 92.0% win, 2.91R, 4.82× ATR travel and 76% reaching 2R, against a baseline of 88.0%, 2.43R, 3.99× ATR and 67% — while keeping roughly one signal in three. ICT Breaker itself is untouched and continues to emit all of its own signals independently.',
+    // Only the timeframes the study could actually rebuild and validate. M1 (391 signals)
+    // and much of M5 (154) lacked the stored candle history, so they are not claimed here.
+    timeframes: ['M15', 'M30', 'H1', 'H4'],
+    config: {
+      minRR: 1.5, maxAgeBars: 3,          // passed through to ictBreaker
+      minBodyRatio: 0.6, minRangeAtr: 1.0, maxBreakerAge: 1, avoidStage: 2, roomBonusAtr: 4,
+    },
+    evaluate: ictBreakPro,
   },
   'ict-plus': {
     id: 'ict-plus',
