@@ -483,12 +483,19 @@ export async function resetChallenge(initialBalance?: number): Promise<Challenge
 export async function fetchStrategies(): Promise<{ ok: boolean; strategies: StrategyMeta[]; symbols: string[]; timeframes: string[]; ftExpiryBars: number }> {
   return fetchJson('/api/strategy-lab/strategies');
 }
-export async function fetchStrategySignals(strategy?: string, timeframe?: string, includeMuted?: boolean, limit?: number): Promise<{ ok: boolean; signals: StrategySignal[] }> {
+export async function fetchStrategySignals(
+  strategy?: string, timeframe?: string, includeMuted?: boolean, limit?: number,
+  window?: { from?: string; to?: string },
+): Promise<{ ok: boolean; signals: StrategySignal[] }> {
   const p = new URLSearchParams();
   if (strategy) p.set('strategy', strategy);
   if (timeframe) p.set('timeframe', timeframe);
   if (includeMuted) p.set('includeMuted', '1');
   if (limit) p.set('limit', String(limit));
+  // Without the window the server returns the newest N regardless of what the caller
+  // asked for, so the log silently disagrees with the report above it.
+  if (window?.from) p.set('from', window.from);
+  if (window?.to) p.set('to', window.to);
   const qs = p.toString();
   return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
 }

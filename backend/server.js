@@ -15350,7 +15350,10 @@ function strategyLabFtLivePosition(row) {
   };
 }
 
-// GET /api/strategy-lab/signals?strategy=&timeframe=&limit= — recent logged signals.
+// GET /api/strategy-lab/signals?strategy=&timeframe=&from=&to=&limit= — logged signals.
+// from/to matter: without them the caller gets the newest N signals regardless of the
+// window it asked for, so a report showing "last 30 days" could silently be displaying
+// only the newest 200 rows (or nothing at all, if the window predates them).
 app.get('/api/strategy-lab/signals', async (req, res) => {
   const pool = await initializeDatabase();
   if (!pool) return res.status(500).json({ error: 'Database not available.' });
@@ -15372,6 +15375,10 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
       if (ids.length) { sql += ` AND strategy IN (${ids.map(() => '?').join(',')})`; params.push(...ids); }
     }
     if (timeframe) { sql += ' AND timeframe = ?'; params.push(timeframe); }
+    // Date window, so the log matches the report window it is displayed under.
+    const dateOk = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+    if (dateOk(req.query.from)) { sql += ' AND signal_time >= ?'; params.push(`${req.query.from} 00:00:00`); }
+    if (dateOk(req.query.to)) { sql += ' AND signal_time < DATE_ADD(?, INTERVAL 1 DAY)'; params.push(`${req.query.to} 00:00:00`); }
     sql += ' ORDER BY signal_time DESC LIMIT ?'; params.push(limit);
     const [rows] = await pool.query(sql, params);
     const num = (v) => (v === null || v === undefined ? null : Number(v));

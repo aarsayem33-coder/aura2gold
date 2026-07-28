@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import AutoTradeReport from './AutoTradeReport';
@@ -174,6 +174,7 @@ export default function StrategyLabReports() {
   const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
+  const [signalsLoading, setSignalsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -204,10 +205,21 @@ export default function StrategyLabReports() {
     return () => clearInterval(t);
   }, [load]);
 
+  // Switching strategy fires a new request while older ones may still be in flight. A
+  // slower earlier response used to land last and repaint the table with the PREVIOUS
+  // strategy's signals while the dropdown showed the new one. Only the newest request
+  // is allowed to write state.
+  const signalReqRef = useRef(0);
   const loadSignals = useCallback(async () => {
     if (!selected) return;
-    try { const r = await fetchStrategySignals(selected); setSignals(r.signals); } catch { /* log is best-effort */ }
-  }, [selected]);
+    const seq = ++signalReqRef.current;
+    setSignalsLoading(true);
+    try {
+      const r = await fetchStrategySignals(selected, undefined, undefined, 500, reportParams);
+      if (seq === signalReqRef.current) setSignals(r.signals);
+    } catch { /* log is best-effort */ }
+    finally { if (seq === signalReqRef.current) setSignalsLoading(false); }
+  }, [selected, reportParams]);
 
   useEffect(() => {
     void loadSignals();
@@ -481,9 +493,18 @@ export default function StrategyLabReports() {
           <div className="flex items-center gap-2">
             <ScrollText size={16} className="text-slate-500" />
             <h3 className="text-sm font-black uppercase tracking-wider text-slate-500">Signal log · {activePerf?.name || selected}</h3>
-            <span className="ml-1 text-[11px] font-semibold text-slate-400">every call tracked by system &amp; email · live position · {logSignals.length} in {perf?.window?.label || 'window'}</span>
+            {signalsLoading
+              ? <span className="ml-1 inline-flex items-center gap-1 text-[11px] font-bold text-slate-400"><Loader2 size={11} className="animate-spin" />loading…</span>
+              : (
+                <span className="ml-1 text-[11px] font-semibold text-slate-400">
+                  every call tracked by system &amp; email · live position · {logSignals.length} in {perf?.window?.label || 'window'}
+                  {logSignals.length > 80 && <span className="text-amber-600"> · showing newest 80</span>}
+                  {logSignals.length >= 500 && <span className="text-amber-600"> (capped at 500)</span>}
+                </span>
+              )}
           </div>
-          <select value={selected} onChange={(e) => setSelected(e.target.value)} className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold">
+          <select value={selected} onChange={(e) => setSelected(e.target.value)} disabled={signalsLoading}
+            className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold disabled:opacity-60">
             {metricStrategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
