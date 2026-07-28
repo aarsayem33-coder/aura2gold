@@ -50,6 +50,7 @@ input bool              InpAutoTrade     = true;                    // Enable tr
 input int               InpTradePollSec  = 3;                       // Trade command poll interval (seconds)
 input long              InpTradeMagic    = 990045;                  // Magic number for Aura auto-trades
 input int               InpTradeSlippage = 30;                      // Max slippage (points)
+input int               InpHistoryHours  = 48;                      // Reconciliation window (hours of closed-trade history to re-push)
 
 input group             "Alert Settings"
 input bool              InpTrackTrades   = true;                    // Send Alerts on Trades (Open/Close)
@@ -65,6 +66,7 @@ datetime last_trade_poll  = 0;
 long     g_known_positions[];       // magic-filtered position ids seen last poll (close detection)
 bool     g_known_positions_primed = false;
 int      g_spec_tick      = 0;      // 0 = include broker contract specs on this poll
+int      g_history_tick   = 0;      // 0 = run the closed-trade reconciliation sweep on this poll
 datetime last_snapshot    = 0;
 datetime last_live_candle = 0;
 datetime last_sma_alert   = 0;
@@ -2119,6 +2121,75 @@ void TradeBridgeDetectCloses()
    g_known_positions_primed = true;
 }
 
+// Periodic RECONCILIATION sweep: push every closed position (our magic) in a rolling
+// window so the backend can adopt whatever the live close report lost.
+//
+// TradeBridgeDetectCloses() reports a close exactly ONCE, fire-and-forget, and drops the
+// position from g_known_positions whether or not the POST arrived. A backend restart, a
+// dropped request, or an EA reload therefore loses that trade permanently. This sweep is
+// the safety net: it re-states history, so a missed close self-heals on the next pass.
+// The backend keys on positionId and ignores duplicates, so replaying is harmless.
+void TradeBridgeReportHistory()
+{
+   datetime from = TimeCurrent() - (datetime)(InpHistoryHours * 3600);
+   if(!HistorySelect(from, TimeCurrent() + 3600)) return;
+
+   string js = "{\"deals\":[";
+   int emitted = 0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0) continue;
+      if(HistoryDealGetInteger(deal, DEAL_MAGIC) != InpTradeMagic) continue;
+      // Only the closing leg carries the realized result for the position.
+      if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+
+      long pid = HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      if(pid <= 0) continue;
+
+      // Sum every deal on this position so partial closes and swap/commission are included.
+      double profit = 0.0, open_price = 0.0, lots = 0.0;
+      long open_time = 0;
+      string dir = "?";
+      if(HistorySelectByPosition(pid))
+      {
+         int pdeals = HistoryDealsTotal();
+         for(int d = 0; d < pdeals; d++)
+         {
+            ulong pd = HistoryDealGetTicket(d);
+            if(pd == 0) continue;
+            profit += HistoryDealGetDouble(pd, DEAL_PROFIT)
+                    + HistoryDealGetDouble(pd, DEAL_SWAP)
+                    + HistoryDealGetDouble(pd, DEAL_COMMISSION);
+            if(HistoryDealGetInteger(pd, DEAL_ENTRY) == DEAL_ENTRY_IN)
+            {
+               open_price = HistoryDealGetDouble(pd, DEAL_PRICE);
+               lots       = HistoryDealGetDouble(pd, DEAL_VOLUME);
+               open_time  = (long)HistoryDealGetInteger(pd, DEAL_TIME);
+               dir = (HistoryDealGetInteger(pd, DEAL_TYPE) == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+            }
+         }
+         HistorySelect(from, TimeCurrent() + 3600);   // restore the window for the outer loop
+      }
+
+      if(emitted > 0) js += ",";
+      js += "{\"positionId\":" + IntegerToString(pid) +
+            ",\"symbol\":\"" + EscapeString(HistoryDealGetString(deal, DEAL_SYMBOL)) + "\"" +
+            ",\"direction\":\"" + dir + "\"" +
+            ",\"lots\":" + DoubleToString(lots, 2) +
+            ",\"openPrice\":" + DoubleToString(open_price, 8) +
+            ",\"closePrice\":" + DoubleToString(HistoryDealGetDouble(deal, DEAL_PRICE), 8) +
+            ",\"profit\":" + DoubleToString(profit, 2) +
+            ",\"openTime\":" + IntegerToString(open_time) +
+            ",\"closeTime\":" + IntegerToString((long)HistoryDealGetInteger(deal, DEAL_TIME)) + "}";
+      emitted++;
+      if(emitted >= 200) break;   // keep the payload sane; the window rolls forward anyway
+   }
+   js += "]}";
+   if(emitted > 0) TradeBridgePost("/api/mt5/trade-history", js);
+}
+
 // Small POST helper for bridge reports (fire-and-forget).
 void TradeBridgePost(string path, string body)
 {
@@ -2237,6 +2308,12 @@ void TradeBridgePoll()
 {
    // 1) Detect and report closed positions FIRST (so results reach you fast).
    TradeBridgeDetectCloses();
+
+   // 1b) Reconciliation sweep every ~20 polls (~1 min). The live close report above fires
+   // once with no retry, so this is what recovers a close lost to a backend restart, a
+   // dropped POST, or an EA reload. Idempotent on the backend.
+   if(g_history_tick <= 0) TradeBridgeReportHistory();
+   g_history_tick = (g_history_tick + 1) % 20;
 
    // 2) Poll with the live account + open-position report.
    bool is_demo = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);

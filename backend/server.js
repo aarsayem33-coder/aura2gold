@@ -9381,7 +9381,17 @@ app.post('/api/mt5/trade-bridge', async (req, res) => {
         for (const row of queued) {
           const conc = autoTradeConcurrencyBlock(cfg, row.symbol);
           if (conc) { await pool.execute("UPDATE mt5_auto_trades SET status='GUARD_SKIP', reason=?, updated_at=? WHERE id=?", [conc.slice(0, 255), toMysqlDate(), row.id]); continue; }
-          await pool.execute("UPDATE mt5_auto_trades SET status='SENT', sent_at=?, account=?, updated_at=? WHERE id=? AND status='QUEUED'", [toMysqlDate(), tradeBridge.account, toMysqlDate(), row.id]);
+          // CLAIM THE COMMAND BEFORE SENDING IT. Two overlapping polls (a second EA
+          // instance, or one EA whose poll overlaps the previous) both SELECT the same
+          // QUEUED row above. The guarded UPDATE means only one of them can flip it to
+          // SENT — but if we push the CMD line regardless of that outcome, BOTH polls
+          // hand the same order to MT5. That opens a second real position with our magic
+          // number and no database row: nothing records its ticket, and when it closes
+          // the report matches nothing and is discarded. Observed live on 2026-07-28
+          // (tickets 3536481449/3536481450 alongside the recorded 3536481452, and the
+          // bridge reporting "6 open" against a cap of 5).
+          const [claim] = await pool.execute("UPDATE mt5_auto_trades SET status='SENT', sent_at=?, account=?, updated_at=? WHERE id=? AND status='QUEUED'", [toMysqlDate(), tradeBridge.account, toMysqlDate(), row.id]);
+          if (!claim?.affectedRows) continue;   // another poll already owns this command
           const expMs = row.expires_at ? new Date(row.expires_at).getTime() : Date.now() + 5 * 60 * 1000;
           lines.push(['CMD', row.id, row.symbol, row.direction, row.order_type, row.lots, row.stop_loss ?? 0, row.take_profit_1 ?? 0, row.entry_price ?? 0, expMs].join('|'));
         }
@@ -9635,18 +9645,85 @@ app.post('/api/mt5/trade-closed', async (req, res) => {
     if (!pool) return res.status(503).json({ error: 'no database' });
     const posId = Number(b.positionId);
     if (!Number.isFinite(posId)) return res.status(400).json({ error: 'positionId required' });
-    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE (position_id=? OR ticket=?) AND status IN ('FILLED','PLACED','SENT') LIMIT 1", [posId, posId]);
-    if (!rows.length) return res.json({ ok: true, matched: false });
+    // Match on identity ALONE. The old query also required status IN (FILLED,PLACED,SENT),
+    // so a row that had been dead-lettered to ERROR ("never reported a result") or swept to
+    // EXPIRED could never be closed out even though its position was live at the broker —
+    // the close was dropped on the floor behind an HTTP 200 with no log. A position that
+    // really closed is a fact; the row's status is our bookkeeping, and it loses.
+    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE position_id=? OR ticket=? LIMIT 1", [posId, posId]);
+    if (!rows.length) {
+      // Unmatched closes are how orphaned positions used to vanish silently. Say so loudly;
+      // the history reconciliation sweep (POST /api/mt5/trade-history) adopts them properly.
+      console.warn(`[AutoTrade] UNMATCHED close for position ${posId} (profit ${b.profit}) — no command row owns it; awaiting history reconciliation`);
+      return res.json({ ok: true, matched: false });
+    }
     const row = rows[0];
+    if (String(row.status).toUpperCase() === 'CLOSED') return res.json({ ok: true, matched: true, already: true });
     const profit = Number(b.profit);
     const closePrice = Number(b.closePrice) || null;
-    await pool.execute("UPDATE mt5_auto_trades SET status='CLOSED', profit=?, close_price=?, closed_at=?, updated_at=? WHERE id=?",
-      [Number.isFinite(profit) ? profit : null, closePrice, toMysqlDate(), toMysqlDate(), row.id]);
+    // Keep the trail when we are rescuing a row the bookkeeping had already written off.
+    const rescued = ['ERROR', 'EXPIRED'].includes(String(row.status).toUpperCase());
+    await pool.execute("UPDATE mt5_auto_trades SET status='CLOSED', profit=?, close_price=?, closed_at=?, updated_at=?, reason=? WHERE id=?",
+      [Number.isFinite(profit) ? profit : null, closePrice, toMysqlDate(), toMysqlDate(),
+       (rescued ? `recovered from ${row.status}: position did close at the broker · ${row.reason || ''}` : (row.reason || '')).slice(0, 255), row.id]);
+    if (rescued) console.warn(`[AutoTrade] recovered ${row.symbol} ${row.timeframe} from ${row.status} — position ${posId} closed for ${profit}`);
     if (Number.isFinite(profit) && String(row.risk_mode).toUpperCase() === 'CHALLENGE') {
       applyChallengeTradeResult(profit, `auto-trade ${row.direction} ${row.symbol} ${row.timeframe}`);
     }
     void autoTradeLifecycleEmail(row, 'CLOSED', { profit, closePrice });
     res.json({ ok: true, matched: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/mt5/trade-history — periodic RECONCILIATION sweep. The EA pushes every closed
+// position carrying our magic over a rolling window; we adopt anything the live path
+// missed. This is the self-healing layer: the live close report is a single
+// fire-and-forget POST with no retry, so a backend restart, a dropped request or an EA
+// reload permanently loses it. Idempotent — safe to replay the same window forever.
+app.post('/api/mt5/trade-history', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const deals = Array.isArray(req.body?.deals) ? req.body.deals : [];
+    let closed = 0, adopted = 0, already = 0;
+    for (const d of deals) {
+      const posId = Number(d?.positionId);
+      if (!Number.isFinite(posId) || posId <= 0) continue;
+      const profit = Number(d.profit);
+      const closePrice = Number(d.closePrice) || null;
+      const closedAt = Number(d.closeTime) > 0 ? new Date(Number(d.closeTime) * 1000) : new Date();
+      const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE position_id=? OR ticket=? LIMIT 1", [posId, posId]);
+      if (rows.length) {
+        const row = rows[0];
+        if (String(row.status).toUpperCase() === 'CLOSED') { already += 1; continue; }
+        await pool.execute("UPDATE mt5_auto_trades SET status='CLOSED', profit=?, close_price=?, closed_at=?, updated_at=?, reason=? WHERE id=?",
+          [Number.isFinite(profit) ? profit : null, closePrice, toMysqlDate(closedAt), toMysqlDate(),
+           `reconciled from MT5 history (live close report was lost) · ${row.reason || ''}`.slice(0, 255), row.id]);
+        if (Number.isFinite(profit) && String(row.risk_mode).toUpperCase() === 'CHALLENGE') {
+          applyChallengeTradeResult(profit, `auto-trade ${row.direction} ${row.symbol} ${row.timeframe}`);
+        }
+        closed += 1;
+        console.warn(`[AutoTrade] reconciled ${row.symbol} ${row.timeframe} position ${posId} (${profit}) — the live close never landed`);
+        continue;
+      }
+      // No command row owns this position: it carries our magic but the system never
+      // recorded it (duplicate dispatch, or a result report that never arrived). Adopt it
+      // so the P/L is honest, and label it clearly rather than inventing a strategy.
+      const [ins] = await pool.execute(
+        `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type,
+           entry_price, lots, mode, status, reason, ticket, position_id, fill_price, close_price, profit, closed_at, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [`adopted:${posId}`, 'unrecorded', String(d.symbol || '?').toUpperCase().slice(0, 32), '—',
+         String(d.direction || '?').toUpperCase().slice(0, 8), 'MARKET',
+         Number(d.openPrice) || null, Number(d.lots) || null, 'AUTO', 'CLOSED',
+         'adopted from MT5 history — this position carried our magic number but no command row owned it',
+         posId, posId, Number(d.openPrice) || null, closePrice, Number.isFinite(profit) ? profit : null,
+         toMysqlDate(closedAt), toMysqlDate(Number(d.openTime) > 0 ? new Date(Number(d.openTime) * 1000) : closedAt), toMysqlDate()],
+      );
+      if (ins?.affectedRows) { adopted += 1; console.warn(`[AutoTrade] ADOPTED untracked position ${posId} ${d.symbol} (${profit}) from MT5 history`); }
+      else already += 1;
+    }
+    res.json({ ok: true, received: deals.length, closed, adopted, already });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
