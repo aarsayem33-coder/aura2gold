@@ -1473,3 +1473,12 @@ export async function fetchStrategyBrokers(window?: { from?: string; to?: string
   else q.set('days', String(window?.days ?? 90));
   return fetchJson(`/api/strategy-lab/brokers?${q.toString()}`);
 }
+
+export interface BridgeAccountRow { login: string; broker: string | null; server: string | null; demo: boolean | null; lastSeenAt: string | null; hasProfile: boolean }
+/** Per-account risk profiles, which login is connected, and every account the bridge has seen. */
+export async function fetchAccountProfiles(): Promise<{
+  ok: boolean; activeAccount: string | null; activeBroker: string | null; armed: string | null;
+  usingProfile: boolean; accounts: BridgeAccountRow[];
+}> {
+  return fetchJson('/api/account-profiles');
+}

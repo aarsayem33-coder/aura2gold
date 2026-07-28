@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Mail, Send, CheckCircle2, XCircle, Bell, Volume2, Route, SlidersHorizontal, FlaskConical, Filter, ScrollText, MonitorSmartphone, ChevronDown, Wallet } from 'lucide-react';
-import { fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, useMt5Stream } from '../mt5Api';
+import { fetchEmailAlertSettings, saveEmailAlertSettings, fetchStrategies, fetchAccountProfiles, useMt5Stream } from '../mt5Api';
+import type { BridgeAccountRow } from '../mt5Api';
 import { formatBdDateTime } from '../utils/time';
 import { playAlertSound, requestNotificationPermission, showBrowserNotification } from '../utils/notifications';
 import type { EmailAlertSettings, StrategyMeta } from '../types';
@@ -376,17 +377,69 @@ export default function NotificationSettings() {
   };
 
   // ── Account & position-sizing (balance + Normal/Challenge modes) ──
-  const ar = emailSettings.accountRisk || defaultEmailAlertSettings.accountRisk!;
-  const setAr = (patch: Partial<NonNullable<typeof emailSettings.accountRisk>>) => {
-    setEmailSettings((current) => ({ ...current, accountRisk: { ...defaultEmailAlertSettings.accountRisk!, ...(current.accountRisk || {}), ...patch } }));
-    setEmailSettingsStatus(null);
-  };
-  const setChallenge = (patch: Partial<NonNullable<typeof emailSettings.accountRisk>['challenge']>) => {
+  // Every control below edits ONE target: either the account-wide fallback or a specific
+  // MT5 login's profile. A $10k evaluation and a $5k demo need different balances and rule
+  // sets, so sizing both off one shared number mis-sizes whichever is not connected.
+  const [editAccount, setEditAccount] = useState('');       // '' = account-wide fallback
+  const [bridgeAccounts, setBridgeAccounts] = useState<BridgeAccountRow[]>([]);
+  const [liveAccount, setLiveAccount] = useState<string | null>(null);
+  useEffect(() => {
+    fetchAccountProfiles()
+      .then((r) => { setBridgeAccounts(r.accounts || []); setLiveAccount(r.activeAccount || r.armed || null); })
+      .catch(() => {});
+  }, []);
+  const arRoot = emailSettings.accountRisk || defaultEmailAlertSettings.accountRisk!;
+  const arProfiles = (arRoot.profiles || {}) as Record<string, Partial<typeof arRoot>>;
+  // A profile inherits the fallback for anything it does not override, so a half-filled
+  // one can never render a blank balance or a zero risk percentage.
+  const ar = editAccount
+    ? { ...arRoot, ...(arProfiles[editAccount] || {}), challenge: { ...arRoot.challenge, ...((arProfiles[editAccount] || {}).challenge || {}) } }
+    : arRoot;
+  const editingProfile = Boolean(editAccount);
+  const profileExists = Boolean(editAccount && arProfiles[editAccount]);
+
+  const writeAccountRisk = (mutate: (base: typeof arRoot) => typeof arRoot) => {
     setEmailSettings((current) => {
-      const base = current.accountRisk || defaultEmailAlertSettings.accountRisk!;
-      return { ...current, accountRisk: { ...base, challenge: { ...base.challenge, ...patch } } };
+      const base = { ...defaultEmailAlertSettings.accountRisk!, ...(current.accountRisk || {}) };
+      return { ...current, accountRisk: mutate(base) };
     });
     setEmailSettingsStatus(null);
+  };
+  const setAr = (patch: Partial<NonNullable<typeof emailSettings.accountRisk>>) => {
+    writeAccountRisk((base) => {
+      if (!editAccount) return { ...base, ...patch };
+      const profiles = { ...(base.profiles || {}) } as Record<string, Record<string, unknown>>;
+      profiles[editAccount] = { ...(profiles[editAccount] || {}), ...patch };
+      return { ...base, profiles };
+    });
+  };
+  const setChallenge = (patch: Partial<NonNullable<typeof emailSettings.accountRisk>['challenge']>) => {
+    writeAccountRisk((base) => {
+      if (!editAccount) return { ...base, challenge: { ...base.challenge, ...patch } };
+      const profiles = { ...(base.profiles || {}) } as Record<string, Record<string, unknown>>;
+      const prev = (profiles[editAccount] || {}) as Record<string, unknown>;
+      profiles[editAccount] = { ...prev, challenge: { ...base.challenge, ...((prev.challenge as object) || {}), ...patch } };
+      return { ...base, profiles };
+    });
+  };
+  /** Seed a profile from the current fallback so the fields are editable immediately. */
+  const createProfile = (login: string, broker?: string | null) => {
+    writeAccountRisk((base) => ({
+      ...base,
+      profiles: {
+        ...(base.profiles || {}),
+        [login]: { balance: base.balance, mode: base.mode, normalRiskPct: base.normalRiskPct, challenge: { ...base.challenge }, broker: broker || null },
+      },
+    }));
+    setEditAccount(login);
+  };
+  const deleteProfile = (login: string) => {
+    writeAccountRisk((base) => {
+      const profiles = { ...(base.profiles || {}) };
+      delete (profiles as Record<string, unknown>)[login];
+      return { ...base, profiles };
+    });
+    setEditAccount('');
   };
 
   const handleSaveEmailSettings = async () => {
@@ -977,6 +1030,51 @@ export default function NotificationSettings() {
               <h3 className="text-sm font-bold text-slate-900">Account &amp; position sizing</h3>
               <p className="text-xs font-medium text-slate-500">Sets the lot size shown on every emailed signal, and labels the email with the mode. Pure risk math — it never changes which signals fire. Not connected to your real broker/prop account; it sizes off the balance you enter here.</p>
             </div>
+
+            {/* Which account these numbers apply to. The system resolves the connected MT5
+                login to its profile at sizing time and falls back to the account-wide
+                values when it has none. */}
+            <div className="border-b border-slate-100 bg-slate-50/60 px-5 py-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">These settings apply to</span>
+                <select
+                  value={editAccount} onChange={(e) => setEditAccount(e.target.value)}
+                  className={`rounded-lg border px-2.5 py-1.5 text-sm font-bold ${editingProfile ? 'border-indigo-400 bg-indigo-50 text-indigo-800' : 'border-slate-300 text-slate-800'}`}
+                >
+                  <option value="">All accounts (default)</option>
+                  {bridgeAccounts.map((a) => (
+                    <option key={a.login} value={a.login}>
+                      {(a.broker || 'Unknown')} · {a.login}{arProfiles[a.login] ? ' ✓' : ''}
+                    </option>
+                  ))}
+                </select>
+                {liveAccount && (
+                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-black text-emerald-700">
+                    CONNECTED: {liveAccount}
+                  </span>
+                )}
+                {editingProfile && !profileExists && (
+                  <button type="button" onClick={() => createProfile(editAccount, bridgeAccounts.find((a) => a.login === editAccount)?.broker)}
+                    className="rounded-lg border border-indigo-300 bg-white px-2.5 py-1 text-xs font-bold text-indigo-700 hover:bg-indigo-50">
+                    Create profile for this account
+                  </button>
+                )}
+                {editingProfile && profileExists && (
+                  <button type="button" onClick={() => deleteProfile(editAccount)}
+                    className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-bold text-rose-700 hover:bg-rose-100">
+                    Remove profile
+                  </button>
+                )}
+              </div>
+              <p className="mt-1.5 text-[11px] font-medium text-slate-400">
+                {!editingProfile
+                  ? 'Used by any account without its own profile.'
+                  : profileExists
+                    ? `Only account ${editAccount} sizes with these numbers. Anything left untouched follows the default above.`
+                    : `Account ${editAccount} has no profile yet — it currently sizes with the default. changing any value below creates one.`}
+              </p>
+            </div>
+
             <div className="space-y-4 px-5 py-4">
               <div className="flex flex-wrap items-center gap-3">
                 <label className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Account balance (USD)</label>
