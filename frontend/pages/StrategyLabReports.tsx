@@ -11,6 +11,16 @@ import type {
 } from '../types';
 
 const REFRESH_MS = 60000;
+
+type SectionKey = 'overview' | 'rankings' | 'sessions' | 'combos' | 'deepdive' | 'log';
+const SECTIONS: { key: SectionKey; label: string }[] = [
+  { key: 'overview', label: 'Overview' },
+  { key: 'rankings', label: 'Rankings' },
+  { key: 'sessions', label: 'Sessions' },
+  { key: 'combos', label: 'Sharpest edges' },
+  { key: 'deepdive', label: 'Deep dive' },
+  { key: 'log', label: 'Signal log' },
+];
 type Metric = 'forex' | 'ftt' | 'at';
 const metricLabel = (m: Metric) => (m === 'ftt' ? 'fixed-time' : m === 'at' ? 'as-traded' : 'forex');
 // Empty bucket so ranking/render never crashes on rows missing an as-traded bucket (older data).
@@ -192,6 +202,9 @@ export default function StrategyLabReports() {
   const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
   const [symbolFilter, setSymbolFilter] = useState('');   // '' = all symbols
+  // One report segment at a time. Every breakdown stacked full-width meant scrolling
+  // past thousands of pixels to compare two of them.
+  const [section, setSection] = useState<SectionKey>('overview');
   const [allSymbols, setAllSymbols] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [signalsLoading, setSignalsLoading] = useState(false);
@@ -359,6 +372,19 @@ export default function StrategyLabReports() {
 
       {error && <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{error}</div>}
 
+      {/* SEGMENT NAV — sticky so switching never requires scrolling back up */}
+      <div className="sticky top-0 z-20 -mx-1 overflow-x-auto bg-slate-50/95 px-1 py-2 backdrop-blur">
+        <div className="flex w-max items-center gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+          {SECTIONS.map((sec) => (
+            <button key={sec.key} type="button" onClick={() => setSection(sec.key)}
+              className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-bold transition ${section === sec.key ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100'}`}>
+              {sec.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {section === 'overview' && (<>
       {/* TOP PICKS — best in each dimension, by the chosen metric */}
       <SectionLabel>Overview · best in each dimension</SectionLabel>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -412,6 +438,10 @@ export default function StrategyLabReports() {
         </div>
       </div>
 
+      </>)}
+
+      {section === 'rankings' && (<>
+      <SectionLabel>Rankings · across all strategies</SectionLabel>
       {/* TIMEFRAME + SYMBOL + SESSION + SCORE global rankings (across all strategies) */}
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2 xl:grid-cols-4">
         <RankTable
@@ -442,10 +472,16 @@ export default function StrategyLabReports() {
         />
       </div>
 
+      </>)}
+
+      {section === 'sessions' && (<>
       {/* SESSION-WISE TOP PERFORMERS — per session: top strategies / symbols / timeframes */}
       <SectionLabel>Session-wise top performers · {metricLabel(metric)}</SectionLabel>
       <SessionBreakdownSection data={sessionBreakdown} metric={metric} minSample={minSample} query={query} loading={loading} />
 
+      </>)}
+
+      {section === 'combos' && (<>
       {/* BEST COMBOS — strategy × symbol × timeframe */}
       <SectionLabel>Sharpest edges</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
@@ -492,6 +528,9 @@ export default function StrategyLabReports() {
         </div>
       </div>
 
+      </>)}
+
+      {section === 'deepdive' && (<>
       {/* SELECTED STRATEGY DEEP-DIVE: by timeframe + by symbol */}
       <SectionLabel>Deep dive · selected strategy</SectionLabel>
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
@@ -516,6 +555,9 @@ export default function StrategyLabReports() {
         </div>
       </div>
 
+      </>)}
+
+      {section === 'log' && (<>
       {/* PER-SIGNAL TRACKED LOG — every signal (system + email), forex + fixed-time, live */}
       <div className="rounded-2xl border border-slate-200 bg-white shadow-card overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
@@ -594,6 +636,8 @@ export default function StrategyLabReports() {
           Every signal is logged (system) regardless of score; <span className="font-bold">SYS</span> = surfaced as a popup, <span className="font-bold">MAIL</span> = emailed · <span className="font-bold text-emerald-600">LIVE</span> shows the fixed-time call&apos;s current position (green winning / red losing) · multiple calls on the same candle are all kept.
         </div>
       </div>
+
+      </>)}
 
       {perf?.note && <p className="text-[11px] font-medium text-slate-400 px-1">{perf.note}</p>}
       </>)}
