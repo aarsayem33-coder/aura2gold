@@ -2642,6 +2642,10 @@ function getMt5Status() {
   const liveAccountSnapshot = connected && mt5State.accountSnapshot?.account === mt5State.account ? mt5State.accountSnapshot : null;
   const snapshotSymbols = Array.isArray(liveAccountSnapshot?.symbols) ? liveAccountSnapshot.symbols : [];
   const snapshotTimeframes = Array.isArray(liveAccountSnapshot?.timeframes) ? liveAccountSnapshot.timeframes : [];
+  // Symbols the CONNECTED broker is actually streaming. Derived from live data rather than
+  // from the account snapshot: the snapshot arrives on its own schedule, so right after a
+  // broker switch it still names the previous account and the identity check below blanked
+  // the whole symbol list — every symbol picker went empty while candles were arriving fine.
   const allSymbols = new Set([
     ...snapshotSymbols,
     ...signals.map((signal) => signal.symbol),
@@ -2695,7 +2699,18 @@ function getMt5Status() {
     indicatorCount: indicators.length,
     aiDecisionCount: aiDecisions.length,
     openTradesCount: openTrades.length,
-    symbols: liveAccountSnapshot ? [...allSymbols].sort() : [],
+      // Gated on the connection only. Requiring the snapshot to match meant a broker switch
+    // (or any terminal that reports snapshots slowly) showed zero symbols.
+    //
+    // SCOPED TO THE CONNECTED BROKER. The observed set accumulates every symbol the app has
+    // ever seen, so after a switch it lists both naming schemes at once (XAUUSD, XAUUSDM,
+    // XAUUSDm) and picking the wrong one silently charts an account you are not trading.
+    // brokerSpecs is reported live by the EA for the account it is attached to, which makes
+    // it the authority on what this broker actually offers. Reports keep the full set via
+    // allSymbols below.
+    symbols: connected ? scopeSymbolsToBroker([...allSymbols]) : [],
+    // Every symbol ever observed, for report surfaces that intentionally span brokers.
+    allSymbols: [...allSymbols].sort(),
     timeframes: liveAccountSnapshot ? [...allTimeframes].sort() : [],
     latestSignal: liveAccountSnapshot ? latestSignal : null,
     latestCandle: liveAccountSnapshot ? latestCandle : null,
@@ -3291,7 +3306,15 @@ app.post('/api/mt5/heartbeat', (req, res) => {
   });
 
   mt5State.lastHeartbeatAt = new Date().toISOString();
-  mt5State.account = data.account || data.accountNumber || mt5State.account;
+  const heartbeatAccount = data.account || data.accountNumber || mt5State.account;
+  // Switching MT5 accounts invalidates the cached snapshot: it carries the PREVIOUS
+  // broker's balance, equity and symbol list, and every surface reading it would keep
+  // showing that account's money under the new broker's name until a fresh one arrived.
+  if (mt5State.accountSnapshot && String(mt5State.accountSnapshot.account || '') !== String(heartbeatAccount || '')) {
+    console.log(`[MT5] account changed ${mt5State.accountSnapshot.account} -> ${heartbeatAccount}; dropping the stale snapshot.`);
+    mt5State.accountSnapshot = null;
+  }
+  mt5State.account = heartbeatAccount;
   mt5State.broker = data.broker || mt5State.broker;
   mt5State.terminal = data.terminal || mt5State.terminal;
   mt5State.version = data.version || data.eaVersion || mt5State.version;
@@ -13347,6 +13370,24 @@ const tradeBridge = { lastSeenAt: 0, account: null, broker: null, server: null, 
 // guessed pip value from a hardcoded table and knew nothing about the broker's minimum
 // stop distance — which mis-sized trades and produced "Invalid stops" rejections.
 const brokerSpecs = new Map();     // SYMBOL(uppercase) -> spec object
+// Specs older than this are treated as a previous broker's and ignored when scoping the
+// live symbol list. The EA refreshes specs about once a minute.
+const BROKER_SPEC_FRESH_MS = 10 * 60 * 1000;
+/**
+ * Narrow an observed symbol list to the symbols the CONNECTED broker currently reports.
+ * Falls back to the full list when the EA has not reported specs yet, so a terminal that
+ * never sends them is not left with an empty picker.
+ */
+function scopeSymbolsToBroker(observed) {
+  const now = Date.now();
+  const live = new Set();
+  for (const [sym, spec] of brokerSpecs) {
+    if (now - Number(spec?.reportedAt || 0) <= BROKER_SPEC_FRESH_MS) live.add(String(sym).toUpperCase());
+  }
+  if (!live.size) return [...observed].sort();
+  const scoped = observed.filter((s) => live.has(String(s).toUpperCase()));
+  return (scoped.length ? scoped : [...observed]).sort();
+}
 function brokerSpecFor(symbol) {
   return brokerSpecs.get(String(symbol || '').toUpperCase()) || null;
 }
@@ -15437,9 +15478,14 @@ app.get('/api/strategy-lab/strategies', (req, res) => {
     return { ...m, control };
   });
   // Curated symbol universe the lab scans — lets the Settings page build the per-strategy
-  // email symbol filter (empty selection = all symbols).
-  const symbols = getCuratedSymbols(getMt5Status().symbols);
-  res.json({ ok: true, strategies, symbols, timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
+  // email symbol filter (empty selection = all symbols). That list follows the CONNECTED
+  // broker. Reports span history, so they also need symbols under a previous broker's
+  // naming (XAUUSDM vs XAUUSD); hand those back separately instead of making report
+  // filters follow the live scope.
+  const st = getMt5Status();
+  const symbols = getCuratedSymbols(st.symbols);
+  const allSymbols = getCuratedSymbols(st.allSymbols || st.symbols);
+  res.json({ ok: true, strategies, symbols, allSymbols, timeframes: STRATEGY_LAB_TIMEFRAMES, ftExpiryBars: STRATEGY_LAB_FT_EXPIRY_BARS });
 });
 
 // GET /api/strategy-lab/live?strategy=&timeframe= — LIVE command per curated symbol on

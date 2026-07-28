@@ -380,7 +380,9 @@ export default function StrategyLabReports() {
       // Disabled strategies are hidden from reports too (manage them on Settings).
       const visible = (m.strategies || []).filter((s) => s.control?.enabled !== false);
       setStrategies(visible);
-      setAllSymbols(m.symbols || []);
+      // Reports span history, so offer every symbol ever observed — including a previous
+      // broker's naming (XAUUSDM) that the live scan no longer lists.
+      setAllSymbols((m as { allSymbols?: string[] }).allSymbols || m.symbols || []);
       setSelected((c) => c || visible[0]?.id || '');
     }).catch(() => {});
     // Real spreads (pips) keyed by symbol, straight from the broker via the EA.
