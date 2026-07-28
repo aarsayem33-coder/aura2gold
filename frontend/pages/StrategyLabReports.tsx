@@ -63,6 +63,24 @@ const matchq = (q: string, ...fields: (string | null | undefined)[]) => {
 };
 
 // Small uppercase group heading to organise the page into clear sections.
+// Net pips: the bottom line a segment produced, with the settled-trade count that made
+// it. Win rate alone hides the case of many small wins funding a few large losses.
+function NetPips({ b }: { b: StrategyForexBucket | null | undefined }) {
+  const v = b?.netPips;
+  if (v === null || v === undefined) return <span className="text-slate-300">—</span>;
+  const n = Number(v);
+  return (
+    <span className="inline-flex flex-col items-end leading-tight">
+      <span className={`font-mono text-xs font-black ${n > 0 ? 'text-emerald-600' : n < 0 ? 'text-rose-600' : 'text-slate-500'}`}>
+        {n > 0 ? '+' : ''}{n.toLocaleString(undefined, { maximumFractionDigits: 0 })}p
+      </span>
+      {b?.expectancyPips != null && (
+        <span className="text-[9px] font-bold text-slate-400">{b.expectancyPips > 0 ? '+' : ''}{b.expectancyPips}p avg · {b.pipsSample ?? 0}</span>
+      )}
+    </span>
+  );
+}
+
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return <h2 className="px-1 pt-1 text-[11px] font-black uppercase tracking-[0.2em] text-slate-400">{children}</h2>;
 }
@@ -173,6 +191,8 @@ export default function StrategyLabReports() {
   const [tab, setTab] = useState<'forex' | 'ftt' | 'at' | 'confluence' | 'autotrade'>('forex');
   const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
+  const [symbolFilter, setSymbolFilter] = useState('');   // '' = all symbols
+  const [allSymbols, setAllSymbols] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [signalsLoading, setSignalsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -182,6 +202,7 @@ export default function StrategyLabReports() {
       // Disabled strategies are hidden from reports too (manage them on Settings).
       const visible = (m.strategies || []).filter((s) => s.control?.enabled !== false);
       setStrategies(visible);
+      setAllSymbols(m.symbols || []);
       setSelected((c) => c || visible[0]?.id || '');
     }).catch(() => {});
   }, []);
@@ -194,10 +215,10 @@ export default function StrategyLabReports() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setPerf(await fetchStrategyPerformance(reportParams)); setError(null); }
+    try { setPerf(await fetchStrategyPerformance({ ...reportParams, symbol: symbolFilter || undefined })); setError(null); }
     catch (err) { setError(err instanceof Error ? err.message : 'Failed to load performance'); }
     finally { setLoading(false); }
-  }, [reportParams]);
+  }, [reportParams, symbolFilter]);
 
   useEffect(() => {
     void load();
@@ -296,6 +317,14 @@ export default function StrategyLabReports() {
         </div>
         <div className="flex items-center gap-2">
           {MetricToggle}
+          {/* Single-symbol lens: every ranking below is recomputed from that symbol's
+              rows, so "which strategy and timeframe works on gold" is answered directly. */}
+          <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)}
+            title="Rebuild every ranking from one symbol's trades only"
+            className={`rounded-lg border px-2 py-1.5 text-sm font-semibold ${symbolFilter ? 'border-amber-400 bg-amber-50 text-amber-800' : 'border-slate-200'}`}>
+            <option value="">All symbols</option>
+            {allSymbols.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
           <select value={range} onChange={(e) => setRange(e.target.value as RangeKey)} className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-semibold">
             {RANGE_OPTIONS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
           </select>
@@ -745,6 +774,7 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
               <th className={`px-4 py-2 text-right ${metric === 'forex' ? 'text-slate-800' : ''}`}>Forex</th>
               <th className={`px-4 py-2 text-right ${metric === 'ftt' ? 'text-violet-600' : ''}`}>Fixed-time</th>
               <th className={`px-4 py-2 text-right ${metric === 'at' ? 'text-teal-600' : ''}`}>As-traded</th>
+              <th className="px-4 py-2 text-right" title="Total pips this segment produced (forex TP/SL), and the settled trades behind it.">Net pips</th>
               <th className="px-4 py-2 text-right">Signals</th>
             </tr>
           </thead>
@@ -756,6 +786,7 @@ function RankTable({ title, sub, icon, colLabel, rows, keyOf, render, metric, mi
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.forex} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.fixedTime} minSample={minSample} bar={false} /></div></td>
                 <td className="px-4 py-2"><div className="flex justify-end"><WinCell b={r.asTraded} minSample={minSample} bar={false} /></div></td>
+                <td className="px-4 py-2 text-right"><NetPips b={r.forex} /></td>
                 <td className="px-4 py-2 text-right font-mono font-bold">{metricTotal(r, metric)}</td>
               </tr>
             )) : (

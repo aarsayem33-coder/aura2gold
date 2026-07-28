@@ -877,6 +877,8 @@ export interface StrategyForexBucket {
   total?: number;
   wins: number; losses: number; expired: number; pending: number;
   winLossSettled: number; winRate: number | null;
+  /** Total pips this segment actually produced, and how many settled trades made it. */
+  netPips?: number | null; pipsSample?: number;
   expectancyPips: number | null; expectancyR: number | null;
   // Average signal R:R offered by this bucket's forex plans (TP3 vs SL at signal time).
   avgRR?: number | null;
@@ -899,6 +901,7 @@ export interface StrategyAtBucket {
   total?: number;
   wins: number; losses: number; draws: number;
   winLossSettled: number; winRate: number | null;
+  netPips?: number | null; pipsSample?: number;
   expectancyPips: number | null;
   confidence: 'weak' | 'early' | 'usable' | 'strong';
 }
@@ -973,6 +976,8 @@ export interface StrategyPerformanceResponse {
   scoreRanking?: StrategyScoreRow[];
   combos: StrategyComboRow[];
   window?: { from: string; to: string; label: string; preset: string | null; days: number };
+  /** Set when every ranking was computed from a single symbol's rows. */
+  symbolFilter?: string | null;
   minSampleToRank: number; generatedAt: string; note: string;
 }
 export interface StrategyLiveRow {

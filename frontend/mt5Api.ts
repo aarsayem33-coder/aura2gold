@@ -499,10 +499,12 @@ export async function fetchStrategySignals(
   const qs = p.toString();
   return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
 }
-export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; from?: string; to?: string; includeMuted?: boolean } = {}): Promise<StrategyPerformanceResponse> {
+export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; from?: string; to?: string; includeMuted?: boolean; symbol?: string } = {}): Promise<StrategyPerformanceResponse> {
   const opts = typeof params === 'number' ? { days: params } : params;
   const q = new URLSearchParams();
   if (opts.includeMuted) q.set('includeMuted', '1');
+  // Single-symbol lens: every ranking is recomputed from that symbol's rows only.
+  if (opts.symbol) q.set('symbol', opts.symbol);
   if (opts.from && opts.to) { q.set('from', opts.from); q.set('to', opts.to); }
   else if (opts.preset) q.set('preset', opts.preset);
   else q.set('days', String(opts.days ?? 90));

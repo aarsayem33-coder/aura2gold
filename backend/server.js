@@ -14855,6 +14855,11 @@ function strategyLabFinalize(b) {
       wins: b.fxWins, losses: b.fxLosses, expired: b.fxExpired, pending: b.fxPending,
       winLossSettled: fxScored,
       winRate: fxScored ? Math.round((b.fxWins / fxScored) * 1000) / 10 : null,
+      // NET pips is the bottom line a segment actually produced; expectancy is that
+      // divided by the trades it took to get there. A high win rate with negative net
+      // pips (many small wins, few big losses) is only visible with both.
+      netPips: b.fxPipsN ? Math.round(b.fxNetPips * 10) / 10 : null,
+      pipsSample: b.fxPipsN,
       expectancyPips: b.fxPipsN ? Math.round((b.fxNetPips / b.fxPipsN) * 10) / 10 : null,
       expectancyR: b.fxRN ? Math.round((b.fxNetR / b.fxRN) * 100) / 100 : null,
       avgRR: b.fxRRCount ? Math.round((b.fxRRSum / b.fxRRCount) * 100) / 100 : null,
@@ -14876,6 +14881,8 @@ function strategyLabFinalize(b) {
         wins: b.atWins, losses: b.atLosses, draws: b.atDraws,
         winLossSettled: atScored,
         winRate: atScored ? Math.round((b.atWins / atScored) * 1000) / 10 : null,
+        netPips: b.atPipsN ? Math.round(b.atNetPips * 10) / 10 : null,
+        pipsSample: b.atPipsN,
         expectancyPips: b.atPipsN ? Math.round((b.atNetPips / b.atPipsN) * 10) / 10 : null,
         confidence: sampleConfidence(atScored),
       };
@@ -14926,15 +14933,25 @@ function strategyLabReportWindow({ days = 90, preset = null, from = null, to = n
   return { fromMs, toMs, preset: p, days, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), label };
 }
 
-async function buildStrategyLabPerformance({ days = 90, preset = null, from = null, to = null } = {}) {
+async function buildStrategyLabPerformance({ days = 90, preset = null, from = null, to = null, symbol = null } = {}) {
   const pool = await initializeDatabase();
   const win = strategyLabReportWindow({ days, preset, from, to });
+  // Optional single-symbol lens: every ranking below is then computed from that symbol's
+  // rows only, so "which strategy and timeframe works on gold" is answered directly
+  // instead of being inferred from blended numbers.
+  const symbolFilter = symbol ? String(symbol).toUpperCase() : null;
   const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], sessionBreakdown: [], scoreRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
-    "SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time, strategy_version, measure_fixed_time, corrected_outcome, corrected_pips FROM mt5_strategy_signals WHERE signal_time >= ? AND signal_time < ? LIMIT 20000",
-    [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
+    `SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time, strategy_version, measure_fixed_time, corrected_outcome, corrected_pips
+       FROM mt5_strategy_signals
+      WHERE signal_time >= ? AND signal_time < ?${symbolFilter ? ' AND UPPER(symbol) = ?' : ''}
+      LIMIT 20000`,
+    symbolFilter
+      ? [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs)), symbolFilter]
+      : [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
   );
+  out.symbolFilter = symbolFilter;
   const byStrat = new Map();
   // Cross-cutting aggregates (across ALL strategies) — answer "which timeframe / which
   // symbol actually works", independent of strategy.
@@ -15440,7 +15457,8 @@ app.get('/api/strategy-lab/performance', async (req, res) => {
     const from = req.query.from ? String(req.query.from) : null;
     const to = req.query.to ? String(req.query.to) : null;
     const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
-    const perf = await buildStrategyLabPerformance({ days, preset, from, to });
+    const symbol = req.query.symbol ? String(req.query.symbol) : null;
+    const perf = await buildStrategyLabPerformance({ days, preset, from, to, symbol });
     if (!includeMuted) {
       const enabled = new Set(enabledStrategyIds());
       perf.strategies = (perf.strategies || []).filter((s) => enabled.has(s.id));
