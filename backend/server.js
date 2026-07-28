@@ -15791,11 +15791,26 @@ app.get('/api/strategy-lab/brokers', async (req, res) => {
         ORDER BY signals DESC`,
       [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
     );
+    // Which symbols each broker actually traded. Lets a UI scope a symbol list to one
+    // account without hardcoding suffix rules (XAUUSDm vs XAUUSD vs XAUUSD.raw).
+    const [symRows] = await pool.query(
+      `SELECT COALESCE(broker, '(unattributed)') broker, symbol, COUNT(*) n
+         FROM mt5_strategy_signals
+        WHERE signal_time >= ? AND signal_time < ?
+        GROUP BY COALESCE(broker, '(unattributed)'), symbol`,
+      [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
+    );
+    const symbolsByBroker = new Map();
+    for (const r of symRows) {
+      if (!symbolsByBroker.has(r.broker)) symbolsByBroker.set(r.broker, []);
+      symbolsByBroker.get(r.broker).push(r.symbol);
+    }
     res.json({
       ok: true,
       live: tradeBridge.broker || null,
       brokers: rows.map((r) => ({
         broker: r.broker, signals: Number(r.signals), symbols: Number(r.symbols),
+        symbolList: (symbolsByBroker.get(r.broker) || []).sort(),
         firstSeen: r.firstSeen ? new Date(r.firstSeen).toISOString() : null,
         lastSeen: r.lastSeen ? new Date(r.lastSeen).toISOString() : null,
       })),

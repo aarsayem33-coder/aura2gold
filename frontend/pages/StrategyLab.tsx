@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Loader2, RefreshCw, FlaskConical, TrendingUp, TrendingDown, BarChart3, Timer, Hourglass, Mail, Radio, Check, ChevronDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { fetchStrategies, fetchStrategySignals, fetchStrategyLive, fetchStrategyLiveFtt } from '../mt5Api';
+import { fetchStrategies, fetchStrategySignals, fetchStrategyLive, fetchStrategyLiveFtt, fetchStrategyBrokers } from '../mt5Api';
+import type { StrategyBrokerRow } from '../mt5Api';
 import type { StrategyMeta, StrategySignal, StrategyLiveResponse, StrategyLiveRow, StrategyFttLiveResponse, StrategyFttLiveRow } from '../types';
 
 const REFRESH_MS = 30000;
@@ -327,6 +328,12 @@ export default function StrategyLab() {
   const [histStrategies, setHistStrategies] = useState<string[]>([]);
   const [scoreBuckets, setScoreBuckets] = useState<string[]>([]);
   const [symbolFilters, setSymbolFilters] = useState<string[]>([]);
+  // Account scope. Two brokers mean two symbol namings for the same instrument (XAUUSD vs
+  // XAUUSDM), so an unscoped dashboard shows both accounts' rows side by side and they read
+  // as duplicates. Selecting a broker narrows every grid and table to that account's symbols.
+  const [brokerScope, setBrokerScope] = useState('');   // '' = all accounts
+  const [brokerRows, setBrokerRows] = useState<StrategyBrokerRow[]>([]);
+  const [liveBroker, setLiveBroker] = useState<string | null>(null);
   const [showMuted, setShowMuted] = useState(false);    // reveal strategies muted in the Strategy Controller
   const [tab, setTab] = useState<Tab>('forex');
   // Fixed-time tab hides forex-only strategies (e.g. LIL SWEEP-PRO+, Special Forex
@@ -348,6 +355,12 @@ export default function StrategyLab() {
   const [signals, setSignals] = useState<StrategySignal[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchStrategyBrokers({ days: 90 })
+      .then((r) => { setBrokerRows(r.brokers || []); setLiveBroker(r.live || null); })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetchStrategies().then((m) => {
@@ -428,6 +441,22 @@ export default function StrategyLab() {
   // setup direction. When a filter is active — or when more than one strategy is selected —
   // we show only the actionable rows that pass (HOLD/NO_DATA noise is hidden, which also
   // keeps the merged multi-strategy view readable); otherwise the grid shows every row.
+  // Symbols belonging to the scoped account, taken from what that broker actually traded
+  // rather than from suffix guesswork. null = no scope, show everything.
+  const scopedSymbols = useMemo(() => {
+    if (!brokerScope) return null;
+    const row = brokerRows.find((b) => b.broker === brokerScope);
+    return row ? new Set(row.symbolList.map((x) => x.toUpperCase())) : null;
+  }, [brokerScope, brokerRows]);
+  const inScope = useCallback((sym?: string | null) => !scopedSymbols || scopedSymbols.has(String(sym || '').toUpperCase()), [scopedSymbols]);
+  // Symbol picks made under a different account would survive the switch and filter the
+  // grids down to nothing, which reads as "no signals" rather than "wrong filter".
+  useEffect(() => {
+    if (!scopedSymbols || !symbolFilters.length) return;
+    const kept = symbolFilters.filter((sym) => scopedSymbols.has(sym.toUpperCase()));
+    if (kept.length !== symbolFilters.length) setSymbolFilters(kept);
+  }, [scopedSymbols, symbolFilters]);
+
   const [minScore, setMinScore] = useState(0);
   const [dirFilter, setDirFilter] = useState(''); // '' | 'LONG' | 'SHORT'
   const [actionableView, setActionableView] = useState(true); // default: hide HOLD noise, signals only
@@ -437,23 +466,23 @@ export default function StrategyLab() {
   const timingRank = (st?: string) => (st === 'TRADABLE' ? 0 : st === 'WAIT' ? 1 : 2);
   const readRank = (v?: string) => (v === 'ENTER_NOW' ? 0 : v === 'WAIT_PULLBACK' ? 1 : 2);
   const forexRows = useMemo(() => {
-    const rows = (live?.rows || []).filter((r) => !actionableOnly || (r.command === 'ENTRY'
+    const rows = (live?.rows || []).filter((r) => inScope(r.symbol)).filter((r) => !actionableOnly || (r.command === 'ENTRY'
       && (minScore === 0 || (r.score ?? 0) >= minScore)
       && (!dirFilter || (dirFilter === 'LONG' ? /BUY/.test(r.direction || '') : /SELL/.test(r.direction || '')))));
     return [...rows].sort((a, b) =>
       (Number(b.command === 'ENTRY') - Number(a.command === 'ENTRY'))
       || (timingRank(a.timing?.status) - timingRank(b.timing?.status))
       || ((b.score ?? 0) - (a.score ?? 0)));
-  }, [live, minScore, dirFilter, actionableOnly]);
+  }, [live, minScore, dirFilter, actionableOnly, inScope]);
   const ftRows = useMemo(() => {
-    const rows = (ftLive?.rows || []).filter((r) => !actionableOnly || (r.command === 'CALL'
+    const rows = (ftLive?.rows || []).filter((r) => inScope(r.symbol)).filter((r) => !actionableOnly || (r.command === 'CALL'
       && (minScore === 0 || (r.score ?? 0) >= minScore)
       && (!dirFilter || (dirFilter === 'LONG' ? r.direction === 'UP' : r.direction === 'DOWN'))));
     return [...rows].sort((a, b) =>
       (Number(b.command === 'CALL') - Number(a.command === 'CALL'))
       || (readRank(a.candleRead?.verdict) - readRank(b.candleRead?.verdict))
       || ((b.score ?? 0) - (a.score ?? 0)));
-  }, [ftLive, minScore, dirFilter, actionableOnly]);
+  }, [ftLive, minScore, dirFilter, actionableOnly, inScope]);
   const entries = forexRows.filter((r) => r.command === 'ENTRY');
   const calls = ftRows.filter((r) => r.command === 'CALL');
   const tradableNow = entries.filter((r) => r.timing?.status === 'TRADABLE').length;
@@ -462,14 +491,18 @@ export default function StrategyLab() {
     ? (ftLive?.rows.length || 0) - (ftLive?.rows || []).filter((r) => r.command === 'CALL').length
     : (live?.rows.length || 0) - (live?.rows || []).filter((r) => r.command === 'ENTRY').length;
   // Recent-table multi-filters apply to BOTH recent tables. Empty selection means all.
-  const histSymbolOptions = useMemo(() => Array.from(new Set([...symbols, ...signals.map((s) => s.symbol)])).sort(), [symbols, signals]);
+  const histSymbolOptions = useMemo(
+    () => Array.from(new Set([...symbols, ...signals.map((s) => s.symbol)])).filter(inScope).sort(),
+    [symbols, signals, inScope],
+  );
   const filteredSignals = useMemo(
     () => signals.filter((s) =>
       (!histStrategies.length || histStrategies.includes(s.strategy))
       && (!histTfs.length || histTfs.includes(s.timeframe))
       && (!symbolFilters.length || symbolFilters.includes(s.symbol))
+      && inScope(s.symbol)
       && (!scoreBuckets.length || scoreBuckets.some((bucket) => inScoreBucket(s.score, bucket)))),
-    [signals, histStrategies, histTfs, symbolFilters, scoreBuckets],
+    [signals, histStrategies, histTfs, symbolFilters, scoreBuckets, inScope],
   );
   // Recent tables: actionable-NOW first (forex TRADABLE limit / fixed-time LIVE open call),
   // then newest signal first.
@@ -583,6 +616,31 @@ export default function StrategyLab() {
               <FlaskConical className="text-violet-600" size={18} />
               <h1 className="text-sm font-black text-slate-900">Strategy Lab</h1>
             </div>
+            {/* Account scope. Two brokers name the same instrument differently (XAUUSD vs
+                XAUUSDM), so an unscoped dashboard lists both accounts' rows together and
+                they read as duplicates of one setup. */}
+            {brokerRows.length > 1 && (
+              <div className="flex items-center gap-0.5 rounded-lg border border-indigo-200 bg-indigo-50/60 p-0.5">
+                <button
+                  type="button" onClick={() => setBrokerScope('')}
+                  title="Show signals from every account"
+                  className={`rounded-md px-2.5 py-1 text-xs font-bold transition ${!brokerScope ? 'bg-indigo-600 text-white' : 'text-indigo-700 hover:bg-white'}`}
+                >
+                  All accounts
+                </button>
+                {brokerRows.map((b) => (
+                  <button
+                    key={b.broker} type="button"
+                    onClick={() => setBrokerScope(brokerScope === b.broker ? '' : b.broker)}
+                    title={`${b.symbolList.length} symbols · ${b.signals.toLocaleString()} signals`}
+                    className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-bold transition ${brokerScope === b.broker ? 'bg-indigo-600 text-white' : 'text-indigo-700 hover:bg-white'}`}
+                  >
+                    {b.broker.split(' ')[0]}
+                    {liveBroker === b.broker && <span className={`h-1.5 w-1.5 rounded-full ${brokerScope === b.broker ? 'bg-emerald-300' : 'bg-emerald-500'}`} title="connected" />}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
               <button type="button" onClick={() => setTab('forex')} className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-bold transition ${tab === 'forex' ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-white'}`}>
                 <TrendingUp size={12} /> Forex
