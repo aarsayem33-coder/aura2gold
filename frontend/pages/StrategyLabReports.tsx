@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot } from 'lucide-react';
+import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot, ChevronDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import AutoTradeReport from './AutoTradeReport';
 import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence } from '../mt5Api';
@@ -88,6 +88,85 @@ function NetPips({ b }: { b: StrategyForexBucket | null | undefined }) {
         <span className="text-[9px] font-bold text-slate-400">{b.expectancyPips > 0 ? '+' : ''}{b.expectancyPips}p avg · {b.pipsSample ?? 0}</span>
       )}
     </span>
+  );
+}
+
+// Summary of whatever the signal log is currently showing, with a symbol drawer.
+// Money is derived per signal from lossAtStop / stopPips — the risk the row was sized
+// for divided by its stop — so it uses each symbol's real contract value instead of a
+// guessed pip price. It is still the SUGGESTED size, not money actually traded.
+function SignalLogSummary({ rows, symbols, selected, onToggle, onClear }: {
+  rows: StrategySignal[];
+  symbols: string[];
+  selected: Set<string>;
+  onToggle: (s: string) => void;
+  onClear: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const s = useMemo(() => {
+    let wins = 0, losses = 0, expired = 0, pending = 0, netPips = 0, pnl = 0, pipsN = 0;
+    for (const r of rows) {
+      const o = String(r.outcome || '').toUpperCase();
+      if (o.endsWith('_WIN') || o === 'WIN') wins += 1;
+      else if (o === 'LOSS') losses += 1;
+      else if (o === 'EXPIRED') expired += 1;
+      else if (o === 'PENDING') pending += 1;
+      const p = r.profitLossPips;
+      if (p !== null && p !== undefined && Number.isFinite(Number(p))) {
+        netPips += Number(p); pipsN += 1;
+        const perPip = r.stopPips && r.lossAtStop ? Number(r.lossAtStop) / Number(r.stopPips) : null;
+        if (perPip !== null && Number.isFinite(perPip)) pnl += Number(p) * perPip;
+      }
+    }
+    const settled = wins + losses;
+    return { wins, losses, expired, pending, settled, netPips, pnl, pipsN,
+      winRate: settled ? Math.round((wins / settled) * 1000) / 10 : null };
+  }, [rows]);
+
+  const Tile = ({ label, value, tone = 'slate', sub }: { label: string; value: string; tone?: string; sub?: string }) => (
+    <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+      <p className="text-[9px] font-black uppercase tracking-wider text-slate-400">{label}</p>
+      <p className={`text-base font-black ${tone}`}>{value}</p>
+      {sub && <p className="text-[9px] font-bold text-slate-400">{sub}</p>}
+    </div>
+  );
+
+  return (
+    <div className="border-b border-slate-100 bg-slate-50/60 px-4 py-3">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+        <Tile label="Wins" value={String(s.wins)} tone="text-emerald-600" sub={`${s.settled} settled`} />
+        <Tile label="Losses" value={String(s.losses)} tone="text-rose-600" sub={s.expired ? `${s.expired} expired` : undefined} />
+        <Tile label="Win rate" value={s.winRate === null ? '—' : `${s.winRate}%`} tone={(s.winRate ?? 0) >= 50 ? 'text-emerald-600' : 'text-rose-600'} sub={s.pending ? `${s.pending} pending` : undefined} />
+        <Tile label="Net pips" value={`${s.netPips > 0 ? '+' : ''}${Math.round(s.netPips).toLocaleString()}`} tone={s.netPips >= 0 ? 'text-emerald-600' : 'text-rose-600'} sub={`${s.pipsN} scored`} />
+        <Tile label="Est. P/L" value={`${s.pnl < 0 ? '-' : '+'}$${Math.abs(s.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}`} tone={s.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'} sub="at suggested size" />
+        <Tile label="Avg / trade" value={s.pipsN ? `${s.netPips / s.pipsN > 0 ? '+' : ''}${(s.netPips / s.pipsN).toFixed(1)}p` : '—'} tone="text-slate-700" sub={`${rows.length} shown`} />
+      </div>
+
+      <div className="mt-2">
+        <button type="button" onClick={() => setOpen((v) => !v)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-600 hover:bg-slate-50">
+          <Coins size={12} />
+          {selected.size ? `${selected.size} symbol${selected.size === 1 ? '' : 's'} filtered` : 'Filter by symbol'}
+          <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+        </button>
+        {selected.size > 0 && (
+          <button type="button" onClick={onClear} className="ml-2 rounded-lg px-2 py-1 text-[11px] font-bold text-slate-400 hover:bg-slate-100 hover:text-slate-600">Clear</button>
+        )}
+        {open && (
+          <div className="mt-2 flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-white p-2">
+            {symbols.length ? symbols.map((sym) => {
+              const on = selected.has(sym);
+              return (
+                <button key={sym} type="button" onClick={() => onToggle(sym)}
+                  className={`rounded-lg border px-2 py-1 text-[11px] font-bold transition ${on ? 'border-amber-400 bg-amber-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300'}`}>
+                  {sym}
+                </button>
+              );
+            }) : <span className="px-1 text-[11px] font-medium text-slate-400">No symbols in this window.</span>}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -205,6 +284,8 @@ export default function StrategyLabReports() {
   // One report segment at a time. Every breakdown stacked full-width meant scrolling
   // past thousands of pixels to compare two of them.
   const [section, setSection] = useState<SectionKey>('overview');
+  // Signal-log symbol drawer. Empty = every symbol.
+  const [logSymbols, setLogSymbols] = useState<Set<string>>(new Set());
   const [allSymbols, setAllSymbols] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [signalsLoading, setSignalsLoading] = useState(false);
@@ -294,6 +375,27 @@ export default function StrategyLabReports() {
     if (!Number.isFinite(from) || !Number.isFinite(to)) return signals;
     return signals.filter((s) => { const t = s.signalTime ? Date.parse(s.signalTime) : NaN; return Number.isFinite(t) && t >= from && t < to; });
   }, [signals, perf]);
+
+  // Symbols present in the log window, and the rows after the drawer filter. Both the
+  // summary card and the table read logVisible, so the totals always describe exactly
+  // what is on screen.
+  const logSymbolOptions = useMemo(
+    () => [...new Set(logSignals.map((x) => x.symbol))].sort(),
+    [logSignals],
+  );
+  const logVisible = useMemo(
+    () => (logSymbols.size ? logSignals.filter((x) => logSymbols.has(x.symbol)) : logSignals),
+    [logSignals, logSymbols],
+  );
+  // A symbol that vanishes from the window (range change) must not keep filtering.
+  useEffect(() => {
+    setLogSymbols((cur) => {
+      if (!cur.size) return cur;
+      const valid = new Set(logSymbolOptions);
+      const next = new Set([...cur].filter((x) => valid.has(x)));
+      return next.size === cur.size ? cur : next;
+    });
+  }, [logSymbolOptions]);
 
   function bestOf<T extends AnyBucketRow>(rows: T[]): T | null {
     if (!rows.length) return null;
@@ -568,8 +670,8 @@ export default function StrategyLabReports() {
               ? <span className="ml-1 inline-flex items-center gap-1 text-[11px] font-bold text-slate-400"><Loader2 size={11} className="animate-spin" />loading…</span>
               : (
                 <span className="ml-1 text-[11px] font-semibold text-slate-400">
-                  every call tracked by system &amp; email · live position · {logSignals.length} in {perf?.window?.label || 'window'}
-                  {logSignals.length > 80 && <span className="text-amber-600"> · showing newest 80</span>}
+                  every call tracked by system &amp; email · live position · {logVisible.length}{logSymbols.size ? ` of ${logSignals.length}` : ''} in {perf?.window?.label || 'window'}
+                  {logVisible.length > 80 && <span className="text-amber-600"> · showing newest 80</span>}
                   {logSignals.length >= 500 && <span className="text-amber-600"> (capped at 500)</span>}
                 </span>
               )}
@@ -579,6 +681,13 @@ export default function StrategyLabReports() {
             {metricStrategies.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
+        <SignalLogSummary
+          rows={logVisible}
+          symbols={logSymbolOptions}
+          selected={logSymbols}
+          onToggle={(sym) => setLogSymbols((cur) => { const n = new Set(cur); if (n.has(sym)) n.delete(sym); else n.add(sym); return n; })}
+          onClear={() => setLogSymbols(new Set())}
+        />
         <div className="overflow-x-auto">
           <table className="w-full min-w-[860px] text-left text-sm">
             <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
@@ -596,7 +705,7 @@ export default function StrategyLabReports() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700">
-              {logSignals.length ? logSignals.slice(0, 80).map((s) => {
+              {logVisible.length ? logVisible.slice(0, 80).map((s) => {
                 const up = /BUY/.test(s.direction);
                 const liveTint = s.live ? (s.live.status === 'WINNING' ? 'bg-emerald-50/40' : s.live.status === 'LOSING' ? 'bg-rose-50/40' : '') : '';
                 return (
