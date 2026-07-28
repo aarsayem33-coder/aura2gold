@@ -427,6 +427,21 @@ export default function StrategyLabReports() {
       .catch(() => {});
   }, [reportParams]);
 
+  // The symbol lens must live inside the broker lens: with both brokers listed you can pick
+  // XAUUSDM while scoped to FTMO and get an empty report that looks like missing data.
+  const brokerSymbols = useMemo(() => {
+    if (!brokerFilter) return null;
+    const row = brokers.find((b) => b.broker === brokerFilter);
+    return row ? row.symbolList : null;
+  }, [brokerFilter, brokers]);
+  const symbolOptions = useMemo(
+    () => (brokerSymbols ? allSymbols.filter((sy) => brokerSymbols.includes(sy)) : allSymbols),
+    [allSymbols, brokerSymbols],
+  );
+  useEffect(() => {
+    if (symbolFilter && brokerSymbols && !brokerSymbols.includes(symbolFilter)) setSymbolFilter('');
+  }, [brokerSymbols, symbolFilter]);
+
   // A broker that has no rows in the newly-chosen window would silently show an empty
   // report, so drop back to "all brokers" instead of leaving a dead filter applied.
   useEffect(() => {
@@ -596,8 +611,8 @@ export default function StrategyLabReports() {
           <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)}
             title="Rebuild every ranking from one symbol's trades only"
             className={`rounded-lg border px-2 py-1.5 text-sm font-semibold ${symbolFilter ? 'border-amber-400 bg-amber-50 text-amber-800' : 'border-slate-200'}`}>
-            <option value="">All symbols</option>
-            {allSymbols.map((s) => <option key={s} value={s}>{s}</option>)}
+            <option value="">All symbols{brokerFilter ? ` (${brokerFilter})` : ''}</option>
+            {symbolOptions.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
           <select value={range} onChange={(e) => setRange(e.target.value as RangeKey)} className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-semibold">
             {RANGE_OPTIONS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}

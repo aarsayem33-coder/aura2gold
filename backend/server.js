@@ -9140,7 +9140,7 @@ app.get('/api/auto-trade/report', async (req, res) => {
     const brokerQ = req.query.broker ? String(req.query.broker) : null;
     if (brokerQ) {
       const reg = loadAutoTradeAccounts().accounts || {};
-      const logins = Object.entries(reg).filter(([, a]) => String(a?.broker || '') === brokerQ).map(([login]) => login);
+      const logins = Object.entries(reg).filter(([, a]) => brokerBrand(a?.broker) === brokerBrand(brokerQ)).map(([login]) => login);
       if (!logins.length) where.push('1=0');            // known broker, no accounts -> no rows
       else { where.push(`account IN (${logins.map(() => '?').join(',')})`); args.push(...logins); }
     }
@@ -13201,6 +13201,17 @@ let challengeStateCache = null;
  * phantom empty challenge run alongside the real one.
  */
 /**
+ * Canonical brand for a broker name. The same firm reaches us under several strings —
+ * "Exness", "Exness Technologies Ltd" — depending on which terminal reported it and when,
+ * so exact-matching splits one account family into several buckets and a filter built from
+ * one string finds nothing in a table that stored another. Compare on the brand token.
+ */
+function brokerBrand(name) {
+  return String(name || '').trim().split(/\s+/)[0].toUpperCase();
+}
+const SQL_BROKER_BRAND = "UPPER(SUBSTRING_INDEX(broker, ' ', 1))";
+
+/**
  * Broker name for the CONNECTED account, taken from the account registry rather than the
  * live bridge string. Returns null when the account is unknown, so an unattributable
  * signal stays unattributed instead of inheriting the previous broker's label.
@@ -15257,10 +15268,10 @@ async function buildStrategyLabPerformance({ days = 90, preset = null, from = nu
   const [rows] = await pool.query(
     `SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time, strategy_version, measure_fixed_time, corrected_outcome, corrected_pips
        FROM mt5_strategy_signals
-      WHERE signal_time >= ? AND signal_time < ?${symbolFilter ? ' AND UPPER(symbol) = ?' : ''}${brokerFilter ? ' AND broker = ?' : ''}
+      WHERE signal_time >= ? AND signal_time < ?${symbolFilter ? ' AND UPPER(symbol) = ?' : ''}${brokerFilter ? ` AND ${SQL_BROKER_BRAND} = ?` : ''}
       LIMIT 20000`,
     [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs)),
-     ...(symbolFilter ? [symbolFilter] : []), ...(brokerFilter ? [brokerFilter] : [])],
+     ...(symbolFilter ? [symbolFilter] : []), ...(brokerFilter ? [brokerBrand(brokerFilter)] : [])],
   );
   out.symbolFilter = symbolFilter;
   out.brokerFilter = brokerFilter;
@@ -15711,7 +15722,7 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
     if (timeframe) { sql += ' AND timeframe = ?'; params.push(timeframe); }
     // Broker lens — see buildStrategyLabPerformance().
     const brokerQ = req.query.broker ? String(req.query.broker) : null;
-    if (brokerQ) { sql += ' AND broker = ?'; params.push(brokerQ); }
+    if (brokerQ) { sql += ` AND ${SQL_BROKER_BRAND} = ?`; params.push(brokerBrand(brokerQ)); }
     // Date window, so the log matches the report window it is displayed under.
     const dateOk = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
     if (dateOk(req.query.from)) { sql += ' AND signal_time >= ?'; params.push(`${req.query.from} 00:00:00`); }
@@ -15811,21 +15822,21 @@ app.get('/api/strategy-lab/brokers', async (req, res) => {
       to: req.query.to ? String(req.query.to) : null,
     });
     const [rows] = await pool.query(
-      `SELECT COALESCE(broker, '(unattributed)') broker, COUNT(*) signals,
+      `SELECT COALESCE(${SQL_BROKER_BRAND}, '(unattributed)') broker, COUNT(*) signals,
               COUNT(DISTINCT symbol) symbols, MIN(signal_time) firstSeen, MAX(signal_time) lastSeen
          FROM mt5_strategy_signals
         WHERE signal_time >= ? AND signal_time < ?
-        GROUP BY COALESCE(broker, '(unattributed)')
+        GROUP BY COALESCE(${SQL_BROKER_BRAND}, '(unattributed)')
         ORDER BY signals DESC`,
       [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
     );
     // Which symbols each broker actually traded. Lets a UI scope a symbol list to one
     // account without hardcoding suffix rules (XAUUSDm vs XAUUSD vs XAUUSD.raw).
     const [symRows] = await pool.query(
-      `SELECT COALESCE(broker, '(unattributed)') broker, symbol, COUNT(*) n
+      `SELECT COALESCE(${SQL_BROKER_BRAND}, '(unattributed)') broker, symbol, COUNT(*) n
          FROM mt5_strategy_signals
         WHERE signal_time >= ? AND signal_time < ?
-        GROUP BY COALESCE(broker, '(unattributed)'), symbol`,
+        GROUP BY COALESCE(${SQL_BROKER_BRAND}, '(unattributed)'), symbol`,
       [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
     );
     const symbolsByBroker = new Map();
@@ -15835,7 +15846,7 @@ app.get('/api/strategy-lab/brokers', async (req, res) => {
     }
     res.json({
       ok: true,
-      live: tradeBridge.broker || null,
+      live: brokerBrand(signalBrokerForAccount() || tradeBridge.broker) || null,
       brokers: rows.map((r) => ({
         broker: r.broker, signals: Number(r.signals), symbols: Number(r.symbols),
         symbolList: (symbolsByBroker.get(r.broker) || []).sort(),

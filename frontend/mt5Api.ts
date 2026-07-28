@@ -1465,7 +1465,7 @@ export async function deleteSavedProjection(id: string): Promise<{ ok: boolean }
   return response.json();
 }
 
-export interface StrategyBrokerRow { broker: string; signals: number; symbols: number; firstSeen: string | null; lastSeen: string | null }
+export interface StrategyBrokerRow { broker: string; signals: number; symbols: number; symbolList: string[]; firstSeen: string | null; lastSeen: string | null }
 /** Which brokers appear in the signal history, for the report filter. */
 export async function fetchStrategyBrokers(window?: { from?: string; to?: string; days?: number; preset?: string }): Promise<{ ok: boolean; live: string | null; brokers: StrategyBrokerRow[] }> {
   const q = new URLSearchParams();
