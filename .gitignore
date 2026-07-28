@@ -4,8 +4,20 @@ node_modules/
 # Environment and secrets
 .env
 .env.*
+# ".env.*" does NOT match a OneDrive sync-conflict copy such as
+# ".env-Redowan's MacBook Air.local" — the machine suffix lands before the dot, so the
+# name starts ".env-" not ".env.". One such file appeared untracked on 2026-07-28 holding
+# live SMTP_PASS, DB_PASSWORD and TRADING_ECONOMICS_API_KEY, one "git add -A" from being
+# published. Match the prefix instead.
+.env*
 !.env.example
 !.env.sample
+
+# OneDrive/Dropbox conflict copies of source files (this repo lives inside OneDrive and is
+# synced from a second machine). They are duplicates, never the file anyone should edit.
+*MacBook*
+*conflicted copy*
+*Conflicted Copy*
 
 # Runtime logs
 *.log
