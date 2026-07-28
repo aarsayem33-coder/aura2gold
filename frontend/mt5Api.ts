@@ -493,6 +493,10 @@ export async function logChallengeTrade(pnl: number, note?: string): Promise<Cha
 export async function setChallengeBalance(balance: number): Promise<ChallengeDashboard> {
   return fetchJson<ChallengeDashboard>('/api/challenge/balance', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ balance }) });
 }
+/** Correct the STARTING balance and keep the run (history, day totals, trade log). */
+export async function setChallengeInitialBalance(initialBalance: number): Promise<ChallengeDashboard> {
+  return fetchJson<ChallengeDashboard>('/api/challenge/initial-balance', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initialBalance }) });
+}
 export async function resetChallenge(initialBalance?: number): Promise<ChallengeDashboard> {
   return fetchJson<ChallengeDashboard>('/api/challenge/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initialBalance }) });
 }

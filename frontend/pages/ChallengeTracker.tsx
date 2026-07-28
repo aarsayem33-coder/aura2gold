@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Trophy, RefreshCw, Loader2, AlertTriangle, ShieldCheck, TrendingUp, TrendingDown, Ban, Wallet } from 'lucide-react';
-import { fetchChallenge, logChallengeTrade, setChallengeBalance, resetChallenge } from '../mt5Api';
+import { fetchChallenge, logChallengeTrade, setChallengeBalance, setChallengeInitialBalance, resetChallenge } from '../mt5Api';
 import type { ChallengeDashboard } from '../types';
 
 const usd = (v: number | null | undefined) => (v === null || v === undefined || Number.isNaN(Number(v)) ? '—' : `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
@@ -36,6 +36,7 @@ export default function ChallengeTracker() {
   const [pnl, setPnl] = useState('');
   const [note, setNote] = useState('');
   const [balanceInput, setBalanceInput] = useState('');
+  const [initialInput, setInitialInput] = useState('');
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async (spin = false) => {
@@ -63,10 +64,22 @@ export default function ChallengeTracker() {
     catch (e) { setErr(e instanceof Error ? e.message : 'Failed'); }
     finally { setBusy(false); }
   };
-  const doReset = async () => {
-    if (!window.confirm('Start a fresh challenge from the configured initial balance? This clears the current run.')) return;
+  // Correct the starting balance and KEEP the run. Every rule line derives from it, so a
+  // stale value quietly shrinks the per-trade cap that gates auto-trade signals.
+  const doInitial = async () => {
+    const val = Number(initialInput);
+    if (!Number.isFinite(val) || val <= 0) return;
     setBusy(true);
-    try { setD(await resetChallenge()); }
+    try { setD(await setChallengeInitialBalance(val)); setInitialInput(''); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Failed'); }
+    finally { setBusy(false); }
+  };
+  const doReset = async () => {
+    const typed = Number(initialInput);
+    const from = Number.isFinite(typed) && typed > 0 ? typed : undefined;
+    if (!window.confirm(`Start a fresh challenge from ${from !== undefined ? `$${from.toLocaleString()}` : 'the configured starting balance'}? This clears the current run.`)) return;
+    setBusy(true);
+    try { setD(await resetChallenge(from)); setInitialInput(''); }
     catch (e) { setErr(e instanceof Error ? e.message : 'Failed'); }
     finally { setBusy(false); }
   };
@@ -138,13 +151,30 @@ export default function ChallengeTracker() {
             </div>
             <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
               <div className="border-b border-slate-100 px-5 py-3"><h3 className="text-sm font-bold text-slate-900">Correct / reset</h3><p className="text-xs font-medium text-slate-500">Set the balance to match your real account, or start a fresh challenge.</p></div>
-              <div className="space-y-3 px-5 py-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Wallet size={15} className="text-slate-400" />
-                  <input type="number" step="0.01" value={balanceInput} onChange={(e) => setBalanceInput(e.target.value)} placeholder={`${d.currentBalance}`} className="w-32 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
-                  <button disabled={busy} onClick={doBalance} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50">Set balance</button>
+              <div className="space-y-4 px-5 py-4">
+                <div>
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Current balance</label>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <Wallet size={15} className="text-slate-400" />
+                    <input type="number" step="0.01" value={balanceInput} onChange={(e) => setBalanceInput(e.target.value)} placeholder={`${d.currentBalance}`} className="w-32 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                    <button disabled={busy} onClick={doBalance} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50">Set balance</button>
+                  </div>
                 </div>
-                <button disabled={busy} onClick={doReset} className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-bold text-rose-700 hover:bg-rose-100 disabled:opacity-50"><RefreshCw size={13} />Reset challenge</button>
+                {/* Starting balance drives the drawdown floor, the profit target and the
+                    per-trade cap that gates auto-trade signals — so it has to be editable
+                    without throwing away the run. */}
+                <div className="border-t border-slate-100 pt-3">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Starting balance</label>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <Trophy size={15} className="text-amber-400" />
+                    <input type="number" step="0.01" value={initialInput} onChange={(e) => setInitialInput(e.target.value)} placeholder={`${d.initialBalance}`} className="w-32 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                    <button disabled={busy} onClick={doInitial} className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm font-bold text-amber-800 hover:bg-amber-100 disabled:opacity-50">Set starting balance</button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] font-medium text-slate-400">
+                    Currently {usd(d.initialBalance)} → drawdown floor {usd(d.ddFloor)}, target {usd(d.target)}, safe risk/trade {usd(d.safePerTradeRisk)}. Keeps your history.
+                  </p>
+                </div>
+                <button disabled={busy} onClick={doReset} className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-bold text-rose-700 hover:bg-rose-100 disabled:opacity-50"><RefreshCw size={13} />Reset challenge{initialInput.trim() ? ` from $${initialInput.trim()}` : ''}</button>
               </div>
             </div>
           </div>

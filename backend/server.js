@@ -9764,6 +9764,30 @@ app.post('/api/challenge/balance', (req, res) => {
     res.json(computeChallengeDashboard());
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
+// Correct the STARTING balance without wiping the run. Every rule line is derived from
+// it — the drawdown floor, the profit target, and the per-trade cap that gates auto-trade
+// signals (challengeSignalGuard) — so a stale value silently throttles trading. Until now
+// the only way to change it was /reset, which throws away the day history and trade log.
+app.post('/api/challenge/initial-balance', (req, res) => {
+  try {
+    const initialBalance = Number(req.body?.initialBalance);
+    if (!Number.isFinite(initialBalance) || initialBalance <= 0) return res.status(400).json({ error: 'initialBalance (positive number) required' });
+    const state = rolloverChallengeState(loadChallengeState());
+    const prev = Number(state.initialBalance);
+    state.initialBalance = Math.round(initialBalance * 100) / 100;
+    // A run that has recorded nothing yet has no history worth preserving, so the current
+    // balance would otherwise be left stranded at the old starting figure.
+    if (!(state.tradeLog || []).length) {
+      state.currentBalance = state.initialBalance;
+      state.dayStartBalance = state.initialBalance;
+      state.peakBalance = state.initialBalance;
+    }
+    state.peakBalance = Math.max(Number(state.peakBalance) || 0, Number(state.currentBalance) || 0);
+    saveChallengeState(state);
+    console.log(`[Challenge] starting balance ${prev} -> ${state.initialBalance}`);
+    res.json(computeChallengeDashboard());
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
 // Start a fresh challenge from the configured (or supplied) initial balance.
 app.post('/api/challenge/reset', (req, res) => {
   try {
