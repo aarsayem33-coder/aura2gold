@@ -311,20 +311,12 @@ export default function Layout({ onLogout }: LayoutProps) {
   const activeStopHunts = useMemo(() => activeStopHuntLabels(now), [now]);
   const stopHuntLabel = activeStopHunts.length ? activeStopHunts.slice(0, 2).join(', ') : 'No Stop-Hunt';
 
+  // Order is deliberate: the seven daily-driver destinations sit up top in the order they
+  // get used, then everything else keeps its previous relative order below.
   const navItems = [
     { path: '/', icon: LayoutDashboard, label: 'Dashboard' },
-    { path: '/terminal', icon: Activity, label: 'Terminal' },
-    { path: '/signals', icon: BarChart3, label: 'Signals' },
-    { path: '/fixed-time', icon: Timer, label: 'Fixed-Time' },
-    { path: '/future-predictions', icon: Brain, label: 'Future Predictions' },
-    { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
-    { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
-    { path: '/live-market-tracker', icon: Gauge, label: 'Live Market Tracker' },
     { path: '/chart', icon: CandlestickChart, label: 'Chart' },
-    { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },
-    { path: '/challenge', icon: Trophy, label: 'Challenge Tracker' },
     { path: '/auto-trading', icon: Bot, label: 'Auto Trading' },
-    { path: '/breakout', icon: Crosshair, label: 'Breakout Tracker' },
     {
       path: '/strategy-lab', icon: FlaskConical, label: 'Strategy Lab',
       children: [
@@ -332,6 +324,19 @@ export default function Layout({ onLogout }: LayoutProps) {
         { path: '/strategy-lab/reports', icon: BarChart3, label: 'Reports' },
       ],
     },
+    { path: '/live-market-tracker', icon: Gauge, label: 'Live Market Tracker' },
+    { path: '/challenge', icon: Trophy, label: 'Challenge Tracker' },
+    { path: '/notifications', icon: BellRing, label: 'Notifications' },
+
+    // ── everything else ──
+    { path: '/terminal', icon: Activity, label: 'Terminal' },
+    { path: '/signals', icon: BarChart3, label: 'Signals' },
+    { path: '/fixed-time', icon: Timer, label: 'Fixed-Time' },
+    { path: '/future-predictions', icon: Brain, label: 'Future Predictions' },
+    { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
+    { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
+    { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },
+    { path: '/breakout', icon: Crosshair, label: 'Breakout Tracker' },
     { path: '/projections', icon: Crosshair, label: 'Pullback Projections' },
     { path: '/calendar', icon: CalendarDays, label: 'Economic Calendar' },
     { path: '/news-high-impact', icon: Newspaper, label: 'High-Impact News' },
@@ -340,7 +345,6 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/ai-signals', icon: Sparkles, label: 'AI Signals' },
     { path: '/mt5', icon: Server, label: 'MT5 Connection' },
     { path: '/data', icon: Database, label: 'Historical Data' },
-    { path: '/notifications', icon: BellRing, label: 'Notifications' },
     { path: '/history', icon: History, label: 'Alert History' },
     {
       path: '/reports', icon: FileBarChart, label: 'Reports',
