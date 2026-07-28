@@ -1597,6 +1597,9 @@ export interface ChallengeDashboard {
   totalProfit: number; todayPnl: number; tradingDays: number; minTradingDays: number;
   largestWinDay: number; consistencyUsedPct: number; consistencyLimitPct: number; consistencyOk: boolean;
   safePerTradeRisk: number; startedAt: string; recentTrades: ChallengeTrade[];
+  /** Runs are per MT5 account, so the page must name whose numbers it is showing. */
+  account?: string; accountBroker?: string | null; accountServer?: string | null; isLiveAccount?: boolean;
+  knownRuns?: { account: string; broker: string | null; balance: number | null; trades: number }[];
 }
 export interface LiveMarketTrackerResponse {
   ok: boolean;

@@ -198,6 +198,12 @@ async function addColumnIfMissing(pool, table, column, definition) {
   await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
+async function addIndexIfMissing(pool, table, indexName, columns) {
+  const [rows] = await pool.query(`SHOW INDEX FROM ${table} WHERE Key_name = ?`, [indexName]);
+  if (rows.length) return;
+  await pool.query(`ALTER TABLE ${table} ADD INDEX ${indexName} ${columns}`);
+}
+
 async function ensureTrackedAiProjectionSchema(pool) {
   await addColumnIfMissing(pool, 'mt5_tracked_ai_projections', 'source_analysis_id', 'VARCHAR(128) NULL');
   await addColumnIfMissing(pool, 'mt5_tracked_ai_projections', 'take_profit_3', 'DECIMAL(20,8) NULL');
@@ -894,6 +900,21 @@ async function initializeDatabase() {
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'corrected_outcome', 'VARCHAR(16) NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'corrected_pips', 'DOUBLE NULL');
       await addColumnIfMissing(pool, 'mt5_strategy_signals', 'correction_reason', 'VARCHAR(255) NULL');
+      // Which broker/account produced the signal, so reports can be filtered broker-wise.
+      // Signals are derived from that broker's candle feed, so mixing two brokers in one
+      // win-rate is comparing different spreads, fills and symbol sets.
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'broker', 'VARCHAR(64) NULL');
+      await addColumnIfMissing(pool, 'mt5_strategy_signals', 'account', 'VARCHAR(32) NULL');
+      await addIndexIfMissing(pool, 'mt5_strategy_signals', 'idx_sig_broker', '(broker)');
+      // One-time backfill. Every row written before this column existed came from Exness:
+      // it is the only broker that had ever connected, and every symbol carries the *M
+      // suffix. The account login is NOT backfilled — several Exness logins were used and
+      // which one produced a given row is not recoverable, so it stays NULL rather than
+      // being invented.
+      try {
+        const [bf] = await pool.execute("UPDATE mt5_strategy_signals SET broker='Exness' WHERE broker IS NULL");
+        if (bf.affectedRows) console.log(`[Migration] Attributed ${bf.affectedRows} historical strategy signals to Exness.`);
+      } catch (e) { console.error('[Migration] broker backfill failed:', e.message); }
 
       return pool;
     })().catch((error) => {
@@ -7510,6 +7531,12 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
       onlyAPlus: true,               // Phase 2 gate — stored now, enforced later
       minRR: 2,
     },
+    // Per-account overrides, keyed by MT5 login. A $10k FTMO evaluation and a $5k Exness
+    // demo need different balances, risk and rule sets, and sizing every trade off one
+    // shared number silently mis-sizes whichever account is not connected. The fields
+    // above act as the fallback for any account without an entry here.
+    // Shape: { "<login>": { label, broker, balance, mode, normalRiskPct, challenge } }
+    profiles: {},
   },
   // Auto-trading controller. mode: OFF | SHADOW (log+email what WOULD trade, no orders) |
   // ASK (queue for one-tap approval) | AUTO (execute immediately). ASK/AUTO require the
@@ -7720,29 +7747,48 @@ function saveEmailAlertSettings(nextSettings) {
     const src = nextSettings.accountRisk;
     const base = DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
     const clampNum = (v, lo, hi, dflt) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
-    const mode = String(src.mode || 'NORMAL').toUpperCase();
-    const ch = (src.challenge && typeof src.challenge === 'object') ? src.challenge : {};
-    const cb = base.challenge;
-    sanitized.accountRisk = {
-      balance: clampNum(src.balance, 1, 100000000, base.balance),
-      mode: ['NORMAL', 'CHALLENGE', 'BOTH'].includes(mode) ? mode : 'NORMAL',
-      normalRiskPct: clampNum(src.normalRiskPct, 0.05, 10, base.normalRiskPct),
-      challenge: {
-        preset: String(ch.preset || cb.preset).slice(0, 32).toUpperCase(),
-        phase: ['EVAL', 'FUNDED'].includes(String(ch.phase || '').toUpperCase()) ? String(ch.phase).toUpperCase() : cb.phase,
-        initialBalance: clampNum(ch.initialBalance, 1, 100000000, cb.initialBalance),
-        profitTargetPct: clampNum(ch.profitTargetPct, 1, 100, cb.profitTargetPct),
-        dailyLossPct: clampNum(ch.dailyLossPct, 0.5, 50, cb.dailyLossPct),
-        maxDrawdownPct: clampNum(ch.maxDrawdownPct, 1, 100, cb.maxDrawdownPct),
-        drawdownType: ['STATIC', 'TRAILING'].includes(String(ch.drawdownType || '').toUpperCase()) ? String(ch.drawdownType).toUpperCase() : cb.drawdownType,
-        maxRiskPerTradePct: clampNum(ch.maxRiskPerTradePct, 0.1, 20, cb.maxRiskPerTradePct),
-        riskPerTradePct: clampNum(ch.riskPerTradePct, 0.05, 10, cb.riskPerTradePct),
-        minTradingDays: Math.round(clampNum(ch.minTradingDays, 0, 60, cb.minTradingDays)),
-        consistencyPct: clampNum(ch.consistencyPct, 0, 100, cb.consistencyPct),
-        onlyAPlus: ch.onlyAPlus !== false,
-        minRR: clampNum(ch.minRR, 0, 10, cb.minRR),
-      },
+    // One risk "leg" (balance + mode + rules). Shared by the account-wide fallback and by
+    // every per-account profile, so a profile can never be validated more loosely.
+    const sanitizeRiskLeg = (o, b) => {
+      const mode = String(o?.mode || 'NORMAL').toUpperCase();
+      const ch = (o?.challenge && typeof o.challenge === 'object') ? o.challenge : {};
+      const cb = b.challenge;
+      return {
+        balance: clampNum(o?.balance, 1, 100000000, b.balance),
+        mode: ['NORMAL', 'CHALLENGE', 'BOTH'].includes(mode) ? mode : 'NORMAL',
+        normalRiskPct: clampNum(o?.normalRiskPct, 0.05, 10, b.normalRiskPct),
+        challenge: {
+          preset: String(ch.preset || cb.preset).slice(0, 32).toUpperCase(),
+          phase: ['EVAL', 'FUNDED'].includes(String(ch.phase || '').toUpperCase()) ? String(ch.phase).toUpperCase() : cb.phase,
+          initialBalance: clampNum(ch.initialBalance, 1, 100000000, cb.initialBalance),
+          profitTargetPct: clampNum(ch.profitTargetPct, 1, 100, cb.profitTargetPct),
+          dailyLossPct: clampNum(ch.dailyLossPct, 0.5, 50, cb.dailyLossPct),
+          maxDrawdownPct: clampNum(ch.maxDrawdownPct, 1, 100, cb.maxDrawdownPct),
+          drawdownType: ['STATIC', 'TRAILING'].includes(String(ch.drawdownType || '').toUpperCase()) ? String(ch.drawdownType).toUpperCase() : cb.drawdownType,
+          maxRiskPerTradePct: clampNum(ch.maxRiskPerTradePct, 0.1, 20, cb.maxRiskPerTradePct),
+          riskPerTradePct: clampNum(ch.riskPerTradePct, 0.05, 10, cb.riskPerTradePct),
+          minTradingDays: Math.round(clampNum(ch.minTradingDays, 0, 60, cb.minTradingDays)),
+          consistencyPct: clampNum(ch.consistencyPct, 0, 100, cb.consistencyPct),
+          onlyAPlus: ch.onlyAPlus !== false,
+          minRR: clampNum(ch.minRR, 0, 10, cb.minRR),
+        },
+      };
     };
+    // Per-account profiles, keyed by MT5 login. Each inherits the account-wide values as
+    // its defaults, so a half-filled profile can never produce a zero-risk or unbounded leg.
+    const profiles = {};
+    const rawProfiles = (src.profiles && typeof src.profiles === 'object') ? src.profiles : {};
+    const fallback = sanitizeRiskLeg(src, base);
+    for (const [login, p] of Object.entries(rawProfiles).slice(0, 40)) {
+      const key = String(login).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 32);
+      if (!key) continue;
+      profiles[key] = {
+        ...sanitizeRiskLeg(p, fallback),
+        label: String(p?.label || '').slice(0, 48) || null,
+        broker: String(p?.broker || '').slice(0, 64) || null,
+      };
+    }
+    sanitized.accountRisk = { ...fallback, profiles };
   }
   // Auto-trading controller — replace whole object on save.
   if (nextSettings && nextSettings.autoTrade && typeof nextSettings.autoTrade === 'object') {
@@ -9740,7 +9786,8 @@ app.post('/api/mt5/trade-history', async (req, res) => {
 // ── Challenge sim-tracker (Phase 2) endpoints ──
 // GET the live dashboard (progress + distance to every rule line).
 app.get('/api/challenge', (req, res) => {
-  try { res.json(computeChallengeDashboard()); }
+  // ?account= lets you inspect another account's run without connecting to it.
+  try { res.json(computeChallengeDashboard(req.query.account ? String(req.query.account) : undefined)); }
   catch (error) { res.status(500).json({ error: error.message }); }
 });
 // Log a trade result you took (P&L in USD, + for win / − for loss). Updates the running
@@ -13047,7 +13094,8 @@ function computeModeSizing(symbol, entry, stop, targets = {}) {
   const pipValue = forexSizingPipValuePerLot(symbol);
   const stopPips = Math.round((Math.abs(e - s) / pipSize) * 10) / 10;
   if (!(stopPips > 0) || !(pipValue > 0)) return null;
-  const cfg = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+  // Follows the CONNECTED account's profile — see activeAccountRisk().
+  const cfg = activeAccountRisk();
   const mode = ['NORMAL', 'CHALLENGE', 'BOTH'].includes(String(cfg.mode).toUpperCase()) ? String(cfg.mode).toUpperCase() : 'NORMAL';
   const balance = finitePositive(cfg.balance) ?? 5000;
   const leg = (riskPct, refBalance) => {
@@ -13108,8 +13156,35 @@ function modeSizingEmailParts(ms, symbol, sig = {}) {
 // rule line. Educational risk tracking, not financial advice.
 const CHALLENGE_STATE_FILE = path.join(__dirname, '.cache', 'challenge_state.json');
 let challengeStateCache = null;
-function challengeRules() {
+
+/**
+ * MT5 login the risk settings and challenge run should follow.
+ *
+ * Falls back to the ARMED account when the bridge is quiet (terminal closed, EA reloaded).
+ * Without that, every restart with no EA connected resolved to a 'default' key and opened a
+ * phantom empty challenge run alongside the real one.
+ */
+function activeAccountKey() {
+  const live = String(tradeBridge.account || '').trim();
+  if (live) return live;
+  return String(loadAutoTradeAccounts().armed || '').trim() || 'default';
+}
+
+/**
+ * The risk settings for the CONNECTED account: its own profile when one exists, otherwise
+ * the account-wide fallback. Everything that sizes a trade goes through here, so switching
+ * MT5 accounts switches balance, mode and rule set together instead of sizing an FTMO
+ * evaluation off an Exness demo's balance.
+ */
+function activeAccountRisk() {
   const cfg = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+  const profile = (cfg.profiles || {})[activeAccountKey()];
+  if (!profile) return cfg;
+  return { ...cfg, ...profile, challenge: { ...(cfg.challenge || {}), ...(profile.challenge || {}) } };
+}
+
+function challengeRules() {
+  const cfg = activeAccountRisk();
   return { ...DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk.challenge, ...(cfg.challenge || {}) };
 }
 function freshChallengeState(initialBalance) {
@@ -13122,34 +13197,60 @@ function freshChallengeState(initialBalance) {
     tradeLog: [],               // [{ ts, pnl, note, balanceAfter }]
   };
 }
-function loadChallengeState() {
-  if (challengeStateCache) return challengeStateCache;
+// The file holds one run PER ACCOUNT: { byAccount: { "<login>": state } }. A single shared
+// run would carry an Exness demo's balance and day history straight into an FTMO
+// evaluation, where the drawdown floor and daily-loss line mean entirely different money.
+function readChallengeFile() {
   try {
-    if (fs.existsSync(CHALLENGE_STATE_FILE)) {
-      challengeStateCache = { ...freshChallengeState(), ...(JSON.parse(fs.readFileSync(CHALLENGE_STATE_FILE, 'utf8')) || {}) };
-      return challengeStateCache;
+    if (!fs.existsSync(CHALLENGE_STATE_FILE)) return { byAccount: {} };
+    const raw = JSON.parse(fs.readFileSync(CHALLENGE_STATE_FILE, 'utf8')) || {};
+    if (raw.byAccount && typeof raw.byAccount === 'object') return { byAccount: raw.byAccount };
+    // Migrate the pre-profiles single run. Ownership is NOT inferred from the armed
+    // pointer: arming is a live control the user changes when switching brokers, so by
+    // migration time it can already name a different account than the one whose trades
+    // built the run — which files an Exness history under an FTMO evaluation. Park it
+    // under 'legacy' instead and say so; assigning it is a one-line edit the user can make
+    // knowingly, and no account silently inherits another's balance.
+    if (raw && Number.isFinite(Number(raw.currentBalance))) {
+      console.log('[Challenge] existing run parked under "legacy" — assign it to an account from the Challenge page.');
+      return { byAccount: { legacy: raw } };
     }
-  } catch { /* fall through to fresh */ }
-  challengeStateCache = freshChallengeState();
-  return challengeStateCache;
+    return { byAccount: {} };
+  } catch { return { byAccount: {} }; }
 }
-function saveChallengeState(state) {
-  challengeStateCache = state;
-  try { fs.mkdirSync(path.dirname(CHALLENGE_STATE_FILE), { recursive: true }); fs.writeFileSync(CHALLENGE_STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.error('[Challenge] save failed:', e.message); }
+function writeChallengeFile(file) {
+  try { fs.mkdirSync(path.dirname(CHALLENGE_STATE_FILE), { recursive: true }); fs.writeFileSync(CHALLENGE_STATE_FILE, JSON.stringify(file, null, 2)); }
+  catch (e) { console.error('[Challenge] save failed:', e.message); }
+}
+function loadChallengeState(accountKey = activeAccountKey()) {
+  if (challengeStateCache && challengeStateCache.key === accountKey) return challengeStateCache.state;
+  const file = readChallengeFile();
+  const stored = file.byAccount[accountKey];
+  // A newly-connected account starts its own run from ITS profile's initial balance.
+  const state = stored ? { ...freshChallengeState(), ...stored } : freshChallengeState();
+  challengeStateCache = { key: accountKey, state };
+  if (!stored) writeChallengeFile({ byAccount: { ...file.byAccount, [accountKey]: state } });
+  return state;
+}
+function saveChallengeState(state, accountKey = activeAccountKey()) {
+  challengeStateCache = { key: accountKey, state };
+  const file = readChallengeFile();
+  file.byAccount[accountKey] = state;
+  writeChallengeFile(file);
 }
 // Daily rollover: at each new UTC day the daily-loss reference resets to the new day's
 // opening balance (Hola: "3% of previous day's closing balance").
-function rolloverChallengeState(state) {
+function rolloverChallengeState(state, accountKey = activeAccountKey()) {
   const today = new Date().toISOString().slice(0, 10);
   if (state.currentDay !== today) {
     state.dayStartBalance = state.currentBalance;
     state.currentDay = today;
-    saveChallengeState(state);
+    saveChallengeState(state, accountKey);
   }
   return state;
 }
-function computeChallengeDashboard() {
-  const state = rolloverChallengeState(loadChallengeState());
+function computeChallengeDashboard(accountKey = activeAccountKey()) {
+  const state = rolloverChallengeState(loadChallengeState(accountKey), accountKey);
   const r = challengeRules();
   const initial = finitePositive(state.initialBalance) ?? finitePositive(r.initialBalance) ?? 5000;
   const current = Number(state.currentBalance);
@@ -13184,6 +13285,18 @@ function computeChallengeDashboard() {
     totalProfit: r2(totalProfit), todayPnl: r2(todayPnl), tradingDays, minTradingDays: r.minTradingDays,
     largestWinDay: r2(largestWinDay), consistencyUsedPct, consistencyLimitPct: r.consistencyPct, consistencyOk,
     safePerTradeRisk, startedAt: state.startedAt, recentTrades: (state.tradeLog || []).slice(-15).reverse(),
+    // Which account's run this is. Runs are per-account, so the page must say whose
+    // numbers it is showing — otherwise a broker switch looks like lost history.
+    account: accountKey,
+    accountBroker: (loadAutoTradeAccounts().accounts || {})[accountKey]?.broker || null,
+    accountServer: (loadAutoTradeAccounts().accounts || {})[accountKey]?.server || null,
+    isLiveAccount: String(tradeBridge.account || '') === String(accountKey),
+    knownRuns: Object.entries(readChallengeFile().byAccount || {}).map(([login, st]) => ({
+      account: login,
+      broker: (loadAutoTradeAccounts().accounts || {})[login]?.broker || null,
+      balance: Number(st?.currentBalance) || null,
+      trades: (st?.tradeLog || []).length,
+    })),
   };
 }
 // Apply a real trade result to the simulated challenge account (auto-fed by the
@@ -13431,7 +13544,7 @@ function buildAutoTradeTicket({ symbol, timeframe, sig, cfg, baseLots, baseRiskA
   }
 
   // ── Risk-size warnings vs the account rules ──
-  const acct = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+  const acct = activeAccountRisk();
   const balance = finitePositive(acct.balance) ?? 5000;
   const riskPctOfBalance = balance > 0 ? (riskAmount / balance) * 100 : null;
   if (riskPctOfBalance !== null && riskPctOfBalance > 5) {
@@ -14526,8 +14639,8 @@ async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, n
          entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3,
          risk_reward, reason, outcome, ft_outcome, at_ref_price, created_at,
          strategy_version, setup_plan, entry_order_type, entry_state, entry_filled_at,
-         setup_event_time, alert_bar_time, valid_until, measure_fixed_time)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?,?,?, ?,?,?,?,?,?,?,?,?)
+         setup_event_time, alert_bar_time, valid_until, measure_fixed_time, broker, account)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?,?,?, ?,?,?,?,?,?,?,?,?,?,?)
      ON DUPLICATE KEY UPDATE score = COALESCE(score, VALUES(score)), grade = COALESCE(grade, VALUES(grade)),
        at_ref_price = COALESCE(at_ref_price, VALUES(at_ref_price)),
        strategy_version = COALESCE(strategy_version, VALUES(strategy_version)),
@@ -14539,6 +14652,7 @@ async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, n
        alert_bar_time = COALESCE(alert_bar_time, VALUES(alert_bar_time)),
        valid_until = COALESCE(valid_until, VALUES(valid_until)),
        measure_fixed_time = COALESCE(measure_fixed_time, VALUES(measure_fixed_time)),
+       broker = COALESCE(broker, VALUES(broker)), account = COALESCE(account, VALUES(account)),
        score_updated_at = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(signal_time), score_updated_at),
        latest_grade    = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(grade), COALESCE(latest_grade, grade)),
        latest_score    = IF(VALUES(score) IS NOT NULL AND NOT (VALUES(score) <=> COALESCE(latest_score, score)), VALUES(score), COALESCE(latest_score, score))`,
@@ -14548,7 +14662,9 @@ async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, n
      strategyVersion, setupPlan, entryOrderType, entryState, filledAt ? toMysqlDate(filledAt) : null,
      Number.isFinite(setupEventMs) ? toMysqlDate(new Date(setupEventMs)) : null,
      Number.isFinite(alertBarMs) ? toMysqlDate(new Date(alertBarMs)) : null,
-     validUntil ? toMysqlDate(validUntil) : null, measureFixedTime ? 1 : 0],
+     validUntil ? toMysqlDate(validUntil) : null, measureFixedTime ? 1 : 0,
+     // Stamp the broker whose feed produced this signal, so reports stay separable.
+     tradeBridge.broker || null, tradeBridge.account || null],
   );
   return { id, affectedRows: res.affectedRows };
 }
@@ -15057,25 +15173,28 @@ function strategyLabReportWindow({ days = 90, preset = null, from = null, to = n
   return { fromMs, toMs, preset: p, days, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), label };
 }
 
-async function buildStrategyLabPerformance({ days = 90, preset = null, from = null, to = null, symbol = null } = {}) {
+async function buildStrategyLabPerformance({ days = 90, preset = null, from = null, to = null, symbol = null, broker = null } = {}) {
   const pool = await initializeDatabase();
   const win = strategyLabReportWindow({ days, preset, from, to });
   // Optional single-symbol lens: every ranking below is then computed from that symbol's
   // rows only, so "which strategy and timeframe works on gold" is answered directly
   // instead of being inferred from blended numbers.
   const symbolFilter = symbol ? String(symbol).toUpperCase() : null;
+  // Broker lens. Signals are derived from a broker's own candle feed, so blending two
+  // brokers into one win-rate compares different spreads, fills and symbol sets.
+  const brokerFilter = broker ? String(broker) : null;
   const out = { strategies: [], timeframeRanking: [], symbolRanking: [], sessionRanking: [], sessionBreakdown: [], scoreRanking: [], combos: [], window: { from: win.from, to: win.to, label: win.label, preset: win.preset, days: win.days }, minSampleToRank: 20, generatedAt: new Date().toISOString() };
   if (!pool) return out;
   const [rows] = await pool.query(
     `SELECT strategy, symbol, timeframe, direction, score, entry_price, stop_loss, risk_reward, outcome, profit_loss_pips, ft_outcome, at_outcome, at_pips, signal_time, bar_time, strategy_version, measure_fixed_time, corrected_outcome, corrected_pips
        FROM mt5_strategy_signals
-      WHERE signal_time >= ? AND signal_time < ?${symbolFilter ? ' AND UPPER(symbol) = ?' : ''}
+      WHERE signal_time >= ? AND signal_time < ?${symbolFilter ? ' AND UPPER(symbol) = ?' : ''}${brokerFilter ? ' AND broker = ?' : ''}
       LIMIT 20000`,
-    symbolFilter
-      ? [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs)), symbolFilter]
-      : [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
+    [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs)),
+     ...(symbolFilter ? [symbolFilter] : []), ...(brokerFilter ? [brokerFilter] : [])],
   );
   out.symbolFilter = symbolFilter;
+  out.brokerFilter = brokerFilter;
   const byStrat = new Map();
   // Cross-cutting aggregates (across ALL strategies) — answer "which timeframe / which
   // symbol actually works", independent of strategy.
@@ -15516,6 +15635,9 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
       if (ids.length) { sql += ` AND strategy IN (${ids.map(() => '?').join(',')})`; params.push(...ids); }
     }
     if (timeframe) { sql += ' AND timeframe = ?'; params.push(timeframe); }
+    // Broker lens — see buildStrategyLabPerformance().
+    const brokerQ = req.query.broker ? String(req.query.broker) : null;
+    if (brokerQ) { sql += ' AND broker = ?'; params.push(brokerQ); }
     // Date window, so the log matches the report window it is displayed under.
     const dateOk = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
     if (dateOk(req.query.from)) { sql += ' AND signal_time >= ?'; params.push(`${req.query.from} 00:00:00`); }
@@ -15573,6 +15695,68 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
 });
 
 // GET /api/strategy-lab/performance?days=  |  ?preset=today|yesterday|last7
+// GET /api/account-profiles — the per-account risk profiles, which one is live, and every
+// account the bridge has ever seen (so the UI can offer to create a profile for a new one).
+app.get('/api/account-profiles', (req, res) => {
+  try {
+    const cfg = loadEmailAlertSettings().accountRisk || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk;
+    const reg = loadAutoTradeAccounts();
+    const known = Object.entries(reg.accounts || {}).map(([login, a]) => ({
+      login,
+      broker: a?.broker || null,
+      server: a?.server || null,
+      demo: a?.demo ?? null,
+      lastSeenAt: a?.lastSeenAt || null,
+      hasProfile: Boolean((cfg.profiles || {})[login]),
+    }));
+    res.json({
+      ok: true,
+      activeAccount: tradeBridge.account || null,
+      activeBroker: tradeBridge.broker || null,
+      armed: reg.armed || null,
+      // What the connected account actually sizes with right now.
+      effective: activeAccountRisk(),
+      usingProfile: Boolean((cfg.profiles || {})[activeAccountKey()]),
+      fallback: { balance: cfg.balance, mode: cfg.mode, normalRiskPct: cfg.normalRiskPct, challenge: cfg.challenge },
+      profiles: cfg.profiles || {},
+      accounts: known.sort((a, b) => String(b.lastSeenAt || '').localeCompare(String(a.lastSeenAt || ''))),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/strategy-lab/brokers — which brokers actually appear in the signal history, with
+// row counts, so the report filter lists real options instead of a hardcoded guess.
+app.get('/api/strategy-lab/brokers', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.json({ ok: true, brokers: [] });
+    const win = strategyLabReportWindow({
+      days: req.query.days ? Number(req.query.days) : 90,
+      preset: req.query.preset ? String(req.query.preset) : null,
+      from: req.query.from ? String(req.query.from) : null,
+      to: req.query.to ? String(req.query.to) : null,
+    });
+    const [rows] = await pool.query(
+      `SELECT COALESCE(broker, '(unattributed)') broker, COUNT(*) signals,
+              COUNT(DISTINCT symbol) symbols, MIN(signal_time) firstSeen, MAX(signal_time) lastSeen
+         FROM mt5_strategy_signals
+        WHERE signal_time >= ? AND signal_time < ?
+        GROUP BY COALESCE(broker, '(unattributed)')
+        ORDER BY signals DESC`,
+      [toMysqlDate(new Date(win.fromMs)), toMysqlDate(new Date(win.toMs))],
+    );
+    res.json({
+      ok: true,
+      live: tradeBridge.broker || null,
+      brokers: rows.map((r) => ({
+        broker: r.broker, signals: Number(r.signals), symbols: Number(r.symbols),
+        firstSeen: r.firstSeen ? new Date(r.firstSeen).toISOString() : null,
+        lastSeen: r.lastSeen ? new Date(r.lastSeen).toISOString() : null,
+      })),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // per-strategy forex + fixed-time win rates over the chosen window.
 app.get('/api/strategy-lab/performance', async (req, res) => {
   try {
@@ -15582,7 +15766,8 @@ app.get('/api/strategy-lab/performance', async (req, res) => {
     const to = req.query.to ? String(req.query.to) : null;
     const includeMuted = req.query.includeMuted === '1' || req.query.includeMuted === 'true';
     const symbol = req.query.symbol ? String(req.query.symbol) : null;
-    const perf = await buildStrategyLabPerformance({ days, preset, from, to, symbol });
+    const broker = req.query.broker ? String(req.query.broker) : null;
+    const perf = await buildStrategyLabPerformance({ days, preset, from, to, symbol, broker });
     if (!includeMuted) {
       const enabled = new Set(enabledStrategyIds());
       perf.strategies = (perf.strategies || []).filter((s) => enabled.has(s.id));

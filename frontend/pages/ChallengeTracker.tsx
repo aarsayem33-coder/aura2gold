@@ -38,13 +38,15 @@ export default function ChallengeTracker() {
   const [balanceInput, setBalanceInput] = useState('');
   const [initialInput, setInitialInput] = useState('');
   const [busy, setBusy] = useState(false);
+  // Which account's run is on screen. Empty = follow the connected/armed account.
+  const [viewAccount, setViewAccount] = useState('');
 
   const load = useCallback(async (spin = false) => {
     if (spin) setLoading(true);
-    try { setD(await fetchChallenge()); setErr(null); }
+    try { setD(await fetchChallenge(viewAccount || undefined)); setErr(null); }
     catch (e) { setErr(e instanceof Error ? e.message : 'Failed to load'); }
     finally { setLoading(false); }
-  }, []);
+  }, [viewAccount]);
 
   useEffect(() => { load(true); const id = setInterval(() => load(false), 15000); return () => clearInterval(id); }, [load]);
 
@@ -103,6 +105,37 @@ export default function ChallengeTracker() {
 
       {d && s && (
         <>
+          {/* Runs are per MT5 account. Without naming the account, switching broker looks
+              exactly like the tracker losing your history. */}
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-3">
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Run for account</p>
+              <p className="truncate text-sm font-black text-slate-800">
+                {d.accountBroker || 'Unknown broker'} <span className="font-mono text-xs font-bold text-slate-500">{d.account}</span>
+                {d.isLiveAccount
+                  ? <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-black text-emerald-700">CONNECTED</span>
+                  : <span className="ml-2 rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-black text-slate-600">NOT CONNECTED</span>}
+              </p>
+              {d.accountServer && <p className="text-[10px] font-medium text-slate-400">{d.accountServer}</p>}
+            </div>
+            {(d.knownRuns?.length ?? 0) > 1 && (
+              <label className="flex items-center gap-2 text-xs font-bold text-slate-500">
+                View
+                <select
+                  value={viewAccount} onChange={(e) => setViewAccount(e.target.value)}
+                  className="rounded-lg border border-slate-300 px-2 py-1.5 text-sm font-bold text-slate-800"
+                >
+                  <option value="">Connected account</option>
+                  {d.knownRuns!.map((r) => (
+                    <option key={r.account} value={r.account}>
+                      {r.broker || 'Unknown'} · {r.account} ({r.trades} trades)
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+          </div>
+
           <div className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border px-5 py-4 ${s.wrap}`}>
             <div className="flex items-center gap-3">
               <span className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-black ${s.chip}`}><s.Icon size={14} />{s.label}</span>

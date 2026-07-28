@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot, ChevronDown } from 'lucide-react';
+import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot, ChevronDown, Building2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import AutoTradeReport from './AutoTradeReport';
-import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence, fetchBrokerSpecs, fetchAutoTradeStatus } from '../mt5Api';
+import { fetchStrategyBrokers, fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence, fetchBrokerSpecs, fetchAutoTradeStatus } from '../mt5Api';
+import type { StrategyBrokerRow } from '../mt5Api';
 import type {
   StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyCorrectedForexBucket, StrategyFtBucket, StrategyAtBucket,
   StrategyTfRow, StrategySymbolRow, StrategySessionRow, StrategyComboRow, StrategySignal,
@@ -353,6 +354,12 @@ export default function StrategyLabReports() {
   const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
   const [symbolFilter, setSymbolFilter] = useState('');   // '' = all symbols
+  // Broker lens, applied to EVERY section. Signals are derived from one broker's candle
+  // feed, so blending brokers into a single win-rate compares different spreads and fills.
+  const [brokerFilter, setBrokerFilter] = useState('');   // '' = all brokers
+  const [brokerOpen, setBrokerOpen] = useState(false);
+  const [brokers, setBrokers] = useState<StrategyBrokerRow[]>([]);
+  const [liveBroker, setLiveBroker] = useState<string | null>(null);
   // One report segment at a time. Every breakdown stacked full-width meant scrolling
   // past thousands of pixels to compare two of them.
   const [section, setSection] = useState<SectionKey>('overview');
@@ -399,16 +406,30 @@ export default function StrategyLabReports() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setPerf(await fetchStrategyPerformance({ ...reportParams, symbol: symbolFilter || undefined })); setError(null); }
+    try { setPerf(await fetchStrategyPerformance({ ...reportParams, symbol: symbolFilter || undefined, broker: brokerFilter || undefined })); setError(null); }
     catch (err) { setError(err instanceof Error ? err.message : 'Failed to load performance'); }
     finally { setLoading(false); }
-  }, [reportParams, symbolFilter]);
+  }, [reportParams, symbolFilter, brokerFilter]);
 
   useEffect(() => {
     void load();
     const t = setInterval(() => void load(), REFRESH_MS);
     return () => clearInterval(t);
   }, [load]);
+
+  // Which brokers actually produced signals in this window — the drawer lists real
+  // options with counts rather than a hardcoded list.
+  useEffect(() => {
+    fetchStrategyBrokers(reportParams)
+      .then((r) => { setBrokers(r.brokers || []); setLiveBroker(r.live || null); })
+      .catch(() => {});
+  }, [reportParams]);
+
+  // A broker that has no rows in the newly-chosen window would silently show an empty
+  // report, so drop back to "all brokers" instead of leaving a dead filter applied.
+  useEffect(() => {
+    if (brokerFilter && brokers.length && !brokers.some((b) => b.broker === brokerFilter)) setBrokerFilter('');
+  }, [brokers, brokerFilter]);
 
   // Switching strategy fires a new request while older ones may still be in flight. A
   // slower earlier response used to land last and repaint the table with the PREVIOUS
@@ -420,11 +441,11 @@ export default function StrategyLabReports() {
     const seq = ++signalReqRef.current;
     setSignalsLoading(true);
     try {
-      const r = await fetchStrategySignals(selected, undefined, undefined, 500, reportParams);
+      const r = await fetchStrategySignals(selected, undefined, undefined, 500, { ...reportParams, broker: brokerFilter || undefined });
       if (seq === signalReqRef.current) setSignals(r.signals);
     } catch { /* log is best-effort */ }
     finally { if (seq === signalReqRef.current) setSignalsLoading(false); }
-  }, [selected, reportParams]);
+  }, [selected, reportParams, brokerFilter]);
 
   useEffect(() => {
     void loadSignals();
@@ -522,6 +543,52 @@ export default function StrategyLabReports() {
         </div>
         <div className="flex items-center gap-2">
           {MetricToggle}
+          {/* Broker lens, applied to every section. A signal is only as good as the feed
+              that produced it — spreads, fills and symbol names differ per broker, so
+              blending two of them into one win-rate compares unlike things. */}
+          <div className="relative">
+            <button
+              type="button" onClick={() => setBrokerOpen((v) => !v)}
+              title="Scope every report section to one broker's signals"
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm font-semibold ${brokerFilter ? 'border-indigo-400 bg-indigo-50 text-indigo-800' : 'border-slate-200 text-slate-600'}`}
+            >
+              <Building2 size={14} />{brokerFilter || 'All brokers'}
+              <ChevronDown size={13} className={brokerOpen ? 'rotate-180 transition-transform' : 'transition-transform'} />
+            </button>
+            {brokerOpen && (
+              <>
+                <div className="fixed inset-0 z-20" onClick={() => setBrokerOpen(false)} />
+                <div className="absolute right-0 z-30 mt-1 w-80 rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
+                  <p className="px-2 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">Filter every section by broker</p>
+                  <button
+                    type="button" onClick={() => { setBrokerFilter(''); setBrokerOpen(false); }}
+                    className={`flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-sm font-bold hover:bg-slate-50 ${!brokerFilter ? 'bg-indigo-50 text-indigo-800' : 'text-slate-700'}`}
+                  >
+                    <span>All brokers</span>
+                    <span className="text-xs font-semibold text-slate-400">{brokers.reduce((a, b) => a + b.signals, 0).toLocaleString()}</span>
+                  </button>
+                  {brokers.map((b) => (
+                    <button
+                      key={b.broker} type="button" onClick={() => { setBrokerFilter(b.broker); setBrokerOpen(false); }}
+                      className={`flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left hover:bg-slate-50 ${brokerFilter === b.broker ? 'bg-indigo-50' : ''}`}
+                    >
+                      <span className="min-w-0">
+                        <span className={`block truncate text-sm font-bold ${brokerFilter === b.broker ? 'text-indigo-800' : 'text-slate-700'}`}>
+                          {b.broker}
+                          {liveBroker === b.broker && <span className="ml-1.5 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9px] font-black text-emerald-700">CONNECTED</span>}
+                        </span>
+                        <span className="block text-[10px] font-medium text-slate-400">
+                          {b.symbols} symbols · {(b.firstSeen || '').slice(0, 10)} → {(b.lastSeen || '').slice(0, 10)}
+                        </span>
+                      </span>
+                      <span className="ml-2 shrink-0 text-xs font-semibold text-slate-400">{b.signals.toLocaleString()}</span>
+                    </button>
+                  ))}
+                  {!brokers.length && <p className="px-2 py-2 text-xs font-medium text-slate-400">No signals in this window.</p>}
+                </div>
+              </>
+            )}
+          </div>
           {/* Single-symbol lens: every ranking below is recomputed from that symbol's
               rows, so "which strategy and timeframe works on gold" is answered directly. */}
           <select value={symbolFilter} onChange={(e) => setSymbolFilter(e.target.value)}

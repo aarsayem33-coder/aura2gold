@@ -484,8 +484,8 @@ export async function armAutoTradeAccount(account: string | null): Promise<{ ok:
   return fetchJson('/api/auto-trade/arm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account }) });
 }
 
-export async function fetchChallenge(): Promise<ChallengeDashboard> {
-  return fetchJson<ChallengeDashboard>('/api/challenge');
+export async function fetchChallenge(account?: string): Promise<ChallengeDashboard> {
+  return fetchJson<ChallengeDashboard>(`/api/challenge${account ? `?account=${encodeURIComponent(account)}` : ''}`);
 }
 export async function logChallengeTrade(pnl: number, note?: string): Promise<ChallengeDashboard> {
   return fetchJson<ChallengeDashboard>('/api/challenge/trade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pnl, note }) });
@@ -506,13 +506,14 @@ export async function fetchStrategies(): Promise<{ ok: boolean; strategies: Stra
 }
 export async function fetchStrategySignals(
   strategy?: string, timeframe?: string, includeMuted?: boolean, limit?: number,
-  window?: { from?: string; to?: string },
+  window?: { from?: string; to?: string; broker?: string },
 ): Promise<{ ok: boolean; signals: StrategySignal[] }> {
   const p = new URLSearchParams();
   if (strategy) p.set('strategy', strategy);
   if (timeframe) p.set('timeframe', timeframe);
   if (includeMuted) p.set('includeMuted', '1');
   if (limit) p.set('limit', String(limit));
+  if (window?.broker) p.set('broker', window.broker);
   // Without the window the server returns the newest N regardless of what the caller
   // asked for, so the log silently disagrees with the report above it.
   if (window?.from) p.set('from', window.from);
@@ -520,12 +521,14 @@ export async function fetchStrategySignals(
   const qs = p.toString();
   return fetchJson(`/api/strategy-lab/signals${qs ? `?${qs}` : ''}`);
 }
-export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; from?: string; to?: string; includeMuted?: boolean; symbol?: string } = {}): Promise<StrategyPerformanceResponse> {
+export async function fetchStrategyPerformance(params: number | { days?: number; preset?: string; from?: string; to?: string; includeMuted?: boolean; symbol?: string; broker?: string } = {}): Promise<StrategyPerformanceResponse> {
   const opts = typeof params === 'number' ? { days: params } : params;
   const q = new URLSearchParams();
   if (opts.includeMuted) q.set('includeMuted', '1');
   // Single-symbol lens: every ranking is recomputed from that symbol's rows only.
   if (opts.symbol) q.set('symbol', opts.symbol);
+  // Broker lens: signals come from that broker's own feed, so the two are not comparable.
+  if (opts.broker) q.set('broker', opts.broker);
   if (opts.from && opts.to) { q.set('from', opts.from); q.set('to', opts.to); }
   else if (opts.preset) q.set('preset', opts.preset);
   else q.set('days', String(opts.days ?? 90));
@@ -1459,4 +1462,14 @@ export async function deleteSavedProjection(id: string): Promise<{ ok: boolean }
     throw new Error(error?.error || `Failed to delete saved projection: ${response.status}`);
   }
   return response.json();
+}
+
+export interface StrategyBrokerRow { broker: string; signals: number; symbols: number; firstSeen: string | null; lastSeen: string | null }
+/** Which brokers appear in the signal history, for the report filter. */
+export async function fetchStrategyBrokers(window?: { from?: string; to?: string; days?: number; preset?: string }): Promise<{ ok: boolean; live: string | null; brokers: StrategyBrokerRow[] }> {
+  const q = new URLSearchParams();
+  if (window?.from && window?.to) { q.set('from', window.from); q.set('to', window.to); }
+  else if (window?.preset) q.set('preset', window.preset);
+  else q.set('days', String(window?.days ?? 90));
+  return fetchJson(`/api/strategy-lab/brokers?${q.toString()}`);
 }
