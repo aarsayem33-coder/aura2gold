@@ -9177,6 +9177,33 @@ app.get('/api/auto-trade/report', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// GET /api/auto-trade/broker-specs — what the EA has reported per symbol, with the
+// derived money maths shown alongside. Read-only; useful for confirming a broker switch
+// resolved the right contracts before anything trades.
+app.get('/api/auto-trade/broker-specs', (req, res) => {
+  try {
+    const out = [...brokerSpecs.values()].map((s) => {
+      const pip = pipSizeForSymbol(s.symbol);
+      return {
+        ...s,
+        derived: {
+          pipSize: pip,
+          valuePerPricePerLot: specValuePerPricePerLot(s),
+          valuePerPipPerLot: forexSizingPipValuePerLot(s.symbol),
+          minStopDistancePips: specMinStopDistance(s) === null ? null : Math.round((specMinStopDistance(s) / pip) * 100) / 100,
+          spreadPips: specSpreadPrice(s) === null ? null : Math.round((specSpreadPrice(s) / pip) * 100) / 100,
+        },
+      };
+    }).sort((a, b) => a.symbol.localeCompare(b.symbol));
+    res.json({
+      account: tradeBridge.account, broker: tradeBridge.broker, demo: tradeBridge.demo,
+      leverage: tradeBridge.leverage, freeMargin: tradeBridge.marginFree,
+      lastSeenSec: tradeBridge.lastSeenAt ? Math.round((Date.now() - tradeBridge.lastSeenAt) / 1000) : null,
+      count: out.length, specs: out,
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // ── Saved combination sets (DB-backed library) ───────────────────────────────
 // GET list · POST save (create or overwrite by name) · DELETE one. Independent of the
 // settings blob: saving a set never touches live trading config, and loading one is a
