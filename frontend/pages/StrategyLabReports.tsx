@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot, ChevronDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import AutoTradeReport from './AutoTradeReport';
-import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence } from '../mt5Api';
+import { fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence, fetchBrokerSpecs, fetchAutoTradeStatus } from '../mt5Api';
 import type {
   StrategyMeta, StrategyPerformanceResponse, StrategyForexBucket, StrategyCorrectedForexBucket, StrategyFtBucket, StrategyAtBucket,
   StrategyTfRow, StrategySymbolRow, StrategySessionRow, StrategyComboRow, StrategySignal,
@@ -95,12 +95,70 @@ function NetPips({ b }: { b: StrategyForexBucket | null | undefined }) {
 // Money is derived per signal from lossAtStop / stopPips — the risk the row was sized
 // for divided by its stop — so it uses each symbol's real contract value instead of a
 // guessed pip price. It is still the SUGGESTED size, not money actually traded.
-function SignalLogSummary({ rows, symbols, selected, onToggle, onClear }: {
+// How long a trade is assumed to occupy a slot, by timeframe. Exact close times are not
+// stored per row, so the concurrency model needs an estimate; longer holds would block
+// MORE trades, so these keep the realistic figure on the optimistic side.
+const TF_HOLD_MIN: Record<string, number> = { M1: 15, M5: 45, M15: 120, M30: 240, H1: 480, H4: 1440, D1: 2880 };
+
+/**
+ * What the auto-trader could plausibly have earned from these signals, as opposed to the
+ * headline that assumes every signal was taken for free with unlimited capital. Applies,
+ * in order: the auto-trade quality gates, the real broker spread per symbol, and a
+ * sequential portfolio walk honouring max-concurrent / one-per-symbol / daily cap.
+ * Still optimistic: fills are assumed exact, and commission and swap are not charged.
+ */
+function realisticPnl(rows: StrategySignal[], spreads: Record<string, number>, cfg: {
+  maxConcurrent: number; onePerSymbol: boolean; maxTradesPerDay: number; minGrade: string; minRR: number;
+}) {
+  const perPip = (r: StrategySignal) => (r.stopPips && r.lossAtStop ? Number(r.lossAtStop) / Number(r.stopPips) : 0);
+  const gradeRank = (g?: string | null) => (g === 'A+' ? 2 : g === 'A' ? 1 : 0);
+  const settled = rows.filter((r) => r.profitLossPips !== null && r.profitLossPips !== undefined);
+
+  const gated = settled
+    .filter((r) => gradeRank(String(r.grade || '').toUpperCase()) >= gradeRank(cfg.minGrade))
+    .filter((r) => !Number.isFinite(Number(r.riskReward)) || Number(r.riskReward) >= cfg.minRR)
+    .sort((a, b) => (Date.parse(a.signalTime || '') || 0) - (Date.parse(b.signalTime || '') || 0));
+
+  const open: { symbol: string; until: number }[] = [];
+  const perDay = new Map<string, number>();
+  const taken: StrategySignal[] = [];
+  let blockedConcurrent = 0, blockedSymbol = 0, blockedCap = 0;
+  for (const r of gated) {
+    const t = Date.parse(r.signalTime || '') || 0;
+    while (open.length && open[0].until <= t) open.shift();
+    const day = (r.signalTime || '').slice(0, 10);
+    if ((perDay.get(day) || 0) >= cfg.maxTradesPerDay) { blockedCap++; continue; }
+    if (open.length >= cfg.maxConcurrent) { blockedConcurrent++; continue; }
+    if (cfg.onePerSymbol && open.some((o) => o.symbol === r.symbol)) { blockedSymbol++; continue; }
+    taken.push(r);
+    perDay.set(day, (perDay.get(day) || 0) + 1);
+    open.push({ symbol: r.symbol, until: t + (TF_HOLD_MIN[r.timeframe] || 120) * 60000 });
+    open.sort((a, b) => a.until - b.until);
+  }
+
+  let pnl = 0, wins = 0, losses = 0;
+  for (const r of taken) {
+    const spread = spreads[r.symbol.toUpperCase()] ?? 1.5;      // pips; default is conservative
+    pnl += (Number(r.profitLossPips) - spread) * perPip(r);
+    if (/WIN/.test(String(r.outcome))) wins += 1;
+    else if (String(r.outcome) === 'LOSS') losses += 1;
+  }
+  const settledTaken = wins + losses;
+  return {
+    pnl, taken: taken.length, considered: settled.length,
+    winRate: settledTaken ? Math.round((wins / settledTaken) * 1000) / 10 : null,
+    blockedConcurrent, blockedSymbol, blockedCap,
+  };
+}
+
+function SignalLogSummary({ rows, symbols, selected, onToggle, onClear, spreads, autoCfg }: {
   rows: StrategySignal[];
   symbols: string[];
   selected: Set<string>;
   onToggle: (s: string) => void;
   onClear: () => void;
+  spreads: Record<string, number>;
+  autoCfg: { maxConcurrent: number; onePerSymbol: boolean; maxTradesPerDay: number; minGrade: string; minRR: number };
 }) {
   const [open, setOpen] = useState(false);
   const s = useMemo(() => {
@@ -123,8 +181,10 @@ function SignalLogSummary({ rows, symbols, selected, onToggle, onClear }: {
       winRate: settled ? Math.round((wins / settled) * 1000) / 10 : null };
   }, [rows]);
 
-  const Tile = ({ label, value, tone = 'slate', sub }: { label: string; value: string; tone?: string; sub?: string }) => (
-    <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+  const real = useMemo(() => realisticPnl(rows, spreads, autoCfg), [rows, spreads, autoCfg]);
+
+  const Tile = ({ label, value, tone = 'slate', sub, title, accent }: { label: string; value: string; tone?: string; sub?: string; title?: string; accent?: boolean }) => (
+    <div title={title} className={`rounded-xl border px-3 py-2 ${accent ? 'border-indigo-300 bg-indigo-50/60' : 'border-slate-200 bg-white'}`}>
       <p className="text-[9px] font-black uppercase tracking-wider text-slate-400">{label}</p>
       <p className={`text-base font-black ${tone}`}>{value}</p>
       {sub && <p className="text-[9px] font-bold text-slate-400">{sub}</p>}
@@ -133,12 +193,24 @@ function SignalLogSummary({ rows, symbols, selected, onToggle, onClear }: {
 
   return (
     <div className="border-b border-slate-100 bg-slate-50/60 px-4 py-3">
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
         <Tile label="Wins" value={String(s.wins)} tone="text-emerald-600" sub={`${s.settled} settled`} />
         <Tile label="Losses" value={String(s.losses)} tone="text-rose-600" sub={s.expired ? `${s.expired} expired` : undefined} />
         <Tile label="Win rate" value={s.winRate === null ? '—' : `${s.winRate}%`} tone={(s.winRate ?? 0) >= 50 ? 'text-emerald-600' : 'text-rose-600'} sub={s.pending ? `${s.pending} pending` : undefined} />
         <Tile label="Net pips" value={`${s.netPips > 0 ? '+' : ''}${Math.round(s.netPips).toLocaleString()}`} tone={s.netPips >= 0 ? 'text-emerald-600' : 'text-rose-600'} sub={`${s.pipsN} scored`} />
-        <Tile label="Est. P/L" value={`${s.pnl < 0 ? '-' : '+'}$${Math.abs(s.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}`} tone={s.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'} sub="at suggested size" />
+        <Tile label="Est. P/L" value={`${s.pnl < 0 ? '-' : '+'}$${Math.abs(s.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}`} tone={s.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600'} sub="every signal, no costs"
+          title="Every settled signal taken at its suggested size, with no spread, no commission and no limit on how many run at once. Compare with Realistic P/L." />
+        <Tile label="Realistic P/L" accent
+          title={`What auto-trading these signals could plausibly have returned.
+
+Applied: min grade ${autoCfg.minGrade}, min R:R ${autoCfg.minRR}, real broker spread per symbol, max ${autoCfg.maxConcurrent} open at once${autoCfg.onePerSymbol ? ', one per symbol' : ''}, ${autoCfg.maxTradesPerDay}/day cap.
+
+Skipped: ${real.blockedConcurrent} already at max open, ${real.blockedSymbol} same symbol open, ${real.blockedCap} daily cap.
+
+Still optimistic — fills are assumed exact and commission/swap are not charged.`}
+          value={`${real.pnl < 0 ? '-' : '+'}$${Math.abs(real.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
+          tone={real.pnl >= 0 ? 'text-indigo-700' : 'text-rose-600'}
+          sub={`${real.taken} of ${real.considered} taken${real.winRate !== null ? ` · ${real.winRate}%` : ''}`} />
         <Tile label="Avg / trade" value={s.pipsN ? `${s.netPips / s.pipsN > 0 ? '+' : ''}${(s.netPips / s.pipsN).toFixed(1)}p` : '—'} tone="text-slate-700" sub={`${rows.length} shown`} />
       </div>
 
@@ -286,6 +358,11 @@ export default function StrategyLabReports() {
   const [section, setSection] = useState<SectionKey>('overview');
   // Signal-log symbol drawer. Empty = every symbol.
   const [logSymbols, setLogSymbols] = useState<Set<string>>(new Set());
+  // Inputs for the realistic P/L card: real per-symbol spread from the broker, and the
+  // portfolio limits the auto-trader actually enforces. Both fall back to sane defaults
+  // when the EA bridge has not reported yet, so the card never blocks on them.
+  const [spreads, setSpreads] = useState<Record<string, number>>({});
+  const [autoCfg, setAutoCfg] = useState({ maxConcurrent: 2, onePerSymbol: true, maxTradesPerDay: 50, minGrade: 'A', minRR: 2 });
   const [allSymbols, setAllSymbols] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [signalsLoading, setSignalsLoading] = useState(false);
@@ -299,6 +376,19 @@ export default function StrategyLabReports() {
       setAllSymbols(m.symbols || []);
       setSelected((c) => c || visible[0]?.id || '');
     }).catch(() => {});
+    // Real spreads (pips) keyed by symbol, straight from the broker via the EA.
+    fetchBrokerSpecs().then((r) => {
+      const map: Record<string, number> = {};
+      for (const sp of r.specs || []) {
+        const pips = sp.derived?.spreadPips;
+        if (typeof pips === 'number') map[sp.symbol.toUpperCase()] = pips;
+      }
+      setSpreads(map);
+    }).catch(() => {});
+    fetchAutoTradeStatus().then((r) => setAutoCfg({
+      maxConcurrent: r.config.maxConcurrent, onePerSymbol: r.config.onePerSymbol,
+      maxTradesPerDay: r.config.maxTradesPerDay, minGrade: r.config.minGrade, minRR: r.config.minRR,
+    })).catch(() => {});
   }, []);
 
   // Resolve the active date window: a valid custom from–to wins, else the preset/day range.
@@ -687,6 +777,8 @@ export default function StrategyLabReports() {
           selected={logSymbols}
           onToggle={(sym) => setLogSymbols((cur) => { const n = new Set(cur); if (n.has(sym)) n.delete(sym); else n.add(sym); return n; })}
           onClear={() => setLogSymbols(new Set())}
+          spreads={spreads}
+          autoCfg={autoCfg}
         />
         <div className="overflow-x-auto">
           <table className="w-full min-w-[860px] text-left text-sm">

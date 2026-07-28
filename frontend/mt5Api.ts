@@ -440,6 +440,23 @@ export async function fetchAutoTradeReport(params: { from?: string; to?: string 
   const qs = q.toString();
   return fetchJson<AutoTradeReport>(`/api/auto-trade/report${qs ? `?${qs}` : ''}`);
 }
+/** Per-symbol contract specs the EA reported, with the derived pip/spread maths. */
+export interface BrokerSpecRow {
+  symbol: string; point: number; digits: number; tickValue: number; tickSize: number;
+  contractSize: number; stopsLevel: number; spread: number;
+  volMin: number; volMax: number; volStep: number; marginPerLot?: number;
+  derived: {
+    pipSize: number; valuePerPricePerLot: number | null; valuePerPipPerLot: number | null;
+    minStopDistancePips: number | null; spreadPips: number | null;
+  };
+}
+export async function fetchBrokerSpecs(): Promise<{
+  account: string | null; broker: string | null; demo: boolean | null;
+  leverage: number | null; freeMargin: number | null; count: number; specs: BrokerSpecRow[];
+}> {
+  return fetchJson('/api/auto-trade/broker-specs');
+}
+
 export async function fetchAutoTradeComboSets(): Promise<{ sets: AutoTradeComboSet[] }> {
   return fetchJson('/api/auto-trade/combo-sets');
 }
