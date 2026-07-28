@@ -9134,6 +9134,16 @@ app.get('/api/auto-trade/report', async (req, res) => {
     const args = [];
     if (from) { where.push('created_at >= ?'); args.push(`${from} 00:00:00`); }
     if (to) { where.push('created_at < DATE_ADD(?, INTERVAL 1 DAY)'); args.push(`${to} 00:00:00`); }
+    // Broker lens, matching the rest of the reports. Auto-trades record the MT5 login, so
+    // resolve the broker NAME to its logins through the account registry rather than
+    // storing a second copy of the name that could drift from it.
+    const brokerQ = req.query.broker ? String(req.query.broker) : null;
+    if (brokerQ) {
+      const reg = loadAutoTradeAccounts().accounts || {};
+      const logins = Object.entries(reg).filter(([, a]) => String(a?.broker || '') === brokerQ).map(([login]) => login);
+      if (!logins.length) where.push('1=0');            // known broker, no accounts -> no rows
+      else { where.push(`account IN (${logins.map(() => '?').join(',')})`); args.push(...logins); }
+    }
     const [rows] = await pool.query(`SELECT * FROM mt5_auto_trades WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 5000`, args);
 
     const r2 = (v) => Math.round(Number(v) * 100) / 100;
@@ -9790,14 +9800,17 @@ app.post('/api/mt5/trade-history', async (req, res) => {
       // so the P/L is honest, and label it clearly rather than inventing a strategy.
       const [ins] = await pool.execute(
         `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type,
-           entry_price, lots, mode, status, reason, ticket, position_id, fill_price, close_price, profit, closed_at, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           entry_price, lots, mode, status, reason, ticket, position_id, fill_price, close_price, profit, closed_at, created_at, updated_at, account)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [`adopted:${posId}`, ADOPTED_STRATEGY_ID, String(d.symbol || '?').toUpperCase().slice(0, 32), '—',
          String(d.direction || '?').toUpperCase().slice(0, 8), 'MARKET',
          Number(d.openPrice) || null, Number(d.lots) || null, 'AUTO', 'CLOSED',
          'adopted from MT5 history — this position carried our magic number but no command row owned it',
          posId, posId, Number(d.openPrice) || null, closePrice, Number.isFinite(profit) ? profit : null,
-         toMysqlDate(closedAt), toMysqlDate(Number(d.openTime) > 0 ? new Date(Number(d.openTime) * 1000) : closedAt), toMysqlDate()],
+         toMysqlDate(closedAt), toMysqlDate(Number(d.openTime) > 0 ? new Date(Number(d.openTime) * 1000) : closedAt), toMysqlDate(),
+         // Adopted rows carry real P&L, so they must be attributable — without an account
+         // they drop out of every broker filter and the money goes missing from the split.
+         tradeBridge.account || null],
       );
       if (ins?.affectedRows) { adopted += 1; console.warn(`[AutoTrade] ADOPTED untracked position ${posId} ${d.symbol} (${profit}) from MT5 history`); }
       else already += 1;
@@ -13187,6 +13200,17 @@ let challengeStateCache = null;
  * Without that, every restart with no EA connected resolved to a 'default' key and opened a
  * phantom empty challenge run alongside the real one.
  */
+/**
+ * Broker name for the CONNECTED account, taken from the account registry rather than the
+ * live bridge string. Returns null when the account is unknown, so an unattributable
+ * signal stays unattributed instead of inheriting the previous broker's label.
+ */
+function signalBrokerForAccount() {
+  const login = String(tradeBridge.account || '').trim();
+  if (!login) return null;
+  return (loadAutoTradeAccounts().accounts || {})[login]?.broker || null;
+}
+
 function activeAccountKey() {
   const live = String(tradeBridge.account || '').trim();
   if (live) return live;
@@ -14705,7 +14729,11 @@ async function persistStrategySignalRow(pool, stratId, symbol, tf, sig, barMs, n
      Number.isFinite(alertBarMs) ? toMysqlDate(new Date(alertBarMs)) : null,
      validUntil ? toMysqlDate(validUntil) : null, measureFixedTime ? 1 : 0,
      // Stamp the broker whose feed produced this signal, so reports stay separable.
-     tradeBridge.broker || null, tradeBridge.account || null],
+     // Resolved from the ACCOUNT, never from tradeBridge.broker: that field is sticky
+     // (`b.broker || tradeBridge.broker`), so a poll that omits the name leaves the
+     // previous broker's string in place and signals get labelled with the account you
+     // just switched away from. No account means no attribution, rather than a guess.
+     signalBrokerForAccount(), tradeBridge.account || null],
   );
   return { id, affectedRows: res.affectedRows };
 }

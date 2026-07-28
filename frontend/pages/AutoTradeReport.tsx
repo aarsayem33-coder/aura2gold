@@ -159,7 +159,7 @@ function BreakdownCard({ title, rows, Icon }: { title: string; rows: AutoTradeGr
   );
 }
 
-export default function AutoTradeReport({ from, to }: { from?: string; to?: string }) {
+export default function AutoTradeReport({ from, to, broker }: { from?: string; to?: string; broker?: string }) {
   const [data, setData] = useState<AutoTradeReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -167,10 +167,10 @@ export default function AutoTradeReport({ from, to }: { from?: string; to?: stri
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setData(await fetchAutoTradeReport({ from, to })); setErr(null); }
+    try { setData(await fetchAutoTradeReport({ from, to, broker })); setErr(null); }
     catch (e) { setErr(e instanceof Error ? e.message : 'Failed to load report'); }
     finally { setLoading(false); }
-  }, [from, to]);
+  }, [from, to, broker]);
 
   useEffect(() => { void load(); const t = setInterval(() => void load(), 30000); return () => clearInterval(t); }, [load]);
 

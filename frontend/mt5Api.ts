@@ -433,10 +433,11 @@ export async function fetchKeyLevelProximity(sensitivity?: string): Promise<KeyL
 export async function fetchAutoTradeStatus(): Promise<AutoTradeStatus> {
   return fetchJson<AutoTradeStatus>('/api/auto-trade');
 }
-export async function fetchAutoTradeReport(params: { from?: string; to?: string } = {}): Promise<AutoTradeReport> {
+export async function fetchAutoTradeReport(params: { from?: string; to?: string; broker?: string } = {}): Promise<AutoTradeReport> {
   const q = new URLSearchParams();
   if (params.from) q.set('from', params.from);
   if (params.to) q.set('to', params.to);
+  if (params.broker) q.set('broker', params.broker);
   const qs = q.toString();
   return fetchJson<AutoTradeReport>(`/api/auto-trade/report${qs ? `?${qs}` : ''}`);
 }

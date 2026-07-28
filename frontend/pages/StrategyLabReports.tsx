@@ -617,7 +617,7 @@ export default function StrategyLabReports() {
       </div>
 
       {tab === 'confluence' && <ConfluenceTab strategies={strategies} rangeParams={reportParams} rangeLabel={perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label || ''} />}
-      {tab === 'autotrade' && <AutoTradeReport from={reportParams.from} to={reportParams.to} />}
+      {tab === 'autotrade' && <AutoTradeReport from={reportParams.from} to={reportParams.to} broker={brokerFilter || undefined} />}
 
       {tab !== 'confluence' && tab !== 'autotrade' && (<>
       {/* SEARCH — filters the strategy leaderboard, combos & per-session strategy lists */}
