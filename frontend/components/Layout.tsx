@@ -32,6 +32,7 @@ import {
   Gauge,
   Trophy,
   Bot,
+  CandlestickChart,
   ChevronDown,
   X
 } from 'lucide-react';
@@ -319,6 +320,7 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
     { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
     { path: '/live-market-tracker', icon: Gauge, label: 'Live Market Tracker' },
+    { path: '/chart', icon: CandlestickChart, label: 'Chart' },
     { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },
     { path: '/challenge', icon: Trophy, label: 'Challenge Tracker' },
     { path: '/auto-trading', icon: Bot, label: 'Auto Trading' },

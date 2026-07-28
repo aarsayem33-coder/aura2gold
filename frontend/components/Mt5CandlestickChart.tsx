@@ -10,6 +10,7 @@ import {
   LineStyle,
 } from 'lightweight-charts';
 import { Maximize2, Minimize2, Crosshair } from 'lucide-react';
+import { timeframeSeconds, bucketPhase, bucketStart, formingBarFor, secsToNextBar } from '../lib/chartTime.js';
 import type { Alert, Mt5Candle } from '../types';
 
 /** Optional trade levels drawn as horizontal price lines on the chart. */
@@ -48,37 +49,8 @@ function toChartTime(value: string) {
   return Math.floor(parsed / 1000);
 }
 
-/** Seconds per timeframe bucket (M5 -> 300). 0 = unknown (no bucketing). */
-function timeframeSeconds(tf: string): number {
-  const m = /^([MHDW])(\d+)?$/.exec((tf || '').toUpperCase());
-  if (!m) return 0;
-  const unit = m[1];
-  const n = Number(m[2] || 1);
-  if (unit === 'M') return n * 60;
-  if (unit === 'H') return n * 3600;
-  if (unit === 'D') return 86400;
-  if (unit === 'W') return 604800;
-  return 0;
-}
+// Bar-time arithmetic lives in ../lib/chartTime.js so it can be unit-tested (chartTime.test.mjs).
 
-/** Build a synthetic live-forming bar for the current period when the feed only
- * delivers closed bars (no intra-bar ticks). Flat at the last close until the next
- * real bar arrives — so the current candle slot exists and the time axis advances,
- * making the chart visibly "live" without inventing price movement. Returns null
- * when real data already covers the current period (or the timeframe is unknown). */
-function formingBarFor(lastClosed: { time: number; close: number } | null, tfSec: number, nowMs = Date.now()) {
-  if (!lastClosed || tfSec <= 0 || !Number.isFinite(lastClosed.close) || lastClosed.close <= 0) return null;
-  const open = Math.floor(Math.floor(nowMs / 1000) / tfSec) * tfSec;
-  if (lastClosed.time >= open) return null; // a real bar already occupies the current period
-  return { time: open, open: lastClosed.close, high: lastClosed.close, low: lastClosed.close, close: lastClosed.close, volume: 0 };
-}
-
-/** Whole seconds remaining until the current timeframe bar closes (for the countdown). */
-function secsToNextBar(tfSec: number, nowMs = Date.now()) {
-  if (tfSec <= 0) return null;
-  const nowSec = Math.floor(nowMs / 1000);
-  return tfSec - (nowSec % tfSec);
-}
 
 /** Robust price precision: gold=2, JPY pairs=3, otherwise infer from magnitude. */
 function priceDigits(symbol: string, sample?: number | null) {
@@ -515,6 +487,9 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const lastLenRef = useRef(0);
   // Latest CLOSED bar (time in seconds + close), used to synthesize the live-forming bar.
   const lastClosedRef = useRef<{ time: number; close: number } | null>(null);
+  // Broker bar phase measured off the feed, so the countdown and the forming bar land on
+  // the SAME boundaries as the real bars (see bucketPhase).
+  const phaseRef = useRef(0);
   const countdownRef = useRef<HTMLDivElement | null>(null);
 
   const candlesRef = useRef<Mt5Candle[]>([]);
@@ -704,13 +679,21 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     // them into one real bar: open from the earliest snapshot, close from the latest,
     // high/low across all, so the candle series is correct.
     const tfSec = timeframeSeconds(timeframe);
+    // Read the broker's bar phase off the feed before bucketing — see bucketPhase().
+    const allSecs: number[] = [];
+    for (const candle of candles) {
+      const ms = new Date(candle.time).getTime();
+      if (!Number.isNaN(ms)) allSecs.push(Math.floor(ms / 1000));
+    }
+    const phase = bucketPhase(allSecs, tfSec);
+    phaseRef.current = phase;
     const byBar = new Map<number, { firstSec: number; lastSec: number; candle: ChartCandle }>();
     for (const candle of candles) {
       if (candle.open === null || candle.high === null || candle.low === null || candle.close === null) continue;
       const ms = new Date(candle.time).getTime();
       if (Number.isNaN(ms)) continue;
       const sec = Math.floor(ms / 1000);
-      const barTime = tfSec > 0 ? Math.floor(sec / tfSec) * tfSec : sec;
+      const barTime = tfSec > 0 ? bucketStart(sec, tfSec, phase) : sec;
       const o = candle.open as number;
       const h = candle.high as number;
       const l = candle.low as number;
@@ -769,7 +752,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     // Render the closed bars plus a synthetic forming bar for the current period
     // (only the candlestick series gets the forming bar; overlays/markers stay on
     // closed data so EMAs/volume aren't skewed by the flat placeholder).
-    const forming = formingBarFor(lastClosedRef.current, tfSec);
+    const forming = formingBarFor(lastClosedRef.current, tfSec, phase);
     series.setData(forming ? [...data, forming] : data);
 
     // Volume — create/remove on demand.
@@ -1039,7 +1022,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     const tick = () => {
       const el = countdownRef.current;
       if (el) {
-        const secs = secsToNextBar(tfSec);
+        const secs = secsToNextBar(tfSec, phaseRef.current);
         if (secs === null) {
           el.textContent = '';
         } else {
@@ -1050,7 +1033,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
       }
       const series = seriesRef.current;
       if (!series) return;
-      const forming = formingBarFor(lastClosedRef.current, tfSec);
+      const forming = formingBarFor(lastClosedRef.current, tfSec, phaseRef.current);
       if (forming) {
         try {
           series.update(forming);

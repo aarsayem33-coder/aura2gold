@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Gauge, RefreshCw, Loader2, TrendingUp, TrendingDown, Minus, AlertTriangle,
-  Activity, Droplets, Layers, Zap, ShieldCheck, Ban, Clock,
+  Activity, Droplets, Layers, Zap, ShieldCheck, Ban, Clock, CandlestickChart,
 } from 'lucide-react';
-import Mt5CandlestickChart from '../components/Mt5CandlestickChart';
-import { fetchLiveMarketTracker, fetchKeyLevelProximity, fetchMt5Candles, useMt5Stream } from '../mt5Api';
-import type { LiveMarketTrackerResponse, LmtOrderBlock, LmtKeyLevel, LmtSweepGrade, Mt5Candle, KeyLevelProximityResponse, KeyLevelPlanLeg } from '../types';
+import { Link } from 'react-router-dom';
+import { fetchLiveMarketTracker, fetchKeyLevelProximity, useMt5Stream } from '../mt5Api';
+import type { LiveMarketTrackerResponse, LmtOrderBlock, LmtKeyLevel, LmtSweepGrade, KeyLevelProximityResponse, KeyLevelPlanLeg } from '../types';
 
 const TF_OPTIONS = ['M1', 'M5', 'M15', 'M30', 'H1'];
 
@@ -263,15 +263,6 @@ function ZoneMap({ t }: { t: LiveMarketTrackerResponse }) {
   );
 }
 
-// Merge fresh candles into the existing set, keyed by bar time (latest wins), sorted
-// ascending and capped. Lets the live SSE stream update the chart between REST polls.
-function mergeCandlesByTime(prev: Mt5Candle[], incoming: Mt5Candle[], cap = 600): Mt5Candle[] {
-  const map = new Map<string, Mt5Candle>();
-  for (const c of prev) map.set(c.time, c);
-  for (const c of incoming) map.set(c.time, c);
-  const merged = [...map.values()].sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
-  return merged.length > cap ? merged.slice(merged.length - cap) : merged;
-}
 
 // ── Key-level proximity panel: every streamed symbol's approaching PDH/PDL + session H/L ──
 function ProximityPlanLine({ leg, symbol, tone }: { leg: KeyLevelPlanLeg | null; symbol: string; tone: 'fade' | 'cont' }) {
@@ -333,21 +324,16 @@ function KeyLevelProximityPanel({ prox }: { prox: KeyLevelProximityResponse | nu
 }
 
 export default function LiveMarketTracker() {
-  const { status, candles: streamCandles } = useMt5Stream();
+  const { status } = useMt5Stream();
   const [symbol, setSymbol] = useState<string>('');
   const [timeframe, setTimeframe] = useState<string>('M5');
   const [data, setData] = useState<LiveMarketTrackerResponse | null>(null);
   const [prox, setProx] = useState<KeyLevelProximityResponse | null>(null);
-  const [candles, setCandles] = useState<Mt5Candle[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const symbolRef = useRef(symbol);
   symbolRef.current = symbol;
   const inFlightRef = useRef(false);
-  // Which instrument the `candles` array currently holds. Used to REPLACE (not merge) on an
-  // instrument switch — so we never mix bars across symbols AND never empty the array (emptying
-  // would unmount the chart via the candles.length gate below, losing its fullscreen state).
-  const candlesKeyRef = useRef('');
 
   const symbolOptions = useMemo(() => {
     const fromStatus = status?.symbols || [];
@@ -368,15 +354,6 @@ export default function LiveMarketTracker() {
       const t = await fetchLiveMarketTracker(symbolRef.current || undefined, timeframe);
       setData(t);
       setError(t.error || null);
-      try {
-        const c = await fetchMt5Candles(t.symbol, timeframe, 300);
-        const key = `${(t.symbol || '').toUpperCase()}|${timeframe.toUpperCase()}`;
-        const fresh = c.candles || [];
-        // Same instrument → merge (keeps live SSE bars); switched instrument → replace wholesale
-        // (clears the old symbol's bars without ever emptying the array / unmounting the chart).
-        setCandles((prev) => (key === candlesKeyRef.current ? mergeCandlesByTime(prev, fresh) : fresh));
-        candlesKeyRef.current = key;
-      } catch { /* chart is best-effort */ }
       try { setProx(await fetchKeyLevelProximity()); } catch { /* proximity panel is best-effort */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load tracker');
@@ -394,20 +371,8 @@ export default function LiveMarketTracker() {
     return () => clearInterval(id);
   }, [load, symbol]);
 
-  // Live-stream fast path: merge SSE candle pushes for the active symbol/timeframe into the
-  // chart the instant they arrive (sub-second), instead of waiting for the next REST poll.
-  useEffect(() => {
-    const sym = (data?.symbol || '').toUpperCase();
-    const tf = timeframe.toUpperCase();
-    const key = `${sym}|${tf}`;
-    // Only merge once the REST load has this instrument in place — never merge across a switch.
-    if (!sym || !streamCandles?.length || key !== candlesKeyRef.current) return;
-    const relevant = streamCandles.filter((c) => (c.symbol || '').toUpperCase() === sym && (c.timeframe || '').toUpperCase() === tf);
-    if (relevant.length) setCandles((prev) => mergeCandlesByTime(prev, relevant));
-  }, [streamCandles, data?.symbol, timeframe]);
 
   const plan = data?.plan;
-  const levels = plan ? { direction: data?.verdict.direction || undefined, entry: plan.entry, stopLoss: plan.sl, takeProfit1: plan.tp ?? undefined } : null;
 
   // Small MT feed indicator (connected state + last-tick age) — shown only when the chart is
   // expanded (the chart component renders it in fullscreen only).
@@ -467,17 +432,17 @@ export default function LiveMarketTracker() {
             <PressureMeter t={data} />
           </div>
 
-          {/* Chart + zone map */}
-          <div className="grid gap-4 lg:grid-cols-3">
-            <div className="lg:col-span-2 rounded-2xl border border-slate-200 bg-white p-2">
-              {candles.length > 0
-                ? <Mt5CandlestickChart
-                    candles={candles} signals={[]} symbol={data.symbol} timeframe={timeframe} levels={levels}
-                    symbolOptions={symbolOptions} timeframeOptions={TF_OPTIONS}
-                    onSymbolChange={setSymbol} onTimeframeChange={setTimeframe}
-                    fullscreenBadge={feedBadge}
-                  />
-                : <div className="flex h-72 items-center justify-center text-sm text-slate-400">No candle data for {data.symbol} {timeframe}.</div>}
+          {/* Zone map. The candles moved to their own full-size route (/chart), which
+              keeps this page about the read: verdict, pressure, zones and levels. */}
+          <div className="grid gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-indigo-200 bg-indigo-50/50 px-4 py-2.5">
+              <p className="text-xs font-semibold text-indigo-900">Looking for the candles? They now have a dedicated full-size chart.</p>
+              <Link
+                to={`/chart?symbol=${encodeURIComponent(data.symbol)}&tf=${encodeURIComponent(timeframe)}`}
+                className="inline-flex items-center gap-1 rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs font-black text-indigo-700 hover:bg-indigo-50"
+              >
+                <CandlestickChart size={14} />Open {data.symbol} {timeframe} chart
+              </Link>
             </div>
             <ZoneMap t={data} />
           </div>
