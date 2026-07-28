@@ -9087,7 +9087,7 @@ app.get('/api/auto-trade/report', async (req, res) => {
       const closedMs = t.closed_at ? new Date(t.closed_at).getTime() : NaN;
       const durationMin = Number.isFinite(openedMs) && Number.isFinite(closedMs) ? Math.max(0, Math.round((closedMs - openedMs) / 60000)) : null;
       return {
-        id: t.id, strategy: t.strategy, strategyName: STRATEGY_LAB_REGISTRY[t.strategy]?.name || t.strategy,
+        id: t.id, strategy: t.strategy, strategyName: strategyDisplayName(t.strategy),
         symbol: t.symbol, timeframe: t.timeframe, direction: t.direction, orderType: t.order_type,
         entry: t.entry_price, fillPrice: t.fill_price, stopLoss: t.stop_loss,
         takeProfit1: t.take_profit_1, takeProfit2: t.take_profit_2, takeProfit3: t.take_profit_3,
@@ -9549,7 +9549,7 @@ async function autoTradeLifecycleEmail(row, phase, extra = {}) {
     if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
     const to = signalEmailToFor(row.symbol, row.timeframe);
     if (!to) return;
-    const strategyName = STRATEGY_LAB_REGISTRY[row.strategy]?.name || row.strategy;
+    const strategyName = strategyDisplayName(row.strategy);
     const sym = row.symbol;
     const pip = pipSizeForSymbol(sym) || 0.0001;
     const buy = /BUY/.test(String(row.direction).toUpperCase());
@@ -9675,6 +9675,16 @@ app.post('/api/mt5/trade-closed', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// Positions adopted from MT5 history carry no strategy: they were taken outside the
+// auto-trader (by hand, or by a command whose result report never came back). The stored
+// id stays 'unrecorded' so the data keeps its meaning; only the label changes, because
+// "unrecorded" reads like a fault in the report when it is simply a trade you took.
+const ADOPTED_STRATEGY_ID = 'unrecorded';
+function strategyDisplayName(id) {
+  if (id === ADOPTED_STRATEGY_ID) return 'By Own';
+  return STRATEGY_LAB_REGISTRY[id]?.name || id;
+}
+
 // POST /api/mt5/trade-history — periodic RECONCILIATION sweep. The EA pushes every closed
 // position carrying our magic over a rolling window; we adopt anything the live path
 // missed. This is the self-healing layer: the live close report is a single
@@ -9713,7 +9723,7 @@ app.post('/api/mt5/trade-history', async (req, res) => {
         `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type,
            entry_price, lots, mode, status, reason, ticket, position_id, fill_price, close_price, profit, closed_at, created_at, updated_at)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [`adopted:${posId}`, 'unrecorded', String(d.symbol || '?').toUpperCase().slice(0, 32), '—',
+        [`adopted:${posId}`, ADOPTED_STRATEGY_ID, String(d.symbol || '?').toUpperCase().slice(0, 32), '—',
          String(d.direction || '?').toUpperCase().slice(0, 8), 'MARKET',
          Number(d.openPrice) || null, Number(d.lots) || null, 'AUTO', 'CLOSED',
          'adopted from MT5 history — this position carried our magic number but no command row owned it',
