@@ -7533,6 +7533,14 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
     // is the sole authority: only these exact combinations trade and the broad
     // strategies/symbols/timeframes lists are ignored. Empty = the broad lists apply.
     combos: [],
+    // Which selection model is in charge: COMBOS (exact triples) or BROAD (the three
+    // lists). Explicit, so switching back to BROAD never requires deleting a carefully
+    // built combination list.
+    //
+    // null = INFER from whether combinations exist. A concrete default here would win the
+    // settings merge for anyone who saved combinations before this switch existed,
+    // silently flipping them from precision to broad and widening what auto-trades.
+    selectionMode: null,
     // Named reusable sets of the above live in their own DB table
     // (mt5_auto_trade_combo_sets) so they persist independently of these settings —
     // see /api/auto-trade/combo-sets.
@@ -7759,6 +7767,11 @@ function saveEmailAlertSettings(nextSettings) {
       onePerSymbol: src.onePerSymbol !== false,
       minGrade: ['A', 'A+'].includes(String(src.minGrade || '').toUpperCase()) ? String(src.minGrade).toUpperCase() : 'A',
       minRR: (() => { const n = Number(src.minRR); return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : base.minRR; })(),
+      // Only ever store an explicit choice; anything else stays null so the inference
+      // in autoTradeSelectionMode() keeps deciding.
+      selectionMode: ['COMBOS', 'BROAD'].includes(String(src.selectionMode || '').toUpperCase())
+        ? String(src.selectionMode).toUpperCase()
+        : null,
       combos: Array.isArray(src.combos)
         ? [...new Set(src.combos
           .map((c) => normalizeAutoTradeCombo(c, { validStrategyIds: validIds, knownTimeframes: KNOWN_TFS }))

@@ -55,10 +55,15 @@ export default function AutoTrading() {
   const cfg: AutoTradeConfig = settings?.autoTrade || status?.config || {
     mode: 'OFF', strategies: [], symbols: [], timeframes: [], sessions: [],
     maxTradesPerDay: 3, maxConcurrent: 2, onePerSymbol: true, minGrade: 'A', minRR: 2,
-    combos: [], execution: DEFAULT_EXEC,
+    combos: [], selectionMode: null, execution: DEFAULT_EXEC,
   };
   const combos = cfg.combos || [];
-  const precision = combos.length > 0;
+  // Explicit switch, so a saved combination list survives a trip through broad mode.
+  // The null fallback below must stay identical to autoTradeSelectionMode() on the server,
+  // or the badge would claim one model while the engine traded the other.
+  const selectionMode: 'COMBOS' | 'BROAD' = cfg.selectionMode === 'COMBOS' ? 'COMBOS'
+    : cfg.selectionMode === 'BROAD' ? 'BROAD' : (combos.length ? 'COMBOS' : 'BROAD');
+  const precision = selectionMode === 'COMBOS';
   const exec: AutoTradeExecution = { ...DEFAULT_EXEC, ...(cfg.execution || {}) };
 
   const load = useCallback(async () => {
@@ -375,15 +380,38 @@ export default function AutoTrading() {
         </div>
       </div>
 
+      {/* SELECTION MODE SWITCHER — the two models are mutually exclusive, and picking
+          one never discards the other's configuration. */}
+      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-card">
+        <p className="mb-2 text-[11px] font-black uppercase tracking-wider text-slate-500">What decides which signals trade</p>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {([
+            ['COMBOS', 'Exact combinations', `${combos.length} pairing${combos.length === 1 ? '' : 's'} · strategy × symbol × timeframe`],
+            ['BROAD', 'Broad selection', `${(cfg.strategies || []).length} strateg${(cfg.strategies || []).length === 1 ? 'y' : 'ies'} × symbols × timeframes`],
+          ] as const).map(([val, label, note]) => (
+            <button key={val} type="button" onClick={() => patch({ selectionMode: val })}
+              className={`rounded-xl border-2 px-4 py-2.5 text-left transition-colors ${selectionMode === val ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:border-indigo-200'}`}>
+              <span className={`flex items-center gap-2 text-sm font-black ${selectionMode === val ? 'text-indigo-700' : 'text-slate-700'}`}>
+                {selectionMode === val && <CheckCircle2 size={14} />}{label}
+              </span>
+              <span className="mt-0.5 block text-[10px] font-semibold text-slate-400">{note}</span>
+            </button>
+          ))}
+        </div>
+        <p className="mt-2 text-[10px] font-medium text-slate-400">
+          Only the selected model decides what trades. The other keeps its settings untouched, so you can switch back at any time without rebuilding it.
+        </p>
+      </div>
+
       {/* Precision combos — exact strategy × symbol × timeframe */}
-      <div className={`rounded-2xl border bg-white shadow-card ${precision ? 'border-indigo-300' : 'border-slate-200'}`}>
+      <div className={`rounded-2xl border bg-white shadow-card ${precision ? 'border-indigo-300' : 'border-slate-200 opacity-60'}`}>
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-5 py-3">
           <div>
             <h3 className="text-sm font-bold text-slate-900">Exact combinations <span className="font-semibold text-slate-400">(strategy × symbol × timeframe)</span></h3>
             <p className="text-xs font-medium text-slate-500">Pick the precise pairings you trust — e.g. <b>Forex Confluence × GBPUSDm × M15</b> without allowing that strategy anywhere else. Add one or more and this list becomes the only thing that trades.</p>
           </div>
           <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-black ${precision ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
-            {precision ? `PRECISION · ${combos.length}` : 'NOT IN USE'}
+            {precision ? `ACTIVE · ${combos.length}` : 'NOT IN USE'}
           </span>
         </div>
         <div className="space-y-3 px-5 py-4">
@@ -488,7 +516,7 @@ export default function AutoTrading() {
       {/* Broad selection — the ONLY part the precision list replaces */}
       <div className={`rounded-2xl border bg-white shadow-card ${precision ? 'border-slate-200 opacity-60' : 'border-slate-200'}`}>
         <div className="border-b border-slate-100 px-5 py-3">
-          <h3 className="text-sm font-bold text-slate-900">Broad selection {precision && <span className="ml-1 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-black text-slate-600">REPLACED BY YOUR EXACT COMBINATIONS</span>}</h3>
+          <h3 className="text-sm font-bold text-slate-900">Broad selection <span className={`ml-1 rounded-full px-2.5 py-1 text-[10px] font-black ${precision ? 'bg-slate-100 text-slate-500' : 'bg-indigo-600 text-white'}`}>{precision ? 'NOT IN USE' : `ACTIVE · ${(cfg.strategies || []).length}`}</span></h3>
           <p className="text-xs font-medium text-slate-500">Strategies are explicit opt-in — none selected = nothing trades. Symbols / timeframes empty = all. {precision ? 'Your exact combinations above decide what trades instead of these three lists — the limits below still apply.' : 'Lot size comes from Account & Sizing.'}</p>
         </div>
         <div className="space-y-4 px-5 py-4">

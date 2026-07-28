@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { autoTradeCombosAllow, normalizeAutoTradeCombo } from './autoTradeFilters.js';
+import { autoTradeCombosAllow, autoTradeSelectionMode, normalizeAutoTradeCombo } from './autoTradeFilters.js';
 
 const KNOWN_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
 const ids = new Set(['forex-confluence', 'ict-breaker']);
@@ -72,4 +72,71 @@ test('normalizeAutoTradeCombo cleans valid input and rejects the rest', () => {
   assert.equal(normalizeAutoTradeCombo('ict-breaker|G|M15', opts), null, 'symbol too short');
   assert.equal(normalizeAutoTradeCombo('ict-breaker|GBPUSDM', opts), null, 'missing timeframe part');
   assert.equal(normalizeAutoTradeCombo('', opts), null);
+});
+
+// ── explicit selection-mode switcher ──
+// Before this, the only way back to broad selection was deleting every combination.
+test('BROAD mode uses the broad lists even while combinations are saved', () => {
+  const cfg = {
+    selectionMode: 'BROAD',
+    combos: ['forex-confluence|GBPUSDM|M15'],          // preserved, but not in charge
+    strategies: ['ict-breaker'], symbols: [], timeframes: [],
+  };
+  assert.equal(autoTradeCombosAllow(cfg, 'ict-breaker', 'XAUUSDM', 'H1'), true,
+    'broad opt-in decides while the combo list sits dormant');
+  assert.equal(autoTradeCombosAllow(cfg, 'forex-confluence', 'GBPUSDM', 'M15'), false,
+    'a saved combination must NOT trade while broad mode is active');
+});
+
+test('COMBOS mode ignores the broad lists', () => {
+  const cfg = {
+    selectionMode: 'COMBOS',
+    combos: ['forex-confluence|GBPUSDM|M15'],
+    strategies: ['ict-breaker'], symbols: [], timeframes: [],
+  };
+  assert.equal(autoTradeCombosAllow(cfg, 'forex-confluence', 'GBPUSDM', 'M15'), true);
+  assert.equal(autoTradeCombosAllow(cfg, 'ict-breaker', 'XAUUSDM', 'H1'), false,
+    'broad opt-in must not leak through in combos mode');
+});
+
+test('COMBOS mode with an empty list trades nothing', () => {
+  const cfg = { selectionMode: 'COMBOS', combos: [], strategies: ['ict-breaker'] };
+  assert.equal(autoTradeCombosAllow(cfg, 'ict-breaker', 'XAUUSDM', 'H1'), false,
+    'must not silently fall back to broad and trade more than selected');
+});
+
+test('switching modes is lossless in both directions', () => {
+  const combos = ['forex-confluence|GBPUSDM|M15'];
+  const strategies = ['ict-breaker'];
+  const asCombos = { selectionMode: 'COMBOS', combos, strategies };
+  const asBroad = { selectionMode: 'BROAD', combos, strategies };
+  // The same stored config answers differently purely on the switch.
+  assert.equal(autoTradeCombosAllow(asCombos, 'forex-confluence', 'GBPUSDM', 'M15'), true);
+  assert.equal(autoTradeCombosAllow(asBroad, 'forex-confluence', 'GBPUSDM', 'M15'), false);
+  assert.equal(autoTradeCombosAllow(asCombos, 'ict-breaker', 'XAUUSDM', 'H1'), false);
+  assert.equal(autoTradeCombosAllow(asBroad, 'ict-breaker', 'XAUUSDM', 'H1'), true);
+});
+
+test('older settings without selectionMode keep the previous behaviour', () => {
+  assert.equal(autoTradeSelectionMode({ combos: ['a|B|M5'] }), 'COMBOS', 'combos present -> precision');
+  assert.equal(autoTradeSelectionMode({ combos: [] }), 'BROAD', 'none -> broad');
+  assert.equal(autoTradeSelectionMode({}), 'BROAD');
+  assert.equal(autoTradeSelectionMode({ selectionMode: 'garbage', combos: [] }), 'BROAD');
+});
+
+// Regression: an unset mode must stay unset all the way through the settings merge.
+// Defaulting it to a concrete 'BROAD' made the default win the merge for anyone who had
+// saved combinations before the switch existed, flipping them from precision to broad and
+// widening what auto-trades without them touching anything.
+test('an unset selectionMode still infers COMBOS when combinations exist', () => {
+  for (const unset of [null, undefined, '']) {
+    const cfg = {
+      selectionMode: unset,
+      combos: ['forex-confluence|GBPUSDM|M15'],
+      strategies: ['ict-breaker'],
+    };
+    assert.equal(autoTradeSelectionMode(cfg), 'COMBOS', `selectionMode ${String(unset)} must infer, not default`);
+    assert.equal(autoTradeCombosAllow(cfg, 'ict-breaker', 'XAUUSDM', 'H1'), false,
+      'a broad-only strategy must not start trading just because the mode was left unset');
+  }
 });

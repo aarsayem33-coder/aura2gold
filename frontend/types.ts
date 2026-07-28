@@ -1503,7 +1503,12 @@ export interface AutoTradeConfig {
   strategies: string[]; symbols: string[]; timeframes: string[]; sessions: string[];
   maxTradesPerDay: number; maxConcurrent: number; onePerSymbol: boolean;
   minGrade: 'A' | 'A+'; minRR: number;
-  /** Exact 'strategyId|SYMBOL|TF' triples ('*' = any). Non-empty = sole authority. */
+  /**
+   * Which selection model is live. Switching does not discard the other one.
+   * null = never chosen explicitly; inferred from whether `combos` is non-empty.
+   */
+  selectionMode: 'COMBOS' | 'BROAD' | null;
+  /** Exact 'strategyId|SYMBOL|TF' triples ('*' = any). */
   combos: string[];
   execution: AutoTradeExecution;
 }
