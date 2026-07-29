@@ -9135,11 +9135,17 @@ app.get('/api/auto-trade/report', async (req, res) => {
     const args = [];
     if (from) { where.push('created_at >= ?'); args.push(`${from} 00:00:00`); }
     if (to) { where.push('created_at < DATE_ADD(?, INTERVAL 1 DAY)'); args.push(`${to} 00:00:00`); }
-    // Broker lens, matching the rest of the reports. Auto-trades record the MT5 login, so
-    // resolve the broker NAME to its logins through the account registry rather than
-    // storing a second copy of the name that could drift from it.
+    // Account lens. One broker can hold several accounts — an evaluation, a funded one, a
+    // demo — and their results must never be added together. An explicit account therefore
+    // wins over the broker filter rather than being narrowed by it.
+    const accountQ = req.query.account ? String(req.query.account).trim() : null;
     const brokerQ = req.query.broker ? String(req.query.broker) : null;
-    if (brokerQ) {
+    if (accountQ) {
+      where.push('account = ?');
+      args.push(accountQ);
+    } else if (brokerQ) {
+      // Broker NAME -> its logins, resolved through the account registry so the name is not
+      // stored twice and cannot drift.
       const reg = loadAutoTradeAccounts().accounts || {};
       const logins = Object.entries(reg).filter(([, a]) => brokerBrand(a?.broker) === brokerBrand(brokerQ)).map(([login]) => login);
       if (!logins.length) where.push('1=0');            // known broker, no accounts -> no rows
@@ -9265,6 +9271,31 @@ app.get('/api/auto-trade/report', async (req, res) => {
       byDirection: groupBy((t) => t.direction),
       byGrade: groupBy((t) => t.grade),
       byHour: groupBy((t) => (t.createdAt ? `${String((new Date(t.createdAt).getUTCHours() + 6) % 24).padStart(2, '0')}:00 BD` : '—')),
+      byAccount: groupBy((t) => t.account || 'unattributed'),
+      // Every account present in the WINDOW, ignoring the account filter itself, so the
+      // picker still lists the others once you have narrowed to one.
+      accounts: await (async () => {
+        const scoped = ['1=1'];
+        const a2 = [];
+        if (from) { scoped.push('created_at >= ?'); a2.push(`${from} 00:00:00`); }
+        if (to) { scoped.push('created_at < DATE_ADD(?, INTERVAL 1 DAY)'); a2.push(`${to} 00:00:00`); }
+        const [rows2] = await pool.query(
+          `SELECT account, COUNT(*) rows_, SUM(CASE WHEN ticket IS NOT NULL THEN 1 ELSE 0 END) executed,
+                  ROUND(SUM(COALESCE(profit,0)),2) net
+             FROM mt5_auto_trades WHERE ${scoped.join(' AND ')} GROUP BY account ORDER BY rows_ DESC`,
+          a2,
+        );
+        const reg = loadAutoTradeAccounts().accounts || {};
+        return rows2.map((r) => ({
+          account: r.account || null,
+          broker: r.account ? (reg[r.account]?.broker || null) : null,
+          server: r.account ? (reg[r.account]?.server || null) : null,
+          demo: r.account ? (reg[r.account]?.demo ?? null) : null,
+          rows: Number(r.rows_), executed: Number(r.executed), net: Number(r.net) || 0,
+          live: String(tradeBridge.account || '') === String(r.account || ''),
+        }));
+      })(),
+      accountFilter: accountQ || null,
       trades,
     });
   } catch (error) { res.status(500).json({ error: error.message }); }

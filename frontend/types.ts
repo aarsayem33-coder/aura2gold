@@ -1584,6 +1584,10 @@ export interface AutoTradeReport {
   byStrategy: AutoTradeGroupRow[]; bySymbol: AutoTradeGroupRow[]; byTimeframe: AutoTradeGroupRow[];
   bySession: AutoTradeGroupRow[]; byDirection: AutoTradeGroupRow[]; byGrade: AutoTradeGroupRow[];
   byHour: AutoTradeGroupRow[];
+  byAccount?: AutoTradeGroupRow[];
+  /** Accounts present in the window, regardless of the current account filter. */
+  accounts?: AutoTradeAccountRow[];
+  accountFilter?: string | null;
   trades: AutoTradeReportRow[];
 }
 export interface ChallengeTrade { ts: string; pnl: number; note: string; balanceAfter: number }
@@ -2353,4 +2357,10 @@ export interface LiquidityRankRow {
 export interface LiquidityRankResponse {
   ok: boolean; timeframe: string; generatedAt: string; symbols: number;
   rows: LiquidityRankRow[]; cached?: boolean;
+}
+
+/** One account present in the auto-trade report window. */
+export interface AutoTradeAccountRow {
+  account: string | null; broker: string | null; server: string | null; demo: boolean | null;
+  rows: number; executed: number; net: number; live: boolean;
 }

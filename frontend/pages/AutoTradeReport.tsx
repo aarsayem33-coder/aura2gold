@@ -160,6 +160,9 @@ function BreakdownCard({ title, rows, Icon }: { title: string; rows: AutoTradeGr
 }
 
 export default function AutoTradeReport({ from, to, broker }: { from?: string; to?: string; broker?: string }) {
+  // Account lens. A broker can hold several accounts — evaluation, funded, demo — and
+  // adding their results together makes every number meaningless. Empty = all accounts.
+  const [account, setAccount] = useState('');
   const [data, setData] = useState<AutoTradeReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -167,10 +170,10 @@ export default function AutoTradeReport({ from, to, broker }: { from?: string; t
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setData(await fetchAutoTradeReport({ from, to, broker })); setErr(null); }
+    try { setData(await fetchAutoTradeReport({ from, to, broker, account: account || undefined })); setErr(null); }
     catch (e) { setErr(e instanceof Error ? e.message : 'Failed to load report'); }
     finally { setLoading(false); }
-  }, [from, to, broker]);
+  }, [from, to, broker, account]);
 
   useEffect(() => { void load(); const t = setInterval(() => void load(), 30000); return () => clearInterval(t); }, [load]);
 
@@ -196,8 +199,47 @@ export default function AutoTradeReport({ from, to, broker }: { from?: string; t
   const s = data.summary;
   const hasClosed = s.trades > 0;
 
+  const accounts = data.accounts || [];
+  const activeAcct = accounts.find((a) => a.account === account) || null;
+
   return (
     <div className="space-y-4">
+      {/* Account lens. One broker can hold an evaluation, a funded account and a demo at
+          once; summing them produces a net that describes no real account. Every number
+          below is scoped to whatever is picked here. */}
+      {accounts.length > 1 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-2.5">
+          <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Account</span>
+          <select
+            value={account}
+            onChange={(e) => setAccount(e.target.value)}
+            className={`rounded-lg border px-2.5 py-1.5 text-sm font-bold ${account ? 'border-indigo-400 bg-indigo-50 text-indigo-800' : 'border-slate-300 text-slate-800'}`}
+          >
+            <option value="">All accounts ({accounts.length})</option>
+            {accounts.filter((a) => a.account).map((a) => (
+              <option key={a.account as string} value={a.account as string}>
+                {(a.broker || 'Unknown')} · {a.account} — {a.executed} executed
+              </option>
+            ))}
+          </select>
+          {activeAcct ? (
+            <span className="flex flex-wrap items-center gap-2 text-[11px] font-semibold text-slate-500">
+              <span>{activeAcct.server || '—'}</span>
+              {activeAcct.demo === true && <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-black text-slate-600">DEMO</span>}
+              {activeAcct.demo === false && <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-black text-rose-700">LIVE MONEY</span>}
+              {activeAcct.live && <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-black text-emerald-700">CONNECTED</span>}
+              <span className={activeAcct.net >= 0 ? 'text-emerald-600' : 'text-rose-600'}>
+                net {activeAcct.net >= 0 ? '+' : ''}{activeAcct.net.toFixed(2)}
+              </span>
+            </span>
+          ) : (
+            <span className="text-[11px] font-medium text-amber-700">
+              Showing every account together — the totals below mix accounts and describe none of them individually.
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Headline stats */}
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
         <Stat label="Net profit" value={usd(s.netProfit, true)} tone={s.netProfit >= 0 ? 'emerald' : 'rose'} Icon={TrendingUp}
