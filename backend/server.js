@@ -687,6 +687,33 @@ async function initializeDatabase() {
       // executable. Deliberately compact (no LONGTEXT blob) and retention-pruned
       // so it never re-bloats the DB like mt5_account_snapshots did.
       await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_strategy_predictions (
+          id VARCHAR(200) PRIMARY KEY,
+          strategy VARCHAR(48) NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          direction VARCHAR(8) NOT NULL,
+          predicted_at DATETIME(3) NOT NULL,
+          horizon_minutes INT NOT NULL,
+          score DECIMAL(6,1) NULL,
+          rank_score DECIMAL(6,1) NULL,
+          grade VARCHAR(4) NULL,
+          entry DOUBLE NULL, stop_loss DOUBLE NULL,
+          take_profit_1 DOUBLE NULL, rr DOUBLE NULL,
+          eta_minutes INT NULL, resolve_minutes INT NULL, total_minutes INT NULL,
+          lots DOUBLE NULL, loss_at_stop DOUBLE NULL, risk_pct DOUBLE NULL,
+          challenge_ok TINYINT NULL,
+          broker VARCHAR(64) NULL, account VARCHAR(32) NULL,
+          -- filled in by the resolver
+          outcome VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+          resolved_at DATETIME(3) NULL,
+          actual_minutes INT NULL,
+          mfe_pips DOUBLE NULL, mae_pips DOUBLE NULL,
+          INDEX idx_pred_time (predicted_at),
+          INDEX idx_pred_outcome (outcome)
+        )
+      `);
+      await pool.query(`
         CREATE TABLE IF NOT EXISTS mt5_execution_forecasts (
           id VARCHAR(96) PRIMARY KEY,
           symbol VARCHAR(32) NOT NULL,
@@ -2268,6 +2295,14 @@ function addTrade(trade) {
 // Default 5 min; floor 1 min. In-memory state still updates every heartbeat.
 const SNAPSHOT_PERSIST_INTERVAL_MS = Math.max(60000, Number(process.env.SNAPSHOT_PERSIST_INTERVAL_MS || 300000));
 // Days of snapshot history to retain; older rows are pruned. Default 14.
+// Resolve predictions against real candles every few minutes, so the accuracy report is
+// never more than one cycle stale and no manual step is required to keep it honest.
+setInterval(() => {
+  resolvePredictions({ limit: 200 })
+    .then((r) => { if (r.resolved) console.log(`[Predictions] resolved ${r.resolved} of ${r.checked} pending.`); })
+    .catch((e) => console.error('[Predictions] resolver pass failed:', e.message));
+}, 5 * 60 * 1000);
+
 const SNAPSHOT_RETENTION_DAYS = Math.max(1, Number(process.env.SNAPSHOT_RETENTION_DAYS || 14));
 let lastSnapshotPersistMs = 0;
 
@@ -15814,6 +15849,201 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
 });
 
 // GET /api/strategy-lab/performance?days=  |  ?preset=today|yesterday|last7
+
+// ─── Prediction tracking ──────────────────────────────────────────────────────
+// A prediction is only worth anything if it can be checked afterwards, so every ranked
+// setup is written once per bar and later resolved against real candles.
+async function persistPredictions(rows, horizonMinutes) {
+  const pool = await initializeDatabase();
+  if (!pool || !rows?.length) return;
+  const now = new Date();
+  for (const r of rows) {
+    // Dedup key: one prediction per strategy/symbol/timeframe/bar. Rescans of the same bar
+    // update nothing, so accuracy is not diluted by how often the page is refreshed.
+    const barMs = Math.floor(now.getTime() / (Math.max(1, predBarMinutes(r.timeframe)) * 60000));
+    const id = `pred:${r.strategy}:${r.symbol}:${r.timeframe}:${barMs}`;
+    try {
+      await pool.execute(
+        `INSERT IGNORE INTO mt5_strategy_predictions
+           (id, strategy, symbol, timeframe, direction, predicted_at, horizon_minutes,
+            score, rank_score, grade, entry, stop_loss, take_profit_1, rr,
+            eta_minutes, resolve_minutes, total_minutes, lots, loss_at_stop, risk_pct,
+            challenge_ok, broker, account)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [id, r.strategy, r.symbol, r.timeframe, r.direction, toMysqlDate(now), horizonMinutes,
+         r.score ?? null, r.rankScore ?? null, r.grade ?? null,
+         r.entry ?? null, r.stopLoss ?? null, r.takeProfit1 ?? null, r.rr ?? null,
+         r.etaMinutes ?? null, r.resolveMinutes ?? null, r.totalMinutes ?? null,
+         r.lots ?? null, r.lossAtStop ?? null, r.riskPct ?? null,
+         r.challengeOk ? 1 : 0, signalBrokerForAccount(), tradeBridge.account || null],
+      );
+    } catch (e) { console.error('[Predictions] insert failed:', e.message); }
+  }
+}
+
+function predBarMinutes(tf) {
+  const m = /^([MH])(\d+)$/.exec(String(tf || '').toUpperCase());
+  if (!m) return 15;
+  return m[1] === 'H' ? Number(m[2]) * 60 : Number(m[2]);
+}
+
+/**
+ * Resolve pending predictions against the candles that came after them.
+ *
+ * MATCHED means TP1 was reached before the stop. MISSED means the stop came first.
+ * EXPIRED means neither happened inside the predicted window — which is a failure of the
+ * TIMING claim, not of the direction, so it is counted separately rather than being folded
+ * into misses.
+ */
+async function resolvePredictions({ limit = 200 } = {}) {
+  const pool = await initializeDatabase();
+  if (!pool) return { checked: 0, resolved: 0 };
+  const [rows] = await pool.query(
+    `SELECT * FROM mt5_strategy_predictions
+      WHERE outcome = 'PENDING' AND predicted_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 5 MINUTE)
+      ORDER BY predicted_at ASC LIMIT ?`, [limit]);
+  let resolved = 0;
+  for (const p of rows) {
+    try {
+      const startMs = new Date(p.predicted_at).getTime();
+      const deadlineMs = startMs + Number(p.horizon_minutes || 180) * 60000;
+      const [cs] = await pool.query(
+        `SELECT candle_time, high, low, close_price FROM mt5_candles
+          WHERE UPPER(symbol)=? AND timeframe=? AND candle_time > ? ORDER BY candle_time ASC LIMIT 500`,
+        [String(p.symbol).toUpperCase(), p.timeframe, toMysqlDate(new Date(startMs))]);
+      if (!cs.length) continue;
+      const buy = String(p.direction).toUpperCase() === 'BUY';
+      const entry = Number(p.entry), stop = Number(p.stop_loss), tp1 = Number(p.take_profit_1);
+      if (![entry, stop, tp1].every(Number.isFinite)) {
+        await pool.execute("UPDATE mt5_strategy_predictions SET outcome='INVALID', resolved_at=? WHERE id=?", [toMysqlDate(), p.id]);
+        resolved += 1; continue;
+      }
+      const pip = pipSizeForSymbol(p.symbol) || 0.0001;
+      let outcome = null, at = null, mfe = 0, mae = 0;
+      for (const c of cs) {
+        const t = new Date(c.candle_time).getTime();
+        const hi = Number(c.high), lo = Number(c.low);
+        mfe = Math.max(mfe, buy ? (hi - entry) / pip : (entry - lo) / pip);
+        mae = Math.max(mae, buy ? (entry - lo) / pip : (hi - entry) / pip);
+        const hitTp = buy ? hi >= tp1 : lo <= tp1;
+        const hitSl = buy ? lo <= stop : hi >= stop;
+        // Both touched inside one bar: the order is unknowable from OHLC, so it is recorded
+        // as AMBIGUOUS rather than guessed in the direction that flatters the score.
+        if (hitTp && hitSl) { outcome = 'AMBIGUOUS'; at = t; break; }
+        if (hitTp) { outcome = 'MATCHED'; at = t; break; }
+        if (hitSl) { outcome = 'MISSED'; at = t; break; }
+        if (t > deadlineMs) { outcome = 'EXPIRED'; at = t; break; }
+      }
+      if (!outcome) continue;                       // still running, leave PENDING
+      await pool.execute(
+        "UPDATE mt5_strategy_predictions SET outcome=?, resolved_at=?, actual_minutes=?, mfe_pips=?, mae_pips=? WHERE id=?",
+        [outcome, toMysqlDate(new Date(at)), Math.max(0, Math.round((at - startMs) / 60000)),
+         Math.round(mfe * 10) / 10, Math.round(mae * 10) / 10, p.id]);
+      resolved += 1;
+    } catch (e) { console.error('[Predictions] resolve failed:', e.message); }
+  }
+  return { checked: rows.length, resolved };
+}
+
+// GET /api/reports/predictions?days=30 — did the predictions actually work?
+//
+// Reports on what was PREDICTED versus what MATCHED. Timing failures (EXPIRED) are kept
+// separate from directional failures (MISSED): a call that was right but slower than
+// claimed is a different problem from one that was simply wrong, and merging them would
+// hide which of the two needs fixing.
+app.get('/api/reports/predictions', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const days = Math.max(1, Math.min(180, Number(req.query.days) || 30));
+    const since = new Date(Date.now() - days * 86400000);
+    const strategy = req.query.strategy ? String(req.query.strategy) : null;
+    const symbol = req.query.symbol ? String(req.query.symbol).toUpperCase() : null;
+
+    const where = ['predicted_at >= ?'];
+    const args = [toMysqlDate(since)];
+    if (strategy) { where.push('strategy = ?'); args.push(strategy); }
+    if (symbol) { where.push('UPPER(symbol) = ?'); args.push(symbol); }
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_strategy_predictions WHERE ${where.join(' AND ')} ORDER BY predicted_at DESC LIMIT 5000`, args);
+
+    const settled = rows.filter((r) => ['MATCHED', 'MISSED'].includes(r.outcome));
+    const matched = settled.filter((r) => r.outcome === 'MATCHED');
+    const n = (v) => (v === null || v === undefined ? null : Number(v));
+    const avg = (list, pick) => {
+      const vals = list.map(pick).filter((v) => Number.isFinite(v));
+      return vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10 : null;
+    };
+    const bucket = (list) => {
+      const set = list.filter((r) => ['MATCHED', 'MISSED'].includes(r.outcome));
+      const won = set.filter((r) => r.outcome === 'MATCHED').length;
+      return {
+        predicted: list.length,
+        settled: set.length,
+        matched: won,
+        missed: set.length - won,
+        expired: list.filter((r) => r.outcome === 'EXPIRED').length,
+        pending: list.filter((r) => r.outcome === 'PENDING').length,
+        ambiguous: list.filter((r) => r.outcome === 'AMBIGUOUS').length,
+        accuracy: set.length ? Math.round((won / set.length) * 1000) / 10 : null,
+        avgScore: avg(list, (r) => Number(r.score)),
+        // Did it resolve as fast as claimed?
+        predictedMinutes: avg(set, (r) => Number(r.total_minutes)),
+        actualMinutes: avg(set, (r) => Number(r.actual_minutes)),
+      };
+    };
+    const groupBy = (keyFn) => {
+      const m = new Map();
+      for (const r of rows) {
+        const k = keyFn(r) ?? '—';
+        if (!m.has(k)) m.set(k, []);
+        m.get(k).push(r);
+      }
+      return [...m.entries()]
+        .map(([key, list]) => ({ key, ...bucket(list) }))
+        .sort((a, b) => (b.accuracy ?? -1) - (a.accuracy ?? -1) || b.settled - a.settled);
+    };
+
+    const overall = bucket(rows);
+    // Timing honesty: of everything that settled, how often did it land inside the window
+    // it was promised in?
+    const inWindow = settled.filter((r) => Number(r.actual_minutes) <= Number(r.horizon_minutes)).length;
+
+    res.json({
+      ok: true,
+      window: { days, from: since.toISOString(), to: new Date().toISOString() },
+      summary: {
+        ...overall,
+        timingHitRate: settled.length ? Math.round((inWindow / settled.length) * 1000) / 10 : null,
+        avgMfePips: avg(settled, (r) => Number(r.mfe_pips)),
+        avgMaePips: avg(settled, (r) => Number(r.mae_pips)),
+      },
+      byStrategy: groupBy((r) => r.strategy),
+      bySymbol: groupBy((r) => r.symbol),
+      byTimeframe: groupBy((r) => r.timeframe),
+      byGrade: groupBy((r) => r.grade),
+      byDirection: groupBy((r) => r.direction),
+      recent: rows.slice(0, 60).map((r) => ({
+        id: r.id, strategy: r.strategy, symbol: r.symbol, timeframe: r.timeframe,
+        direction: r.direction, predictedAt: r.predicted_at ? new Date(r.predicted_at).toISOString() : null,
+        score: n(r.score), grade: r.grade, rr: n(r.rr),
+        entry: n(r.entry), stopLoss: n(r.stop_loss), takeProfit1: n(r.take_profit_1),
+        predictedMinutes: n(r.total_minutes), actualMinutes: n(r.actual_minutes),
+        outcome: r.outcome, resolvedAt: r.resolved_at ? new Date(r.resolved_at).toISOString() : null,
+        mfePips: n(r.mfe_pips), maePips: n(r.mae_pips),
+        challengeOk: r.challenge_ok === 1,
+      })),
+      note: 'MATCHED = TP1 reached before the stop. EXPIRED = neither inside the predicted window (a timing failure, not a direction failure). AMBIGUOUS = both touched in one bar, where OHLC cannot say which came first.',
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/reports/predictions/resolve — force a resolver pass (it also runs on a timer).
+app.post('/api/reports/predictions/resolve', async (req, res) => {
+  try { res.json({ ok: true, ...(await resolvePredictions({ limit: 500 })) }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // GET /api/strategy-predictions?horizonHours=3 — every enabled strategy evaluated live
 // across the connected broker's symbols, kept only when the setup can plausibly be entered
 // inside the horizon, sized to the CHALLENGE rules, and ranked on quality AND how soon it
@@ -15964,6 +16194,10 @@ app.get('/api/strategy-predictions', async (req, res) => {
       ],
     };
     predictionCache = { key, at: Date.now(), payload };
+    // Record what was predicted so accuracy can be measured later. One row per setup bar,
+    // so re-scanning the same setup every 45s does not inflate the count. Best-effort: a
+    // failure here must never break the page.
+    void persistPredictions(ranked, horizonMinutes).catch((e) => console.error('[Predictions] persist failed:', e.message));
     res.json(payload);
   } catch (error) { res.status(500).json({ error: error.message }); }
 });

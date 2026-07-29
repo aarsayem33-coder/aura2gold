@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot, ChevronDown, Building2 } from 'lucide-react';
+import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe, ScrollText, TrendingUp, TrendingDown, Mail, Radio, Search, Bot, ChevronDown, Building2, Brain } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import AutoTradeReport from './AutoTradeReport';
+import PredictionReport from './PredictionReport';
 import { fetchStrategyBrokers, fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence, fetchBrokerSpecs, fetchAutoTradeStatus } from '../mt5Api';
 import type { StrategyBrokerRow } from '../mt5Api';
 import type {
@@ -350,7 +351,7 @@ export default function StrategyLabReports() {
   const [range, setRange] = useState<RangeKey>('last7');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
-  const [tab, setTab] = useState<'forex' | 'ftt' | 'at' | 'confluence' | 'autotrade'>('forex');
+  const [tab, setTab] = useState<'forex' | 'ftt' | 'at' | 'confluence' | 'autotrade' | 'predictions'>('forex');
   const metric: Metric = tab === 'ftt' ? 'ftt' : tab === 'at' ? 'at' : 'forex';
   const [query, setQuery] = useState('');
   const [symbolFilter, setSymbolFilter] = useState('');   // '' = all symbols
@@ -405,6 +406,17 @@ export default function StrategyLabReports() {
     () => (range === 'custom' && customFrom && customTo && customFrom <= customTo) ? { from: customFrom, to: customTo } : rangeToParams(range),
     [range, customFrom, customTo],
   );
+
+  // The prediction report takes a day count; derive it from the same window control the
+  // rest of the page uses so the two never disagree.
+  const predictionDays = useMemo(() => {
+    const { from, to } = reportParams;
+    if (from && to) {
+      const d = Math.round((Date.parse(to) - Date.parse(from)) / 86400000) + 1;
+      return Math.max(1, Math.min(180, d));
+    }
+    return 30;
+  }, [reportParams]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -544,6 +556,7 @@ export default function StrategyLabReports() {
       <button type="button" onClick={() => setTab('at')} className={`rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'at' ? 'bg-teal-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`} title="As-traded: realistic result — entered at the live price when the signal fired, expiry at +duration.">As-traded</button>
       <button type="button" onClick={() => setTab('confluence')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'confluence' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}><Layers size={12} />Confluence</button>
       <button type="button" onClick={() => setTab('autotrade')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'autotrade' ? 'bg-emerald-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`} title="Real auto-trades placed through the EA bridge: profit, pips, R, and a day-by-day calendar."><Bot size={12} />Auto Trades</button>
+      <button type="button" onClick={() => setTab('predictions')} className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-bold transition ${tab === 'predictions' ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`} title="How the recorded predictions actually turned out: predicted vs matched, and whether they resolved inside the window they promised."><Brain size={12} />Predictions</button>
     </div>
   );
 
@@ -633,6 +646,7 @@ export default function StrategyLabReports() {
 
       {tab === 'confluence' && <ConfluenceTab strategies={strategies} rangeParams={reportParams} rangeLabel={perf?.window?.label || RANGE_OPTIONS.find((o) => o.key === range)?.label || ''} />}
       {tab === 'autotrade' && <AutoTradeReport from={reportParams.from} to={reportParams.to} broker={brokerFilter || undefined} />}
+      {tab === 'predictions' && <PredictionReport days={predictionDays} />}
 
       {tab !== 'confluence' && tab !== 'autotrade' && (<>
       {/* SEARCH — filters the strategy leaderboard, combos & per-session strategy lists */}

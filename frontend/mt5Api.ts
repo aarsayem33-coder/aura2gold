@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, createContext, useContext } from 'react';
 import type {
   StrategyPredictionResponse,
+  PredictionReportResponse,
   LiquidityChartResponse,
   LiquidityRankResponse,
   Alert,
@@ -1503,4 +1504,9 @@ export async function fetchLiquidityRanking(timeframe: string): Promise<Liquidit
 /** Every enabled strategy scored and ranked inside a 1-3 hour window. */
 export async function fetchStrategyPredictions(horizonHours = 3): Promise<StrategyPredictionResponse> {
   return fetchJson<StrategyPredictionResponse>(`/api/strategy-predictions?horizonHours=${encodeURIComponent(String(horizonHours))}`);
+}
+
+/** How the recorded predictions actually turned out. */
+export async function fetchPredictionReport(days = 30): Promise<PredictionReportResponse> {
+  return fetchJson<PredictionReportResponse>(`/api/reports/predictions?days=${encodeURIComponent(String(days))}`);
 }

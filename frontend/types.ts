@@ -2389,3 +2389,29 @@ export interface StrategyPredictionResponse {
   };
   count: number; predictions: StrategyPrediction[]; caveats: string[];
 }
+
+/** One grouped row in the prediction accuracy report. */
+export interface PredictionGroupRow {
+  key: string; predicted: number; settled: number; matched: number; missed: number;
+  expired: number; pending: number; ambiguous: number;
+  accuracy: number | null; avgScore: number | null;
+  predictedMinutes: number | null; actualMinutes: number | null;
+}
+export interface PredictionRecentRow {
+  id: string; strategy: string; symbol: string; timeframe: string; direction: string;
+  predictedAt: string | null; score: number | null; grade: string | null; rr: number | null;
+  entry: number | null; stopLoss: number | null; takeProfit1: number | null;
+  predictedMinutes: number | null; actualMinutes: number | null;
+  outcome: string; resolvedAt: string | null;
+  mfePips: number | null; maePips: number | null; challengeOk: boolean;
+}
+export interface PredictionReportResponse {
+  ok: boolean;
+  window: { days: number; from: string; to: string };
+  summary: PredictionGroupRow & {
+    timingHitRate: number | null; avgMfePips: number | null; avgMaePips: number | null;
+  };
+  byStrategy: PredictionGroupRow[]; bySymbol: PredictionGroupRow[];
+  byTimeframe: PredictionGroupRow[]; byGrade: PredictionGroupRow[]; byDirection: PredictionGroupRow[];
+  recent: PredictionRecentRow[]; note: string;
+}
