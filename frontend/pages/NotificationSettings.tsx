@@ -1122,6 +1122,46 @@ export default function NotificationSettings() {
                     <button key={ph} type="button" onClick={() => setChallenge({ phase: ph })} className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition-colors ${ar.challenge.phase === ph ? 'border-amber-500 bg-amber-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300'}`}>{ph === 'EVAL' ? 'Evaluation' : 'Funded'}</button>
                   ))}
                 </div>
+                {/* Cautions for the two settings that decide real money: risk % sizes every
+                    trade, cap % refuses it. They interact with the daily-loss and drawdown
+                    lines, so a value that looks fine alone can be unworkable together —
+                    and the failure is silent (trades just stop, or never size as intended). */}
+                {(() => {
+                  const ch = ar.challenge;
+                  const bal = Number(ch.initialBalance) || 0;
+                  const risk = Number(ch.riskPerTradePct) || 0;
+                  const cap = Number(ch.maxRiskPerTradePct) || 0;
+                  const daily = Number(ch.dailyLossPct) || 0;
+                  const dd = Number(ch.maxDrawdownPct) || 0;
+                  const $ = (pct: number) => `$${Math.round(bal * pct / 100).toLocaleString()}`;
+                  const cautions: { tone: 'red' | 'amber'; text: string }[] = [];
+                  if (cap > 0 && risk > cap) cautions.push({ tone: 'red',
+                    text: `Risk per trade (${risk}% = ${$(risk)}) is ABOVE your per-trade cap (${cap}% = ${$(cap)}). Sizing aims higher than the cap allows, so the guard refuses these trades and almost nothing will execute.` });
+                  if (daily > 0 && cap >= daily) cautions.push({ tone: 'red',
+                    text: `Per-trade cap (${cap}% = ${$(cap)}) is at or above your daily-loss limit (${daily}% = ${$(daily)}). A single losing trade can breach the day.` });
+                  else if (daily > 0 && cap > daily / 2) cautions.push({ tone: 'amber',
+                    text: `Per-trade cap (${$(cap)}) is more than half your daily-loss room (${$(daily)}). Two losers in a day would breach it.` });
+                  if (daily > 0 && risk > 0 && daily / risk < 3) cautions.push({ tone: 'amber',
+                    text: `At ${risk}% per trade you get about ${Math.floor(daily / risk)} losing trades before the daily limit. Under 3 leaves no room for a normal losing streak.` });
+                  if (dd > 0 && risk > 0 && dd / risk < 8) cautions.push({ tone: 'amber',
+                    text: `About ${Math.floor(dd / risk)} losers would hit max drawdown (${dd}% = ${$(dd)}). Most funded rules assume 10+.` });
+                  if (cap > 2) cautions.push({ tone: 'amber',
+                    text: `Per-trade cap of ${cap}% is above the 2% hard cap most funded programmes enforce.` });
+                  if (!cautions.length) return (
+                    <div className="mb-3 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-2.5 text-[11px] font-bold text-emerald-800">
+                      ✓ Risk {risk}% ({$(risk)}) sits under your {cap}% cap ({$(cap)}), and both leave room against the {daily}% daily limit and {dd}% drawdown.
+                    </div>
+                  );
+                  return (
+                    <div className="mb-3 space-y-1.5">
+                      {cautions.map((c, i) => (
+                        <div key={i} className={`rounded-xl border px-4 py-2.5 text-[11px] font-semibold leading-relaxed ${c.tone === 'red' ? 'border-rose-300 bg-rose-50 text-rose-900' : 'border-amber-300 bg-amber-50 text-amber-900'}`}>
+                          <span className="font-black">{c.tone === 'red' ? 'CAUTION' : 'Heads up'}</span> — {c.text}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   {([
                     ['Your per-trade risk %', 'riskPerTradePct', 0.05, 10, 0.05, 'What you actually risk. 0.5% keeps you far from every breach line.'],
@@ -1133,12 +1173,33 @@ export default function NotificationSettings() {
                     ['Min trading days', 'minTradingDays', 0, 60, 1, 'Hola 1-Step: 2 days.'],
                     ['Consistency %', 'consistencyPct', 0, 100, 1, 'No single day > this % of total profit.'],
                     ['Min R:R', 'minRR', 0, 10, 0.1, 'Phase 2 quality gate (stored now).'],
-                  ] as const).map(([label, key, min, max, step, note]) => (
-                    <div key={key}>
-                      <label className="block text-[11px] font-semibold text-slate-500" title={note}>{label}</label>
-                      <input type="number" min={min} max={max} step={step} value={(ar.challenge as Record<string, number>)[key]} onChange={(e) => setChallenge({ [key]: Number(e.target.value) } as Partial<NonNullable<typeof emailSettings.accountRisk>['challenge']>)} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
-                    </div>
-                  ))}
+                  ] as const).map(([label, key, min, max, step, note]) => {
+                    // The two risk dials get a live dollar figure under them and turn red
+                    // when they contradict each other — reading "1.2%" tells you nothing
+                    // about whether it is safe on this account size.
+                    const isRiskDial = key === 'riskPerTradePct' || key === 'maxRiskPerTradePct';
+                    const bal = Number(ar.challenge.initialBalance) || 0;
+                    const val = Number((ar.challenge as Record<string, number>)[key]) || 0;
+                    const conflict = isRiskDial && Number(ar.challenge.maxRiskPerTradePct) > 0
+                      && Number(ar.challenge.riskPerTradePct) > Number(ar.challenge.maxRiskPerTradePct);
+                    return (
+                      <div key={key}>
+                        <label className="block text-[11px] font-semibold text-slate-500" title={note}>{label}</label>
+                        <input
+                          type="number" min={min} max={max} step={step}
+                          value={(ar.challenge as Record<string, number>)[key]}
+                          onChange={(e) => setChallenge({ [key]: Number(e.target.value) } as Partial<NonNullable<typeof emailSettings.accountRisk>['challenge']>)}
+                          className={`mt-0.5 w-full rounded-lg border px-2.5 py-1.5 text-sm font-bold text-slate-800 ${conflict ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                        />
+                        {isRiskDial && bal > 0 && (
+                          <p className={`mt-0.5 text-[10px] font-bold ${conflict ? 'text-rose-600' : 'text-slate-400'}`}>
+                            = ${Math.round(bal * val / 100).toLocaleString()} per trade
+                            {key === 'maxRiskPerTradePct' ? ' (blocks above this)' : ' (sizes the lots)'}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
                   <div>
                     <label className="block text-[11px] font-semibold text-slate-500">Drawdown type</label>
                     <div className="mt-0.5 flex gap-1.5">
