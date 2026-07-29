@@ -2388,6 +2388,11 @@ export interface StrategyPredictionResponse {
     safePerTradeRisk: number; riskPerTradePct: number; maxRiskPerTradePct: number;
   };
   count: number; predictions: StrategyPrediction[]; caveats: string[];
+  /** Every scanned strategy, including those with nothing to show. */
+  coverage?: {
+    strategy: string; name: string; evaluated: number; signals: number;
+    kept: number; droppedHorizon: number; droppedNoTicket: number; droppedSizing: number;
+  }[];
 }
 
 /** One grouped row in the prediction accuracy report. */

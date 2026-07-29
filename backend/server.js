@@ -16067,6 +16067,16 @@ app.get('/api/strategy-predictions', async (req, res) => {
     const rows = [];
     let evaluated = 0;
     let outsideHorizon = 0;
+    // Per-strategy coverage. Without this, a strategy that simply has no setup right now is
+    // indistinguishable from one the scan skipped, and the page looks like it is ignoring
+    // most of the lab.
+    const coverage = new Map();
+    for (const id of strategies) {
+      coverage.set(id, {
+        strategy: id, name: STRATEGY_LAB_REGISTRY[id]?.name || id,
+        evaluated: 0, signals: 0, kept: 0, droppedHorizon: 0, droppedNoTicket: 0, droppedSizing: 0,
+      });
+    }
 
     // Strategy context normally comes from the in-memory ring buffer, which only holds what
     // has streamed since the last restart. A predictions page that is blank for the first
@@ -16126,22 +16136,28 @@ app.get('/api/strategy-predictions', async (req, res) => {
           let sig = null;
           try { sig = evaluateStrategy(stratId, ctx); } catch { continue; }
           evaluated += 1;
+          const cov = coverage.get(stratId);
+          if (cov) cov.evaluated += 1;
           if (!sig || !sig.decision) continue;
+          if (cov) cov.signals += 1;
           const entry = Number(sig.entry), stop = Number(sig.stopLoss), tp1 = Number(sig.takeProfit1);
-          if (![entry, stop, tp1].every(Number.isFinite)) continue;
+          if (![entry, stop, tp1].every(Number.isFinite)) { if (cov) cov.droppedNoTicket += 1; continue; }
 
           const timing = strategyLabLiveTiming(symbol, sig.decision, price, entry, stop, sig.meta || null);
           const eta = estimateEtaMinutes({ status: timing?.status, price, entry, atr, timeframe: tf });
           if (eta === null) continue;
           // The whole trade must fit the window: the wait for entry PLUS the travel to TP1.
           const resolve = estimateResolveMinutes({ entry, target: tp1, atr, timeframe: tf });
-          if (eta > horizonMinutes || (resolve !== null && eta + resolve > horizonMinutes)) { outsideHorizon += 1; continue; }
+          if (eta > horizonMinutes || (resolve !== null && eta + resolve > horizonMinutes)) {
+            outsideHorizon += 1; if (cov) cov.droppedHorizon += 1; continue;
+          }
 
           // Size to the CHALLENGE leg and run the same guard the auto-trader uses, so a
           // projection can never suggest more risk than the challenge rules permit.
           const ms = computeModeSizing(symbol, entry, stop, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
           const leg = ms?.challenge || ms?.normal || null;
-          if (!leg) continue;
+          if (!leg) { if (cov) cov.droppedSizing += 1; continue; }
+          if (cov) cov.kept += 1;
           const guard = ms?.challenge ? challengeSignalGuard(leg.lossAtStop, sig.grade, sig.riskRewardRatio) : { eligible: true, warnings: [] };
 
           rows.push({
@@ -16186,6 +16202,9 @@ app.get('/api/strategy-predictions', async (req, res) => {
         riskPerTradePct: ch.rules?.riskPerTradePct, maxRiskPerTradePct: ch.rules?.maxRiskPerTradePct,
       },
       count: ranked.length,
+      // Every scanned strategy, including the ones with nothing to show, so "no setup right
+      // now" is visibly different from "not scanned".
+      coverage: [...coverage.values()].sort((a, b) => b.kept - a.kept || a.name.localeCompare(b.name)),
       predictions: ranked.slice(0, 40),
       caveats: [
         'Projections of setups already present in the data — not forecasts of price.',

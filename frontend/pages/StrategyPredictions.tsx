@@ -24,6 +24,7 @@ export default function StrategyPredictions() {
   const [fOrderType, setFOrderType] = useState('');
   const [fMinScore, setFMinScore] = useState(0);
   const [fChallengeOnly, setFChallengeOnly] = useState(false);
+  const [showCoverage, setShowCoverage] = useState(false);
   const [data, setData] = useState<StrategyPredictionResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -268,6 +269,55 @@ export default function StrategyPredictions() {
           </div>
         )}
       </div>
+
+      {/* Strategy coverage. A strategy with no setup right now must be visibly different
+          from one that was never scanned, otherwise the page looks like it is only using a
+          handful of the lab. */}
+      {!!data?.coverage?.length && (
+        <div className="rounded-2xl border border-slate-200 bg-white shadow-card">
+          <button
+            type="button" onClick={() => setShowCoverage((v) => !v)}
+            className="flex w-full items-center justify-between px-5 py-3 text-left"
+          >
+            <span className="text-sm font-bold text-slate-900">
+              Strategy coverage
+              <span className="ml-2 text-[11px] font-semibold text-slate-500">
+                all {data.coverage.length} scanned · {data.coverage.filter((c) => c.kept > 0).length} have a setup right now
+              </span>
+            </span>
+            <span className="text-xs font-bold text-slate-400">{showCoverage ? 'hide' : 'show'}</span>
+          </button>
+          {showCoverage && (
+            <div className="overflow-x-auto border-t border-slate-100">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 text-[10px] uppercase tracking-wider text-slate-500">
+                  <tr>
+                    <th className="px-3 py-2">Strategy</th><th className="px-3 py-2">Evaluated</th>
+                    <th className="px-3 py-2">Signals</th><th className="px-3 py-2">Shown</th>
+                    <th className="px-3 py-2">Beyond window</th><th className="px-3 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {data.coverage.map((c) => (
+                    <tr key={c.strategy} className={c.kept ? '' : 'text-slate-400'}>
+                      <td className="px-3 py-1.5 font-bold">{c.name}</td>
+                      <td className="px-3 py-1.5">{c.evaluated}</td>
+                      <td className="px-3 py-1.5">{c.signals}</td>
+                      <td className="px-3 py-1.5 font-black text-slate-700">{c.kept}</td>
+                      <td className="px-3 py-1.5">{c.droppedHorizon || ''}</td>
+                      <td className="px-3 py-1.5">
+                        {c.kept ? <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-black text-emerald-700">ON THE BOARD</span>
+                          : c.signals ? <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-black text-amber-700">FIRED, OUTSIDE WINDOW</span>
+                            : <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-black text-slate-500">NO SETUP RIGHT NOW</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="rounded-2xl border border-slate-200 bg-slate-50 px-5 py-4">
         <h3 className="text-sm font-bold text-slate-900">How to read these</h3>
