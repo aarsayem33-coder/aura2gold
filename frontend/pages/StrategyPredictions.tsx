@@ -15,6 +15,15 @@ const digitsFor = (s: string) => {
 
 export default function StrategyPredictions() {
   const [horizon, setHorizon] = useState(3);
+  // Filters run on the already-fetched list rather than refetching: the scan is expensive
+  // (600 evaluations) and the result set is small, so narrowing it should be instant.
+  const [fStrategy, setFStrategy] = useState('');
+  const [fTimeframe, setFTimeframe] = useState('');
+  const [fSymbol, setFSymbol] = useState('');
+  const [fDirection, setFDirection] = useState('');
+  const [fOrderType, setFOrderType] = useState('');
+  const [fMinScore, setFMinScore] = useState(0);
+  const [fChallengeOnly, setFChallengeOnly] = useState(false);
   const [data, setData] = useState<StrategyPredictionResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -32,8 +41,34 @@ export default function StrategyPredictions() {
     return () => clearInterval(t);
   }, [load]);
 
-  const rows = data?.predictions || [];
+  const all = data?.predictions || [];
   const ch = data?.challenge;
+
+  // Options come from what is actually on the board, so you can never pick a combination
+  // that returns nothing by construction.
+  const uniq = (pick: (p: StrategyPrediction) => string) =>
+    Array.from(new Set(all.map(pick).filter(Boolean))).sort();
+  const strategyOptions = Array.from(
+    new Map(all.map((p) => [p.strategy, p.strategyName])).entries(),
+  ).sort((a, b) => a[1].localeCompare(b[1]));
+  const timeframeOptions = uniq((p) => p.timeframe);
+  const symbolOptions = uniq((p) => p.symbol);
+  const orderTypeOptions = uniq((p) => p.orderType);
+
+  const rows = all.filter((p) => (
+    (!fStrategy || p.strategy === fStrategy)
+    && (!fTimeframe || p.timeframe === fTimeframe)
+    && (!fSymbol || p.symbol === fSymbol)
+    && (!fDirection || p.direction === fDirection)
+    && (!fOrderType || p.orderType === fOrderType)
+    && (p.score ?? 0) >= fMinScore
+    && (!fChallengeOnly || p.challengeOk)
+  ));
+  const filtersActive = Boolean(fStrategy || fTimeframe || fSymbol || fDirection || fOrderType || fMinScore > 0 || fChallengeOnly);
+  const clearFilters = () => {
+    setFStrategy(''); setFTimeframe(''); setFSymbol(''); setFDirection(''); setFOrderType('');
+    setFMinScore(0); setFChallengeOnly(false);
+  };
 
   return (
     <div className="mx-auto max-w-[1600px] space-y-4 pb-24">
@@ -94,6 +129,71 @@ export default function StrategyPredictions() {
       </div>
 
       {err && <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-700">{err}</div>}
+
+      {/* Filters. Every control narrows the same fetched list. */}
+      <div className="flex flex-wrap items-end gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3">
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Strategy</span>
+          <select value={fStrategy} onChange={(e) => setFStrategy(e.target.value)}
+            className={`rounded-lg border px-2 py-1.5 text-xs font-bold ${fStrategy ? 'border-violet-400 bg-violet-50 text-violet-800' : 'border-slate-300 text-slate-700'}`}>
+            <option value="">All ({strategyOptions.length})</option>
+            {strategyOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Timeframe</span>
+          <select value={fTimeframe} onChange={(e) => setFTimeframe(e.target.value)}
+            className={`rounded-lg border px-2 py-1.5 text-xs font-bold ${fTimeframe ? 'border-violet-400 bg-violet-50 text-violet-800' : 'border-slate-300 text-slate-700'}`}>
+            <option value="">All</option>
+            {timeframeOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Symbol</span>
+          <select value={fSymbol} onChange={(e) => setFSymbol(e.target.value)}
+            className={`rounded-lg border px-2 py-1.5 text-xs font-bold ${fSymbol ? 'border-violet-400 bg-violet-50 text-violet-800' : 'border-slate-300 text-slate-700'}`}>
+            <option value="">All ({symbolOptions.length})</option>
+            {symbolOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Setup</span>
+          <select value={fDirection} onChange={(e) => setFDirection(e.target.value)}
+            className={`rounded-lg border px-2 py-1.5 text-xs font-bold ${fDirection ? 'border-violet-400 bg-violet-50 text-violet-800' : 'border-slate-300 text-slate-700'}`}>
+            <option value="">Buy &amp; sell</option>
+            <option value="BUY">Buy only</option>
+            <option value="SELL">Sell only</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Order</span>
+          <select value={fOrderType} onChange={(e) => setFOrderType(e.target.value)}
+            className={`rounded-lg border px-2 py-1.5 text-xs font-bold ${fOrderType ? 'border-violet-400 bg-violet-50 text-violet-800' : 'border-slate-300 text-slate-700'}`}>
+            <option value="">All</option>
+            {orderTypeOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Min score {fMinScore || ''}</span>
+          <div className="flex items-center gap-1.5">
+            <input type="range" min={0} max={100} step={5} value={fMinScore}
+              onChange={(e) => setFMinScore(Number(e.target.value))} className="w-28 accent-violet-600" />
+            <span className={`w-8 text-xs font-black ${fMinScore ? 'text-violet-700' : 'text-slate-400'}`}>{fMinScore || 'any'}</span>
+          </div>
+        </label>
+        <button type="button" onClick={() => setFChallengeOnly((v) => !v)}
+          className={`rounded-lg border px-2.5 py-1.5 text-xs font-bold ${fChallengeOnly ? 'border-emerald-400 bg-emerald-50 text-emerald-800' : 'border-slate-300 text-slate-600 hover:bg-slate-50'}`}>
+          Challenge-compliant only
+        </button>
+        <span className="ml-auto flex items-center gap-2 text-[11px] font-bold text-slate-500">
+          {rows.length} of {all.length}
+          {filtersActive && (
+            <button type="button" onClick={clearFilters} className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-bold text-slate-600 hover:bg-slate-50">
+              Clear
+            </button>
+          )}
+        </span>
+      </div>
 
       <div className="space-y-2">
         {rows.map((p: StrategyPrediction, i: number) => {
@@ -157,7 +257,9 @@ export default function StrategyPredictions() {
 
         {!rows.length && !loading && (
           <div className="rounded-2xl border border-slate-200 bg-white px-5 py-10 text-center text-sm font-semibold text-slate-400">
-            No setup currently fits a {horizon}-hour window. {data ? `${data.scanned.evaluated} evaluated.` : ''}
+            {all.length
+              ? <>All {all.length} setups were filtered out. <button type="button" onClick={clearFilters} className="underline">Clear the filters</button> to see them.</>
+              : <>No setup currently fits a {horizon}-hour window. {data ? `${data.scanned.evaluated} evaluated.` : ''}</>}
           </div>
         )}
         {loading && !rows.length && (
