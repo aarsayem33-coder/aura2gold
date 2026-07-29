@@ -2338,3 +2338,19 @@ export interface LiquidityChartResponse {
   draw?: { primary: { price: number; label: string; pool: string; scope: string } | null; alternative: { price: number; label: string; pool: string; scope: string } | null; basis: string; invalidation: string };
   caveats?: string[];
 }
+
+/** One symbol's row in the liquidity ranking drawer. */
+export interface LiquidityRankRow {
+  symbol: string; ok: boolean; note?: string;
+  price?: number; atr?: number; bias?: string | null; events?: string[];
+  score?: number; grade?: string | null; direction?: 'BUY' | 'SELL' | null;
+  rr?: number | null;
+  target?: { price: number; label: string; pool: string; scope: string } | null;
+  invalidation?: number | null;
+  reasons?: string[]; blockers?: string[];
+  freshCount?: number; sweptCount?: number;
+}
+export interface LiquidityRankResponse {
+  ok: boolean; timeframe: string; generatedAt: string; symbols: number;
+  rows: LiquidityRankRow[]; cached?: boolean;
+}

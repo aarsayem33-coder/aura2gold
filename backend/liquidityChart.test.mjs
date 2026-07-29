@@ -179,3 +179,91 @@ test('missing daily/weekly candles are declared, not silently ignored', () => {
   assert.ok(r.caveats.some((c) => /daily/i.test(c)), 'must say PDH/PDL are unavailable');
   assert.ok(r.caveats.some((c) => /weekly/i.test(c)), 'must say PWH/PWL are unavailable');
 });
+
+// ── setup scoring / ranking ──
+import { scoreLiquiditySetup } from './liquidityChart.js';
+
+const analysis = (over = {}) => ({
+  ok: true, price: 100, atr: 2,
+  structure: { bias: 'RANGING', swings: [], events: [] },
+  levels: [],
+  ...over,
+});
+const lvl = (o) => ({
+  type: 'MAJOR_SWING_LOW', label: 'Swing low', price: 95, side: 'below', status: 'FRESH',
+  strength: 2, scope: 'INTERNAL', pool: 'SSL', inducement: false, sweptAtMs: 1, distancePips: 10, ...o,
+});
+
+test('direction comes from the side whose liquidity was taken', () => {
+  const buy = scoreLiquiditySetup(analysis({ levels: [
+    lvl({ price: 96, side: 'below', pool: 'SSL', status: 'SWEPT', sweptAtMs: 200 }),
+    lvl({ price: 112, side: 'above', pool: 'BSL', status: 'FRESH', scope: 'EXTERNAL' }),
+  ] }));
+  assert.equal(buy.direction, 'BUY', 'sell-side taken -> look up');
+
+  const sell = scoreLiquiditySetup(analysis({ levels: [
+    lvl({ price: 104, side: 'above', pool: 'BSL', status: 'SWEPT', sweptAtMs: 200 }),
+    lvl({ price: 88, side: 'below', pool: 'SSL', status: 'FRESH', scope: 'EXTERNAL' }),
+  ] }));
+  assert.equal(sell.direction, 'SELL', 'buy-side taken -> look down');
+});
+
+test('no suggestion without a fresh pool to target', () => {
+  const r = scoreLiquiditySetup(analysis({ levels: [
+    lvl({ price: 96, side: 'below', status: 'SWEPT', sweptAtMs: 200 }),
+  ] }));
+  assert.equal(r.target, null);
+  assert.ok(r.blockers.some((b) => /no fresh pool/.test(b)));
+});
+
+test('no suggestion when nothing has been swept', () => {
+  const r = scoreLiquiditySetup(analysis({ levels: [lvl({ status: 'FRESH' })] }));
+  assert.equal(r.direction, null);
+  assert.ok(r.blockers.some((b) => /no liquidity has been taken/.test(b)));
+});
+
+test('structure agreement raises the score, disagreement lowers it', () => {
+  const base = { levels: [
+    lvl({ price: 96, side: 'below', pool: 'SSL', status: 'SWEPT', sweptAtMs: 200, strength: 5 }),
+    lvl({ price: 112, side: 'above', pool: 'BSL', status: 'FRESH', scope: 'EXTERNAL' }),
+  ] };
+  const withTrend = scoreLiquiditySetup(analysis({ ...base, structure: { bias: 'BULLISH', events: [] } }));
+  const against = scoreLiquiditySetup(analysis({ ...base, structure: { bias: 'BEARISH', events: [] } }));
+  assert.ok(withTrend.score > against.score, `${withTrend.score} should beat ${against.score}`);
+  assert.ok(against.blockers.some((b) => /against the direction/.test(b)));
+});
+
+test('a target too close to be worth it is called out, not hidden', () => {
+  const r = scoreLiquiditySetup(analysis({ levels: [
+    lvl({ price: 96, side: 'below', pool: 'SSL', status: 'SWEPT', sweptAtMs: 200 }),
+    lvl({ price: 101, side: 'above', pool: 'BSL', status: 'FRESH' }),   // 1R vs 4 risk
+  ] }), { minRR: 1.5 });
+  assert.ok(r.rr !== null && r.rr < 1.5);
+  assert.ok(r.blockers.some((b) => /below the .*R floor/.test(b)));
+});
+
+test('score stays inside 0-100 and always carries a grade', () => {
+  const r = scoreLiquiditySetup(analysis({ levels: [
+    lvl({ price: 99, side: 'below', pool: 'SSL', status: 'SWEPT', sweptAtMs: 200, strength: 5 }),
+    lvl({ price: 140, side: 'above', pool: 'BSL', status: 'FRESH', scope: 'EXTERNAL' }),
+  ], structure: { bias: 'BULLISH', events: [{ type: 'CHoCH', direction: 'UP' }] } }));
+  assert.ok(r.score >= 0 && r.score <= 100);
+  assert.ok(['A+', 'A', 'B', 'C'].includes(r.grade));
+});
+
+test('invalidation is the level that was swept', () => {
+  const r = scoreLiquiditySetup(analysis({ levels: [
+    lvl({ price: 96, side: 'below', pool: 'SSL', status: 'SWEPT', sweptAtMs: 200 }),
+    lvl({ price: 112, side: 'above', pool: 'BSL', status: 'FRESH', scope: 'EXTERNAL' }),
+  ] }));
+  assert.equal(r.invalidation, 96, 'back through the swept level kills the read');
+});
+
+test('an invalidation a few ticks from price is refused, not quoted as a huge R', () => {
+  const r = scoreLiquiditySetup(analysis({ price: 100, atr: 2, levels: [
+    lvl({ price: 99.9, side: 'below', pool: 'SSL', status: 'SWEPT', sweptAtMs: 200 }),  // 0.05x ATR away
+    lvl({ price: 130, side: 'above', pool: 'BSL', status: 'FRESH', scope: 'EXTERNAL' }),
+  ] }));
+  assert.equal(r.rr, null, 'must not quote an R off a non-existent stop');
+  assert.ok(r.blockers.some((b) => /too close to be a usable stop/.test(b)));
+});

@@ -20,7 +20,7 @@ import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
-import { buildLiquidityChart } from './liquidityChart.js';
+import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
@@ -15818,6 +15818,64 @@ app.get('/api/liquidity-chart', async (req, res) => {
       dailyCandles: dailyCandles && dailyCandles.length >= 2 ? dailyCandles : null,
     });
     res.json({ ok: true, symbol, timeframe: tf, bars: candles.length, generatedAt: new Date().toISOString(), ...out });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/liquidity-chart/ranking?timeframe= — the same read across every live symbol,
+// scored and ranked so you can see which instrument is best positioned right now.
+// Analysis only: no entry timing, no spread/margin checks, no orders. Cached briefly
+// because it walks 500 bars per symbol.
+let liquidityRankCache = null;
+const LIQUIDITY_RANK_TTL_MS = 30000;
+app.get('/api/liquidity-chart/ranking', async (req, res) => {
+  try {
+    const tf = String(req.query.timeframe || 'M15').toUpperCase();
+    const key = tf;
+    if (liquidityRankCache && liquidityRankCache.key === key && Date.now() - liquidityRankCache.at < LIQUIDITY_RANK_TTL_MS) {
+      return res.json({ ...liquidityRankCache.payload, cached: true });
+    }
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    // Only the CONNECTED broker's symbols — ranking an instrument this account cannot
+    // trade would be worse than useless.
+    const symbols = getCuratedSymbols(getMt5Status().symbols || []);
+    const read = async (symbol, series, want) => {
+      const [rows] = await pool.query(
+        'SELECT candle_time, open_price, high, low, close_price, volume FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?',
+        [symbol.toUpperCase(), series, want],
+      );
+      return rows.reverse().map((r) => ({
+        time: new Date(r.candle_time).toISOString(),
+        open: Number(r.open_price), high: Number(r.high),
+        low: Number(r.low), close: Number(r.close_price), volume: Number(r.volume) || 0,
+      }));
+    };
+    const rows = [];
+    for (const symbol of symbols) {
+      try {
+        const candles = await read(symbol, tf, 500);
+        if (candles.length < 30) { rows.push({ symbol, ok: false, note: `only ${candles.length} bars` }); continue; }
+        const daily = await read(symbol, 'D1', 20);
+        const analysis = buildLiquidityChart(candles, { symbol, dailyCandles: daily.length >= 2 ? daily : null });
+        const setup = scoreLiquiditySetup(analysis);
+        rows.push({
+          symbol, ok: true,
+          price: analysis.price, atr: analysis.atr,
+          bias: analysis.structure?.bias || null,
+          events: (analysis.structure?.events || []).map((e) => `${e.type} ${e.direction}`),
+          score: setup.score, grade: setup.grade || null, direction: setup.direction,
+          rr: setup.rr, target: setup.target, invalidation: setup.invalidation,
+          reasons: setup.reasons, blockers: setup.blockers,
+          freshCount: (analysis.levels || []).filter((l) => l.status === 'FRESH').length,
+          sweptCount: (analysis.levels || []).filter((l) => l.status === 'SWEPT').length,
+        });
+      } catch (e) { rows.push({ symbol, ok: false, note: e.message }); }
+    }
+    // Tradable reads first, best score first; unusable symbols sink to the bottom.
+    rows.sort((a, b) => (Number(b.ok && b.direction) - Number(a.ok && a.direction)) || ((b.score || 0) - (a.score || 0)));
+    const payload = { ok: true, timeframe: tf, generatedAt: new Date().toISOString(), symbols: rows.length, rows };
+    liquidityRankCache = { key, at: Date.now(), payload };
+    res.json(payload);
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 

@@ -138,6 +138,100 @@ export function analyseStructure(candles) {
 }
 
 /**
+ * Score one symbol's liquidity picture as a potential trade, and state a direction.
+ *
+ * The premise is the standard one: liquidity taken on one side is fuel for a move toward
+ * the opposite side. A sweep BELOW price (sell-side stops run) with price reclaiming back
+ * up points at the buy-side pool above, and vice versa. So the direction comes from which
+ * side was most recently swept, then agreement with structure and a real target either
+ * raise or lower confidence.
+ *
+ * This ranks READS, not signals. It has no entry timing, no spread check and no risk sizing
+ * — that is what the strategy engines and the auto-trader do. Returned as a scenario.
+ */
+export function scoreLiquiditySetup(analysis, { minRR = 1.5, minRiskAtr = 0.3 } = {}) {
+  const out = { score: 0, direction: null, rr: null, target: null, invalidation: null, reasons: [], blockers: [] };
+  if (!analysis || !analysis.ok) { out.blockers.push('no analysis'); return out; }
+  const price = n(analysis.price);
+  const atr = n(analysis.atr);
+  const levels = analysis.levels || [];
+  if (!(price > 0) || !(atr > 0) || !levels.length) { out.blockers.push('not enough data'); return out; }
+
+  // Most recently swept pool decides the working direction.
+  const swept = levels.filter((l) => l.status === 'SWEPT');
+  const sweptBelow = swept.filter((l) => l.side === 'below').sort((a, b) => (b.sweptAtMs || 0) - (a.sweptAtMs || 0))[0] || null;
+  const sweptAbove = swept.filter((l) => l.side === 'above').sort((a, b) => (b.sweptAtMs || 0) - (a.sweptAtMs || 0))[0] || null;
+  const newest = [sweptBelow, sweptAbove].filter(Boolean).sort((a, b) => (b.sweptAtMs || 0) - (a.sweptAtMs || 0))[0] || null;
+  if (!newest) { out.blockers.push('no liquidity has been taken recently'); return out; }
+
+  const direction = newest.side === 'below' ? 'BUY' : 'SELL';
+  out.direction = direction;
+  out.reasons.push(`${newest.pool} taken at ${newest.price} (${newest.label}) — price reclaimed back inside`);
+
+  // Target: nearest FRESH pool on the opposite side. Without one there is nothing to aim at.
+  const wantSide = direction === 'BUY' ? 'above' : 'below';
+  const fresh = levels
+    .filter((l) => l.side === wantSide && l.status === 'FRESH' && (direction === 'BUY' ? l.price > price : l.price < price))
+    .sort((a, b) => (direction === 'BUY' ? a.price - b.price : b.price - a.price));
+  const target = fresh.find((l) => l.scope === 'EXTERNAL') || fresh[0] || null;
+  if (!target) { out.blockers.push('no fresh pool to target on the opposite side'); return out; }
+  out.target = { price: target.price, label: target.label, pool: target.pool, scope: target.scope };
+
+  // Invalidation: beyond the swept level — if price goes back through it, the read is wrong.
+  const invalidation = newest.price;
+  out.invalidation = invalidation;
+  const risk = Math.abs(price - invalidation);
+  const reward = Math.abs(target.price - price);
+  out.rr = risk > 0 ? Math.round((reward / risk) * 100) / 100 : null;
+  // A stop a few ticks from spot is not a stop. When price has barely travelled from the
+  // level it swept, the arithmetic produces enormous R multiples (a live scan showed 243R)
+  // that read as the best opportunity on the board while actually meaning "the setup has
+  // not moved yet". Require the invalidation to sit a real distance away before quoting R.
+  if (risk < atr * minRiskAtr) {
+    out.blockers.push(`invalidation is only ${(risk / atr).toFixed(2)}x ATR from price — too close to be a usable stop`);
+    out.rr = null;
+  }
+
+  let score = 40;
+  // Structure agreeing with the direction is the single strongest confirmation.
+  const bias = analysis.structure?.bias;
+  if ((direction === 'BUY' && bias === 'BULLISH') || (direction === 'SELL' && bias === 'BEARISH')) {
+    score += 18; out.reasons.push(`structure reads ${bias}, agreeing with the direction`);
+  } else if (bias === 'RANGING') {
+    score += 4; out.reasons.push('structure is ranging — no help either way');
+  } else {
+    score -= 12; out.blockers.push(`structure reads ${bias}, against the direction`);
+  }
+  // A CHoCH in the same direction is the classic post-sweep confirmation.
+  const choch = (analysis.structure?.events || []).find((e) => e.type === 'CHoCH'
+    && ((direction === 'BUY' && e.direction === 'UP') || (direction === 'SELL' && e.direction === 'DOWN')));
+  if (choch) { score += 14; out.reasons.push(`CHoCH ${choch.direction} confirms the shift`); }
+
+  // Quality of what was taken: PDH/PDL and equal highs/lows are real pools, a lone swing is thin.
+  if (newest.strength >= 5) { score += 12; out.reasons.push('the level taken was a top-tier pool (PDH/PDL or session extreme)'); }
+  else if (newest.strength >= 4) { score += 8; out.reasons.push('the level taken was stacked (equal highs/lows)'); }
+
+  // Room to the target, and whether it is worth taking.
+  if (out.rr !== null) {
+    if (out.rr >= 3) { score += 14; out.reasons.push(`${out.rr}R to the target pool`); }
+    else if (out.rr >= minRR) { score += 8; out.reasons.push(`${out.rr}R to the target pool`); }
+    else { score -= 15; out.blockers.push(`only ${out.rr}R to the target — below the ${minRR}R floor`); }
+  } else {
+    score -= 20;   // no quotable R means the read is not actionable yet
+  }
+  if (target.scope === 'EXTERNAL') { score += 6; out.reasons.push('target is external liquidity (a real draw)'); }
+  // An untaken inducement between price and the target usually gets run first.
+  const inducement = levels.find((l) => l.inducement && l.side === wantSide && l.status === 'FRESH');
+  if (inducement) { score -= 6; out.blockers.push(`inducement at ${inducement.price} sits in the way and will likely be run first`); }
+  // A target price cannot reach is not a target.
+  if (reward / atr > 12) { score -= 8; out.blockers.push('target is more than 12x ATR away'); }
+
+  out.score = Math.max(0, Math.min(100, Math.round(score)));
+  out.grade = out.score >= 80 ? 'A+' : out.score >= 70 ? 'A' : out.score >= 55 ? 'B' : 'C';
+  return out;
+}
+
+/**
  * Full analysis for one symbol/timeframe. Pure: candles in, analysis out.
  *
  * External vs internal is decided by the current dealing range — the most recent confirmed

@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Droplets, Loader2, RefreshCw, Wifi, WifiOff, ArrowUp, ArrowDown } from 'lucide-react';
+import { Droplets, Loader2, RefreshCw, Wifi, WifiOff, ArrowUp, ArrowDown, ListOrdered, X } from 'lucide-react';
 import Mt5CandlestickChart from '../components/Mt5CandlestickChart';
-import { fetchMt5Candles, fetchLiquidityChart, useMt5Stream } from '../mt5Api';
+import { fetchMt5Candles, fetchLiquidityChart, fetchLiquidityRanking, useMt5Stream } from '../mt5Api';
 import { mergeCandlesByTime } from '../lib/candles';
-import type { Mt5Candle, LiquidityChartResponse, LiquidityLevel } from '../types';
+import type { Mt5Candle, LiquidityChartResponse, LiquidityLevel, LiquidityRankRow } from '../types';
 
 const TF_OPTIONS = ['M5', 'M15', 'M30', 'H1', 'H4'];
 const BAR_COUNT = 500;
@@ -42,6 +42,25 @@ export default function LiquidityChart() {
   const [showOn, setShowOn] = useState<Record<string, boolean>>({
     FRESH: true, TESTED: true, REJECTED: true, SWEPT: true, BROKEN_ACCEPTED: false, INVALIDATED: false,
   });
+
+  // Ranking drawer: the same read scored across every live symbol.
+  const [rankOpen, setRankOpen] = useState(false);
+  const [rank, setRank] = useState<LiquidityRankRow[]>([]);
+  const [rankLoading, setRankLoading] = useState(false);
+  const [rankAt, setRankAt] = useState<string | null>(null);
+
+  const loadRanking = useCallback(async () => {
+    setRankLoading(true);
+    try {
+      const r = await fetchLiquidityRanking(timeframe);
+      setRank(r.rows || []);
+      setRankAt(r.generatedAt || null);
+    } catch { /* drawer is best-effort */ }
+    finally { setRankLoading(false); }
+  }, [timeframe]);
+
+  // Only scan when the drawer is actually open — it walks 500 bars per symbol.
+  useEffect(() => { if (rankOpen) void loadRanking(); }, [rankOpen, loadRanking]);
 
   const loadedKeyRef = useRef('');
   const reqRef = useRef(0);
@@ -126,6 +145,12 @@ export default function LiquidityChart() {
         </div>
         <div className="flex items-center gap-2">
           {feedBadge}
+          <button
+            onClick={() => setRankOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-bold text-white hover:bg-sky-700"
+          >
+            <ListOrdered size={15} />Rank symbols
+          </button>
           <button onClick={() => load(true)} className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-bold text-slate-600 hover:bg-slate-50">
             {loading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}Refresh
           </button>
@@ -272,6 +297,107 @@ export default function LiquidityChart() {
           </p>
         </div>
       </div>
+
+      {/* Ranking drawer - the same liquidity read scored across every live symbol, so you
+          can see which instrument is best positioned before committing to one chart. */}
+      {rankOpen && (
+        <>
+          <div className="fixed inset-0 z-40 bg-slate-900/30" onClick={() => setRankOpen(false)} />
+          <aside className="fixed right-0 top-0 z-50 flex h-full w-full max-w-3xl flex-col border-l border-slate-200 bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+              <div>
+                <h2 className="flex items-center gap-2 text-base font-black text-slate-900">
+                  <ListOrdered size={18} className="text-sky-600" />Best-positioned symbols
+                </h2>
+                <p className="text-[11px] font-medium text-slate-500">
+                  {timeframe} - scored on which side of liquidity was taken and what is left to target
+                  {rankAt ? ` - ${new Date(rankAt).toLocaleTimeString()}` : ''}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={() => void loadRanking()} className="rounded-lg border border-slate-300 px-2.5 py-1 text-xs font-bold text-slate-600 hover:bg-slate-50">
+                  {rankLoading ? <Loader2 size={13} className="animate-spin" /> : 'Rescan'}
+                </button>
+                <button onClick={() => setRankOpen(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"><X size={18} /></button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4">
+              {rankLoading && !rank.length && (
+                <div className="flex h-40 items-center justify-center text-sm font-semibold text-slate-400">
+                  <Loader2 className="mr-2 animate-spin" size={16} />Scanning every symbol...
+                </div>
+              )}
+              <div className="space-y-2">
+                {rank.map((r, i) => {
+                  const tradable = r.ok && r.direction && r.rr !== null && r.rr !== undefined;
+                  const buy = r.direction === 'BUY';
+                  const d = digitsFor(r.symbol, r.price ?? null);
+                  const fmt = (v?: number | null) => (v === null || v === undefined ? '-' : Number(v).toFixed(d));
+                  return (
+                    <div
+                      key={r.symbol}
+                      className={`rounded-xl border px-4 py-3 ${tradable ? 'border-slate-200 bg-white' : 'border-slate-200 bg-slate-50 opacity-70'}`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-black text-slate-400">#{i + 1}</span>
+                          <button
+                            onClick={() => { setSymbol(r.symbol); setRankOpen(false); }}
+                            className="text-sm font-black text-slate-900 underline decoration-dotted hover:text-sky-700"
+                            title="Open this symbol on the chart"
+                          >
+                            {r.symbol}
+                          </button>
+                          {r.direction && (
+                            <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black text-white ${buy ? 'bg-emerald-600' : 'bg-rose-600'}`}>
+                              {buy ? <ArrowUp size={10} /> : <ArrowDown size={10} />}{r.direction}
+                            </span>
+                          )}
+                          {r.grade && <span className="rounded bg-slate-900 px-1.5 py-0.5 text-[10px] font-black text-white">{r.grade}</span>}
+                          {r.bias && <span className="text-[10px] font-bold text-slate-400">{r.bias}</span>}
+                        </div>
+                        <div className="flex items-center gap-3 text-[11px] font-bold">
+                          <span className="text-slate-400">score <span className="text-slate-800">{r.score ?? '-'}</span></span>
+                          <span className="text-slate-400">R:R <span className={r.rr ? 'text-slate-800' : 'text-rose-500'}>{r.rr ?? 'n/a'}</span></span>
+                        </div>
+                      </div>
+
+                      {r.ok && (
+                        <div className="mt-1.5 grid gap-1 text-[11px] sm:grid-cols-3">
+                          <span className="text-slate-500">price <span className="font-mono font-bold text-slate-700">{fmt(r.price)}</span></span>
+                          <span className="text-slate-500">target <span className="font-mono font-bold text-emerald-700">{fmt(r.target?.price)}</span> {r.target?.pool || ''}</span>
+                          <span className="text-slate-500">invalid <span className="font-mono font-bold text-rose-600">{fmt(r.invalidation)}</span></span>
+                        </div>
+                      )}
+
+                      {!!r.reasons?.length && (
+                        <ul className="mt-1.5 list-disc space-y-0.5 pl-4 text-[11px] font-medium text-slate-600">
+                          {r.reasons.slice(0, 3).map((x, k) => <li key={k}>{x}</li>)}
+                        </ul>
+                      )}
+                      {!!r.blockers?.length && (
+                        <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[11px] font-medium text-amber-700">
+                          {r.blockers.slice(0, 2).map((x, k) => <li key={k}>{x}</li>)}
+                        </ul>
+                      )}
+                      {!r.ok && <p className="mt-1 text-[11px] font-medium text-slate-400">{r.note}</p>}
+                    </div>
+                  );
+                })}
+                {!rankLoading && !rank.length && (
+                  <p className="py-8 text-center text-sm text-slate-400">No symbols returned a liquidity read.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="border-t border-slate-200 bg-slate-50 px-5 py-3 text-[11px] font-medium text-slate-500">
+              Direction follows the side whose liquidity was most recently taken - stops run below point up, above point down.
+              These are reads, not signals: no entry timing, no spread or margin check, no position sizing.
+            </div>
+          </aside>
+        </>
+      )}
     </div>
   );
 }
