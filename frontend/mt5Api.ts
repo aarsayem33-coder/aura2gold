@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState, createContext, useContext } from 'react';
 import type {
+  StrategyPredictionResponse,
   LiquidityChartResponse,
   LiquidityRankResponse,
   Alert,
@@ -1497,4 +1498,9 @@ export async function fetchLiquidityChart(symbol: string, timeframe: string): Pr
 /** Liquidity read scored across every live symbol, ranked best-positioned first. */
 export async function fetchLiquidityRanking(timeframe: string): Promise<LiquidityRankResponse> {
   return fetchJson<LiquidityRankResponse>(`/api/liquidity-chart/ranking?timeframe=${encodeURIComponent(timeframe)}`);
+}
+
+/** Every enabled strategy scored and ranked inside a 1-3 hour window. */
+export async function fetchStrategyPredictions(horizonHours = 3): Promise<StrategyPredictionResponse> {
+  return fetchJson<StrategyPredictionResponse>(`/api/strategy-predictions?horizonHours=${encodeURIComponent(String(horizonHours))}`);
 }

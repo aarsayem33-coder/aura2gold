@@ -20,7 +20,9 @@ import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
+import { atr14 as liquidityAtr14 } from './liquidityEngine.js';
 import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
+import { estimateEtaMinutes, estimateResolveMinutes, rankPredictions } from './strategyPredictions.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
@@ -15812,6 +15814,160 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
 });
 
 // GET /api/strategy-lab/performance?days=  |  ?preset=today|yesterday|last7
+// GET /api/strategy-predictions?horizonHours=3 — every enabled strategy evaluated live
+// across the connected broker's symbols, kept only when the setup can plausibly be entered
+// inside the horizon, sized to the CHALLENGE rules, and ranked on quality AND how soon it
+// can be taken.
+//
+// These are projections of setups that already exist in the data, not forecasts of price.
+// Nothing here places an order or sends an email.
+const PREDICTION_TFS = ['M5', 'M15', 'M30', 'H1'];
+let predictionCache = null;
+const PREDICTION_TTL_MS = 45000;
+app.get('/api/strategy-predictions', async (req, res) => {
+  try {
+    const horizonHours = Math.max(1, Math.min(6, Number(req.query.horizonHours) || 3));
+    const horizonMinutes = Math.round(horizonHours * 60);
+    const key = String(horizonMinutes);
+    if (predictionCache && predictionCache.key === key && Date.now() - predictionCache.at < PREDICTION_TTL_MS) {
+      return res.json({ ...predictionCache.payload, cached: true });
+    }
+    const symbols = getCuratedSymbols(getMt5Status().symbols || []);
+    const strategies = enabledStrategyIds().filter((id) => STRATEGY_LAB_REGISTRY[id] && !STRATEGY_LAB_REGISTRY[id].measureFixedTime);
+    const rows = [];
+    let evaluated = 0;
+    let outsideHorizon = 0;
+
+    // Strategy context normally comes from the in-memory ring buffer, which only holds what
+    // has streamed since the last restart. A predictions page that is blank for the first
+    // hour after every restart is useless, so read the series from the database once per
+    // symbol and build the contexts from that. Falls back to the live buffer if the DB is
+    // unavailable, so behaviour never gets worse than before.
+    const dbPool = await initializeDatabase();
+    const SERIES = ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+    const seriesFor = new Map();          // symbol -> { tf: candles[] }
+    if (dbPool) {
+      for (const symbol of symbols) {
+        const bySeries = {};
+        for (const series of SERIES) {
+          try {
+            const [cr] = await dbPool.query(
+              'SELECT candle_time, open_price, high, low, close_price, volume FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?',
+              [symbol.toUpperCase(), series, series === 'D1' ? 30 : 400],
+            );
+            bySeries[series] = cr.reverse().map((r) => ({
+              time: new Date(r.candle_time).toISOString(),
+              open: Number(r.open_price), high: Number(r.high),
+              low: Number(r.low), close: Number(r.close_price), volume: Number(r.volume) || 0,
+            }));
+          } catch { bySeries[series] = []; }
+        }
+        seriesFor.set(symbol, bySeries);
+      }
+    }
+    const contextFor = (symbol, tf) => {
+      const bySeries = seriesFor.get(symbol);
+      if (!bySeries) return buildStrategyContext(symbol, tf);
+      const candles = closedBarsOnly(bySeries[tf] || [], tf);
+      if (!candles || candles.length < 60) return null;
+      const htfTf = NEXT_HIGHER_TF[tf] || null;
+      const ltfTf = NEXT_LOWER_TF[tf] || null;
+      return {
+        symbol, timeframe: tf, candles, candlesIncludeFormingBar: false, pip: pipSizeForSymbol(symbol),
+        h4Trend: getTimeframeTrend(closedBarsOnly(bySeries.H4 || [], 'H4')),
+        h1Trend: getTimeframeTrend(closedBarsOnly(bySeries.H1 || [], 'H1')),
+        dailyCandles: bySeries.D1 || [],
+        htfTimeframe: htfTf, htfCandles: htfTf ? closedBarsOnly(bySeries[htfTf] || [], htfTf) : null,
+        ltfTimeframe: ltfTf, ltfCandles: ltfTf ? closedBarsOnly(bySeries[ltfTf] || [], ltfTf) : null,
+      };
+    };
+
+    for (const tf of PREDICTION_TFS) {
+      for (const symbol of symbols) {
+        const ctx = contextFor(symbol, tf);
+        if (!ctx) continue;
+        const price = Number(ctx.candles?.[ctx.candles.length - 1]?.close);
+        // buildStrategyContext does not carry an ATR, so derive it from the same candles.
+        // Without it neither the entry ETA nor the time-to-target can be estimated, and the
+        // horizon filter silently degrades to "let everything through".
+        const atr = Number(liquidityAtr14(ctx.candles)) || null;
+        for (const stratId of strategies) {
+          if (!strategyTimeframes(stratId).includes(tf)) continue;
+          let sig = null;
+          try { sig = evaluateStrategy(stratId, ctx); } catch { continue; }
+          evaluated += 1;
+          if (!sig || !sig.decision) continue;
+          const entry = Number(sig.entry), stop = Number(sig.stopLoss), tp1 = Number(sig.takeProfit1);
+          if (![entry, stop, tp1].every(Number.isFinite)) continue;
+
+          const timing = strategyLabLiveTiming(symbol, sig.decision, price, entry, stop, sig.meta || null);
+          const eta = estimateEtaMinutes({ status: timing?.status, price, entry, atr, timeframe: tf });
+          if (eta === null) continue;
+          // The whole trade must fit the window: the wait for entry PLUS the travel to TP1.
+          const resolve = estimateResolveMinutes({ entry, target: tp1, atr, timeframe: tf });
+          if (eta > horizonMinutes || (resolve !== null && eta + resolve > horizonMinutes)) { outsideHorizon += 1; continue; }
+
+          // Size to the CHALLENGE leg and run the same guard the auto-trader uses, so a
+          // projection can never suggest more risk than the challenge rules permit.
+          const ms = computeModeSizing(symbol, entry, stop, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+          const leg = ms?.challenge || ms?.normal || null;
+          if (!leg) continue;
+          const guard = ms?.challenge ? challengeSignalGuard(leg.lossAtStop, sig.grade, sig.riskRewardRatio) : { eligible: true, warnings: [] };
+
+          rows.push({
+            strategy: stratId,
+            strategyName: STRATEGY_LAB_REGISTRY[stratId]?.name || stratId,
+            symbol, timeframe: tf,
+            direction: sig.decision,
+            score: Number(sig.score) || 0,
+            grade: sig.grade || null,
+            price,
+            entry, stopLoss: stop,
+            takeProfit1: sig.takeProfit1 ?? null,
+            takeProfit2: sig.takeProfit2 ?? null,
+            takeProfit3: sig.takeProfit3 ?? null,
+            rr: sig.riskRewardRatio ?? null,
+            orderType: strategySignalOrderType({ ...(sig.meta || {}), strategy: stratId }),
+            timingStatus: timing?.status || null,
+            timingMessage: timing?.message || null,
+            etaMinutes: eta,
+            resolveMinutes: resolve,
+            // Challenge-compliant sizing, and whether the challenge rules would actually allow it.
+            riskMode: ms?.challenge ? 'CHALLENGE' : 'NORMAL',
+            lots: leg.lots, riskAmount: leg.riskAmount, riskPct: leg.riskPct,
+            lossAtStop: leg.lossAtStop, stopPips: leg.stopPips,
+            challengeOk: Boolean(guard.eligible && !guard.warnings.length),
+            challengeWarnings: guard.warnings || [],
+            reason: String(sig.reason || '').slice(0, 200),
+          });
+        }
+      }
+    }
+    const ranked = rankPredictions(rows, { horizonMinutes });
+    const ch = computeChallengeDashboard();
+    const payload = {
+      ok: true,
+      horizonHours, horizonMinutes,
+      generatedAt: new Date().toISOString(),
+      scanned: { symbols: symbols.length, strategies: strategies.length, timeframes: PREDICTION_TFS, evaluated, outsideHorizon },
+      challenge: {
+        account: ch.account, broker: ch.accountBroker,
+        initialBalance: ch.initialBalance, safePerTradeRisk: ch.safePerTradeRisk,
+        riskPerTradePct: ch.rules?.riskPerTradePct, maxRiskPerTradePct: ch.rules?.maxRiskPerTradePct,
+      },
+      count: ranked.length,
+      predictions: ranked.slice(0, 40),
+      caveats: [
+        'Projections of setups already present in the data — not forecasts of price.',
+        'ETA assumes price covers about half an ATR per bar; it is an order-of-magnitude estimate.',
+        'Sized to the challenge rules, but no spread, margin or broker stop-distance check is applied here.',
+      ],
+    };
+    predictionCache = { key, at: Date.now(), payload };
+    res.json(payload);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // GET /api/liquidity-chart?symbol=&timeframe= — the liquidity read behind /chart/liquidity.
 // Read-only: it reuses detectKeyLiquidityLevels for WHERE the liquidity sits and adds the
 // status classification (fresh / tested / rejected / swept / broken+accepted) plus market

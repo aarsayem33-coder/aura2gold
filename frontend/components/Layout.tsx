@@ -339,7 +339,13 @@ export default function Layout({ onLogout }: LayoutProps) {
     { path: '/terminal', icon: Activity, label: 'Terminal' },
     { path: '/signals', icon: BarChart3, label: 'Signals' },
     { path: '/fixed-time', icon: Timer, label: 'Fixed-Time' },
-    { path: '/future-predictions', icon: Brain, label: 'Future Predictions' },
+    {
+      path: '/future-predictions', icon: Brain, label: 'Future Predictions',
+      children: [
+        { path: '/future-predictions', icon: Brain, label: 'Execution Forecast', end: true },
+        { path: '/future-predictions/setups', icon: Crosshair, label: 'Strategy Predictions' },
+      ],
+    },
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
     { path: '/day-trading-desk', icon: LineChart, label: 'Day Trading Desk' },
     { path: '/signal-tracker', icon: Radar, label: 'Signal Tracker' },

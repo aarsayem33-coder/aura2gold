@@ -2364,3 +2364,28 @@ export interface AutoTradeAccountRow {
   account: string | null; broker: string | null; server: string | null; demo: boolean | null;
   rows: number; executed: number; net: number; live: boolean;
 }
+
+/** One ranked setup on the Strategy Predictions page. */
+export interface StrategyPrediction {
+  strategy: string; strategyName: string; symbol: string; timeframe: string;
+  direction: 'BUY' | 'SELL'; score: number; grade: string | null;
+  price: number; entry: number; stopLoss: number;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  rr: number | null; orderType: string;
+  timingStatus: string | null; timingMessage: string | null;
+  etaMinutes: number; resolveMinutes: number | null; totalMinutes: number | null;
+  etaLabel: string; resolveLabel: string; rankScore: number;
+  riskMode: string; lots: number; riskAmount: number; riskPct: number;
+  lossAtStop: number; stopPips: number;
+  challengeOk: boolean; challengeWarnings: string[];
+  reason: string;
+}
+export interface StrategyPredictionResponse {
+  ok: boolean; horizonHours: number; horizonMinutes: number; generatedAt: string; cached?: boolean;
+  scanned: { symbols: number; strategies: number; timeframes: string[]; evaluated: number; outsideHorizon: number };
+  challenge: {
+    account: string | null; broker: string | null; initialBalance: number;
+    safePerTradeRisk: number; riskPerTradePct: number; maxRiskPerTradePct: number;
+  };
+  count: number; predictions: StrategyPrediction[]; caveats: string[];
+}

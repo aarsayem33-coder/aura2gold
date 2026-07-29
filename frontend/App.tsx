@@ -14,6 +14,7 @@ import DayTradingDesk from './pages/DayTradingDesk.tsx';
 import LiveMarketTracker from './pages/LiveMarketTracker.tsx';
 import ChartStudio from './pages/ChartStudio.tsx';
 import LiquidityChart from './pages/LiquidityChart.tsx';
+import StrategyPredictions from './pages/StrategyPredictions.tsx';
 import ChallengeTracker from './pages/ChallengeTracker.tsx';
 import AutoTrading from './pages/AutoTrading.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
@@ -90,6 +91,7 @@ export default function App() {
           <Route path="signals" element={<SignalDashboard />} />
           <Route path="fixed-time" element={<FixedTimeTrading />} />
           <Route path="future-predictions" element={<FuturePredictions />} />
+          <Route path="future-predictions/setups" element={<StrategyPredictions />} />
           <Route path="projections" element={<Projections />} />
           <Route path="calendar" element={<EconomicCalendar />} />
           <Route path="news-high-impact" element={<HighImpactNews />} />
