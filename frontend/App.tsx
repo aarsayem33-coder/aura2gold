@@ -13,6 +13,7 @@ import DayTradingBrief from './pages/DayTradingBrief.tsx';
 import DayTradingDesk from './pages/DayTradingDesk.tsx';
 import LiveMarketTracker from './pages/LiveMarketTracker.tsx';
 import ChartStudio from './pages/ChartStudio.tsx';
+import LiquidityChart from './pages/LiquidityChart.tsx';
 import ChallengeTracker from './pages/ChallengeTracker.tsx';
 import AutoTrading from './pages/AutoTrading.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
@@ -96,6 +97,7 @@ export default function App() {
           <Route path="day-trading-desk" element={<DayTradingDesk />} />
           <Route path="live-market-tracker" element={<LiveMarketTracker />} />
           <Route path="chart" element={<ChartStudio />} />
+          <Route path="chart/liquidity" element={<LiquidityChart />} />
           <Route path="signal-tracker" element={<SignalTracker />} />
           <Route path="challenge" element={<ChallengeTracker />} />
           <Route path="auto-trading" element={<AutoTrading />} />

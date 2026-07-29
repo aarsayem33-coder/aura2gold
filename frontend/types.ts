@@ -2315,3 +2315,26 @@ export interface ForexBacktestResponse {
   filters: Record<string, unknown>;
   status?: Mt5Status;
 }
+
+/** One classified liquidity level from /api/liquidity-chart. */
+export interface LiquidityLevel {
+  type: string; label: string; price: number; side: 'above' | 'below';
+  distance: number; distancePips: number; distanceAtr: number | null;
+  strength: number; swept: boolean; fresh: boolean;
+  status: 'FRESH' | 'TESTED' | 'REJECTED' | 'SWEPT' | 'BROKEN_ACCEPTED' | 'INVALIDATED';
+  evidence: string; touches: number; closesBeyond: number;
+  pool: 'BSL' | 'SSL'; scope: 'EXTERNAL' | 'INTERNAL';
+  inducement: boolean; importance: string; confidence: string;
+}
+export interface LiquidityChartResponse {
+  ok: boolean; error?: string;
+  symbol?: string; timeframe?: string; bars?: number; generatedAt?: string;
+  price?: number; atr?: number;
+  dealingRange?: { high: number; low: number } | null;
+  structure?: { bias: string; swings: { i: number; price: number; kind: string; label: string }[]; events: { type: string; direction: string; level: number; note: string }[] };
+  levels?: LiquidityLevel[];
+  recentlySwept?: LiquidityLevel[];
+  invalidatedCount?: number; consideredCount?: number;
+  draw?: { primary: { price: number; label: string; pool: string; scope: string } | null; alternative: { price: number; label: string; pool: string; scope: string } | null; basis: string; invalidation: string };
+  caveats?: string[];
+}

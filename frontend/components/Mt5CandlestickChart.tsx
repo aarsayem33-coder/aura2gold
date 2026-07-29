@@ -38,6 +38,12 @@ interface Mt5CandlestickChartProps {
   onTimeframeChange?: (timeframe: string) => void;
   /** Small status node rendered top-center ONLY when the chart is expanded (fullscreen). */
   fullscreenBadge?: React.ReactNode;
+  /**
+   * Extra horizontal lines drawn on top of everything else. Purely additive: when the prop
+   * is absent nothing is created and the chart behaves exactly as before, so /chart is
+   * unaffected. Used by the Liquidity Chart route to draw its classified levels.
+   */
+  extraLines?: { price: number; color: string; title: string; dashed?: boolean }[] | null;
 }
 
 type ChartCandle = { time: any; open: number; high: number; low: number; close: number; volume: number };
@@ -438,7 +444,7 @@ function tradeZones(data: ChartCandle[], pivots: Pivot[]): { demand: TradeZone |
   return { demand, supply, price };
 }
 
-export default function Mt5CandlestickChart({ candles, signals, symbol, timeframe, levels, symbolOptions, timeframeOptions, onSymbolChange, onTimeframeChange, fullscreenBadge }: Mt5CandlestickChartProps) {
+export default function Mt5CandlestickChart({ candles, signals, symbol, timeframe, levels, symbolOptions, timeframeOptions, onSymbolChange, onTimeframeChange, fullscreenBadge, extraLines }: Mt5CandlestickChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLDivElement | null>(null);
 
@@ -824,6 +830,13 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
       analysisLinesRef.current.push(series.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title }));
     };
 
+    // Caller-supplied lines (Liquidity Chart). No-op when the prop is absent.
+    if (Array.isArray(extraLines)) {
+      for (const l of extraLines) {
+        addAnalysisLine(l.price, l.color, l.title, l.dashed ? LineStyle.Dashed : LineStyle.Solid);
+      }
+    }
+
     const needPivots = showTrendlines || showZigzag || showZones;
     const pivots = needPivots ? detectPivots(data, 3) : [];
     const analysisMarkers: ChartMarker[] = [];
@@ -1009,7 +1022,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         chart.timeScale().fitContent();
       }
     }
-  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showIchimoku, showTrend, showTrendlines, showZigzag, showDensity, showZones, levels]);
+  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showIchimoku, showTrend, showTrendlines, showZigzag, showDensity, showZones, levels, extraLines]);
 
   // ─── Effect D: live forming bar + countdown (1s) ────────────────────────
   // The feed sends closed bars only, so without this the chart sits frozen between

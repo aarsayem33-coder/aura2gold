@@ -33,6 +33,7 @@ import {
   Trophy,
   Bot,
   CandlestickChart,
+  Droplets,
   ChevronDown,
   X
 } from 'lucide-react';
@@ -315,7 +316,13 @@ export default function Layout({ onLogout }: LayoutProps) {
   // get used, then everything else keeps its previous relative order below.
   const navItems = [
     { path: '/', icon: LayoutDashboard, label: 'Dashboard' },
-    { path: '/chart', icon: CandlestickChart, label: 'Chart' },
+    {
+      path: '/chart', icon: CandlestickChart, label: 'Chart',
+      children: [
+        { path: '/chart', icon: CandlestickChart, label: 'Price Chart', end: true },
+        { path: '/chart/liquidity', icon: Droplets, label: 'Liquidity Chart' },
+      ],
+    },
     { path: '/auto-trading', icon: Bot, label: 'Auto Trading' },
     {
       path: '/strategy-lab', icon: FlaskConical, label: 'Strategy Lab',

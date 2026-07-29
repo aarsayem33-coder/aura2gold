@@ -20,6 +20,7 @@ import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
+import { buildLiquidityChart } from './liquidityChart.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
@@ -15780,6 +15781,46 @@ app.get('/api/strategy-lab/signals', async (req, res) => {
 });
 
 // GET /api/strategy-lab/performance?days=  |  ?preset=today|yesterday|last7
+// GET /api/liquidity-chart?symbol=&timeframe= — the liquidity read behind /chart/liquidity.
+// Read-only: it reuses detectKeyLiquidityLevels for WHERE the liquidity sits and adds the
+// status classification (fresh / tested / rejected / swept / broken+accepted) plus market
+// structure. Nothing here feeds signals, trading or email — it is an analysis surface.
+app.get('/api/liquidity-chart', async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || '').trim();
+    const tf = String(req.query.timeframe || 'M15').toUpperCase();
+    if (!symbol) return res.status(400).json({ error: 'symbol is required' });
+    // Read from the DB, not the in-memory ring buffer: the buffer holds only what has
+    // streamed since the last restart (often a single bar), while a liquidity read needs
+    // real history to find swings and session extremes.
+    const readSeries = async (series, want) => {
+      const pool = await initializeDatabase();
+      if (!pool) return [];
+      const [rows] = await pool.query(
+        'SELECT candle_time, open_price, high, low, close_price, volume FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?',
+        [symbol.toUpperCase(), series, want],
+      );
+      return rows.reverse().map((r) => ({
+        time: new Date(r.candle_time).toISOString(),
+        open: Number(r.open_price), high: Number(r.high),
+        low: Number(r.low), close: Number(r.close_price), volume: Number(r.volume) || 0,
+      }));
+    };
+    const candles = await readSeries(tf, 500);
+    if (!candles || candles.length < 30) {
+      return res.status(404).json({ error: `Not enough ${tf} candles for ${symbol} yet (have ${candles?.length || 0}, need 30).` });
+    }
+    // Daily bars give PDH/PDL. Absent, buildLiquidityChart declares them missing rather
+    // than inventing the levels.
+    const dailyCandles = await readSeries('D1', 20);
+    const out = buildLiquidityChart(candles, {
+      symbol,
+      dailyCandles: dailyCandles && dailyCandles.length >= 2 ? dailyCandles : null,
+    });
+    res.json({ ok: true, symbol, timeframe: tf, bars: candles.length, generatedAt: new Date().toISOString(), ...out });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // GET /api/account-profiles — the per-account risk profiles, which one is live, and every
 // account the bridge has ever seen (so the UI can offer to create a profile for a new one).
 app.get('/api/account-profiles', (req, res) => {

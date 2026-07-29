@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState, createContext, useContext } from 'react';
 import type {
+  LiquidityChartResponse,
   Alert,
   AiAccuracyStats,
   AiAnalyzeResponse,
@@ -1482,4 +1483,10 @@ export async function fetchAccountProfiles(): Promise<{
   usingProfile: boolean; accounts: BridgeAccountRow[];
 }> {
   return fetchJson('/api/account-profiles');
+}
+
+/** Classified liquidity read for one symbol/timeframe (Liquidity Chart route). */
+export async function fetchLiquidityChart(symbol: string, timeframe: string): Promise<LiquidityChartResponse> {
+  const q = new URLSearchParams({ symbol, timeframe });
+  return fetchJson<LiquidityChartResponse>(`/api/liquidity-chart?${q.toString()}`);
 }
