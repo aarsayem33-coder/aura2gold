@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { Activity, BarChart3, CalendarClock, CheckCircle2, ClipboardList, Clock, FlaskConical, Loader2, RefreshCcw, Timer, TrendingUp, XCircle } from 'lucide-react';
+import { Activity, BarChart3, CalendarClock, CheckCircle2, ClipboardList, Clock, Crosshair, FlaskConical, Loader2, RefreshCcw, Timer, TrendingUp, XCircle } from 'lucide-react';
 import { formatBdDateParts } from '../../utils/time';
 
 // ── formatting helpers (shared across all report pages) ──
@@ -88,6 +88,7 @@ const REPORT_TABS = [
   { to: '/reports/signals', label: 'Signal Log', icon: ClipboardList, end: false },
   { to: '/reports/calibration', label: 'Calibration', icon: Activity, end: false },
   { to: '/reports/forecasts', label: 'Forecasts', icon: CalendarClock, end: false },
+  { to: '/reports/setup-forecasts', label: 'Setup Forecasts', icon: Crosshair, end: false },
   { to: '/reports/backtest', label: 'Backtest', icon: FlaskConical, end: false },
 ];
 

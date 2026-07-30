@@ -21,6 +21,13 @@ import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
 import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
 import { atr14 as liquidityAtr14 } from './liquidityEngine.js';
+// Setup forecasts: conditional level-based predictions. Pure modules; server.js only wires
+// persistence, the scan interval and the API. None of these touch the live signal path.
+import { HORIZON_BUCKETS as FORECAST_HORIZON_BUCKETS } from './setupForecast.js';
+import { runForecasts as runSetupForecasts, groupByHorizon as groupForecastsByHorizon } from './setupForecastRunner.js';
+import { emptyStats as emptyForecastStats, mergeStats as mergeForecastStats, discriminationReport as forecastDiscriminationReport } from './forecastDiscrimination.js';
+import { buildForecastPlan } from './forecastTradePlan.js';
+import { LIFECYCLE as FORECAST_LIFECYCLE, driftEntry as forecastDriftEntry, applyDrift as applyForecastDrift, driftSummary as forecastDriftSummary, resolveForecast as resolveOneForecast } from './forecastLifecycle.js';
 import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
 import { estimateEtaMinutes, estimateResolveMinutes, rankPredictions } from './strategyPredictions.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
@@ -30,6 +37,7 @@ import { findOrderFillIndex } from './orderFill.js';
 import { assessEntryReadiness, buildEntryReadyEmail } from './entryReadyAlert.js';
 import { autoTradeCombosAllow, normalizeAutoTradeCombo } from './autoTradeFilters.js';
 import { valuePerPricePerLot as specValuePerPricePerLot, minStopDistance as specMinStopDistance, spreadPrice as specSpreadPrice, assessMargin as specAssessMargin } from './brokerSpecs.js';
+import { MANUAL_STRATEGY_ID, normalizeManualTradeHistory } from './manualTradeHistory.js';
 import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
@@ -713,6 +721,42 @@ async function initializeDatabase() {
           INDEX idx_pred_outcome (outcome)
         )
       `);
+      // Setup forecasts: conditional "IF price reaches level L and behaves like X" claims.
+      // One ACTIVE (WAITING) row per forecastKey at a time; the same key may recur later as
+      // a NEW row once the old one resolved, which is why the PK is key+firstSeen rather
+      // than the key alone. drift_json holds the score history the page charts.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_setup_forecasts (
+          id VARCHAR(200) PRIMARY KEY,
+          fkey VARCHAR(160) NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          scenario VARCHAR(16) NOT NULL,
+          side VARCHAR(8) NOT NULL,
+          level DOUBLE NOT NULL,
+          level_type VARCHAR(24) NULL, level_label VARCHAR(64) NULL, level_strength INT NULL,
+          atr DOUBLE NULL, price_at_forecast DOUBLE NULL,
+          expected_direction VARCHAR(8) NOT NULL,
+          consensus_direction VARCHAR(8) NULL,
+          distance_pips DOUBLE NULL, distance_atr DOUBLE NULL,
+          eta_min INT NULL, eta_mid INT NULL, eta_max INT NULL,
+          horizon VARCHAR(12) NULL,
+          rank_score DECIMAL(7,2) NULL, best_score DECIMAL(6,1) NULL,
+          best_strategy VARCHAR(48) NULL, agree_count INT NULL, dissent_count INT NULL,
+          fires_json TEXT NULL, plan_json TEXT NULL, bars_json TEXT NULL, drift_json MEDIUMTEXT NULL,
+          created_at DATETIME(3) NOT NULL,
+          updated_at DATETIME(3) NOT NULL,
+          status VARCHAR(12) NOT NULL DEFAULT 'WAITING',
+          resolved_at DATETIME(3) NULL,
+          actual VARCHAR(20) NULL,
+          matched TINYINT NULL,
+          actual_minutes INT NULL,
+          mfe_pips DOUBLE NULL, mae_pips DOUBLE NULL,
+          INDEX idx_sf_key (fkey),
+          INDEX idx_sf_status (status),
+          INDEX idx_sf_created (created_at)
+        )
+      `);
       await pool.query(`
         CREATE TABLE IF NOT EXISTS mt5_execution_forecasts (
           id VARCHAR(96) PRIMARY KEY,
@@ -842,6 +886,9 @@ async function initializeDatabase() {
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'sent_at', 'DATETIME(3) NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'position_id', 'BIGINT NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'account', 'VARCHAR(32) NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'source', "VARCHAR(16) NOT NULL DEFAULT 'AUTO'");
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'broker', 'VARCHAR(128) NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'server', 'VARCHAR(128) NULL');
 
       // Saved auto-trade combination sets — a reusable LIBRARY of strategy x symbol x
       // timeframe lists, kept in the DB (not the settings blob) so they persist on their
@@ -1277,9 +1324,51 @@ async function pruneOldAccountSnapshots() {
   }
 }
 
+// Retention for mt5_indicators — the table that tripped the hosting DB quota.
+//
+// Measured 2026-07-30: 3,381,508 rows / 1450 MB, i.e. 83% of a 1.74 GB database. Once the
+// quota is exceeded the provider revokes SELECT, which takes down every report that reads the
+// DB (predictions, setup forecasts, calibration) with a bare "SELECT command denied".
+//
+// Nothing reads past the newest MAX_INDICATORS (100k) rows — line ~1533 is the only reader and
+// it is a `ORDER BY candle_time DESC LIMIT ?`. So roughly 3.28M rows are permanently
+// unreachable, and pruning them is recoverable-by-recomputation telemetry, not trade history.
+//
+// DISABLED BY DEFAULT. This deletes millions of rows, which is the user's decision, not a side
+// effect of shipping a feature. Enable with INDICATOR_RETENTION_ENABLED=1 in backend/.env.local
+// (optionally INDICATOR_RETENTION_DAYS, default 30). Batched to stay under the statement
+// timeout, so it drains gradually rather than locking the table in one statement.
+const INDICATOR_RETENTION_ENABLED = String(process.env.INDICATOR_RETENTION_ENABLED || '') === '1';
+const INDICATOR_RETENTION_DAYS = Math.max(1, Number(process.env.INDICATOR_RETENTION_DAYS || 30));
+let lastIndicatorPruneMs = 0;
+let indicatorPruneNagged = false;
+async function pruneOldIndicators() {
+  if (!INDICATOR_RETENTION_ENABLED) {
+    if (!indicatorPruneNagged) {
+      indicatorPruneNagged = true;
+      console.log('[Indicators] retention is OFF. mt5_indicators grows without bound and has tripped the DB quota before (1.45GB / 3.4M rows). Set INDICATOR_RETENTION_ENABLED=1 to prune rows older than %dd.', INDICATOR_RETENTION_DAYS);
+    }
+    return;
+  }
+  const nowMs = Date.now();
+  if (nowMs - lastIndicatorPruneMs < 3600000) return;   // at most hourly
+  lastIndicatorPruneMs = nowMs;
+  const pool = await initializeDatabase();
+  if (!pool) return;
+  try {
+    const [r] = await pool.execute(
+      'DELETE FROM mt5_indicators WHERE created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT 20000',
+      [INDICATOR_RETENTION_DAYS]);
+    if (r.affectedRows) console.log(`[Indicators] pruned ${r.affectedRows} rows older than ${INDICATOR_RETENTION_DAYS}d`);
+  } catch (err) {
+    console.error('[Indicators] retention prune failed:', err.message);
+  }
+}
+
 async function persistIndicator(indicator) {
   const pool = await initializeDatabase();
   if (!pool) return;
+  void pruneOldIndicators();
 
   await pool.execute(
     `INSERT INTO mt5_indicators (
@@ -9037,7 +9126,7 @@ app.get('/api/auto-trade', async (req, res) => {
     let todayCount = 0, decisions = [];
     if (pool) {
       todayCount = await autoTradesToday(pool);
-      const [rows] = await pool.query('SELECT * FROM mt5_auto_trades ORDER BY created_at DESC LIMIT 50');
+      const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE COALESCE(source,'AUTO') <> 'MANUAL' ORDER BY created_at DESC LIMIT 50");
       decisions = rows.map((r) => ({
         id: r.id, strategy: r.strategy, strategyName: STRATEGY_LAB_REGISTRY[r.strategy]?.name || r.strategy,
         symbol: r.symbol, timeframe: r.timeframe, direction: r.direction, orderType: r.order_type,
@@ -9159,6 +9248,20 @@ app.post('/api/auto-trade/validate', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+function autoTradeReportAccountKey(account, broker, server) {
+  const json = JSON.stringify([String(account || ''), String(broker || ''), String(server || '')]);
+  return `scope:${Buffer.from(json).toString('base64url')}`;
+}
+
+function parseAutoTradeReportAccountKey(value) {
+  if (!String(value || '').startsWith('scope:')) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(String(value).slice(6), 'base64url').toString('utf8'));
+    if (!Array.isArray(parsed) || parsed.length !== 3 || !String(parsed[0] || '').trim()) return null;
+    return { account: String(parsed[0]), broker: String(parsed[1] || ''), server: String(parsed[2] || '') };
+  } catch { return null; }
+}
+
 // GET /api/auto-trade/report?from=&to= — full auto-trade performance report:
 // summary, per-day (calendar), per-strategy/symbol/timeframe/session/direction/hour
 // breakdowns, and every trade with pips, R-multiple and duration. Read-only.
@@ -9176,17 +9279,37 @@ app.get('/api/auto-trade/report', async (req, res) => {
     // demo — and their results must never be added together. An explicit account therefore
     // wins over the broker filter rather than being narrowed by it.
     const accountQ = req.query.account ? String(req.query.account).trim() : null;
+    const accountScope = parseAutoTradeReportAccountKey(accountQ);
     const brokerQ = req.query.broker ? String(req.query.broker) : null;
     if (accountQ) {
       where.push('account = ?');
-      args.push(accountQ);
+      args.push(accountScope?.account || accountQ);
+      if (accountScope) {
+        // Legacy auto rows predate broker/server columns. Include them only in the scope
+        // currently recorded for that login; never leak them into another broker/server
+        // that happens to reuse the same account number.
+        const registered = loadAutoTradeAccounts().accounts?.[accountScope.account];
+        const registryOwnsScope = registered
+          && String(registered.broker || '') === accountScope.broker
+          && String(registered.server || '') === accountScope.server;
+        where.push(registryOwnsScope
+          ? "((COALESCE(broker,'') = ? AND COALESCE(server,'') = ?) OR (COALESCE(source,'AUTO') <> 'MANUAL' AND broker IS NULL AND server IS NULL))"
+          : "(COALESCE(broker,'') = ? AND COALESCE(server,'') = ?)");
+        args.push(accountScope.broker, accountScope.server);
+      }
     } else if (brokerQ) {
       // Broker NAME -> its logins, resolved through the account registry so the name is not
-      // stored twice and cannot drift.
+      // stored twice and cannot drift. Manual-report rows also carry broker directly because
+      // reporting remains available while the auto-trade bridge is disabled.
       const reg = loadAutoTradeAccounts().accounts || {};
       const logins = Object.entries(reg).filter(([, a]) => brokerBrand(a?.broker) === brokerBrand(brokerQ)).map(([login]) => login);
-      if (!logins.length) where.push('1=0');            // known broker, no accounts -> no rows
-      else { where.push(`account IN (${logins.map(() => '?').join(',')})`); args.push(...logins); }
+      const clauses = ["UPPER(SUBSTRING_INDEX(broker, ' ', 1)) = ?"];
+      args.push(brokerBrand(brokerQ));
+      if (logins.length) {
+        clauses.push(`(COALESCE(source,'AUTO') <> 'MANUAL' AND broker IS NULL AND account IN (${logins.map(() => '?').join(',')}))`);
+        args.push(...logins);
+      }
+      where.push(`(${clauses.join(' OR ')})`);
     }
     const [rows] = await pool.query(`SELECT * FROM mt5_auto_trades WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 5000`, args);
 
@@ -9317,20 +9440,32 @@ app.get('/api/auto-trade/report', async (req, res) => {
         if (from) { scoped.push('created_at >= ?'); a2.push(`${from} 00:00:00`); }
         if (to) { scoped.push('created_at < DATE_ADD(?, INTERVAL 1 DAY)'); a2.push(`${to} 00:00:00`); }
         const [rows2] = await pool.query(
-          `SELECT account, COUNT(*) rows_, SUM(CASE WHEN ticket IS NOT NULL THEN 1 ELSE 0 END) executed,
-                  ROUND(SUM(COALESCE(profit,0)),2) net
-             FROM mt5_auto_trades WHERE ${scoped.join(' AND ')} GROUP BY account ORDER BY rows_ DESC`,
+          `SELECT account, broker, server, COUNT(*) rows_, SUM(CASE WHEN ticket IS NOT NULL THEN 1 ELSE 0 END) executed,
+                   ROUND(SUM(COALESCE(profit,0)),2) net
+             FROM mt5_auto_trades WHERE ${scoped.join(' AND ')}
+             GROUP BY account, broker, server ORDER BY rows_ DESC`,
           a2,
         );
         const reg = loadAutoTradeAccounts().accounts || {};
-        return rows2.map((r) => ({
-          account: r.account || null,
-          broker: r.account ? (reg[r.account]?.broker || null) : null,
-          server: r.account ? (reg[r.account]?.server || null) : null,
-          demo: r.account ? (reg[r.account]?.demo ?? null) : null,
-          rows: Number(r.rows_), executed: Number(r.executed), net: Number(r.net) || 0,
-          live: String(tradeBridge.account || '') === String(r.account || ''),
-        }));
+        const merged = new Map();
+        for (const r of rows2) {
+          const account = r.account || null;
+          const broker = r.broker || (account ? (reg[account]?.broker || null) : null);
+          const server = r.server || (account ? (reg[account]?.server || null) : null);
+          const key = autoTradeReportAccountKey(account, broker, server);
+          const current = merged.get(key) || {
+            key, account, broker, server,
+            demo: account ? (reg[account]?.demo ?? null) : null,
+            rows: 0, executed: 0, net: 0,
+            live: String(tradeBridge.account || '') === String(account || '')
+              && (!server || !tradeBridge.server || String(tradeBridge.server) === String(server)),
+          };
+          current.rows += Number(r.rows_) || 0;
+          current.executed += Number(r.executed) || 0;
+          current.net = Math.round((current.net + (Number(r.net) || 0)) * 100) / 100;
+          merged.set(key, current);
+        }
+        return [...merged.values()].sort((a, b) => b.rows - a.rows);
       })(),
       accountFilter: accountQ || null,
       trades,
@@ -9798,7 +9933,7 @@ app.post('/api/mt5/trade-closed', async (req, res) => {
     // EXPIRED could never be closed out even though its position was live at the broker —
     // the close was dropped on the floor behind an HTTP 200 with no log. A position that
     // really closed is a fact; the row's status is our bookkeeping, and it loses.
-    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE position_id=? OR ticket=? LIMIT 1", [posId, posId]);
+    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE COALESCE(source,'AUTO') <> 'MANUAL' AND (position_id=? OR ticket=?) LIMIT 1", [posId, posId]);
     if (!rows.length) {
       // Unmatched closes are how orphaned positions used to vanish silently. Say so loudly;
       // the history reconciliation sweep (POST /api/mt5/trade-history) adopts them properly.
@@ -9827,9 +9962,8 @@ app.post('/api/mt5/trade-closed', async (req, res) => {
 // auto-trader (by hand, or by a command whose result report never came back). The stored
 // id stays 'unrecorded' so the data keeps its meaning; only the label changes, because
 // "unrecorded" reads like a fault in the report when it is simply a trade you took.
-const ADOPTED_STRATEGY_ID = 'unrecorded';
 function strategyDisplayName(id) {
-  if (id === ADOPTED_STRATEGY_ID) return 'By Own';
+  if (id === MANUAL_STRATEGY_ID || id === 'unrecorded') return 'By Own';
   return STRATEGY_LAB_REGISTRY[id]?.name || id;
 }
 
@@ -9850,7 +9984,7 @@ app.post('/api/mt5/trade-history', async (req, res) => {
       const profit = Number(d.profit);
       const closePrice = Number(d.closePrice) || null;
       const closedAt = Number(d.closeTime) > 0 ? new Date(Number(d.closeTime) * 1000) : new Date();
-      const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE position_id=? OR ticket=? LIMIT 1", [posId, posId]);
+      const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE COALESCE(source,'AUTO') <> 'MANUAL' AND (position_id=? OR ticket=?) LIMIT 1", [posId, posId]);
       if (rows.length) {
         const row = rows[0];
         if (String(row.status).toUpperCase() === 'CLOSED') { already += 1; continue; }
@@ -9871,7 +10005,7 @@ app.post('/api/mt5/trade-history', async (req, res) => {
         `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type,
            entry_price, lots, mode, status, reason, ticket, position_id, fill_price, close_price, profit, closed_at, created_at, updated_at, account)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [`adopted:${posId}`, ADOPTED_STRATEGY_ID, String(d.symbol || '?').toUpperCase().slice(0, 32), '—',
+         [`adopted:${posId}`, 'unrecorded', String(d.symbol || '?').toUpperCase().slice(0, 32), '—',
          String(d.direction || '?').toUpperCase().slice(0, 8), 'MARKET',
          Number(d.openPrice) || null, Number(d.lots) || null, 'AUTO', 'CLOSED',
          'adopted from MT5 history — this position carried our magic number but no command row owned it',
@@ -9885,6 +10019,42 @@ app.post('/api/mt5/trade-history', async (req, res) => {
       else already += 1;
     }
     res.json({ ok: true, received: deals.length, closed, adopted, already });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Manual MT5 history is reporting-only and remains active when auto execution is off.
+// The EA establishes activatedAt on first use, so this endpoint can never backfill trades
+// from before the feature was enabled. Replayed overlap windows are safe via the scoped ID.
+app.post('/api/mt5/manual-trade-history', async (req, res) => {
+  try {
+    const payload = normalizeManualTradeHistory(req.body);
+    if (payload.error) return res.status(400).json({ error: payload.error });
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+
+    let imported = 0;
+    for (const deal of payload.deals) {
+      const openedAt = deal.openTime && deal.openTime > 0 ? new Date(deal.openTime * 1000) : new Date(deal.closeTime * 1000);
+      const closedAt = new Date(deal.closeTime * 1000);
+      const [result] = await pool.execute(
+        `INSERT INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type,
+           entry_price, lots, mode, status, reason, ticket, position_id, fill_price, close_price,
+           profit, closed_at, created_at, updated_at, account, source, broker, server)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE
+           symbol=VALUES(symbol), direction=VALUES(direction), entry_price=VALUES(entry_price),
+           lots=VALUES(lots), close_price=VALUES(close_price), profit=VALUES(profit),
+           closed_at=VALUES(closed_at), updated_at=VALUES(updated_at), reason=VALUES(reason),
+           account=VALUES(account), source=VALUES(source), broker=VALUES(broker), server=VALUES(server)`,
+        [deal.id, MANUAL_STRATEGY_ID, deal.symbol, '—', deal.direction, 'MARKET',
+          deal.openPrice, deal.lots, 'MANUAL', 'CLOSED',
+          `manual MT5 trade (${deal.reason.toLowerCase()})`, deal.positionId, deal.positionId,
+          deal.openPrice, deal.closePrice, deal.profit, toMysqlDate(closedAt), toMysqlDate(openedAt),
+          toMysqlDate(), payload.account, 'MANUAL', payload.broker, payload.server],
+      );
+      if (result?.affectedRows) imported += 1;
+    }
+    res.json({ ok: true, received: payload.deals.length, imported, account: payload.account });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
@@ -13714,7 +13884,7 @@ function num1(v) { return Number.isFinite(Number(v)) ? Math.round(Number(v) * 10
 
 async function autoTradesToday(pool) {
   const [rows] = await pool.query(
-    "SELECT COUNT(*) n FROM mt5_auto_trades WHERE status IN ('SHADOW','PROPOSED','APPROVED','QUEUED','SENT','FILLED','CLOSED') AND created_at >= UTC_DATE()",
+    "SELECT COUNT(*) n FROM mt5_auto_trades WHERE COALESCE(source,'AUTO') <> 'MANUAL' AND status IN ('SHADOW','PROPOSED','APPROVED','QUEUED','SENT','FILLED','CLOSED') AND created_at >= UTC_DATE()",
   );
   return Number(rows[0]?.n) || 0;
 }
@@ -16220,6 +16390,412 @@ app.get('/api/strategy-predictions', async (req, res) => {
     res.json(payload);
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
+
+// ─── Setup Forecasts: conditional level-based predictions ────────────────────────────
+// "IF price reaches this level and behaves like X, WHICH strategies would fire, by their
+// own rules?" The pure pipeline lives in setupForecast.js -> setupForecastRunner.js ->
+// forecastTradePlan.js -> forecastLifecycle.js; this block is only wiring — DB persistence,
+// the scan/resolve intervals and the API. It never touches the live signal path, never
+// writes to mt5_strategy_signals, and never reaches the auto-trader or email.
+const SETUP_FORECAST_TFS = ['M15', 'H1'];
+const SETUP_FORECAST_SCAN_MS = Math.max(5, Number(process.env.SETUP_FORECAST_SCAN_MIN || 15)) * 60000;
+const SETUP_FORECAST_DISC_FILE = path.join(__dirname, '.cache', 'setup_forecast_discrimination.json');
+
+// The level-vs-shape discrimination measurement survives restarts in a small JSON file
+// (same pattern as the challenge state). Losing it would un-drop the shape-driven
+// strategies until 40+ scenarios per arm re-accumulate.
+function loadForecastDiscrimination() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SETUP_FORECAST_DISC_FILE, 'utf8'));
+    if (raw && typeof raw.byStrategy === 'object') return raw;
+  } catch { /* first run */ }
+  return emptyForecastStats();
+}
+function saveForecastDiscrimination(stats) {
+  try {
+    fs.mkdirSync(path.dirname(SETUP_FORECAST_DISC_FILE), { recursive: true });
+    fs.writeFileSync(SETUP_FORECAST_DISC_FILE, JSON.stringify(stats));
+  } catch (e) { console.error('[SetupForecast] discrimination save failed:', e.message); }
+}
+
+async function setupForecastSeries(pool, symbol, series, want) {
+  const [rows] = await pool.query(
+    'SELECT candle_time, open_price, high, low, close_price, volume FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?',
+    [symbol.toUpperCase(), series, want],
+  );
+  return rows.reverse().map((r) => ({
+    time: new Date(r.candle_time).toISOString(),
+    open: Number(r.open_price), high: Number(r.high),
+    low: Number(r.low), close: Number(r.close_price), volume: Number(r.volume) || 0,
+  }));
+}
+
+// Context from the DATABASE, like the predictions page: the in-memory ring buffer holds only
+// what streamed since the last restart, and a forecast scan that goes blind after every
+// restart would supersede all its own forecasts.
+async function setupForecastContext(pool, symbol, tf) {
+  const candles = closedBarsOnly(await setupForecastSeries(pool, symbol, tf, 400), tf);
+  if (!candles || candles.length < 60) return null;
+  const htfTf = NEXT_HIGHER_TF[tf] || null;
+  const ltfTf = NEXT_LOWER_TF[tf] || null;
+  const [h4c, h1c, dailyCandles, htfCandles, ltfCandles] = await Promise.all([
+    setupForecastSeries(pool, symbol, 'H4', 150),
+    setupForecastSeries(pool, symbol, 'H1', 150),
+    setupForecastSeries(pool, symbol, 'D1', 8),
+    htfTf ? setupForecastSeries(pool, symbol, htfTf, 200) : null,
+    ltfTf ? setupForecastSeries(pool, symbol, ltfTf, 200) : null,
+  ]);
+  const ctx = {
+    symbol, timeframe: tf, candles, candlesIncludeFormingBar: false, pip: pipSizeForSymbol(symbol),
+    h4Trend: getTimeframeTrend(closedBarsOnly(h4c, 'H4')),
+    h1Trend: getTimeframeTrend(closedBarsOnly(h1c, 'H1')),
+    dailyCandles,
+    htfTimeframe: htfTf, htfCandles: htfTf ? closedBarsOnly(htfCandles, htfTf) : null,
+    ltfTimeframe: ltfTf, ltfCandles: ltfTf ? closedBarsOnly(ltfCandles, ltfTf) : null,
+  };
+  const price = Number(candles[candles.length - 1]?.close);
+  const atr = Number(liquidityAtr14(candles)) || null;
+  if (!(price > 0) || !(atr > 0)) return null;
+  const { levels } = detectKeyLiquidityLevels(candles, { symbol, dailyCandles });
+  return { ctx, price, atr, levels };
+}
+
+let setupForecastScanBusy = false;
+let setupForecastLastScan = null;
+async function runSetupForecastScan({ reason = 'interval' } = {}) {
+  if (setupForecastScanBusy) return { skipped: 'busy' };
+  setupForecastScanBusy = true;
+  const startedAt = Date.now();
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return { skipped: 'no database' };
+    const symbols = getCuratedSymbols(getMt5Status().symbols || []);
+    if (!symbols.length) return { skipped: 'no symbols' };
+    // Same strategy set as the predictions page: enabled, real lab engines, forex-style
+    // tickets only (fixed-time engines measure expiry bets, not SL/TP trades).
+    const allIds = enabledStrategyIds().filter((id) => STRATEGY_LAB_REGISTRY[id] && !STRATEGY_LAB_REGISTRY[id].measureFixedTime);
+    const discrimination = loadForecastDiscrimination();
+    const dashboard = computeChallengeDashboard();
+    const riskBudget = Number(dashboard?.safePerTradeRisk) > 0 ? Number(dashboard.safePerTradeRisk) : null;
+
+    let fresh = emptyForecastStats();
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    let inserted = 0, updated = 0, superseded = 0, forecastCount = 0;
+    const droppedReport = [];
+
+    for (const tf of SETUP_FORECAST_TFS) {
+      for (const symbol of symbols) {
+        let prep = null;
+        try { prep = await setupForecastContext(pool, symbol, tf); } catch { prep = null; }
+        if (!prep) continue;
+        const ids = allIds.filter((id) => strategyTimeframes(id).includes(tf));
+        if (!ids.length) continue;
+
+        const out = runSetupForecasts({
+          base: prep.ctx, levels: prep.levels, atr: prep.atr, price: prep.price,
+          pip: forexSizingPipSize(symbol), symbol, timeframe: tf,
+          strategyIds: ids, evaluate: evaluateStrategy, discrimination,
+        });
+        fresh = mergeForecastStats(fresh, out.stats, { decay: 1 });
+        for (const d of out.dropped) if (!droppedReport.some((x) => x.strategyId === d.strategyId)) droppedReport.push(d);
+        forecastCount += out.forecasts.length;
+
+        // Upsert each forecast against its ACTIVE row (same key, status WAITING). A key whose
+        // old row already resolved legitimately starts a NEW row — the level came back into
+        // play — so the PK is key + first-seen, not the key alone.
+        for (const f of out.forecasts) {
+          const { plan } = buildForecastPlan({
+            forecast: f,
+            pipSize: forexSizingPipSize(symbol),
+            pipValuePerLot: forexSizingPipValuePerLot(symbol),
+            riskBudget, dashboard,
+          });
+          const [activeRows] = await pool.query(
+            "SELECT id, drift_json FROM mt5_setup_forecasts WHERE fkey=? AND status='WAITING' LIMIT 1", [f.key]);
+          const firesJson = JSON.stringify(f.fires.slice(0, 12));
+          const planJson = plan ? JSON.stringify(plan) : null;
+          const point = forecastDriftEntry(f, now);
+          if (activeRows.length) {
+            let drift = [];
+            try { drift = JSON.parse(activeRows[0].drift_json || '[]'); } catch { drift = []; }
+            drift = applyForecastDrift(drift, point);
+            await pool.query(
+              `UPDATE mt5_setup_forecasts SET
+                 consensus_direction=?, distance_pips=?, distance_atr=?,
+                 eta_min=?, eta_mid=?, eta_max=?, horizon=?,
+                 rank_score=?, best_score=?, best_strategy=?, agree_count=?, dissent_count=?,
+                 fires_json=?, plan_json=?, drift_json=?, atr=?,
+                 updated_at=? WHERE id=?`,
+              [f.consensusDirection, f.distance?.pips ?? null, f.distance?.atr ?? null,
+                f.eta?.minMinutes ?? null, f.eta?.midMinutes ?? null, f.eta?.maxMinutes ?? null, f.horizon?.key || null,
+                f.rankScore ?? null, f.bestScore ?? null, f.bestStrategy || null, f.agreeCount ?? 0, f.dissentCount ?? 0,
+                firesJson, planJson, JSON.stringify(drift), f.atr ?? prep.atr,
+                toMysqlDate(nowIso), activeRows[0].id],
+            );
+            updated += 1;
+          } else {
+            await pool.query(
+              `INSERT INTO mt5_setup_forecasts
+                 (id, fkey, symbol, timeframe, scenario, side, level, level_type, level_label, level_strength,
+                  atr, price_at_forecast, expected_direction, consensus_direction,
+                  distance_pips, distance_atr, eta_min, eta_mid, eta_max, horizon,
+                  rank_score, best_score, best_strategy, agree_count, dissent_count,
+                  fires_json, plan_json, bars_json, drift_json, created_at, updated_at, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'WAITING')`,
+              [`${f.key}|${now}`, f.key, symbol, tf, f.scenario, f.side, f.level,
+                f.levelType || null, f.levelLabel || null, f.levelStrength ?? null,
+                prep.atr, prep.price, f.expectedDirection, f.consensusDirection,
+                f.distance?.pips ?? null, f.distance?.atr ?? null,
+                f.eta?.minMinutes ?? null, f.eta?.midMinutes ?? null, f.eta?.maxMinutes ?? null, f.horizon?.key || null,
+                f.rankScore ?? null, f.bestScore ?? null, f.bestStrategy || null, f.agreeCount ?? 0, f.dissentCount ?? 0,
+                firesJson, planJson, JSON.stringify(f.scenarioBars), JSON.stringify([point]),
+                toMysqlDate(nowIso), toMysqlDate(nowIso)],
+            );
+            inserted += 1;
+          }
+        }
+
+        // A WAITING forecast this scan no longer produces has lost its premise (level swept,
+        // out of range, or nothing fires any more). Two missed scans of grace before it is
+        // SUPERSEDED, so one noisy scan cannot kill a live forecast.
+        const [sup] = await pool.query(
+          `UPDATE mt5_setup_forecasts SET status='SUPERSEDED', resolved_at=?
+             WHERE status='WAITING' AND symbol=? AND timeframe=? AND updated_at < ?`,
+          [toMysqlDate(nowIso), symbol, tf, toMysqlDate(new Date(now - 2 * SETUP_FORECAST_SCAN_MS).toISOString())],
+        );
+        superseded += sup.affectedRows || 0;
+      }
+    }
+
+    // Fold this scan's evidence into the accumulated measurement. Decay 0.97 per scan keeps
+    // roughly the last month of 15-minute scans relevant without freezing old regimes in.
+    saveForecastDiscrimination(mergeForecastStats(discrimination, fresh, { decay: 0.97 }));
+
+    setupForecastLastScan = {
+      at: nowIso, reason, ms: Date.now() - startedAt,
+      symbols: symbols.length, timeframes: SETUP_FORECAST_TFS,
+      forecasts: forecastCount, inserted, updated, superseded,
+      dropped: droppedReport.map((d) => ({ strategyId: d.strategyId, lift: d.lift })),
+    };
+    console.log(`[SetupForecast] scan (${reason}): ${forecastCount} forecasts, +${inserted} new, ~${updated} updated, ${superseded} superseded in ${setupForecastLastScan.ms}ms`);
+    return setupForecastLastScan;
+  } finally {
+    setupForecastScanBusy = false;
+  }
+}
+
+// Resolve WAITING forecasts against the candles that closed since each was made.
+async function resolveSetupForecasts({ limit = 300 } = {}) {
+  const pool = await initializeDatabase();
+  if (!pool) return { resolved: 0 };
+  const [rows] = await pool.query(
+    "SELECT id, symbol, timeframe, scenario, side, level, atr, expected_direction, eta_max, created_at FROM mt5_setup_forecasts WHERE status='WAITING' ORDER BY created_at ASC LIMIT ?",
+    [limit]);
+  let resolved = 0, expired = 0;
+  for (const row of rows) {
+    try {
+      const createdIso = new Date(row.created_at).toISOString();
+      const [cr] = await pool.query(
+        'SELECT candle_time, open_price, high, low, close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? AND candle_time > ? ORDER BY candle_time ASC LIMIT 600',
+        [String(row.symbol).toUpperCase(), row.timeframe, toMysqlDate(createdIso)]);
+      const since = closedBarsOnly(cr.map((r) => ({
+        time: new Date(r.candle_time).toISOString(),
+        open: Number(r.open_price), high: Number(r.high), low: Number(r.low), close: Number(r.close_price),
+      })), row.timeframe);
+      const outcome = resolveOneForecast({
+        createdAt: createdIso, level: Number(row.level), side: row.side, atr: Number(row.atr),
+        scenario: row.scenario, expectedDirection: row.expected_direction, etaMaxMinutes: Number(row.eta_max) || null,
+      }, since, { pip: forexSizingPipSize(row.symbol) });
+      if (!outcome) continue;
+      await pool.query(
+        `UPDATE mt5_setup_forecasts SET status=?, resolved_at=?, actual=?, matched=?, actual_minutes=?, mfe_pips=?, mae_pips=? WHERE id=? AND status='WAITING'`,
+        [outcome.status, toMysqlDate(outcome.resolvedAt), outcome.actual || null,
+          outcome.matched === undefined ? null : outcome.matched ? 1 : 0,
+          outcome.actualMinutes ?? null, outcome.mfePips ?? null, outcome.maePips ?? null, row.id]);
+      if (outcome.status === FORECAST_LIFECYCLE.EXPIRED) expired += 1; else resolved += 1;
+    } catch (e) { console.error('[SetupForecast] resolve failed for', row.id, e.message); }
+  }
+  if (resolved || expired) console.log(`[SetupForecast] resolved ${resolved}, expired ${expired}`);
+  return { resolved, expired, checked: rows.length };
+}
+
+// GET /api/setup-forecasts — active forecasts, ranked and grouped into horizon buckets.
+app.get('/api/setup-forecasts', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const where = ["status='WAITING'"];
+    const args = [];
+    const q = (v) => String(v || '').trim();
+    if (q(req.query.symbol)) { where.push('UPPER(symbol)=?'); args.push(q(req.query.symbol).toUpperCase()); }
+    if (q(req.query.timeframe)) { where.push('timeframe=?'); args.push(q(req.query.timeframe).toUpperCase()); }
+    if (q(req.query.scenario)) { where.push('scenario=?'); args.push(q(req.query.scenario).toUpperCase()); }
+    if (q(req.query.strategy)) { where.push('best_strategy=?'); args.push(q(req.query.strategy)); }
+    if (Number(req.query.minScore) > 0) { where.push('best_score>=?'); args.push(Number(req.query.minScore)); }
+    if (q(req.query.bucket)) { where.push('horizon=?'); args.push(q(req.query.bucket)); }
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_setup_forecasts WHERE ${where.join(' AND ')} ORDER BY rank_score DESC LIMIT 200`, args);
+
+    const parse = (s, fallback) => { try { return JSON.parse(s) || fallback; } catch { return fallback; } };
+    const forecasts = rows.map((r) => {
+      const drift = parse(r.drift_json, []);
+      return {
+        id: r.id, key: r.fkey, symbol: r.symbol, timeframe: r.timeframe,
+        scenario: r.scenario, side: r.side, level: Number(r.level),
+        levelType: r.level_type, levelLabel: r.level_label, levelStrength: r.level_strength,
+        expectedDirection: r.expected_direction, consensusDirection: r.consensus_direction,
+        distance: { pips: r.distance_pips, atr: r.distance_atr },
+        eta: { minMinutes: r.eta_min, midMinutes: r.eta_mid, maxMinutes: r.eta_max },
+        horizon: { key: r.horizon, label: (FORECAST_HORIZON_BUCKETS.find((b) => b.key === r.horizon) || {}).label || r.horizon },
+        rankScore: Number(r.rank_score), bestScore: Number(r.best_score), bestStrategy: r.best_strategy,
+        agreeCount: r.agree_count, dissentCount: r.dissent_count,
+        fires: parse(r.fires_json, []),
+        plan: parse(r.plan_json, null),
+        scenarioBars: parse(r.bars_json, []),
+        drift, driftSummary: forecastDriftSummary(drift),
+        createdAt: new Date(r.created_at).toISOString(),
+        updatedAt: new Date(r.updated_at).toISOString(),
+      };
+    });
+
+    const discrimination = loadForecastDiscrimination();
+    const allIds = enabledStrategyIds().filter((id) => STRATEGY_LAB_REGISTRY[id] && !STRATEGY_LAB_REGISTRY[id].measureFixedTime);
+    // The in-memory scan record is lost on restart, which made the page claim "no scan yet"
+    // while displaying 150 stored forecasts. Fall back to the data's own freshness.
+    let lastScan = setupForecastLastScan;
+    if (!lastScan) {
+      const [[fresh]] = await pool.query(
+        "SELECT MAX(updated_at) AS at, COUNT(*) AS n FROM mt5_setup_forecasts WHERE status='WAITING'");
+      if (fresh?.at) {
+        lastScan = { at: new Date(fresh.at).toISOString(), forecasts: Number(fresh.n) || 0, fromStoredRows: true };
+      }
+    }
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      lastScan,
+      count: forecasts.length,
+      buckets: groupForecastsByHorizon(forecasts, FORECAST_HORIZON_BUCKETS).map((b) => ({
+        key: b.key, label: b.label, count: b.forecasts.length, forecasts: b.forecasts,
+      })),
+      // The measured level-vs-shape evidence, so the page can show WHY a strategy is
+      // excluded (or flagged unmeasured) instead of it just being silently absent.
+      discrimination: forecastDiscriminationReport(allIds, discrimination),
+      caveats: [
+        'Forecasts are conditional: prices and tickets assume the scenario bar actually happens at the level.',
+        'The scenario bar is a canonical construction from the level and ATR — inspect it in scenarioBars.',
+        'ETA assumes about half an ATR of travel per bar; the band is deliberately wide.',
+        'Tickets are sized to the challenge rules at scan time; re-check before trading.',
+      ],
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/setup-forecasts/scan — manual trigger (page refresh button / testing).
+//
+// Returns immediately rather than awaiting the scan. A full sweep is ~2 minutes (10 symbols x
+// 2 timeframes x ~24 strategies x levels x scenarios x 2 stages, plus the placebo arm), which
+// exceeds every default HTTP client timeout — awaiting it made the endpoint look broken while
+// the scan was in fact succeeding. Poll GET /api/setup-forecasts and watch `lastScan.at`.
+app.post('/api/setup-forecasts/scan', (req, res) => {
+  if (setupForecastScanBusy) return res.json({ ok: true, started: false, reason: 'a scan is already running', lastScan: setupForecastLastScan });
+  res.json({ ok: true, started: true, note: 'scan running in background; poll /api/setup-forecasts for lastScan', lastScan: setupForecastLastScan });
+  void (async () => {
+    try {
+      await runSetupForecastScan({ reason: 'manual' });
+      await resolveSetupForecasts();
+    } catch (e) { console.error('[SetupForecast] manual scan failed:', e.message); }
+  })();
+});
+
+// GET /api/reports/setup-forecasts — how much was predicted, how much matched.
+app.get('/api/reports/setup-forecasts', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 14));
+    const since = toMysqlDate(new Date(Date.now() - days * 86400000).toISOString());
+    const [rows] = await pool.query(
+      `SELECT symbol, timeframe, scenario, best_strategy, status, actual, matched, actual_minutes, eta_mid, mfe_pips, mae_pips, rank_score
+         FROM mt5_setup_forecasts WHERE created_at >= ? ORDER BY created_at DESC LIMIT 5000`, [since]);
+
+    const total = rows.length;
+    const waiting = rows.filter((r) => r.status === 'WAITING').length;
+    const resolvedRows = rows.filter((r) => r.status === 'RESOLVED');
+    const matched = resolvedRows.filter((r) => r.matched === 1);
+    const expired = rows.filter((r) => r.status === 'EXPIRED').length;
+    const superseded = rows.filter((r) => r.status === 'SUPERSEDED').length;
+    const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
+
+    const groupBy = (keyFn) => {
+      const m = new Map();
+      for (const r of resolvedRows) {
+        const k = keyFn(r) || '—';
+        if (!m.has(k)) m.set(k, { key: k, resolved: 0, matched: 0 });
+        const g = m.get(k);
+        g.resolved += 1;
+        if (r.matched === 1) g.matched += 1;
+      }
+      return [...m.values()].map((g) => ({ ...g, matchRate: pct(g.matched, g.resolved) }))
+        .sort((a, b) => b.resolved - a.resolved);
+    };
+    const avg = (list, f) => {
+      const v = list.map(f).filter((x) => Number.isFinite(Number(x))).map(Number);
+      return v.length ? Math.round((v.reduce((a, b) => a + b, 0) / v.length) * 10) / 10 : null;
+    };
+
+    res.json({
+      ok: true, days,
+      totals: {
+        forecasts: total, waiting, resolved: resolvedRows.length,
+        matched: matched.length, matchRate: pct(matched.length, resolvedRows.length),
+        expired, superseded,
+        // EXPIRED means the condition never occurred — kept out of the match rate on purpose,
+        // and reported so a page can show "arrival rate" separately from "match rate".
+        arrivalRate: pct(resolvedRows.length, resolvedRows.length + expired),
+      },
+      timing: {
+        avgActualMinutes: avg(resolvedRows, (r) => r.actual_minutes),
+        avgEtaMidMinutes: avg(resolvedRows, (r) => r.eta_mid),
+      },
+      followThrough: {
+        matchedAvgMfePips: avg(matched, (r) => r.mfe_pips),
+        matchedAvgMaePips: avg(matched, (r) => r.mae_pips),
+      },
+      byScenario: groupBy((r) => r.scenario),
+      byStrategy: groupBy((r) => r.best_strategy),
+      bySymbol: groupBy((r) => r.symbol),
+      actualsWhenMismatched: (() => {
+        const m = new Map();
+        for (const r of resolvedRows.filter((x) => x.matched !== 1)) m.set(r.actual || '—', (m.get(r.actual || '—') || 0) + 1);
+        return [...m.entries()].map(([actual, count]) => ({ actual, count })).sort((a, b) => b.count - a.count);
+      })(),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Retention. This project has repeatedly had its hosting DB quota tripped by an unpruned
+// table (mt5_account_snapshots once, mt5_indicators at 1.45GB as of this writing — which
+// revokes SELECT and takes the reports down), so a new table ships with pruning from day one.
+// Only resolved rows are pruned: a WAITING forecast is still live regardless of age.
+const SETUP_FORECAST_RETENTION_DAYS = Math.max(1, Number(process.env.SETUP_FORECAST_RETENTION_DAYS || 30));
+async function pruneSetupForecasts() {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [r] = await pool.execute(
+      "DELETE FROM mt5_setup_forecasts WHERE status <> 'WAITING' AND resolved_at IS NOT NULL AND resolved_at < DATE_SUB(NOW(), INTERVAL ? DAY)",
+      [SETUP_FORECAST_RETENTION_DAYS]);
+    if (r.affectedRows) console.log(`[SetupForecast] pruned ${r.affectedRows} resolved forecasts older than ${SETUP_FORECAST_RETENTION_DAYS}d`);
+  } catch (e) { console.error('[SetupForecast] retention prune failed:', e.message); }
+}
+setInterval(pruneSetupForecasts, 6 * 3600 * 1000);
+
+// First scan shortly after boot (waits for the candle feed to settle), then on the interval.
+setTimeout(() => { runSetupForecastScan({ reason: 'boot' }).catch((e) => console.error('[SetupForecast] boot scan failed:', e.message)); }, 90 * 1000);
+setInterval(() => { runSetupForecastScan({ reason: 'interval' }).catch((e) => console.error('[SetupForecast] scan failed:', e.message)); }, SETUP_FORECAST_SCAN_MS);
+setInterval(() => { resolveSetupForecasts().catch((e) => console.error('[SetupForecast] resolve failed:', e.message)); }, 5 * 60000);
 
 // GET /api/liquidity-chart?symbol=&timeframe= — the liquidity read behind /chart/liquidity.
 // Read-only: it reuses detectKeyLiquidityLevels for WHERE the liquidity sits and adds the

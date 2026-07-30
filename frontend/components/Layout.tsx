@@ -343,7 +343,7 @@ export default function Layout({ onLogout }: LayoutProps) {
       path: '/future-predictions', icon: Brain, label: 'Future Predictions',
       children: [
         { path: '/future-predictions', icon: Brain, label: 'Execution Forecast', end: true },
-        { path: '/future-predictions/setups', icon: Crosshair, label: 'Strategy Predictions' },
+        { path: '/future-predictions/setups', icon: Crosshair, label: 'Setup Forecasts' },
       ],
     },
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
@@ -368,6 +368,7 @@ export default function Layout({ onLogout }: LayoutProps) {
         { path: '/reports/signals', icon: ClipboardList, label: 'Signal Log' },
         { path: '/reports/calibration', icon: Activity, label: 'Calibration' },
         { path: '/reports/forecasts', icon: CalendarClock, label: 'Forecasts' },
+        { path: '/reports/setup-forecasts', icon: Crosshair, label: 'Setup Forecasts' },
         { path: '/reports/backtest', icon: FlaskConical, label: 'Backtest' },
       ],
     },

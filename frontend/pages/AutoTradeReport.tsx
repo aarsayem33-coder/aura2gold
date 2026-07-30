@@ -200,7 +200,7 @@ export default function AutoTradeReport({ from, to, broker }: { from?: string; t
   const hasClosed = s.trades > 0;
 
   const accounts = data.accounts || [];
-  const activeAcct = accounts.find((a) => a.account === account) || null;
+  const activeAcct = accounts.find((a) => a.key === account) || null;
 
   return (
     <div className="space-y-4">
@@ -217,7 +217,7 @@ export default function AutoTradeReport({ from, to, broker }: { from?: string; t
           >
             <option value="">All accounts ({accounts.length})</option>
             {accounts.filter((a) => a.account).map((a) => (
-              <option key={a.account as string} value={a.account as string}>
+              <option key={a.key} value={a.key}>
                 {(a.broker || 'Unknown')} · {a.account} — {a.executed} executed
               </option>
             ))}

@@ -14,7 +14,7 @@ import DayTradingDesk from './pages/DayTradingDesk.tsx';
 import LiveMarketTracker from './pages/LiveMarketTracker.tsx';
 import ChartStudio from './pages/ChartStudio.tsx';
 import LiquidityChart from './pages/LiquidityChart.tsx';
-import StrategyPredictions from './pages/StrategyPredictions.tsx';
+import SetupForecasts from './pages/SetupForecasts.tsx';
 import ChallengeTracker from './pages/ChallengeTracker.tsx';
 import AutoTrading from './pages/AutoTrading.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
@@ -36,6 +36,7 @@ import FixedOutcomes from './pages/reports/FixedOutcomes.tsx';
 import SignalLog from './pages/reports/SignalLog.tsx';
 import CalibrationReport from './pages/reports/CalibrationReport.tsx';
 import ForecastsReport from './pages/reports/ForecastsReport.tsx';
+import SetupForecastReport from './pages/reports/SetupForecastReport.tsx';
 import BacktestReport from './pages/reports/BacktestReport.tsx';
 import Admin from './pages/Admin.tsx';
 import HistoricalData from './pages/HistoricalData.tsx';
@@ -91,7 +92,7 @@ export default function App() {
           <Route path="signals" element={<SignalDashboard />} />
           <Route path="fixed-time" element={<FixedTimeTrading />} />
           <Route path="future-predictions" element={<FuturePredictions />} />
-          <Route path="future-predictions/setups" element={<StrategyPredictions />} />
+          <Route path="future-predictions/setups" element={<SetupForecasts />} />
           <Route path="projections" element={<Projections />} />
           <Route path="calendar" element={<EconomicCalendar />} />
           <Route path="news-high-impact" element={<HighImpactNews />} />
@@ -120,6 +121,7 @@ export default function App() {
           <Route path="reports/signals" element={<SignalLog />} />
           <Route path="reports/calibration" element={<CalibrationReport />} />
           <Route path="reports/forecasts" element={<ForecastsReport />} />
+          <Route path="reports/setup-forecasts" element={<SetupForecastReport />} />
           <Route path="reports/backtest" element={<BacktestReport />} />
           <Route path="data" element={<HistoricalData />} />
           <Route path="ai-signals" element={<AiSignals />} />

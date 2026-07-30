@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState, createContext, useContext 
 import type {
   StrategyPredictionResponse,
   PredictionReportResponse,
+  SetupForecastResponse,
+  SetupForecastReportResponse,
   LiquidityChartResponse,
   LiquidityRankResponse,
   Alert,
@@ -1509,4 +1511,14 @@ export async function fetchStrategyPredictions(horizonHours = 3): Promise<Strate
 /** How the recorded predictions actually turned out. */
 export async function fetchPredictionReport(days = 30): Promise<PredictionReportResponse> {
   return fetchJson<PredictionReportResponse>(`/api/reports/predictions?days=${encodeURIComponent(String(days))}`);
+}
+
+/** Active conditional setup forecasts, grouped into horizon buckets. */
+export async function fetchSetupForecasts(): Promise<SetupForecastResponse> {
+  return fetchJson<SetupForecastResponse>('/api/setup-forecasts');
+}
+
+/** How the setup forecasts actually resolved: arrivals, matches, timing. */
+export async function fetchSetupForecastReport(days = 14): Promise<SetupForecastReportResponse> {
+  return fetchJson<SetupForecastReportResponse>(`/api/reports/setup-forecasts?days=${encodeURIComponent(String(days))}`);
 }

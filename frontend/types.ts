@@ -2361,6 +2361,7 @@ export interface LiquidityRankResponse {
 
 /** One account present in the auto-trade report window. */
 export interface AutoTradeAccountRow {
+  key: string;
   account: string | null; broker: string | null; server: string | null; demo: boolean | null;
   rows: number; executed: number; net: number; live: boolean;
 }
@@ -2419,4 +2420,67 @@ export interface PredictionReportResponse {
   byStrategy: PredictionGroupRow[]; bySymbol: PredictionGroupRow[];
   byTimeframe: PredictionGroupRow[]; byGrade: PredictionGroupRow[]; byDirection: PredictionGroupRow[];
   recent: PredictionRecentRow[]; note: string;
+}
+
+// ── Setup Forecasts (conditional level-based predictions) ────────────────────
+export interface ForecastFire {
+  strategyId: string; decision: string; agrees: boolean; stage: number;
+  score: number | null; grade: string | null;
+  entry: number | null; stopLoss: number | null;
+  takeProfit: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  rr: number | null;
+}
+export interface ForecastPlan {
+  strategyId: string; direction: string;
+  entry: number; stopLoss: number;
+  takeProfit: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  profitAtFinalTp: number | null; rrToFinal: number | null;
+  stopPips: number; rr: number | null;
+  lots: number; lossAtStop: number; profitAtTp: number | null;
+  riskBudget: number; overBudget: boolean; minForced: boolean;
+  challenge: { eligible: boolean | null; warnings: string[] };
+  conditional: boolean;
+}
+export interface ForecastDriftPoint { ts: string; rankScore: number; bestScore: number; agree: number; etaMid: number | null }
+export interface SetupForecast {
+  id: string; key: string; symbol: string; timeframe: string;
+  scenario: string; side: string; level: number;
+  levelType: string | null; levelLabel: string | null; levelStrength: number | null;
+  expectedDirection: string; consensusDirection: string | null;
+  distance: { pips: number | null; atr: number | null };
+  eta: { minMinutes: number | null; midMinutes: number | null; maxMinutes: number | null };
+  horizon: { key: string; label: string };
+  rankScore: number; bestScore: number; bestStrategy: string | null;
+  agreeCount: number; dissentCount: number;
+  fires: ForecastFire[];
+  plan: ForecastPlan | null;
+  scenarioBars: Array<{ time: string; open: number; high: number; low: number; close: number }>;
+  drift: ForecastDriftPoint[];
+  driftSummary: { rank: number; score: number; points: number };
+  createdAt: string; updatedAt: string;
+}
+export interface ForecastDiscriminationRow {
+  strategyId: string; verdict: string; realRate: number; placeboRate: number;
+  lift: number | null; levelOnly: boolean; realScenarios: number; placeboScenarios: number;
+}
+export interface SetupForecastResponse {
+  ok: boolean; generatedAt: string;
+  lastScan: { at: string; ms: number; forecasts: number; inserted: number; updated: number; superseded: number } | null;
+  count: number;
+  buckets: Array<{ key: string; label: string; count: number; forecasts: SetupForecast[] }>;
+  discrimination: ForecastDiscriminationRow[];
+  caveats: string[];
+}
+export interface SetupForecastReportResponse {
+  ok: boolean; days: number;
+  totals: {
+    forecasts: number; waiting: number; resolved: number; matched: number;
+    matchRate: number | null; expired: number; superseded: number; arrivalRate: number | null;
+  };
+  timing: { avgActualMinutes: number | null; avgEtaMidMinutes: number | null };
+  followThrough: { matchedAvgMfePips: number | null; matchedAvgMaePips: number | null };
+  byScenario: Array<{ key: string; resolved: number; matched: number; matchRate: number | null }>;
+  byStrategy: Array<{ key: string; resolved: number; matched: number; matchRate: number | null }>;
+  bySymbol: Array<{ key: string; resolved: number; matched: number; matchRate: number | null }>;
+  actualsWhenMismatched: Array<{ actual: string; count: number }>;
 }
