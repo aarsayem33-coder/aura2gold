@@ -46,6 +46,7 @@ import { matchTradeToForecast, strategyMatchRates, resolveWindow } from './forec
 import { assessTracked, shouldAlert, TRACK_VERDICT } from './forecastTracking.js';
 import { renderCandleChart } from './chartRender.js';
 import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
+import { resolveAtr, buildAiMarketContext, formatAiMarketContext, formatDisciplineAdvisory } from './aiMarketContext.js';
 import { estimateEtaMinutes, estimateResolveMinutes, rankPredictions } from './strategyPredictions.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
@@ -4257,6 +4258,9 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
     const fttPrediction = generateFttPrediction({ symbol, expiry: '5m', timeframe, candles: candleList, indicators, marketLevels: [], accountSnapshot: mt5State.accountSnapshot, h4Candles, h1Candles });
     const breakout = buildBreakoutCandidate({ symbol, timeframe, candles: candleList });
     const sizing = strategyLabSizing(symbol, sd.entryPrice, sd.stopLoss, { tp1: sd.takeProfit1, tp2: sd.takeProfit2, tp3: sd.takeProfit3 });
+    // systemDecision has no top-level `atr` — it lives on the feature vector. Reading sd.atr
+    // yielded undefined on every call, so scoreChartSetup's stop-distance check never ran.
+    const atrValue = resolveAtr({ systemDecision: sd, breakout, candles: candleList });
 
     // Enabled strategies' read (so the decision "can use strategies" — respects the controller).
     let strategies = [];
@@ -4278,7 +4282,7 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
     const timeTrigger = buildConditionalTimeTrigger({ candles: candleList, timeframe, level, direction: dir, timezone: process.env.APP_TIME_ZONE || 'Asia/Dhaka' });
 
     const groundTruth = {
-      systemDecision: { decision: sd.decision, entry: sd.entryPrice, stopLoss: sd.stopLoss, takeProfit1: sd.takeProfit1, takeProfit2: sd.takeProfit2, takeProfit3: sd.takeProfit3, riskReward: sd.riskRewardRatio, grade: sd.grade, regime: sd.regime, htfBias: sd.htfBias, confidence: sd.confidence },
+      systemDecision: { decision: sd.decision, entry: sd.entryPrice, stopLoss: sd.stopLoss, takeProfit1: sd.takeProfit1, takeProfit2: sd.takeProfit2, takeProfit3: sd.takeProfit3, riskReward: sd.riskRewardRatio, grade: sd.grade, regime: sd.regime, htfBias: sd.htfBias, confidence: sd.confidence, atr: atrValue },
       supportResistance: sd.supportResistance || { support: [], resistance: [] },
       breakout, persistence, timeTrigger,
       ftt: { direction: fttPrediction.direction, confidence: fttPrediction.confidence, timeframeMapping: fttPrediction.indicators?.timeframeMapping || null },
@@ -4286,11 +4290,32 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
       strategies,
     };
 
+    // The positional read: structure with CHoCH, the live liquidity map (PDH/PDL, session
+    // highs/lows, round numbers, equal highs/lows), dealing range and draw. The prompt used to
+    // ask the model to eyeball this off the image while the engine had already measured it.
+    // Best-effort, and never fatal: a failed context degrades the prompt, it does not fail the
+    // analysis the user is waiting on.
+    let chartMarketRead = '';
+    let chartDiscipline = '';
+    try {
+      const aiCtx = buildAiMarketContext({
+        symbol, timeframe, candles: candleList,
+        dailyCandles: getRecentCandles(symbol, 'D1', 20),
+        price: sd.entryPrice, atr: atrValue, systemDecision: sd,
+      });
+      chartMarketRead = formatAiMarketContext(aiCtx);
+      // ADVISORY ONLY. Deliberately not passed to scoreChartSetup below, so the setup score is
+      // provably independent of the day's R budget however the model reacts to reading it.
+      chartDiscipline = formatDisciplineAdvisory(await cachedDailyRiskBudget(await initializeDatabase()));
+    } catch (e) {
+      console.warn('[ChartAnalysis] market context unavailable:', e.message);
+    }
+
     // Deterministic fallback (built once; used if Gemini can't read the image).
     const systemAnalysis = buildSystemChartAnalysis({ symbol, timeframe, tradeMode, systemDecision: sd, fttPrediction, breakout, sizing, candles: candleList, strategies, supportResistance: sd.supportResistance, timezone: process.env.APP_TIME_ZONE || 'Asia/Dhaka' });
 
     // ── PRIMARY: Gemini vision ──
-    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: GEMINI_MODEL, imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth, style, bias });
+    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: GEMINI_MODEL, imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth, style, bias, marketRead: chartMarketRead, discipline: chartDiscipline });
 
     if (vision.available) {
       // Recompute lots server-side from the vision entry/SL (never trust the model's lot).
@@ -4306,7 +4331,7 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
         takeProfit1: vision.forexPlan?.takeProfit1, takeProfit2: vision.forexPlan?.takeProfit2,
         takeProfit3: vision.forexPlan?.takeProfit3,
         aiConfidence: vision.confidence, strategyMatch: vMatch, htfBias: sd.htfBias,
-        atr: sd.atr ?? null, spread: brokerSpecFor(symbol)?.spread ?? null,
+        atr: atrValue, spread: brokerSpecFor(symbol)?.spread ?? null,
         dataFresh: fresh.dataFresh,
       });
       const forexPlan = (tradeMode === 'FTT') ? null : {
@@ -4352,10 +4377,16 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
         strategyMatch: vMatch,
         style, bias, instrument: playbookFor(symbol).label,
         reasoning: vision.reasoning, keyFactors: vision.key_factors,
+        // Where the model's visual read disagrees with the deterministic labels, and its note
+        // to the human about today's risk state. Both are reported, never folded into a score.
+        structureAgreement: vision.structureAgreement || [],
+        disciplineNote: vision.disciplineNote || null,
         system: systemAnalysis, // deterministic read alongside, for comparison
         dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds, marketStatus: fresh.marketStatus,
         honesty: [
           `Chart read by Gemini vision, reconciled with live ${symbol} ${timeframe} math. Lots recomputed server-side. Estimates, not guarantees.`,
+          ...(chartMarketRead ? ['The model was given the deterministic structure and liquidity map; it was asked to agree or disagree with it, not to re-derive it.'] : []),
+          ...(chartDiscipline ? ['Today\'s risk state was shown as advisory context only — it does not affect the setup score, which is computed server-side without it.'] : []),
           ...(fresh.dataFresh ? [] : [`Underlying ${symbol} ${timeframe} candles are NOT live (${fresh.marketStatus.state === 'CLOSED' ? 'market closed' : 'feed stale'}, last data ${fresh.staleSeconds}s ago) — treat as last-session study, not a live signal.`]),
         ],
       });
@@ -14073,6 +14104,24 @@ async function computeDailyRiskBudget(pool) {
   }
 }
 
+// The R budget scans mt5_system_signal_log from UTC midnight. Three AI reviewers now want it
+// alongside the brief, and the pool is small enough that background sweeps have starved user
+// requests before — so the answer is memoised. 60s is far finer than the thing it describes:
+// a day's realised R does not move between two clicks.
+let dailyRiskMemo = { at: 0, value: null };
+async function cachedDailyRiskBudget(pool, ttlMs = 60000) {
+  const now = Date.now();
+  if (dailyRiskMemo.value && now - dailyRiskMemo.at < ttlMs) return dailyRiskMemo.value;
+  try {
+    const value = await computeDailyRiskBudget(pool);
+    dailyRiskMemo = { at: now, value };
+    return value;
+  } catch {
+    // Advisory context must never fail the analysis that carries it.
+    return { available: false };
+  }
+}
+
 // GET /api/day-trading/brief — the pre-session brief. Per curated symbol on one
 // timeframe: bias, regime, grade/score, EMA-extension (over-extension guard),
 // nearest S/R, ADR usage, and any active execution forecast — plus today's news
@@ -19011,6 +19060,12 @@ app.post('/api/setup-forecasts/:id/analyze', async (req, res) => {
     // Live context. Best-effort: a missing piece degrades the prompt, it does not fail the call.
     const market = { session: strategyLabSession(new Date().toISOString())?.key || null };
     let marketRead = '';
+    let structureRead = '';
+    let structureLevelCount = 0;
+    // ADVISORY ONLY. Shown to the model as position-management information for the human; it
+    // is never passed to reconcileForecastAi, so the server-side score is provably independent
+    // of the R budget however the model reacts to reading it.
+    const disciplineRead = formatDisciplineAdvisory(await cachedDailyRiskBudget(pool));
     let chart = null;
     // Overlay data for the chart, taken from the same market read the prompt text uses.
     let chartOrderBlocks = [], chartZones = [], chartRetests = [];
@@ -19032,6 +19087,19 @@ app.post('/api/setup-forecasts/:id/analyze', async (req, res) => {
         // structure, sweeps, S/R, breaker and retests of this level.
         const read = buildMarketRead({ candles: prep.ctx.candles, symbol: r.symbol, level: Number(r.level), atr: prep.atr });
         marketRead = formatMarketRead(read, { symbol: r.symbol, timeframe: r.timeframe });
+
+        // The POSITIONAL read layered on the candle-level one: where price sits in the dealing
+        // range, which levels are still live, and which way the draw points. Same detectors the
+        // strategies use, so the reviewer is told the structure instead of inferring it.
+        const aiCtx = buildAiMarketContext({
+          symbol: r.symbol, timeframe: r.timeframe,
+          candles: prep.ctx.candles, dailyCandles: prep.ctx.dailyCandles,
+          price: prep.price, atr: prep.atr,
+          h4Trend: prep.ctx.h4Trend, h1Trend: prep.ctx.h1Trend,
+          focusLevel: Number(r.level),
+        });
+        structureRead = formatAiMarketContext(aiCtx);
+        structureLevelCount = aiCtx.ok ? aiCtx.liquidity.counts.shown : 0;
 
         // The chart is drawn from the SAME read the prompt text describes, so the image and
         // the words can never disagree. Indices are rebased onto the 80-bar slice the chart
@@ -19085,7 +19153,7 @@ app.post('/api/setup-forecasts/:id/analyze', async (req, res) => {
     } catch { /* news optional */ }
 
     const wantVision = String(req.query.vision || '1') !== '0' && Boolean(chart);
-    const prompt = buildForecastAiPrompt({ forecast, market, news, marketRead, hasImage: wantVision });
+    const prompt = buildForecastAiPrompt({ forecast, market, news, marketRead, structureRead, disciplineRead, hasImage: wantVision });
     const out = await analyzeForecastWithGemini({
       projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION,
       model: String(req.query.model || 'gemini-2.5-flash'),
@@ -19128,6 +19196,9 @@ app.post('/api/setup-forecasts/:id/analyze', async (req, res) => {
           vision: wantVision,
           chartPng: wantVision ? `data:image/png;base64,${chart.png.toString('base64')}` : null,
           sections: marketRead ? marketRead.split('\n').filter((l) => /^[A-Z][a-z].*:/.test(l)).length : 0,
+          // `saw` is an honest inventory of what the model was given, so a silent context
+          // failure shows up as a zero here rather than as a quietly worse review.
+          structureLevels: structureLevelCount,
         },
         analysedAt: new Date().toISOString(),
         caveats: [
@@ -20317,6 +20388,11 @@ app.post('/api/ict-predictions/:id/analyze', async (req, res) => {
 
     const market = { session: strategyLabSession(new Date().toISOString())?.key || null };
     let marketRead = '';
+    let structureRead = '';
+    let structureLevelCount = 0;
+    // ADVISORY ONLY — never reaches reconcileIctAi, so the server-side score cannot move with
+    // the R budget no matter how the model reacts to reading it.
+    const disciplineRead = formatDisciplineAdvisory(await cachedDailyRiskBudget(pool));
     let chart = null;
     try {
       const prep = await setupForecastContext(pool, r.symbol, r.timeframe);
@@ -20334,6 +20410,19 @@ app.post('/api/ict-predictions/:id/analyze', async (req, res) => {
 
         const read = buildMarketRead({ candles: prep.ctx.candles, symbol: r.symbol, level: Number(r.level), atr: prep.atr });
         marketRead = formatMarketRead(read, { symbol: r.symbol, timeframe: r.timeframe });
+
+        // Positional read: the dealing range, the live liquidity map and the stated draw. The
+        // ICT question is entirely about which pool price reaches first, so being told where
+        // the untouched liquidity sits is the difference between a real review and a guess.
+        const aiCtx = buildAiMarketContext({
+          symbol: r.symbol, timeframe: r.timeframe,
+          candles: prep.ctx.candles, dailyCandles: prep.ctx.dailyCandles,
+          price: prep.price, atr: prep.atr,
+          h4Trend: prep.ctx.h4Trend, h1Trend: prep.ctx.h1Trend,
+          focusLevel: Number(r.level),
+        });
+        structureRead = formatAiMarketContext(aiCtx);
+        structureLevelCount = aiCtx.ok ? aiCtx.liquidity.counts.shown : 0;
 
         // The chart is drawn from the SAME candles the prompt describes, so image and words can
         // never disagree. The PROJECTED bars are deliberately NOT drawn — the model is judging
@@ -20362,7 +20451,7 @@ app.post('/api/ict-predictions/:id/analyze', async (req, res) => {
     } catch { /* news optional */ }
 
     const wantVision = String(req.query.vision || '1') !== '0' && Boolean(chart);
-    const prompt = buildIctAiPrompt({ prediction, market, news, marketRead, hasImage: wantVision });
+    const prompt = buildIctAiPrompt({ prediction, market, news, marketRead, structureRead, disciplineRead, hasImage: wantVision });
     const out = await analyzeForecastWithGemini({
       projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION,
       model: String(req.query.model || 'gemini-2.5-flash'),
@@ -20399,6 +20488,9 @@ app.post('/api/ict-predictions/:id/analyze', async (req, res) => {
           vision: wantVision,
           chartPng: wantVision ? `data:image/png;base64,${chart.png.toString('base64')}` : null,
           projectedBarsShown: false,
+          // Honest inventory: a silent context failure reads as a zero rather than as a
+          // quietly worse review.
+          structureLevels: structureLevelCount,
         },
         analysedAt: new Date().toISOString(),
         caveats: [

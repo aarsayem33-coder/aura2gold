@@ -201,3 +201,55 @@ test('the fallback is honest when nothing backs the scenario', () => {
   const v = deterministicForecastView({ ...FORECAST, fires: [] }, 'quota exceeded');
   assert.match(v.summary, /no strategy currently backs/);
 });
+
+// ── discipline is advisory, and provably cannot move the verdict ─────────────
+// The prompt wording asks the model not to downgrade on a spent risk budget. Wording alone is
+// not a guarantee, so these assert the STRUCTURAL half: everything the model is asked to judge
+// on is byte-identical whether the desk is flat or down its daily stop.
+
+const advisory = (limitHit) => [
+  '=== TRADING DISCIPLINE STATE (ADVISORY — READ IT, DO NOT SCORE IT) ===',
+  limitHit ? 'DAILY STOP REACHED — the playbook says the desk stops trading today.' : 'Room remaining: 0.6R.',
+  'It MUST NOT change your verdict.',
+].join('\n');
+
+test('the discipline block is optional and absent by default', () => {
+  const p = buildForecastAiPrompt({ forecast: FORECAST });
+  assert.ok(!p.includes('TRADING DISCIPLINE STATE'));
+});
+
+test('everything outside the discipline block is invariant to the R budget', () => {
+  const calm = buildForecastAiPrompt({ forecast: FORECAST, disciplineRead: advisory(false) });
+  const blown = buildForecastAiPrompt({ forecast: FORECAST, disciplineRead: advisory(true) });
+  const HEAD = '=== TRADING DISCIPLINE STATE';
+  assert.equal(calm.slice(0, calm.indexOf(HEAD)), blown.slice(0, blown.indexOf(HEAD)),
+    'the setup description changed with the risk budget');
+  assert.equal(calm.slice(calm.indexOf('YOUR JOB')), blown.slice(blown.indexOf('YOUR JOB')),
+    'the scoring instructions changed with the risk budget');
+});
+
+test('the advisory sits before YOUR JOB so the constraint is read last', () => {
+  const p = buildForecastAiPrompt({ forecast: FORECAST, disciplineRead: advisory(false) });
+  assert.ok(p.indexOf('TRADING DISCIPLINE STATE') < p.indexOf('YOUR JOB'));
+});
+
+test('discipline_note is captured, bounded, and null when unset', () => {
+  assert.equal(normaliseForecastAi({}).disciplineNote, null);
+  assert.equal(normaliseForecastAi({ discipline_note: 'down 2R today' }).disciplineNote, 'down 2R today');
+  assert.equal(normaliseForecastAi({ discipline_note: 'x'.repeat(500) }).disciplineNote.length, 300);
+});
+
+test('the discipline note rides through reconciliation without touching the ticket', () => {
+  // The real guarantee: the note reaches the UI (the human needs it), but every SCORED field —
+  // direction, score, verdict, entry, stop, targets, issues — is bit-identical with and
+  // without it. Nothing risk-budget shaped can move the trade.
+  const base = normaliseForecastAi({
+    direction: 'BUY', score: 70, entry: 4000, stop_loss: 3990, take_profit_1: 4020, verdict: 'TAKE',
+  });
+  const withNote = { ...base, disciplineNote: 'DAILY STOP HIT — do not trade again today' };
+  const a = reconcileForecastAi(base, FORECAST);
+  const b = reconcileForecastAi(withNote, FORECAST);
+  assert.equal(b.disciplineNote, 'DAILY STOP HIT — do not trade again today', 'the human must still see it');
+  const strip = ({ disciplineNote, ...rest }) => rest;
+  assert.deepEqual(strip(b), strip(a), 'a discipline note changed a scored field');
+});

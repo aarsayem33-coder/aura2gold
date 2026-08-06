@@ -35,7 +35,7 @@ export function capScore(v) {
  * without that, a model handed a confident-looking forecast tends to rubber-stamp it, which
  * makes the whole feature worthless.
  */
-export function buildForecastAiPrompt({ forecast, market = {}, news = [], marketRead = '', hasImage = false }) {
+export function buildForecastAiPrompt({ forecast, market = {}, news = [], marketRead = '', structureRead = '', disciplineRead = '', hasImage = false }) {
   const f = forecast || {};
   const fires = (f.fires || []).slice(0, 8).map((x) =>
     `${x.strategyId}: ${x.decision} score ${x.score ?? '?'}${x.grade ? ` grade ${x.grade}` : ''}${x.agrees ? '' : ' (DISAGREES with the scenario)'}`);
@@ -69,6 +69,7 @@ These are computed by the same detectors the trading strategies use — treat th
 suggestions. Read the raw candles yourself for anything they do not cover, but do NOT contradict
 a measured value with an impression.
 ${marketRead || 'no structural read available'}
+${structureRead ? `\n${structureRead}\n` : ''}
 ${news.length ? `Upcoming news (next 12h): ${news.map((e) => `${e.currency} ${e.impact} "${e.title}" in ${e.in_minutes}m`).join('; ')}` : 'No high-impact news scheduled in the next 12h.'}
 
 ${hasImage ? `A CHART IMAGE IS ATTACHED
@@ -76,7 +77,7 @@ It is rendered from exactly the candles listed above — same data, drawn. Use i
 candle formations, wick length, momentum, where the level sits relative to structure. If what
 you see in the image disagrees with a measured value above, trust the measurement and say so.
 
-` : ''}YOUR JOB
+` : ''}${disciplineRead ? `${disciplineRead}\n\n` : ''}YOUR JOB
 Judge this setup independently. You are EXPECTED to disagree when the evidence warrants it —
 a review that always agrees is useless. If the level is weak, the scenario is unlikely, the
 trend opposes it, or news makes it untradeable, say so and set a low score.
@@ -84,6 +85,11 @@ trend opposes it, or news makes it untradeable, say so and set a low score.
 Give your OWN trade plan. Entry should be where you would actually get in relative to the
 level. Stop must be on the losing side of entry, targets on the winning side, and the stop
 must sit beyond the structure that would invalidate the idea — not at an arbitrary distance.
+
+Use the liquidity map. Say whether you agree with the stated DRAW ON LIQUIDITY, and name the
+level you think price reaches first. A target sitting beyond an untouched opposing pool is a
+target that pool will most likely cap — if your take-profit is on the far side of fresh
+liquidity, justify why price gets through it.
 
 Reply with ONLY this JSON:
 {
@@ -99,6 +105,7 @@ Reply with ONLY this JSON:
   "invalidation": "what would prove this idea wrong",
   "key_risks": ["risk 1", "risk 2"],
   "rationale": "2-4 sentences. Be specific about THIS level and THIS structure.",
+  "discipline_note": "one sentence to the HUMAN about today's risk state, or null. It must NOT influence direction, score or verdict — it is the only place risk-budget talk belongs.",
   "verdict": "TAKE" | "WATCH" | "SKIP"
 }`;
 }
@@ -129,6 +136,9 @@ export function normaliseForecastAi(parsed) {
     invalidation: String(p.invalidation || '').slice(0, 400),
     keyRisks: Array.isArray(p.key_risks) ? p.key_risks.map((r) => String(r).slice(0, 200)).slice(0, 5) : [],
     rationale: String(p.rationale || '').slice(0, 1200),
+    // Advisory only, and kept out of every scored field on purpose — reconcileForecastAi never
+    // reads it, so nothing here can move the ticket or the score.
+    disciplineNote: p.discipline_note ? String(p.discipline_note).slice(0, 300) : null,
     verdict: ['TAKE', 'WATCH', 'SKIP'].includes(verdict) ? verdict : 'WATCH',
   };
 }

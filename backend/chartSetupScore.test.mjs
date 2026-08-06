@@ -187,3 +187,27 @@ test('scoring is deterministic', () => {
   const args = { ...BUY, aiConfidence: 70, atr: 10, htfBias: 'BULLISH' };
   assert.deepEqual(scoreChartSetup(args), scoreChartSetup(args));
 });
+
+// ── the silent-null ATR regression ───────────────────────────────────────────
+// The caller passed `sd.atr`, which never existed on systemDecision, so this component was
+// dead in production while every unit test here kept passing — the tests supplied an ATR the
+// real call site never did. These assert the OBSERVABLE difference, so a future caller that
+// loses the ATR again shows up as a missing factor rather than as silence.
+
+test('stop distance scores only when an ATR is supplied', () => {
+  const withAtr = scoreChartSetup({ ...BUY, atr: 10 });
+  const withoutAtr = scoreChartSetup({ ...BUY, atr: null });
+  const factor = (r) => r.breakdown.find((b) => b.factor === 'stop distance');
+  assert.ok(factor(withAtr), 'stop distance must be scored when ATR is known');
+  assert.equal(factor(withoutAtr), undefined, 'stop distance must be absent when ATR is unknown');
+  assert.notEqual(withAtr.score, withoutAtr.score);
+});
+
+test('a noise-width stop is penalised once ATR is wired', () => {
+  // 1-point stop against a 10-point ATR = 0.1x — inside the noise. This is the RR-106 case
+  // that went unpunished for as long as the ATR was undefined.
+  const noise = scoreChartSetup({ ...BUY, stopLoss: 3999, takeProfit3: 4030, atr: 10 });
+  const f = noise.breakdown.find((b) => b.factor === 'stop distance');
+  assert.ok(f, 'expected a stop distance factor');
+  assert.ok(f.points < 0, `expected a penalty, got ${f.points}`);
+});

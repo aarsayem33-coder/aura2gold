@@ -37,7 +37,7 @@ const SETUP_WORDS = {
  * are assumptions. A reviewer that is not told the displacement was ASSUMED will treat a 95 as
  * evidence and rubber-stamp it, which makes the whole panel worthless.
  */
-export function buildIctAiPrompt({ prediction, market = {}, news = [], marketRead = '', hasImage = false }) {
+export function buildIctAiPrompt({ prediction, market = {}, news = [], marketRead = '', structureRead = '', disciplineRead = '', hasImage = false }) {
   const p = prediction || {};
   const m = p.measurements || {};
   const gates = (m.gates || []).map((g) => `  ${g.label}: ${g.value ?? 'unknown'} — ${g.pass === null ? 'not measured' : g.pass ? 'PASS' : 'FAIL'} (${g.detail})`);
@@ -97,6 +97,7 @@ These come from the same detectors the strategies use — treat them as facts. R
 yourself for anything they do not cover, but do not contradict a measured value with an
 impression.
 ${marketRead || 'no structural read available'}
+${structureRead ? `\n${structureRead}\n` : ''}
 ${news.length ? `Upcoming news (next 12h): ${news.map((e) => `${e.currency} ${e.impact} "${e.title}" in ${e.in_minutes}m`).join('; ')}` : 'No high-impact news scheduled in the next 12h.'}
 
 ${hasImage ? `A CHART IMAGE IS ATTACHED
@@ -105,15 +106,17 @@ where the pool sits relative to structure, how price has behaved around it befor
 approach looks impulsive or exhausted. If the image disagrees with a measured value, trust the
 measurement and say so.
 
-` : ''}YOUR JOB
+` : ''}${disciplineRead ? `${disciplineRead}\n\n` : ''}YOUR JOB
 Answer the ICT question, not a generic one:
 
 1. REACH — is price likely to trade to ${p.level} at all inside the estimated window?
 2. SWEEP OR ACCEPT — this is the trade. If price gets there, does the liquidity grab FAIL
    (sweep and reject, the prediction) or does price ACCEPT through and continue? Say which and
    why, in structural terms.
-3. DRAW — is the target actually the draw on liquidity, or is there closer opposing liquidity
-   that would cap the move first?
+3. DRAW — is the target actually the draw on liquidity? The liquidity map above names a
+   PRIMARY and ALTERNATIVE draw with its reasoning. Say whether you agree, and if not, name
+   the pool you think caps the move first. Untouched liquidity between entry and target is
+   the usual reason a good-looking target never gets paid.
 4. CONTEXT — does the higher timeframe, the session, or upcoming news make this untradeable?
 
 You are EXPECTED to disagree when the evidence warrants it. A review that always agrees is
@@ -141,6 +144,7 @@ Reply with ONLY this JSON:
   "invalidation": "what would prove this idea wrong",
   "key_risks": ["risk 1", "risk 2"],
   "rationale": "2-4 sentences. Be specific about THIS pool and THIS structure.",
+  "discipline_note": "one sentence to the HUMAN about today's risk state, or null. It must NOT influence direction, score or verdict — it is the only place risk-budget talk belongs.",
   "verdict": "TAKE" | "WATCH" | "SKIP"
 }`;
 }
@@ -175,6 +179,8 @@ export function normaliseIctAi(parsed) {
     invalidation: String(p.invalidation || '').slice(0, 400),
     keyRisks: Array.isArray(p.key_risks) ? p.key_risks.map((r) => String(r).slice(0, 200)).slice(0, 5) : [],
     rationale: String(p.rationale || '').slice(0, 1200),
+    // Advisory only: reconcileIctAi never reads it, so it cannot move the ticket or the score.
+    disciplineNote: p.discipline_note ? String(p.discipline_note).slice(0, 300) : null,
     verdict: pick(p.verdict, ['TAKE', 'WATCH', 'SKIP'], 'WATCH'),
   };
 }

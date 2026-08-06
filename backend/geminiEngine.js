@@ -1044,7 +1044,7 @@ export async function analyzeAiSignalsWithGemini({
 // { available:false } so the route can fall back to pure system analysis. This
 // function is read-only and isolated — it never touches live signal scoring.
 
-function buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, style = null, bias = null }) {
+function buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, style = null, bias = null, marketRead = '', discipline = '' }) {
   const gt = groundTruth || {};
   // The persona goes BEFORE the doctrine so the model reads its role first: a scalper and a day
   // trader take different trades off the same chart, and gold/Nasdaq/S&P each need their own
@@ -1059,19 +1059,24 @@ function buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, sty
 The user uploaded a CHART SCREENSHOT for ${symbol} on the ${timeframe} timeframe.
 Trade mode requested: ${tradeMode}.
 
-STEP 1 — READ THE IMAGE: identify candlesticks, swing structure (HH/HL/LH/LL), the
-trend, support/resistance zones, notable chart/candle patterns, and any BREAKOUT
-(PRE = compressing into a level, or CONFIRMED = a candle closed decisively beyond it).
+STEP 1 — READ THE IMAGE FOR SHAPE. The engine has ALREADY labelled market structure
+(HH/HL/LH/LL, BOS, CHoCH) deterministically from candle CLOSES, and its labels are below.
+Do not re-derive them and do not restate them — that adds nothing. Your job on the image is
+what the labels cannot carry: how the last 10-15 candles BEHAVED (impulsive, grinding, or
+exhausted), wick character into the levels, whether the approach looks like acceptance or
+rejection, visible compression, and whether this looks like a chart you would actually trade.
 
-STEP 2 — RECONCILE WITH GROUND TRUTH: a deterministic engine already analysed the LIVE
-${symbol} ${timeframe} data. Treat its numeric levels as ground truth. For any PRICE you
-output (entry/SL/TP/level), PREFER these live numbers; only use a value read from the
-image if the engine has nothing, and then mark it approximate. If the image clearly
-disagrees with the live math (e.g. a stale screenshot), say so and trust the live data.
+STEP 2 — AGREE OR DISAGREE, ITEM BY ITEM. For each of: (a) structural bias, (b) the latest
+structure event, (c) premium/discount location, (d) the stated draw on liquidity — say AGREE
+or DISAGREE and why, in "structureAgreement". Disagreement is valuable and expected; a
+reviewer that agrees with everything has told us nothing. BUT: for any PRICE you output
+(entry/SL/TP/level), always use the engine's numbers. Disagree about the READ, never about
+the arithmetic. If the image looks like a different market from the numbers, the screenshot
+is probably stale — say so, and the live math wins.
 
 --- DETERMINISTIC GROUND TRUTH (live ${symbol} ${timeframe}) ---
 ${JSON.stringify(gt, null, 2)}
-
+${marketRead ? `\n${marketRead}\n` : ''}${discipline ? `\n${discipline}\n` : ''}
 RULES:
 - Apply the capital-protection doctrine. "NO TRADE / WAIT" is valid. Confidence <= 95, never a guarantee.
 - Forex plan: entry, logical stop loss (structural invalidation), TP1/TP2/TP3, reward:risk >= 1.5. (Lot size is recomputed by the server — you may omit it.)
@@ -1084,13 +1089,15 @@ Return STRICT JSON ONLY:
   "confidence": 0-95,
   "detection": {
     "trend": "BULLISH|BEARISH|RANGING|UNCLEAR",
-    "structure": ["short structure notes (HH/HL/BOS/CHoCH/sweep)"],
+    "structure": ["YOUR OWN words for what the IMAGE shows — candle behaviour, wick character, acceptance vs rejection. Not a restatement of the engine's labels."],
     "srZones": [{"type":"SUPPORT|RESISTANCE","level":number,"note":"string"}],
     "patterns": ["e.g. bull flag, double top"],
     "breakout": {"phase":"NONE|PRE|CONFIRMED","direction":"UP|DOWN|NONE","level":number}
   },
   "forexPlan": {"decision":"BUY|SELL|HOLD","entry":number,"stopLoss":number,"takeProfit1":number,"takeProfit2":number,"takeProfit3":number,"riskReward":number,"invalidation":"string"},
   "fttPlan": {"direction":"UP|DOWN|HOLD","expiry":"2m|3m|5m|15m|30m|1h","suggestedTimeframe":"M1|M5|M15|M30|H1","expectedCandlesInDirection":number,"timeTrigger":{"atLabel":"string","condition":"ABOVE|BELOW","level":number,"elseAction":"IGNORE"}},
+  "structureAgreement": [{"item":"bias|structure event|location|draw","agree":true,"note":"why you agree or disagree"}],
+  "discipline_note": "one sentence to the HUMAN about today's risk state, or null. It must NOT influence your verdict, score, confidence or prices.",
   "reasoning": "concise professional write-up: image read, reconciliation with live math, invalidation, expectancy, final verdict",
   "key_factors": ["..."]
 }`;
@@ -1099,12 +1106,12 @@ Return STRICT JSON ONLY:
 export async function analyzeChartImageWithGemini({
   projectId, location = 'global', model = 'gemini-2.5-flash',
   imageBase64, mimeType = 'image/jpeg', symbol, timeframe, tradeMode = 'BOTH', groundTruth = {},
-  style = null, bias = null,
+  style = null, bias = null, marketRead = '', discipline = '',
 }) {
   const unavailable = { available: false };
   if (!isGeminiConfigured(projectId) || !imageBase64) return unavailable;
 
-  const prompt = buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, style, bias });
+  const prompt = buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, style, bias, marketRead, discipline });
 
   let response;
   try {
@@ -1133,7 +1140,13 @@ export async function analyzeChartImageWithGemini({
     const message = await response.text().catch(() => '');
     if (model === 'gemini-2.5-pro') {
       console.warn(`[Chart Vision Gemini] pro failed (${response.status}); retrying with flash.`);
-      return analyzeChartImageWithGemini({ projectId, location, model: 'gemini-2.5-flash', imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth });
+      // The retry MUST carry everything the first attempt had. It previously dropped style and
+      // bias, so any retried request silently lost the trader persona and answered as the
+      // generic prompt — the caller could not tell the difference from the response.
+      return analyzeChartImageWithGemini({
+        projectId, location, model: 'gemini-2.5-flash', imageBase64, mimeType,
+        symbol, timeframe, tradeMode, groundTruth, style, bias, marketRead, discipline,
+      });
     }
     console.error(`[Chart Vision Gemini] API error ${response.status}:`, message);
     return unavailable;
@@ -1174,6 +1187,14 @@ export async function analyzeChartImageWithGemini({
       },
       reasoning: enforceHonesty(String(parsed.reasoning || 'No reasoning provided.')),
       key_factors: (Array.isArray(parsed.key_factors) ? parsed.key_factors : []).map((f) => enforceHonesty(String(f))),
+      // Where the model's visual read DISAGREES with the deterministic labels. Kept as data
+      // rather than averaged into the verdict: a disagreement is a flag for the human, and an
+      // absent array is a non-event (older responses simply will not carry it).
+      structureAgreement: (Array.isArray(parsed.structureAgreement) ? parsed.structureAgreement : [])
+        .slice(0, 6)
+        .map((a) => ({ item: String(a?.item || '').slice(0, 40), agree: a?.agree === true, note: String(a?.note || '').slice(0, 200) })),
+      // Advisory only — never reaches scoreChartSetup, so it cannot move the setup score.
+      disciplineNote: parsed.discipline_note ? enforceHonesty(String(parsed.discipline_note)).slice(0, 300) : null,
     };
   } catch (error) {
     console.error('[Chart Vision Gemini] Failed to parse response:', error.message);
