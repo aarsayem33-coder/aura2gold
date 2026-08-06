@@ -6,8 +6,8 @@
   "description": "Node backend for proxying Google Cloud API requests",
   "main": "server.js",
   "scripts": {
-    "start": "node --env-file=.env.local server.js",
-    "dev": "nodemon --env-file=.env.local server.js"
+    "start": "node --max-old-space-size=8192 --env-file=.env.local server.js",
+    "dev": "nodemon --exec \"node --max-old-space-size=8192 --env-file=.env.local server.js\""
   },
   "dependencies": {
     "dotenv": "^17.2.3",

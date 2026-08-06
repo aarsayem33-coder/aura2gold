@@ -1,6 +1,7 @@
 import fetch from 'node-fetch';
 import { GoogleAuth } from 'google-auth-library';
 import { getUpcomingForSymbol } from './economicCalendar.js';
+import { buildPersonaPrompt } from './chartTraderPersona.js';
 
 function stripCodeFences(text) {
   return String(text || '')
@@ -152,16 +153,21 @@ function buildVertexEndpoint({ projectId, location, model }) {
 // Both APIs accept the same { contents, generationConfig } body and return the
 // same { candidates: [{ content: { parts: [{ text }] } }] } shape, so every
 // caller below works unchanged regardless of which mode is active.
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+// READ LAZILY, not at module load. In ESM every `import` is evaluated BEFORE the importing
+// module's first statement, and server.js calls dotenv.config() in its body — so a constant
+// captured here always saw an empty environment. The configured key was therefore ignored and
+// every call silently fell back to Vertex ADC, which then failed with access_denied while the
+// logs blamed the wrong auth mode.
+const geminiApiKey = () => process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
 
 /** True when AI can run at all — either an API key OR a Vertex project is present. */
 export function isGeminiConfigured(projectId) {
-  return Boolean(GEMINI_API_KEY || projectId);
+  return Boolean(geminiApiKey() || projectId);
 }
 
 /** Which auth mode is active, for logging / health reporting. */
 export function geminiAuthMode() {
-  return GEMINI_API_KEY ? 'api-key' : 'vertex-adc';
+  return geminiApiKey() ? 'api-key' : 'vertex-adc';
 }
 
 /**
@@ -172,11 +178,12 @@ export function geminiAuthMode() {
 async function geminiGenerateContent({ projectId, location = 'global', model, contents, generationConfig }) {
   const body = JSON.stringify({ contents, generationConfig });
 
-  if (GEMINI_API_KEY) {
+  const apiKey = geminiApiKey();
+  if (apiKey) {
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
     return fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body,
     });
   }
@@ -1037,9 +1044,16 @@ export async function analyzeAiSignalsWithGemini({
 // { available:false } so the route can fall back to pure system analysis. This
 // function is read-only and isolated — it never touches live signal scoring.
 
-function buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth }) {
+function buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, style = null, bias = null }) {
   const gt = groundTruth || {};
-  return `${TRADER_DOCTRINE}
+  // The persona goes BEFORE the doctrine so the model reads its role first: a scalper and a day
+  // trader take different trades off the same chart, and gold/Nasdaq/S&P each need their own
+  // playbook. Omitted when the caller did not ask for a style, so the original generic path is
+  // completely unchanged.
+  const persona = style ? `${buildPersonaPrompt({ symbol, timeframe, style, bias })}
+
+` : '';
+  return `${persona}${TRADER_DOCTRINE}
 
 === TASK: CHART IMAGE ANALYSIS (VISION) ===
 The user uploaded a CHART SCREENSHOT for ${symbol} on the ${timeframe} timeframe.
@@ -1085,11 +1099,12 @@ Return STRICT JSON ONLY:
 export async function analyzeChartImageWithGemini({
   projectId, location = 'global', model = 'gemini-2.5-flash',
   imageBase64, mimeType = 'image/jpeg', symbol, timeframe, tradeMode = 'BOTH', groundTruth = {},
+  style = null, bias = null,
 }) {
   const unavailable = { available: false };
   if (!isGeminiConfigured(projectId) || !imageBase64) return unavailable;
 
-  const prompt = buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth });
+  const prompt = buildChartVisionPrompt({ symbol, timeframe, tradeMode, groundTruth, style, bias });
 
   let response;
   try {
@@ -1163,5 +1178,70 @@ export async function analyzeChartImageWithGemini({
   } catch (error) {
     console.error('[Chart Vision Gemini] Failed to parse response:', error.message);
     return unavailable;
+  }
+}
+
+// ─── Setup-forecast review ────────────────────────────────────────────────────
+// A second opinion on ONE conditional forecast. The prompt and all response handling live in
+// forecastAi.js so they can be tested without an API key; this function is only the call.
+//
+// Returns { available:false, reason } on every failure path rather than throwing — the page
+// must be able to say "no AI ran" instead of showing a fabricated analysis.
+export async function analyzeForecastWithGemini({
+  projectId,
+  location = 'global',
+  model = 'gemini-2.5-flash',
+  prompt,
+  imageBase64 = null,        // rendered chart PNG; the model looks at it alongside the text
+}) {
+  if (!isGeminiConfigured(projectId)) {
+    return { available: false, reason: 'Gemini is not configured (set GEMINI_API_KEY or GOOGLE_CLOUD_PROJECT).' };
+  }
+  if (!prompt) return { available: false, reason: 'no prompt built' };
+
+  let response;
+  try {
+    response = await geminiGenerateContent({
+      projectId,
+      location,
+      model,
+      contents: [{
+        role: 'user',
+        parts: imageBase64
+          ? [{ text: prompt }, { inlineData: { mimeType: 'image/png', data: imageBase64 } }]
+          : [{ text: prompt }],
+      }],
+      generationConfig: {
+        // Low temperature: this is analysis, not ideation. Two reviews of the same unchanged
+        // forecast should not disagree with each other.
+        temperature: 0.2,
+        topP: 0.95,
+        maxOutputTokens: 2048,
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    });
+  } catch (error) {
+    console.error(`[ForecastAI] request failed (${geminiAuthMode()}):`, error.message);
+    return { available: false, reason: `Gemini request failed (${geminiAuthMode()}).` };
+  }
+
+  if (!response.ok) {
+    const message = await response.text().catch(() => '');
+    if (model === 'gemini-2.5-pro') {
+      console.warn(`[ForecastAI] pro failed (${response.status}); retrying with flash.`);
+      return analyzeForecastWithGemini({ projectId, location, model: 'gemini-2.5-flash', prompt, imageBase64 });
+    }
+    console.error(`[ForecastAI] API error ${response.status}:`, message.slice(0, 300));
+    return { available: false, reason: `Gemini returned ${response.status}.` };
+  }
+
+  try {
+    const data = await response.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+    return { available: true, parsed: JSON.parse(stripCodeFences(text)), model };
+  } catch (error) {
+    console.error('[ForecastAI] failed to parse response:', error.message);
+    return { available: false, reason: 'Gemini returned a response that could not be parsed.' };
   }
 }

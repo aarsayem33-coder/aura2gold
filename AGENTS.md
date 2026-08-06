@@ -41,6 +41,58 @@ The architecture is **memory-first**: incoming candles go into an in-memory stor
 to the browser via SSE **instantly**; the MySQL write is fire-and-forget (`void persist().catch()`).
 Analysis reads from memory, never blocks on the DB.
 
+### Local MySQL installation (2026-08-06)
+
+MySQL Community Server **8.4.9 LTS** is installed locally through winget package
+`Oracle.MySQL`. This is a prepared migration target; **the backend still uses the remote DB**
+from `backend/.env.local`. Do not change `DB_HOST` until a selective migration is complete and
+verified.
+
+```
+Windows service: MySQL84 (Automatic)
+Server/client:   C:\Program Files\MySQL\MySQL Server 8.4\bin
+Config:          C:\ProgramData\MySQL\MySQL Server 8.4\my.ini
+Data directory:  C:\ProgramData\MySQL\MySQL Server 8.4\Data
+Host/port:       127.0.0.1:3306 (localhost only)
+Database:        aura_gold_alerts (currently empty migration target)
+App user:        aura_app@127.0.0.1
+Time zone:       +00:00
+Charset:         utf8mb4 / utf8mb4_0900_ai_ci
+```
+
+The generated root and app passwords are **not in the repo or OneDrive**. They are stored in a
+Windows DPAPI-encrypted, current-user-only file:
+
+```
+%LOCALAPPDATA%\AuraGoldAlerts\mysql-local-credentials.xml
+```
+
+PowerShell retrieval for a one-off local command (never print or commit the password):
+
+```powershell
+$c = Import-Clixml "$env:LOCALAPPDATA\AuraGoldAlerts\mysql-local-credentials.xml"
+$env:MYSQL_PWD = [Net.NetworkCredential]::new('', $c.AppPassword).Password
+& "C:\Program Files\MySQL\MySQL Server 8.4\bin\mysql.exe" -h $c.Host -P $c.Port -u $c.AppUser -D $c.Database
+Remove-Item Env:MYSQL_PWD
+```
+
+Local DB migration cautions:
+
+1. The MySQL data directory must stay outside OneDrive. Never point `datadir` into this repo.
+2. Disk space was about 49 GB free at installation. Use a **selective dump**, not a whole-DB copy.
+3. Do **not** import remote `mt5_indicators` (historically ~1.45 GB / 3.4M rows); current code uses
+   local indicator storage instead.
+4. Check the remote server flavor/version before dumping. Hostinger may use MariaDB; normalize
+   incompatible collations/`utf8mb3` when importing into MySQL 8.4.
+5. Diagnostic scripts must keep `timezone:'Z'` (same rule as Trap #8 below).
+6. `backend/.cache/history.db` and `indicators.db` are SQLite files inside OneDrive today. Moving
+   them is a separate operation: stop the backend first, move/copy safely, repoint configuration,
+   then integrity-check before deleting the originals. Do not move live WAL files ad hoc.
+
+Recommended migration sequence: inspect remote flavor and table sizes; dump schema plus only
+actively-read tables; import locally; run row-count/date-range checks; temporarily start the
+backend against local MySQL; verify reports and writes; only then update `backend/.env.local`.
+
 > **Outcome resolver — DO NOT expire wins (2026-06-21).** `processForexEmailReports` and
 > `processSystemSignalLog` keep PENDING + young (<72h) TP1/TP2 wins "open" for possible TP upgrade.
 > The age>72h branch must **only** expire rows whose outcome is still `PENDING` — never overwrite a

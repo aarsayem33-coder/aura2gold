@@ -52,6 +52,10 @@ input long              InpTradeMagic    = 990045;                  // Magic num
 input int               InpTradeSlippage = 30;                      // Max slippage (points)
 input int               InpHistoryHours  = 48;                      // Reconciliation window (hours of closed-trade history to re-push)
 
+input group             "Manual Trade Reporting"
+input bool              InpReportManualTrades = true;               // Import future manual MT5 closes into Auto Trade Report
+input int               InpManualReportSec = 60;                    // Manual close reconciliation interval (seconds)
+
 input group             "Alert Settings"
 input bool              InpTrackTrades   = true;                    // Send Alerts on Trades (Open/Close)
 input bool              InpTrackSMACross = false;                   // Send Alerts on SMA Crossover
@@ -63,6 +67,10 @@ input int               InpSlowSmaPeriod = 20;                      // Slow SMA 
 int      timer_ticks      = 0;
 datetime last_heartbeat   = 0;
 datetime last_trade_poll  = 0;
+datetime last_manual_report = 0;
+datetime g_manual_history_activated = 0;
+datetime g_manual_history_cursor = 0;
+long     g_manual_history_scope = 0;
 long     g_known_positions[];       // magic-filtered position ids seen last poll (close detection)
 bool     g_known_positions_primed = false;
 int      g_spec_tick      = 0;      // 0 = include broker contract specs on this poll
@@ -117,8 +125,10 @@ int OnInit()
    Print("Aura Gold EA Initializing...");
    PrintStartupDiagnostics();
    
-   // Set timer for heartbeats and snapshots
-   if(InpSendHeartbeat || InpSendSnapshot)
+   if(InpReportManualTrades) ManualHistoryInit();
+
+   // Set timer for heartbeats, snapshots and independent manual trade reporting.
+   if(InpSendHeartbeat || InpSendSnapshot || InpReportManualTrades)
    {
       EventSetTimer(1); // Check every second for interval matching
    }
@@ -158,7 +168,11 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    Print("Aura Gold EA Deinitializing...");
-   if(InpSendHeartbeat || InpSendSnapshot)
+   // Hand the trade bridge over immediately rather than leaving the next chart to wait out the
+   // lease. Changing a chart's timeframe deinitialises and reinitialises the EA, so without this
+   // the bridge would go quiet for up to the lease duration on every timeframe switch.
+   TradeBridgeReleaseLeadership();
+   if(InpSendHeartbeat || InpSendSnapshot || InpReportManualTrades)
    {
       EventKillTimer();
    }
@@ -198,16 +212,39 @@ void OnTimer()
 {
    datetime now = TimeLocal();
 
-   // Always send heartbeats even during history sync to keep backend connection alive
-   if(InpSendHeartbeat && (now - last_heartbeat >= InpHeartbeatSec))
+   // Heartbeat and manual-history are ACCOUNT-WIDE, not per-chart: they describe the terminal
+   // and the account, so sending them from every chart is the same fact repeated N times.
+   //
+   // With 24 charts attached this was the traffic that starved the feed — 1,512 failed POSTs
+   // (err 5203) — and a failed heartbeat is exactly what makes the backend declare the EA
+   // disconnected after 120s. Leader-gating them is what keeps the connection up.
+   //
+   // Live candles below are deliberately NOT gated: each chart streams its OWN symbol and
+   // timeframe, so that traffic is distinct work rather than duplication.
+   bool bridge_leader = TradeBridgeIsLeader();
+
+   if(InpSendHeartbeat && bridge_leader && (now - last_heartbeat >= InpHeartbeatSec))
    {
       SendHeartbeat();
+   }
+
+   // Reporting is independent of auto execution. Enabling this never polls for or places
+   // an order; it only imports manual positions closed after the feature was activated.
+   if(InpReportManualTrades && bridge_leader && (now - last_manual_report >= MathMax(10, InpManualReportSec)))
+   {
+      last_manual_report = now;
+      ManualHistoryReport();
    }
 
    // Auto-trading bridge: poll the backend for approved trade commands, execute them,
    // and report closed positions. Runs even during history sync — a trade command is
    // time-critical. The backend gates everything (mode/filters/caps/armed account).
-   if(InpAutoTrade && (now - last_trade_poll >= InpTradePollSec))
+   //
+   // ONE INSTANCE ONLY — see TradeBridgeIsLeader(). The bridge is account-wide, not per-chart,
+   // and 24 charts each polling it produced ~8 requests/second, 1,512 failed POSTs, eleven
+   // duplicate reports of a single position close, and commands that executed at the broker but
+   // could never report back ("EA picked the command up but never reported a result").
+   if(InpAutoTrade && bridge_leader && (now - last_trade_poll >= InpTradePollSec))
    {
       last_trade_poll = now;
       TradeBridgePoll();
@@ -1971,6 +2008,214 @@ bool UploadHistoryChunk(string symbol, string tf_label, MqlRates &rates[], int s
 }
 
 //+------------------------------------------------------------------+
+//| MANUAL TRADE REPORTING                                           |
+//| Read-only history export for trades opened by MT5 desktop,       |
+//| mobile or web. It is deliberately independent of auto trading.   |
+//+------------------------------------------------------------------+
+long ManualHistoryScopeId(long account)
+{
+   string value = IntegerToString(account) + "|" + AccountInfoString(ACCOUNT_COMPANY) + "|" + AccountInfoString(ACCOUNT_SERVER);
+   uint hash = 2166136261;
+   for(int i = 0; i < StringLen(value); i++)
+      hash = (hash ^ (uint)StringGetCharacter(value, i)) * 16777619;
+   return (long)hash;
+}
+
+string ManualHistoryKey(string kind, long scope)
+{
+   return "AuraManualV1" + kind + "_" + IntegerToString(scope);
+}
+
+datetime ManualHistoryNow()
+{
+   datetime now = TimeTradeServer();
+   if(now <= 0) now = TimeLocal();
+   return now;
+}
+
+void ManualHistoryInit()
+{
+   long account = AccountInfoInteger(ACCOUNT_LOGIN);
+   if(account <= 0) return;
+   long scope = ManualHistoryScopeId(account);
+   string start_key = ManualHistoryKey("Start", scope);
+   string cursor_key = ManualHistoryKey("Cursor", scope);
+   datetime now = ManualHistoryNow();
+   if(!GlobalVariableCheck(start_key)) GlobalVariableSet(start_key, (double)now);
+   g_manual_history_activated = (datetime)GlobalVariableGet(start_key);
+   if(!GlobalVariableCheck(cursor_key)) GlobalVariableSet(cursor_key, (double)g_manual_history_activated);
+   g_manual_history_cursor = (datetime)GlobalVariableGet(cursor_key);
+   if(g_manual_history_cursor < g_manual_history_activated) g_manual_history_cursor = g_manual_history_activated;
+   g_manual_history_scope = scope;
+   Print("Aura Manual Report: active for account ", account, " from ", TimeToString(g_manual_history_activated, TIME_DATE|TIME_SECONDS));
+}
+
+bool ManualEntryReason(long reason)
+{
+   return reason == DEAL_REASON_CLIENT || reason == DEAL_REASON_MOBILE || reason == DEAL_REASON_WEB;
+}
+
+string ManualReasonName(long reason)
+{
+   if(reason == DEAL_REASON_MOBILE) return "MOBILE";
+   if(reason == DEAL_REASON_WEB) return "WEB";
+   return "CLIENT";
+}
+
+bool ManualPositionStillOpen(long position_id)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetTicket(i) == 0) continue;
+      if(PositionGetInteger(POSITION_IDENTIFIER) == position_id) return true;
+   }
+   return false;
+}
+
+bool ManualPositionKnown(long &ids[], long position_id)
+{
+   for(int i = 0; i < ArraySize(ids); i++)
+      if(ids[i] == position_id) return true;
+   return false;
+}
+
+bool ManualHistoryPost(string body)
+{
+   string url = InpServerUrl + "/api/mt5/manual-trade-history";
+   string headers = "Content-Type: application/json\r\n";
+   char post_bytes[]; char result[]; string result_headers;
+   ArrayResize(post_bytes, StringLen(body));
+   StringToCharArray(body, post_bytes, 0, StringLen(body), CP_UTF8);
+   ResetLastError();
+   int res = WebRequest("POST", url, headers, InpTimeout, post_bytes, result, result_headers);
+   if(res >= 200 && res < 300) return true;
+   Print("Aura Manual Report: POST failed, code=", res, ", err=", GetLastError());
+   return false;
+}
+
+void ManualHistoryReport()
+{
+   long account = AccountInfoInteger(ACCOUNT_LOGIN);
+   if(account <= 0) return;
+   long scope = ManualHistoryScopeId(account);
+   if(scope != g_manual_history_scope || g_manual_history_activated <= 0) ManualHistoryInit();
+   if(g_manual_history_activated <= 0) return;
+
+   datetime scan_to = ManualHistoryNow();
+   datetime scan_from = g_manual_history_cursor - 300; // replay a short overlap after dropped responses
+   if(scan_from < g_manual_history_activated) scan_from = g_manual_history_activated;
+   if(scan_to <= scan_from || !HistorySelect(scan_from, scan_to + 1)) return;
+
+   long positions[];
+   int history_total = HistoryDealsTotal();
+   for(int i = 0; i < history_total; i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0) continue;
+      long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY && entry != DEAL_ENTRY_INOUT) continue;
+      datetime close_time = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+      if(close_time < g_manual_history_activated) continue;
+      long position_id = HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      if(position_id <= 0 || ManualPositionKnown(positions, position_id)) continue;
+      int n = ArraySize(positions);
+      ArrayResize(positions, n + 1);
+      positions[n] = position_id;
+   }
+
+   string deals_json = "[";
+   int emitted = 0;
+   for(int p = 0; p < ArraySize(positions); p++)
+   {
+      long position_id = positions[p];
+      if(ManualPositionStillOpen(position_id) || !HistorySelectByPosition(position_id)) continue;
+
+      bool has_manual_entry = false, has_non_manual_entry = false, has_inout = false;
+      double profit = 0.0, entry_value = 0.0, exit_value = 0.0, entry_volume = 0.0, exit_volume = 0.0;
+      datetime open_time = 0, close_time = 0;
+      string symbol = "", direction = "BUY", reason_name = "CLIENT";
+      int position_deals = HistoryDealsTotal();
+      for(int d = 0; d < position_deals; d++)
+      {
+         ulong pd = HistoryDealGetTicket(d);
+         if(pd == 0) continue;
+         long entry = HistoryDealGetInteger(pd, DEAL_ENTRY);
+         long type = HistoryDealGetInteger(pd, DEAL_TYPE);
+         long reason = HistoryDealGetInteger(pd, DEAL_REASON);
+         if(entry == DEAL_ENTRY_INOUT) has_inout = true;
+         double volume = HistoryDealGetDouble(pd, DEAL_VOLUME);
+         double price = HistoryDealGetDouble(pd, DEAL_PRICE);
+         datetime deal_time = (datetime)HistoryDealGetInteger(pd, DEAL_TIME);
+         profit += HistoryDealGetDouble(pd, DEAL_PROFIT)
+                 + HistoryDealGetDouble(pd, DEAL_SWAP)
+                 + HistoryDealGetDouble(pd, DEAL_COMMISSION)
+                 + HistoryDealGetDouble(pd, DEAL_FEE);
+
+         if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
+         {
+            if(ManualEntryReason(reason))
+            {
+               has_manual_entry = true;
+               reason_name = ManualReasonName(reason);
+            }
+            else has_non_manual_entry = true;
+            entry_value += price * volume;
+            entry_volume += volume;
+            if(open_time <= 0 || deal_time < open_time) open_time = deal_time;
+            if(symbol == "") symbol = HistoryDealGetString(pd, DEAL_SYMBOL);
+            direction = (type == DEAL_TYPE_SELL) ? "SELL" : "BUY";
+         }
+         if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY || entry == DEAL_ENTRY_INOUT)
+         {
+            exit_value += price * volume;
+            exit_volume += volume;
+            if(deal_time > close_time) close_time = deal_time;
+         }
+      }
+
+      // Mixed manual/EA netting positions cannot be attributed honestly, so skip them.
+      if(has_inout)
+      {
+         Print("Aura Manual Report: skipped netting reversal position ", position_id, " (INOUT cannot be split honestly)");
+         continue;
+      }
+      if(!has_manual_entry || has_non_manual_entry || entry_volume <= 0 || exit_volume <= 0) continue;
+      if(open_time < g_manual_history_activated || close_time < g_manual_history_activated) continue;
+      double open_price = entry_value / entry_volume;
+      double close_price = exit_value / exit_volume;
+      if(emitted > 0) deals_json += ",";
+      deals_json += "{\"positionId\":" + IntegerToString(position_id) +
+                    ",\"symbol\":\"" + EscapeString(symbol) + "\"" +
+                    ",\"direction\":\"" + direction + "\"" +
+                    ",\"lots\":" + DoubleToString(entry_volume, 2) +
+                    ",\"openPrice\":" + DoubleToString(open_price, 8) +
+                    ",\"closePrice\":" + DoubleToString(close_price, 8) +
+                    ",\"profit\":" + DoubleToString(profit, 2) +
+                    ",\"openTime\":" + IntegerToString((long)open_time) +
+                    ",\"closeTime\":" + IntegerToString((long)close_time) +
+                    ",\"reason\":\"" + reason_name + "\"}";
+      emitted++;
+   }
+   deals_json += "]";
+
+   bool is_demo = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);
+   string body = "{\"account\":\"" + IntegerToString(account) + "\"" +
+                 ",\"broker\":\"" + EscapeString(AccountInfoString(ACCOUNT_COMPANY)) + "\"" +
+                 ",\"server\":\"" + EscapeString(AccountInfoString(ACCOUNT_SERVER)) + "\"" +
+                 ",\"currency\":\"" + EscapeString(AccountInfoString(ACCOUNT_CURRENCY)) + "\"" +
+                 ",\"demo\":" + (is_demo ? "true" : "false") +
+                 ",\"activatedAt\":" + IntegerToString((long)g_manual_history_activated) +
+                 ",\"deals\":" + deals_json + "}";
+
+   if(emitted == 0 || ManualHistoryPost(body))
+   {
+      g_manual_history_cursor = scan_to;
+      GlobalVariableSet(ManualHistoryKey("Cursor", scope), (double)g_manual_history_cursor);
+      if(emitted > 0) Print("Aura Manual Report: imported/reconciled ", emitted, " closed position(s)");
+   }
+}
+
+//+------------------------------------------------------------------+
 //| AUTO-TRADING BRIDGE                                              |
 //| The backend is the brain (filters, caps, approvals, armed        |
 //| account); this module is only the hands: poll for commands,      |
@@ -2190,6 +2435,97 @@ void TradeBridgeReportHistory()
    if(emitted > 0) TradeBridgePost("/api/mt5/trade-history", js);
 }
 
+//+------------------------------------------------------------------+
+//| Trade-bridge leader election                                      |
+//+------------------------------------------------------------------+
+// The trade bridge is ACCOUNT-WIDE, not per-chart: it polls for commands, executes them, and
+// reports closes for the whole terminal. Running it on every chart is not redundancy — it is
+// the same work done N times.
+//
+// Measured on 2026-08-05 with 24 charts attached: ~8 bridge polls per second, 1,512 failed
+// trade-history POSTs (err 5203), a single position close reported eleven times, and commands
+// that executed at the broker but whose result POST never landed — which the backend then
+// dead-lettered as "EA picked the command up but never reported a result".
+//
+// So exactly one chart runs it. The claim is a GlobalVariable holding a heartbeat timestamp,
+// the same mechanism this EA already uses for the manual-history cursor. It is deliberately
+// lease-based rather than a permanent flag: a permanent claim would leave the bridge dead if
+// its chart were closed, the timeframe changed, or the terminal restarted mid-session.
+#define TRADE_BRIDGE_LEADER_KEY  "AuraTradeBridgeLeader"
+#define TRADE_BRIDGE_LEASE_SEC   15      // a lease older than this is treated as abandoned
+
+// This instance's identity. ChartID is unique per chart within the terminal, which is exactly
+// the scope the lease needs to cover.
+long   g_bridge_leader_id   = 0;
+bool   g_bridge_is_leader   = false;
+datetime g_bridge_last_claim = 0;
+
+bool TradeBridgeIsLeader()
+{
+   if(g_bridge_leader_id == 0) g_bridge_leader_id = ChartID();
+   datetime now = TimeLocal();
+
+   string owner_key = TRADE_BRIDGE_LEADER_KEY + "Owner";
+   string beat_key  = TRADE_BRIDGE_LEADER_KEY + "Beat";
+
+   double owner = GlobalVariableCheck(owner_key) ? GlobalVariableGet(owner_key) : 0;
+   datetime beat = GlobalVariableCheck(beat_key) ? (datetime)GlobalVariableGet(beat_key) : 0;
+   bool lease_expired = (now - beat) > TRADE_BRIDGE_LEASE_SEC;
+
+   // Already ours: renew the lease and carry on. The renewal is what tells the other charts the
+   // bridge is still alive.
+   if((long)owner == g_bridge_leader_id && !lease_expired)
+   {
+      GlobalVariableSet(beat_key, (double)now);
+      return true;
+   }
+
+   // Unclaimed, or the holder stopped renewing (chart closed, timeframe changed, terminal
+   // restarted). Take it.
+   if(owner == 0 || lease_expired)
+   {
+      GlobalVariableSet(owner_key, (double)g_bridge_leader_id);
+      GlobalVariableSet(beat_key, (double)now);
+      // Re-read: if two charts claimed in the same tick, only the one whose id survived the
+      // write actually owns it. Without this both would believe they had won.
+      if((long)GlobalVariableGet(owner_key) != g_bridge_leader_id)
+      {
+         g_bridge_is_leader = false;
+         return false;
+      }
+      if(!g_bridge_is_leader)
+      {
+         g_bridge_is_leader = true;
+         Print("Aura AutoTrade: this chart (", _Symbol, " ", EnumToString((ENUM_TIMEFRAMES)_Period),
+               ") is now the trade-bridge leader — other charts will skip it");
+      }
+      return true;
+   }
+
+   // Someone else holds a live lease.
+   if(g_bridge_is_leader)
+   {
+      g_bridge_is_leader = false;
+      Print("Aura AutoTrade: another chart took over the trade bridge — this one is standing down");
+   }
+   return false;
+}
+
+// Release the claim on shutdown so the next chart can take over immediately rather than waiting
+// out the lease. Best-effort: a hard terminal kill skips this, and the lease expiry covers it.
+void TradeBridgeReleaseLeadership()
+{
+   if(!g_bridge_is_leader) return;
+   string owner_key = TRADE_BRIDGE_LEADER_KEY + "Owner";
+   if(GlobalVariableCheck(owner_key) && (long)GlobalVariableGet(owner_key) == g_bridge_leader_id)
+   {
+      GlobalVariableSet(owner_key, 0);
+      GlobalVariableSet(TRADE_BRIDGE_LEADER_KEY + "Beat", 0);
+      Print("Aura AutoTrade: released trade-bridge leadership");
+   }
+   g_bridge_is_leader = false;
+}
+
 // Small POST helper for bridge reports (fire-and-forget).
 void TradeBridgePost(string path, string body)
 {
@@ -2202,6 +2538,33 @@ void TradeBridgePost(string path, string body)
    int res = WebRequest("POST", url, headers, InpTimeout, post_bytes, result, result_headers);
    if(res < 200 || res >= 300)
       Print("Aura AutoTrade: POST ", path, " failed, code=", res, ", err=", GetLastError());
+}
+
+// A trade RESULT is not optional telemetry: it is the only record that an order reached the
+// broker. A single timed-out POST used to lose it permanently, and the server then dead-lettered
+// the command after three minutes as "EA picked the command up but never reported a result" —
+// while the order was actually resting live. The backend stalls occasionally (database quota
+// throttling, cold report endpoints), so one attempt is not enough.
+//
+// Retries with a widening pause. Deliberately NOT used for candle streaming, where a dropped
+// frame is replaced by the next one a second later.
+void TradeBridgePostCritical(string path, string body)
+{
+   for(int attempt = 0; attempt < 4; attempt++)
+   {
+      string url = InpServerUrl + path;
+      string headers = "Content-Type: application/json\r\n";
+      char post_bytes[]; char result[]; string result_headers;
+      ArrayResize(post_bytes, StringLen(body));
+      StringToCharArray(body, post_bytes, 0, StringLen(body), CP_UTF8);
+      ResetLastError();
+      // Longer than InpTimeout: this call must survive a slow backend, not give up on it.
+      int res = WebRequest("POST", url, headers, 15000, post_bytes, result, result_headers);
+      if(res >= 200 && res < 300) return;
+      Print("Aura AutoTrade: POST ", path, " attempt ", attempt + 1, " failed, code=", res, ", err=", GetLastError());
+      Sleep(500 * (attempt + 1));
+   }
+   Print("Aura AutoTrade: GIVING UP on ", path, " — the server will dead-letter this command");
 }
 
 // Broker-supported filling mode for a symbol.
@@ -2225,6 +2588,162 @@ double TradeBridgeNormalizeLots(string sym, double lots)
    return NormalizeDouble(lots, 2);
 }
 
+
+// Attach a stop and target to an already-open position, retrying briefly.
+//
+// Only ever called AFTER a market order was refused with 10016 and re-sent bare. The values
+// passed in are the STRATEGY's own sl/tp — nothing is recalculated or nudged here, so a trade
+// either carries the stop it was designed with or it does not exist.
+// Attach a stop (and optionally a target) to an OPEN position on request: SLTP|id|posId|sym|sl|tp
+//
+// The sniper mode enters bare on purpose — a market order with sl=0 cannot be refused for
+// "10016 invalid stops", which is what 29 of 29 of this account's rejections were, and the
+// ict-breaker edge dies within minutes of the trigger. This command is what closes that window
+// a few seconds later.
+//
+// A tp of 0 means "stop only", which is the normal case here: the user sets targets by hand.
+void TradeBridgeSetSlTp(string line)
+{
+   string f[];
+   int n = StringSplit(line, '|', f);
+   if(n < 6) { Print("Aura AutoTrade: malformed sltp: ", line); return; }
+   string id      = f[1];
+   long   pos_id  = (long)StringToInteger(f[2]);
+   string sym     = f[3];
+   double sl      = StringToDouble(f[4]);
+   double tp      = StringToDouble(f[5]);
+
+   string why = "";
+   // Three attempts: the price is moving and a stop can momentarily sit inside the broker's
+   // minimum distance. Giving up after one try would leave the position unprotected.
+   bool ok = TradeBridgeApplySlTp(sym, pos_id, sl, tp, 3, why);
+
+   string body = "{\"id\":\"" + EscapeString(id) + "\",\"action\":\"SLTP\"" +
+                 ",\"ok\":" + (ok ? "true" : "false") +
+                 ",\"message\":\"" + EscapeString(ok ? "stop attached" : why) + "\"}";
+   TradeBridgePostCritical("/api/mt5/trade-result", body);
+   Print("Aura AutoTrade: sltp ", (ok ? "OK " : "FAILED "), sym, " pos=", pos_id, " sl=", sl, (ok ? "" : " " + why));
+}
+
+bool TradeBridgeApplySlTp(string sym, long position_id, double sl, double tp, int attempts, string &fail_reason)
+{
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   for(int a = 0; a < attempts; a++)
+   {
+      MqlTradeRequest r; MqlTradeResult rr;
+      ZeroMemory(r); ZeroMemory(rr);
+      r.action   = TRADE_ACTION_SLTP;
+      r.symbol   = sym;
+      r.position = position_id;
+      r.sl       = (sl > 0) ? NormalizeDouble(sl, digits) : 0;
+      r.tp       = (tp > 0) ? NormalizeDouble(tp, digits) : 0;
+      r.magic    = InpTradeMagic;
+      ResetLastError();
+      bool sent = OrderSend(r, rr);
+      if(sent && (rr.retcode == TRADE_RETCODE_DONE || rr.retcode == TRADE_RETCODE_PLACED))
+         return true;
+      fail_reason = "SLTP retcode " + IntegerToString((long)rr.retcode) + " " + rr.comment;
+      Sleep(300);   // give the server a moment; prices move and the level may become valid
+   }
+   return false;
+}
+
+// Close a position we could not protect. Losing the trade is strictly better than holding
+// unprotected size on an account with a daily-loss limit.
+bool TradeBridgeCloseNaked(string sym, long position_id, double lots, bool was_buy)
+{
+   MqlTradeRequest r; MqlTradeResult rr;
+   ZeroMemory(r); ZeroMemory(rr);
+   r.action       = TRADE_ACTION_DEAL;
+   r.symbol       = sym;
+   r.position     = position_id;
+   r.volume       = lots;
+   r.type         = was_buy ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;   // opposite closes it
+   r.price        = was_buy ? SymbolInfoDouble(sym, SYMBOL_BID) : SymbolInfoDouble(sym, SYMBOL_ASK);
+   r.deviation    = InpTradeSlippage;
+   r.magic        = InpTradeMagic;
+   r.type_filling = TradeBridgeFilling(sym);
+   r.comment      = "AuraAuto naked-close";
+   ResetLastError();
+   bool sent = OrderSend(r, rr);
+   return sent && (rr.retcode == TRADE_RETCODE_DONE || rr.retcode == TRADE_RETCODE_DONE_PARTIAL);
+}
+
+// Remove a resting pending order: DEL|id|ticket|symbol
+//
+// Reports back through the same result endpoint with action=CANCEL, so the server only marks
+// the row cancelled once the BROKER has confirmed it — a request that fails leaves the order
+// live and says so, rather than the UI showing it gone while it still rests at the broker.
+void TradeBridgeCancel(string line)
+{
+   string f[];
+   int n = StringSplit(line, '|', f);
+   if(n < 3) { Print("Aura AutoTrade: malformed cancel: ", line); return; }
+   string id = f[1];
+   ulong ticket = (ulong)StringToInteger(f[2]);
+
+   MqlTradeRequest r; MqlTradeResult rr;
+   ZeroMemory(r); ZeroMemory(rr);
+   r.action = TRADE_ACTION_REMOVE;
+   r.order  = ticket;
+   ResetLastError();
+   bool sent = OrderSend(r, rr);
+   bool ok = sent && (rr.retcode == TRADE_RETCODE_DONE || rr.retcode == TRADE_RETCODE_PLACED);
+   // An order that is already gone is a success from the caller's point of view: the goal was
+   // "it must not be resting", and it is not.
+   if(!ok && !OrderSelect(ticket)) ok = true;
+
+   string body = "{\"id\":\"" + EscapeString(id) + "\",\"action\":\"CANCEL\"" +
+                 ",\"ok\":" + (ok ? "true" : "false") +
+                 ",\"retcode\":" + IntegerToString((long)rr.retcode) +
+                 ",\"message\":\"" + EscapeString(rr.comment) + "\"}";
+   TradeBridgePostCritical("/api/mt5/trade-result", body);
+   Print("Aura AutoTrade: cancel ", (ok ? "OK " : "FAILED "), "ticket=", ticket, " retcode=", rr.retcode);
+}
+
+// Modify a RESTING pending order in place: MOD|id|ticket|symbol|entry|sl|tp
+//
+// TRADE_ACTION_MODIFY changes a pending order's price, stop and target. It deliberately does
+// NOT carry a volume: MT5 cannot change a pending order's lot size, and silently ignoring a
+// requested size change would leave the server believing a resize happened. The backend sends
+// lot changes as a cancel plus a fresh CMD instead.
+//
+// Reports through the same result endpoint as CANCEL, so the row only leaves MODIFYING once the
+// BROKER has confirmed — a failed modify leaves the original order resting and says so.
+void TradeBridgeModify(string line)
+{
+   string f[];
+   int n = StringSplit(line, '|', f);
+   if(n < 7) { Print("Aura AutoTrade: malformed modify: ", line); return; }
+   string id     = f[1];
+   ulong  ticket = (ulong)StringToInteger(f[2]);
+   string sym    = f[3];
+   double entry  = StringToDouble(f[4]);
+   double sl     = StringToDouble(f[5]);
+   double tp     = StringToDouble(f[6]);
+
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   MqlTradeRequest r; MqlTradeResult rr;
+   ZeroMemory(r); ZeroMemory(rr);
+   r.action = TRADE_ACTION_MODIFY;
+   r.order  = ticket;
+   r.symbol = sym;
+   r.price  = NormalizeDouble(entry, digits);
+   r.sl     = (sl > 0) ? NormalizeDouble(sl, digits) : 0;
+   r.tp     = (tp > 0) ? NormalizeDouble(tp, digits) : 0;
+   r.type_time = ORDER_TIME_GTC;
+   ResetLastError();
+   bool sent = OrderSend(r, rr);
+   bool ok = sent && (rr.retcode == TRADE_RETCODE_DONE || rr.retcode == TRADE_RETCODE_PLACED);
+
+   string body = "{\"id\":\"" + EscapeString(id) + "\",\"action\":\"MODIFY\"" +
+                 ",\"ok\":" + (ok ? "true" : "false") +
+                 ",\"retcode\":" + IntegerToString((long)rr.retcode) +
+                 ",\"message\":\"" + EscapeString(rr.comment) + "\"}";
+   TradeBridgePostCritical("/api/mt5/trade-result", body);
+   Print("Aura AutoTrade: modify ", (ok ? "OK " : "FAILED "), "ticket=", ticket, " retcode=", rr.retcode);
+}
+
 // Execute one CMD line: CMD|id|symbol|dir|type|lots|sl|tp|entry|expiresMsEpoch
 void TradeBridgeExecute(string line)
 {
@@ -2240,6 +2759,9 @@ void TradeBridgeExecute(string line)
    double tp = StringToDouble(f[7]);
    double entry = StringToDouble(f[8]);
    long expires_ms = StringToInteger(f[9]);
+   // Optional fields — absent when talking to an older server, in which case both gates stay off.
+   double slip_tol_pct = (n >= 11) ? StringToDouble(f[10]) : -1.0;
+   double risk_budget  = (n >= 12) ? StringToDouble(f[11]) : 0.0;
 
    // Resolve to the exact broker symbol (handles suffix/case, e.g. XAUUSDM -> XAUUSDm).
    string sym = MatchBrokerSymbol(want_symbol);
@@ -2265,6 +2787,60 @@ void TradeBridgeExecute(string line)
       req.action = TRADE_ACTION_DEAL;
       req.type   = is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
       req.price  = is_buy ? SymbolInfoDouble(sym, SYMBOL_ASK) : SymbolInfoDouble(sym, SYMBOL_BID);
+
+      // ── Slippage gate ──────────────────────────────────────────────────────────
+      //
+      // The ticket was priced when the signal fired; this fills at the live price while SL and
+      // TP stay where they were. Every pip of adverse movement is taken OUT of the reward and
+      // added INTO the risk. Live evidence: 508997768 filled 36.5 pips late, turning a planned
+      // $40 risk into $71 and an RR of 2.46 into 0.18.
+      //
+      // Measured as a share of the STOP distance, mirroring backend/slippageGate.js, which is
+      // where this rule is specified and tested.
+      if(slip_tol_pct >= 0.0 && entry > 0 && sl > 0)
+      {
+         double planned_stop = MathAbs(entry - sl);
+         if(planned_stop > 0)
+         {
+            double adverse = is_buy ? (req.price - entry) : (entry - req.price);
+            double pct = (adverse / planned_stop) * 100.0;
+            if(pct > slip_tol_pct)
+            {
+               string why = StringFormat("setup moved: filled %.1f%% of the stop distance away (limit %.1f%%)", pct, slip_tol_pct);
+               Print("Aura AutoTrade: REFUSED ", sym, " — ", why);
+               string body = "{\"id\":\"" + EscapeString(id) + "\",\"ok\":false,\"retcode\":0" +
+                             ",\"message\":\"" + EscapeString(why) + "\"}";
+               TradeBridgePostCritical("/api/mt5/trade-result", body);
+               return;                                  // nothing is sent to the broker
+            }
+
+            // Within tolerance but still late: the stop is now further away than planned, so
+            // hold the MONEY at risk constant by trimming the size. The stop is never moved —
+            // it marks the level that invalidates the trade.
+            if(risk_budget > 0 && adverse > 0)
+            {
+               double real_stop_dist = MathAbs(req.price - sl);
+               double tick_val  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+               double tick_size = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+               if(real_stop_dist > 0 && tick_val > 0 && tick_size > 0)
+               {
+                  double loss_per_lot = (real_stop_dist / tick_size) * tick_val;
+                  if(loss_per_lot > 0)
+                  {
+                     double want = risk_budget / loss_per_lot;
+                     double resized = TradeBridgeNormalizeLots(sym, want);
+                     if(resized > 0 && resized < lots)
+                     {
+                        Print("Aura AutoTrade: resized ", sym, " ", DoubleToString(lots, 2), " -> ",
+                              DoubleToString(resized, 2), " lots to hold risk at ", DoubleToString(risk_budget, 2));
+                        lots = resized;
+                        req.volume = lots;
+                     }
+                  }
+               }
+            }
+         }
+      }
    }
    else // LIMIT or STOP pending order at the signal entry
    {
@@ -2291,16 +2867,81 @@ void TradeBridgeExecute(string line)
    bool ok = sent && (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED || res.retcode == TRADE_RETCODE_DONE_PARTIAL);
    long ticket = (long)(res.order > 0 ? res.order : res.deal);
    double price = (res.price > 0) ? res.price : req.price;
+   string extra_note = "";
+
+   // ── 10016 fallback: open bare, then attach the SAME stop and target ──
+   //
+   // On market-execution accounts the broker fills at its own price and then validates the
+   // attached SL/TP against THAT fill. If they do not satisfy its live constraint it refuses
+   // the whole request, so nothing opens at all — 10016 with no position. This is what a
+   // human works around by opening first and setting the stop afterwards.
+   //
+   // Deliberately a fallback, not the default: the normal path above keeps the position
+   // protected from its first instant. Splitting every order into two requests would open a
+   // window with no stop on EVERY trade. Here the window only exists on an order that was
+   // otherwise refused outright, and it is closed immediately if the stop will not attach.
+   //
+   // The sl/tp values are the strategy's own, passed through untouched.
+   if(!ok && res.retcode == TRADE_RETCODE_INVALID_STOPS && otype == "MARKET" && (sl > 0 || tp > 0))
+   {
+      Print("Aura AutoTrade: 10016 with stops attached — retrying bare then setting SL/TP on ", sym);
+      MqlTradeRequest bare; MqlTradeResult bres;
+      ZeroMemory(bare); ZeroMemory(bres);
+      bare.action       = TRADE_ACTION_DEAL;
+      bare.symbol       = sym;
+      bare.volume       = lots;
+      bare.magic        = InpTradeMagic;
+      bare.deviation    = InpTradeSlippage;
+      bare.type         = is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      bare.price        = is_buy ? SymbolInfoDouble(sym, SYMBOL_ASK) : SymbolInfoDouble(sym, SYMBOL_BID);
+      bare.type_filling = TradeBridgeFilling(sym);
+      bare.comment      = "AuraAuto";
+      bare.sl = 0; bare.tp = 0;                       // the whole point of the retry
+      ResetLastError();
+      bool bsent = OrderSend(bare, bres);
+      bool bok = bsent && (bres.retcode == TRADE_RETCODE_DONE || bres.retcode == TRADE_RETCODE_DONE_PARTIAL);
+      if(!bok)
+      {
+         extra_note = " (bare retry also failed: " + IntegerToString((long)bres.retcode) + ")";
+         Print("Aura AutoTrade: bare retry failed on ", sym, " retcode=", bres.retcode);
+      }
+      else
+      {
+         // Resolve the position id: for a market fill it equals the opening order ticket.
+         long pos_id = (long)bres.order;
+         if(pos_id <= 0 && bres.deal > 0 && HistorySelectByPosition((long)bres.deal))
+            pos_id = (long)HistoryDealGetInteger(bres.deal, DEAL_POSITION_ID);
+         string why = "";
+         if(TradeBridgeApplySlTp(sym, pos_id, sl, tp, 3, why))
+         {
+            ok = true;
+            ticket = pos_id;
+            price = (bres.price > 0) ? bres.price : bare.price;
+            extra_note = " (opened bare, SL/TP set after fill)";
+            Print("Aura AutoTrade: recovered ", sym, " — bare fill @", DoubleToString(price, 8), ", SL/TP attached");
+         }
+         else
+         {
+            // Could not protect it. Close rather than leave naked size on the account.
+            bool closed = TradeBridgeCloseNaked(sym, pos_id, lots, is_buy);
+            extra_note = closed
+               ? " (opened bare but SL/TP refused: " + why + " — position CLOSED, no naked exposure)"
+               : " (opened bare, SL/TP refused: " + why + " — AND CLOSE FAILED, position may be UNPROTECTED)";
+            Print("Aura AutoTrade: could not attach SL/TP on ", sym, " — ", why,
+                  closed ? " — closed the position" : " — CLOSE FAILED, CHECK THE TERMINAL");
+         }
+      }
+   }
 
    string body = "{\"id\":\"" + EscapeString(id) + "\"" +
                  ",\"ok\":" + (ok ? "true" : "false") +
                  ",\"ticket\":" + IntegerToString(ticket) +
                  ",\"price\":" + DoubleToString(price, 8) +
                  ",\"retcode\":" + IntegerToString((long)res.retcode) +
-                 ",\"message\":\"" + EscapeString(res.comment) + "\"}";
-   TradeBridgePost("/api/mt5/trade-result", body);
+                 ",\"message\":\"" + EscapeString(res.comment + extra_note) + "\"}";
+   TradeBridgePostCritical("/api/mt5/trade-result", body);
    Print("Aura AutoTrade: ", (ok ? "EXECUTED " : "FAILED "), otype, " ", (is_buy ? "BUY " : "SELL "), sym,
-         " lots=", DoubleToString(lots, 2), " retcode=", res.retcode, " ticket=", ticket);
+         " lots=", DoubleToString(lots, 2), " retcode=", res.retcode, " ticket=", ticket, extra_note);
 }
 
 // Main poll: report state, receive commands, execute, detect closes.
@@ -2350,5 +2991,8 @@ void TradeBridgePoll()
       string line = lines[i];
       StringReplace(line, "\r", "");
       if(StringFind(line, "CMD|") == 0) TradeBridgeExecute(line);
+      else if(StringFind(line, "DEL|") == 0) TradeBridgeCancel(line);
+      else if(StringFind(line, "MOD|") == 0) TradeBridgeModify(line);
+      else if(StringFind(line, "SLTP|") == 0) TradeBridgeSetSlTp(line);
    }
 }

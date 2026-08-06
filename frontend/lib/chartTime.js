@@ -57,21 +57,75 @@ export function bucketStart(sec, tfSec, phase = 0) {
 }
 
 /**
- * Synthetic live-forming bar for the current period, for feeds that only deliver CLOSED
- * bars. Flat at the last close, so the current slot exists and the axis advances without
- * inventing price movement. Returns null when a real bar already covers the period.
+ * How stale a live bar may be before it stops counting as live.
+ *
+ * The EA streams the forming bar about once a second. Three seconds tolerates a missed post or
+ * two; beyond that the price on screen is old enough that showing it as a moving candle would
+ * be a claim the feed cannot support.
  */
-export function formingBarFor(lastClosed, tfSec, phase = 0, nowMs = Date.now()) {
-  if (!lastClosed || !(tfSec > 0)) return null;
+export const LIVE_BAR_MAX_AGE_MS = 3000;
+
+/**
+ * Is this a genuine forming bar from the feed, fresh enough to draw as live?
+ *
+ * The EA sends the CURRENT period's real OHLC every second. A bar qualifies when it covers the
+ * period we are actually in and arrived recently — anything older is a closed bar or a stalled
+ * feed, and neither should animate.
+ */
+export function isLiveBar(bar, tfSec, phase = 0, nowMs = Date.now(), maxAgeMs = LIVE_BAR_MAX_AGE_MS) {
+  if (!bar || !(tfSec > 0)) return false;
+  const open = bucketStart(Math.floor(nowMs / 1000), tfSec, phase);
+  if (Number(bar.time) !== open) return false;
+  // receivedAt is when WE got it. Without it the bar's own timestamp says nothing about
+  // freshness — a forming bar keeps the period's opening time for the whole period.
+  const at = bar.receivedAt ? Date.parse(bar.receivedAt) : null;
+  if (at === null || Number.isNaN(at)) return false;
+  return nowMs - at <= maxAgeMs;
+}
+
+/**
+ * The bar to draw for the current period.
+ *
+ * Prefers the REAL forming bar the feed is streaming — true OHLC that moves intrabar, which is
+ * what makes the chart and every indicator computed from it actually live.
+ *
+ * Falls back to a flat bar at the last close when no fresh forming bar exists. That fallback is
+ * deliberately inert: it makes the current slot exist so the axis advances, without inventing
+ * price movement the feed never reported. `stale: true` marks it so the UI can say so rather
+ * than presenting a placeholder as a live price.
+ */
+export function formingBarFor(lastClosed, tfSec, phase = 0, nowMs = Date.now(), liveBar = null) {
+  if (!(tfSec > 0)) return null;
+  const open = bucketStart(Math.floor(nowMs / 1000), tfSec, phase);
+
+  // Real forming bar from the feed — use it exactly as reported.
+  if (isLiveBar(liveBar, tfSec, phase, nowMs)) {
+    const o = Number(liveBar.open), h = Number(liveBar.high);
+    const l = Number(liveBar.low), c = Number(liveBar.close);
+    if ([o, h, l, c].every((v) => Number.isFinite(v) && v > 0)) {
+      // Guard the invariant rather than trusting it: a bar whose high is below its close would
+      // be silently mis-drawn, and the indicators would inherit the error.
+      return {
+        time: open,
+        open: o,
+        high: Math.max(h, o, c),
+        low: Math.min(l, o, c),
+        close: c,
+        volume: Number(liveBar.volume) || 0,
+        live: true,
+      };
+    }
+  }
+
+  if (!lastClosed) return null;
   const close = Number(lastClosed.close);
   if (!Number.isFinite(close) || close <= 0) return null;
-  const open = bucketStart(Math.floor(nowMs / 1000), tfSec, phase);
   if (lastClosed.time >= open) return null;
   // Extend by at most ONE period. Over a weekend or a feed outage the current period sits
   // many bars ahead of the last close; a flat bar there invents a candle across a gap that
   // never traded and drags the time axis into empty space.
   if (open - lastClosed.time > tfSec) return null;
-  return { time: open, open: close, high: close, low: close, close, volume: 0 };
+  return { time: open, open: close, high: close, low: close, close, volume: 0, stale: true };
 }
 
 /** Whole seconds until the current bar closes, or null when the timeframe is unknown. */

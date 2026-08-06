@@ -12,6 +12,7 @@
 
 import { detectBreaker, detectLiquidityPools, buildLiquidityPlan, fractalSwings, atr14, detectSecondDrive, gradeSweep, detectKeyLiquidityLevels, detectLiquidityPinRejection, detectDisplacement, roundStepFor } from './liquidityEngine.js';
 import { buildBreakoutCandidate, BREAKOUT_GRADE_RANK } from './breakoutEngine.js';
+import { goldScalpPlan } from './goldScalp.js';
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
 const n = (v) => Number(v);
@@ -3833,6 +3834,23 @@ function lilSweepProPlus(ctx) {
   return best;
 }
 
+// ── Gold Scalping (Brad Gold 5-step framework) ───────────────────────────────
+// Two entry models from one source, registered separately so the lab can rank them against
+// each other instead of the choice being an opinion. All logic lives in goldScalp.js; these
+// are adapters that hand the lab context to it. No existing engine is read or modified.
+function goldScalpSweep(ctx) {
+  return goldScalpPlan({
+    candles: ctx?.candles, h1Trend: ctx?.h1Trend, pip: ctx?.pip,
+    variant: 'SWEEP', options: ctx?.config || {},
+  });
+}
+function goldScalpMss(ctx) {
+  return goldScalpPlan({
+    candles: ctx?.candles, h1Trend: ctx?.h1Trend, pip: ctx?.pip,
+    variant: 'MSS', options: { ...(ctx?.config || {}), requireMss: true },
+  });
+}
+
 export const STRATEGIES = {
   'special-forex-sniper': {
     id: 'special-forex-sniper',
@@ -4126,6 +4144,34 @@ export const STRATEGIES = {
     timeframes: ['M5', 'M15', 'M30'],
     config: { minRR: 2, windowOnly: true, asianLookback: 130, sweepScan: 14, stopBufAtr: 0.2 },
     evaluate: smcAsianSweep,
+  },
+  'gold-scalping': {
+    id: 'gold-scalping',
+    name: 'Gold Scalping',
+    // MARKET: the trigger bar IS the entry. Framing it as a resting limit would match the
+    // video more literally but measurably worse here — the 2026-07-13 limit experiment
+    // expired 76% unfilled, and a 355-signal replay filled only 30% within four bars, with
+    // those fills adversely selected (they are the ones that came back to stop you out).
+    entryOrderType: 'MARKET',
+    source: 'Brad Gold — "BEST Gold Scalping Strategy (Beginner to PRO)"',
+    description: 'The aggressive model from the source\'s five-step gold framework. H1 and M15 structure must AGREE (misalignment is a hard reject — the source rates the one misaligned trade he took 5/10). Price must then be MITIGATING a demand/supply zone right now, never mid-range; a recent swing must have been SWEPT AND RECLAIMED (a pierce that stays through is a breakout, not a sweep); and the trigger bar must close with a real body in the trade direction — the extra confirmation the source actually used on his live trade. Stop sits under the protected extreme (the low/high that did the sweeping). Target is the NEAREST opposing swing, deliberately conservative: this is a scalp, "get in fast, get out faster", not a runner. No minimum R:R gate — the source targets the nearest liquidity, so a 2R floor would reject its own logic; R:R is recorded so expectancy can be measured instead.',
+    timeframes: ['M5', 'M15'],
+    // Off until backtested. Disabled strategies are still scanned and logged so the ranking
+    // accumulates, but stay off every user-facing surface.
+    defaultEnabled: false,
+    config: { requireConfirmCandle: true },
+    evaluate: goldScalpSweep,
+  },
+  'gold-scalping-mss': {
+    id: 'gold-scalping-mss',
+    name: 'Gold Scalping (Market Shift)',
+    entryOrderType: 'MARKET',
+    source: 'Brad Gold — "BEST Gold Scalping Strategy (Beginner to PRO)", conservative entry model',
+    description: 'The conservative model from the same source. Everything the aggressive variant requires, PLUS a market shift — price closing through the last opposing internal swing — and then a pullback back into the zone that CAUSED that shift. The source is explicit about the trade-off: this misses setups when price never pulls back, but avoids the false breakouts the aggressive entry is exposed to. It fires only once price has already returned into the shift zone, so the alert is the entry moment rather than a resting order. Stop respects whichever is further, the swept extreme or the shift zone, so it is never placed inside the structure it is meant to survive.',
+    timeframes: ['M5', 'M15'],
+    defaultEnabled: false,
+    config: { requireConfirmCandle: true },
+    evaluate: goldScalpMss,
   },
 };
 

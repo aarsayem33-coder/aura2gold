@@ -9,7 +9,14 @@ import {
   LineSeries,
   LineStyle,
 } from 'lightweight-charts';
-import { Maximize2, Minimize2, Crosshair } from 'lucide-react';
+import { fetchChartAnalysis } from '../mt5Api';
+import type { ChartAnalysisResponse } from '../types';
+import {
+  loadAnalysisHistory, saveAnalysis, deleteAnalysis, clearAnalysisHistory,
+  latestAnalysisFor, MAX_ANALYSIS_HISTORY,
+} from '../lib/aiAnalysisHistory';
+import type { StoredAnalysis } from '../lib/aiAnalysisHistory';
+import { Maximize2, Minimize2, Crosshair, TrendingUp, TrendingDown } from 'lucide-react';
 import { timeframeSeconds, bucketPhase, bucketStart, formingBarFor, secsToNextBar } from '../lib/chartTime.js';
 import type { Alert, Mt5Candle } from '../types';
 
@@ -412,6 +419,132 @@ class KumoCloudPrimitive {
   }
 }
 
+interface OrderBlockZone { top: number; bottom: number; time: any; index: number; bull: boolean }
+
+/**
+ * Order blocks: the last opposing candle before a displacement move, still unmitigated.
+ *
+ * A demand block is a DOWN candle that price then left upward by at least one ATR and has not
+ * traded back through since; supply is the mirror. "Unmitigated" is the whole point — once
+ * price has closed through a block its orders are filled and it stops being a level, so a
+ * chart that keeps drawing it is showing history, not context.
+ */
+function detectOrderBlocks(data: ChartCandle[], lookback = 180): OrderBlockZone[] {
+  if (!Array.isArray(data) || data.length < 30) return [];
+  // Average true range over the recent window — the displacement yardstick.
+  const from = Math.max(1, data.length - lookback);
+  let atr = 0, atrN = 0;
+  for (let i = Math.max(1, data.length - 30); i < data.length; i++) {
+    atr += Math.max(data[i].high - data[i].low, Math.abs(data[i].high - data[i - 1].close), Math.abs(data[i].low - data[i - 1].close));
+    atrN += 1;
+  }
+  atr = atrN ? atr / atrN : 0;
+  if (!(atr > 0)) return [];
+
+  const out: OrderBlockZone[] = [];
+  const last = data.length - 1;
+  for (let i = last - 2; i >= from; i--) {
+    const c = data[i];
+    const bull = c.close < c.open;            // demand = the down candle before an up move
+    const bear = c.close > c.open;
+    if (!bull && !bear) continue;
+    const n1 = data[i + 1], n2 = data[i + 2];
+    if (!n1 || !n2) continue;
+    const moved = bull ? Math.max(n1.high, n2.high) - c.high : c.low - Math.min(n1.low, n2.low);
+    if (!(moved >= atr)) continue;
+    const height = c.high - c.low;
+    if (!(height > 0) || height > atr * 2) continue;   // wider than 2 ATR is a region, not a level
+    // Mitigated since? Then it is spent and must not be drawn.
+    let breached = false;
+    for (let j = i + 3; j <= last; j++) {
+      if (bull ? data[j].low <= c.low : data[j].high >= c.high) { breached = true; break; }
+    }
+    if (breached) continue;
+    out.push({ top: c.high, bottom: c.low, time: c.time, index: i, bull });
+    if (out.length >= 4) break;                        // nearest four; more becomes a grey smear
+  }
+  return out;
+}
+
+/**
+ * Candles that came back and touched a still-live order block — the retest.
+ *
+ * Only the FIRST bar of each visit counts: price sitting inside a zone for six bars is one
+ * retest, not six, and circling every bar would bury the zone it is meant to highlight.
+ */
+function detectRetestBars(data: ChartCandle[], zones: OrderBlockZone[]): ChartMarker[] {
+  if (!zones.length) return [];
+  const out: ChartMarker[] = [];
+  for (const z of zones) {
+    let inside = false;
+    for (let i = z.index + 3; i < data.length; i++) {
+      const touching = data[i].low <= z.top && data[i].high >= z.bottom;
+      if (touching && !inside) {
+        out.push({
+          time: data[i].time,
+          position: z.bull ? 'belowBar' : 'aboveBar',
+          color: '#d97706',
+          shape: 'circle',
+          text: 'retest',
+        });
+      }
+      inside = touching;
+    }
+  }
+  // Markers must be in ascending time order or lightweight-charts drops them silently.
+  return out.sort((a, b) => Number(a.time) - Number(b.time));
+}
+
+/**
+ * Transparent rectangles for the order blocks, drawn on the pane canvas behind the candles.
+ *
+ * Same approach as KumoCloudPrimitive: lightweight-charts has no native box shape, and using
+ * the chart's own coordinate conversions keeps the boxes correct under zoom, pan and resize.
+ * Grey and translucent on purpose — a zone is CONTEXT, and a solid or coloured fill would
+ * hide the price action it exists to frame.
+ */
+class OrderBlockPrimitive {
+  _chart: any = null;
+  _series: any = null;
+  _zones: OrderBlockZone[] = [];
+  setData(zones: OrderBlockZone[]) { this._zones = zones; }
+  attached({ chart, series }: any) { this._chart = chart; this._series = series; }
+  detached() { this._chart = null; this._series = null; }
+  updateAllViews() { /* stateless — recomputed every draw */ }
+  paneViews() {
+    return [{
+      zOrder: () => 'bottom' as const,
+      renderer: () => ({
+        draw: (target: any) => {
+          const chart = this._chart, series = this._series, zones = this._zones;
+          if (!chart || !series || !zones.length) return;
+          target.useMediaCoordinateSpace((scope: any) => {
+            const ctx = scope.context;
+            const ts = chart.timeScale();
+            for (const z of zones) {
+              const yTop = series.priceToCoordinate(z.top);
+              const yBot = series.priceToCoordinate(z.bottom);
+              if (yTop === null || yBot === null) continue;
+              // From the block's own bar to the right edge: the zone is live until price
+              // mitigates it, so it should extend to now rather than stop where it formed.
+              const x0 = ts.timeToCoordinate(z.time);
+              const left = x0 === null ? 0 : x0;
+              const right = scope.mediaSize.width;
+              ctx.fillStyle = 'rgba(100, 116, 139, 0.16)';
+              ctx.fillRect(left, Math.min(yTop, yBot), Math.max(0, right - left), Math.abs(yBot - yTop));
+              ctx.strokeStyle = 'rgba(100, 116, 139, 0.55)';
+              ctx.setLineDash([4, 3]);
+              ctx.lineWidth = 1;
+              ctx.strokeRect(left, Math.min(yTop, yBot), Math.max(0, right - left), Math.abs(yBot - yTop));
+              ctx.setLineDash([]);
+            }
+          });
+        },
+      }),
+    }];
+  }
+}
+
 interface TradeZone { top: number; bottom: number; time: any }
 
 /** Nearest UNVIOLATED demand zone below price (buy area) and supply zone above price
@@ -461,6 +594,59 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const [showZigzag, setShowZigzag] = useState(false);
   const [showDensity, setShowDensity] = useState(false);
   const [showZones, setShowZones] = useState(false);
+  const [showOrderBlocks, setShowOrderBlocks] = useState(false);
+  // AI trade-desk panel. Style and direction are chosen BEFORE the read, because a scalper and
+  // a day trader take different trades off the same chart.
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiStyle, setAiStyle] = useState<'SCALP' | 'DAY'>('DAY');
+  const [aiBias, setAiBias] = useState<'LONG' | 'SHORT' | 'BOTH'>('BOTH');
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiErr, setAiErr] = useState<string | null>(null);
+  const [aiOut, setAiOut] = useState<ChartAnalysisResponse | null>(null);
+  // Reads are kept for later: the panel used to lose its result the moment it closed, and each
+  // one costs a Gemini call. History holds the last 20 in full; the drawer reopens any of them.
+  const [aiHistory, setAiHistory] = useState<StoredAnalysis[]>(() => loadAnalysisHistory());
+  const [aiHistoryOpen, setAiHistoryOpen] = useState(false);
+  // Which stored read is on screen, so the drawer can mark it and so a restored read is not
+  // mistaken for one just produced by the button.
+  const [aiViewingId, setAiViewingId] = useState<string | null>(null);
+
+  // Reopening the panel brings back the last read for THIS series rather than an empty box.
+  // Only when nothing is displayed, so it can never overwrite a fresh result.
+  useEffect(() => {
+    if (!aiOpen || aiOut || aiBusy) return;
+    const last = latestAnalysisFor(symbol, timeframe);
+    if (last) { setAiOut(last.result); setAiViewingId(last.id); }
+  }, [aiOpen, aiOut, aiBusy, symbol, timeframe]);
+
+  const runAi = async () => {
+    setAiBusy(true); setAiErr(null); setAiOut(null); setAiViewingId(null);
+    try {
+      // No image is sent: the server renders the chart from the same candles it analyses, so
+      // what the model sees and what the maths reconciles against cannot drift apart.
+      const out = await fetchChartAnalysis({
+        symbol, timeframe, tradeMode: 'FOREX', style: aiStyle,
+        bias: aiStyle === 'SCALP' ? aiBias : 'BOTH', mimeType: 'image/png',
+      });
+      setAiOut(out);
+      const next = saveAnalysis({
+        symbol, timeframe, style: aiStyle,
+        bias: aiStyle === 'SCALP' ? aiBias : 'BOTH',
+        result: out,
+      });
+      setAiHistory(next);
+      setAiViewingId(next[0]?.id ?? null);
+    } catch (e) {
+      setAiErr(e instanceof Error ? e.message : 'Analysis failed');
+    } finally { setAiBusy(false); }
+  };
+
+  const openStoredAnalysis = (entry: StoredAnalysis) => {
+    setAiOut(entry.result);
+    setAiViewingId(entry.id);
+    setAiErr(null);
+    setAiHistoryOpen(false);
+  };
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const chartRef = useRef<any>(null);
@@ -471,6 +657,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const ema50SeriesRef = useRef<any>(null);
   const ema200SeriesRef = useRef<any>(null);
   const markersApiRef = useRef<any>(null);
+  const obPrimitiveRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
   // Market-structure overlay series/lines (separate from trade-level price lines so
   // toggling them never clears Entry/SL/TP).
@@ -493,6 +680,10 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   const lastLenRef = useRef(0);
   // Latest CLOSED bar (time in seconds + close), used to synthesize the live-forming bar.
   const lastClosedRef = useRef<{ time: number; close: number } | null>(null);
+  // The newest bar exactly as the feed reported it, including receivedAt. formingBarFor needs
+  // the arrival time to judge whether the feed is actually live — a forming bar keeps the
+  // period's opening timestamp for the whole period, so its own time says nothing about that.
+  const liveBarRef = useRef<any>(null);
   // Broker bar phase measured off the feed, so the countdown and the forming bar land on
   // the SAME boundaries as the real bars (see bucketPhase).
   const phaseRef = useRef(0);
@@ -561,6 +752,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     ema50SeriesRef.current = null;
     ema200SeriesRef.current = null;
     markersApiRef.current = null;
+    obPrimitiveRef.current = null;
     priceLinesRef.current = [];
     regMidRef.current = null;
     regUpRef.current = null;
@@ -578,6 +770,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     // Drop the previous instrument's last-closed reference so Effect D can't paint a stale
     // forming bar (old symbol's price) onto the fresh series before new data loads.
     lastClosedRef.current = null;
+    liveBarRef.current = null;
 
     const renderLegend = (candle: any) => {
       const legendEl = legendRef.current;
@@ -754,12 +947,31 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     // bar pinned to the current period (the feed only sends closed bars).
     const lastBar = data[data.length - 1];
     lastClosedRef.current = { time: Number(lastBar.time), close: Number(lastBar.close) };
+    // Carry receivedAt through from the source candle for this bar so the live check has it.
+    const srcNewest = [...(candles || [])].sort(
+      (a, b) => Date.parse(String(b.time)) - Date.parse(String(a.time)),
+    )[0];
+    liveBarRef.current = srcNewest
+      ? {
+        time: Math.floor(Date.parse(String(srcNewest.time)) / 1000),
+        open: Number(srcNewest.open), high: Number(srcNewest.high),
+        low: Number(srcNewest.low), close: Number(srcNewest.close),
+        volume: Number(srcNewest.volume) || 0,
+        receivedAt: (srcNewest as any).receivedAt ?? null,
+      }
+      : null;
 
     // Render the closed bars plus a synthetic forming bar for the current period
     // (only the candlestick series gets the forming bar; overlays/markers stay on
     // closed data so EMAs/volume aren't skewed by the flat placeholder).
-    const forming = formingBarFor(lastClosedRef.current, tfSec, phase);
-    series.setData(forming ? [...data, forming] : data);
+    const forming = formingBarFor(lastClosedRef.current, tfSec, phase, Date.now(), liveBarRef.current);
+    // APPEND only when the forming bar is genuinely a new period. Now that the feed streams the
+    // real forming bar, `data` usually ALREADY ends with it — appending then produces two bars
+    // at the same timestamp and lightweight-charts rejects the whole series ("data must be asc
+    // ordered by time"). When it is already there, setData carries it and the 1-second effect
+    // keeps it updated in place.
+    const lastTime = Number(data[data.length - 1].time);
+    series.setData(forming && Number(forming.time) > lastTime ? [...data, forming] : data);
 
     // Volume — create/remove on demand.
     if (showVolume) {
@@ -968,7 +1180,22 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         };
       });
     const patternMarkers = showPatterns ? detectCandlePatterns(data) : [];
-    const allMarkers = [...signalMarkers, ...patternMarkers, ...analysisMarkers].sort((a, b) => Number(a.time) - Number(b.time));
+
+    // Order blocks: transparent grey boxes behind the candles, with the bars that came back
+    // to them circled. The primitive is attached once to the candle series and then simply
+    // fed new data — re-attaching on every render leaks a primitive per pass.
+    const obZones = showOrderBlocks ? detectOrderBlocks(data) : [];
+    if (!obPrimitiveRef.current) {
+      obPrimitiveRef.current = new OrderBlockPrimitive();
+      try { series.attachPrimitive(obPrimitiveRef.current); } catch { obPrimitiveRef.current = null; }
+    }
+    obPrimitiveRef.current?.setData(obZones);
+    const retestMarkers = obZones.length ? detectRetestBars(data, obZones) : [];
+    if (obZones.length) {
+      badgeChips.push(`<span class="font-black text-slate-500">▭ ${obZones.length} OB</span><span class="text-slate-400">${retestMarkers.length} retest${retestMarkers.length === 1 ? '' : 's'}</span>`);
+    }
+
+    const allMarkers = [...signalMarkers, ...patternMarkers, ...analysisMarkers, ...retestMarkers].sort((a, b) => Number(a.time) - Number(b.time));
     if (!markersApiRef.current) markersApiRef.current = createSeriesMarkers(series, []);
     markersApiRef.current.setMarkers(allMarkers as any);
 
@@ -1022,7 +1249,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         chart.timeScale().fitContent();
       }
     }
-  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showIchimoku, showTrend, showTrendlines, showZigzag, showDensity, showZones, levels, extraLines]);
+  }, [candles, signals, symbol, timeframe, showVolume, showEma9, showEma21, showEma50, showEma200, showPatterns, showIchimoku, showTrend, showTrendlines, showZigzag, showDensity, showZones, showOrderBlocks, levels, extraLines]);
 
   // ─── Effect D: live forming bar + countdown (1s) ────────────────────────
   // The feed sends closed bars only, so without this the chart sits frozen between
@@ -1041,12 +1268,16 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
         } else {
           const m = Math.floor(secs / 60);
           const s = secs % 60;
-          el.textContent = `● LIVE · next ${timeframe} in ${m}:${String(s).padStart(2, '0')}`;
+          // Says LIVE only when a real forming bar is arriving. A placeholder that called
+          // itself live would be the chart claiming more than the feed supports.
+          const fb = formingBarFor(lastClosedRef.current, tfSec, phaseRef.current, Date.now(), liveBarRef.current);
+          const isLive = Boolean(fb && (fb as any).live);
+          el.textContent = `${isLive ? '● LIVE' : '○ waiting for tick'} · next ${timeframe} in ${m}:${String(s).padStart(2, '0')}`;
         }
       }
       const series = seriesRef.current;
       if (!series) return;
-      const forming = formingBarFor(lastClosedRef.current, tfSec, phaseRef.current);
+      const forming = formingBarFor(lastClosedRef.current, tfSec, phaseRef.current, Date.now(), liveBarRef.current);
       if (forming) {
         try {
           series.update(forming);
@@ -1101,7 +1332,7 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
 
   const wrapperClass = isFullscreen
     ? 'fixed inset-0 z-[60] bg-white p-3'
-    : 'relative h-[clamp(420px,52vh,640px)] w-full overflow-hidden rounded-2xl border border-slate-100 bg-white';
+    : 'relative h-[clamp(300px,58vh,640px)] w-full overflow-hidden rounded-2xl border border-slate-100 bg-white';
 
   // When the in-chart symbol/TF switcher is shown, push the legend + badge down so
   // they don't sit under it.
@@ -1181,6 +1412,15 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
           {toggleBtn(showZigzag, 'ZigZag', () => setShowZigzag((v) => !v), 'bg-indigo-50 text-indigo-700 border-indigo-200')}
           {toggleBtn(showDensity, 'Density', () => setShowDensity((v) => !v), 'bg-amber-50 text-amber-700 border-amber-200')}
           {toggleBtn(showZones, 'Zones', () => setShowZones((v) => !v), 'bg-emerald-50 text-emerald-700 border-emerald-200')}
+          {toggleBtn(showOrderBlocks, 'Order blocks', () => setShowOrderBlocks((v) => !v), 'bg-slate-100 text-slate-700 border-slate-300')}
+          <button
+            type="button"
+            onClick={() => setAiOpen((v) => !v)}
+            className={`rounded-lg border px-2.5 py-1 text-[11px] font-black transition-colors ${
+              aiOpen ? 'border-violet-500 bg-violet-500 text-white' : 'border-violet-200 bg-violet-50 text-violet-700 hover:border-violet-400'
+            }`}
+            title={`Professional AI read of the live ${symbol} ${timeframe} chart`}
+          >AI analysis</button>
           <span className="mx-0.5 h-4 w-px bg-slate-200" />
           <button
             onClick={() => {
@@ -1203,6 +1443,379 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
             {isFullscreen ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
           </button>
         </div>
+
+        {/* AI trade-desk panel. Overlays the chart so the read sits beside the price action
+            it describes. The style/direction choice happens BEFORE the read — a scalper and a
+            day trader take different trades off the same chart. */}
+        {aiOpen && (
+          <div className="absolute inset-x-2 top-12 z-40 max-h-[88%] overflow-y-auto rounded-xl border border-violet-200 bg-white/97 p-3 shadow-xl backdrop-blur sm:inset-x-auto sm:right-2 sm:w-[24rem]">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-black uppercase tracking-wider text-violet-700">
+                AI desk · {symbol} {timeframe}
+              </p>
+              <div className="flex items-center gap-2">
+                {/* Closing is no longer destructive — every read is in history — but the way
+                    back has to be visible, or the panel still feels like it lost the result. */}
+                <button
+                  type="button"
+                  onClick={() => setAiHistoryOpen((v) => !v)}
+                  className={`rounded-md border px-1.5 py-0.5 text-[10px] font-black transition ${
+                    aiHistoryOpen
+                      ? 'border-violet-500 bg-violet-500 text-white'
+                      : 'border-violet-200 bg-violet-50 text-violet-700 hover:border-violet-400'
+                  }`}
+                  title={`Last ${MAX_ANALYSIS_HISTORY} saved reads`}
+                >History{aiHistory.length ? ` (${aiHistory.length})` : ''}</button>
+                <button type="button" onClick={() => setAiOpen(false)} className="text-[11px] font-bold text-slate-400 hover:text-slate-600">close</button>
+              </div>
+            </div>
+
+            {aiHistoryOpen && (
+              <div className="mt-2 rounded-lg border border-violet-200 bg-violet-50/60 p-1.5">
+                <div className="flex items-center justify-between px-0.5">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-violet-700">
+                    Saved reads · last {MAX_ANALYSIS_HISTORY}
+                  </p>
+                  {aiHistory.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => { setAiHistory(clearAnalysisHistory()); setAiViewingId(null); }}
+                      className="text-[10px] font-bold text-slate-400 hover:text-rose-600"
+                    >clear all</button>
+                  )}
+                </div>
+
+                {aiHistory.length === 0 ? (
+                  <p className="px-0.5 py-2 text-[10px] font-medium text-slate-500">
+                    No saved reads yet. Every analysis you run is kept here automatically.
+                  </p>
+                ) : (
+                  <ul className="mt-1 max-h-56 space-y-1 overflow-y-auto pr-0.5">
+                    {aiHistory.map((h) => {
+                      const when = new Date(h.savedAt);
+                      const isCurrent = h.id === aiViewingId;
+                      const isThisSeries = h.symbol === symbol && h.timeframe === timeframe;
+                      return (
+                        <li key={h.id}>
+                          <div className={`flex items-center gap-1 rounded-md border px-1.5 py-1 transition ${
+                            isCurrent ? 'border-violet-400 bg-white' : 'border-transparent bg-white/70 hover:border-violet-300'
+                          }`}>
+                            <button
+                              type="button"
+                              onClick={() => openStoredAnalysis(h)}
+                              className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                              title={`Reopen this read from ${when.toLocaleString()}`}
+                            >
+                              <span className={`shrink-0 rounded px-1 py-0.5 text-[9px] font-black ${
+                                h.result.verdict === 'TAKE' ? 'bg-emerald-100 text-emerald-800'
+                                  : h.result.verdict === 'WATCH' ? 'bg-amber-100 text-amber-800' : 'bg-slate-200 text-slate-700'
+                              }`}>{h.result.verdict || '—'}</span>
+                              <span className="min-w-0 truncate text-[10px] font-black text-slate-700">
+                                {h.symbol} {h.timeframe}
+                                {/* Reads from other series stay listed but are marked, so a
+                                    EURUSD read is never mistaken for the chart in front of you. */}
+                                {!isThisSeries && <span className="ml-1 font-bold text-amber-600">other chart</span>}
+                              </span>
+                              <span className="ml-auto shrink-0 text-[9px] font-bold text-slate-400">
+                                {h.style === 'SCALP' ? 'scalp' : 'day'} · {when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const next = deleteAnalysis(h.id);
+                                setAiHistory(next);
+                                if (aiViewingId === h.id) { setAiViewingId(null); setAiOut(null); }
+                              }}
+                              className="shrink-0 px-0.5 text-[11px] font-bold leading-none text-slate-300 hover:text-rose-600"
+                              title="Remove this read"
+                            >×</button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            <div className="mt-2 flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+              {(['SCALP', 'DAY'] as const).map((v) => (
+                <button key={v} type="button" onClick={() => setAiStyle(v)}
+                  className={`flex-1 rounded-md px-2 py-1 text-[11px] font-black transition ${
+                    aiStyle === v ? 'bg-violet-600 text-white' : 'text-slate-500 hover:bg-white'
+                  }`}>{v === 'SCALP' ? 'Scalping' : 'Day trading'}</button>
+              ))}
+            </div>
+
+            {/* Direction is asked ONLY for scalping — a scalper usually has a side in mind and
+                wants it stress-tested; a day read starts from the higher-timeframe bias. */}
+            {aiStyle === 'SCALP' && (
+              <div className="mt-1.5">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Position you are considering</p>
+                <div className="mt-1 flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+                  {(['LONG', 'SHORT', 'BOTH'] as const).map((v) => (
+                    <button key={v} type="button" onClick={() => setAiBias(v)}
+                      className={`flex-1 rounded-md px-2 py-1 text-[11px] font-black transition ${
+                        aiBias === v ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-white'
+                      }`}>{v === 'BOTH' ? 'Open read' : v}</button>
+                  ))}
+                </div>
+                {aiBias !== 'BOTH' && (
+                  <p className="mt-1 text-[10px] font-medium text-slate-400">
+                    It will judge whether a {aiBias.toLowerCase()} is justified — and say no if it is not.
+                  </p>
+                )}
+              </div>
+            )}
+
+            <button type="button" onClick={runAi} disabled={aiBusy}
+              className="mt-2 w-full rounded-lg bg-violet-600 px-3 py-2 text-xs font-black text-white transition hover:bg-violet-700 disabled:bg-slate-300">
+              {aiBusy ? 'Reading the chart…' : 'Analyse this chart'}
+            </button>
+
+            {aiErr && <p className="mt-2 rounded-lg bg-rose-50 px-2 py-1.5 text-[11px] font-bold text-rose-700">{aiErr}</p>}
+
+            {aiOut && (
+              <div className="mt-2 space-y-2">
+                {/* A read pulled back from history describes the chart as it was THEN. Price has
+                    moved since, so the entry/stop levels below may no longer be valid — say so
+                    explicitly rather than let an old ticket read as a live one. */}
+                {(() => {
+                  const viewed = aiHistory.find((h) => h.id === aiViewingId);
+                  if (!viewed) return null;
+                  const ageMin = Math.round((Date.now() - new Date(viewed.savedAt).getTime()) / 60000);
+                  if (ageMin < 1) return null;
+                  const stale = ageMin >= 15;
+                  return (
+                    <div className={`rounded-lg border px-2 py-1 ${
+                      stale ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-slate-50'
+                    }`}>
+                      <p className={`text-[10px] font-bold ${stale ? 'text-amber-800' : 'text-slate-500'}`}>
+                        Saved read from {new Date(viewed.savedAt).toLocaleString()} ·{' '}
+                        {ageMin < 60 ? `${ageMin}m` : `${Math.floor(ageMin / 60)}h ${ageMin % 60}m`} ago
+                        {stale && ' — levels may be out of date, re-run for a current read'}
+                      </p>
+                    </div>
+                  );
+                })()}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${
+                    aiOut.verdict === 'TAKE' ? 'bg-emerald-100 text-emerald-800'
+                      : aiOut.verdict === 'WATCH' ? 'bg-amber-100 text-amber-800' : 'bg-slate-200 text-slate-700'
+                  }`}>{aiOut.verdict || '—'}</span>
+                  {/* The call itself. The field is `decision`, not `direction` — reading the
+                      wrong name meant the panel never showed BUY or SELL at all.
+                      Matched on /BUY|SELL/ rather than equality because the model also returns
+                      STRONG_BUY and STRONG_SELL, which an === check silently painted as a sell.
+                      Always rendered, including HOLD: "no trade" is an answer, and a blank
+                      space reads as a missing one. */}
+                  {(() => {
+                    const call = String(aiOut.forexPlan?.decision || aiOut.fttPlan?.direction || '').toUpperCase();
+                    if (!call) return null;
+                    const buy = /BUY/.test(call);
+                    const sell = /SELL/.test(call);
+                    return (
+                      <span className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[12px] font-black ${
+                        buy ? 'bg-emerald-600 text-white' : sell ? 'bg-rose-600 text-white' : 'bg-slate-200 text-slate-700'
+                      }`}>
+                        {buy ? <TrendingUp size={12} /> : sell ? <TrendingDown size={12} /> : null}
+                        {call.replace('_', ' ')}
+                      </span>
+                    );
+                  })()}
+                  <span className="text-[11px] font-bold text-slate-500">conf {aiOut.confidence ?? '—'}</span>
+                  {aiOut.instrument && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[9px] font-black text-slate-600">{aiOut.instrument}</span>}
+                </div>
+
+                {/* The ticket. Score and grade are computed server-side from checkable
+                    evidence — geometry, R:R measured to the final target, engine agreement,
+                    HTF alignment, stop sanity — not from the model's own confidence. */}
+                {(() => {
+                  const fp = aiOut.forexPlan as (typeof aiOut.forexPlan & {
+                    setupScore?: number | null; setupGrade?: string | null;
+                    scoreBreakdown?: Array<{ factor: string; points: number; why: string }>;
+                    scoreNote?: string | null; lots?: number | null;
+                    suggestedLots?: number | null; sizingIsHypothetical?: boolean;
+                    stopPips?: number | null; lossAtStop?: number | null;
+                  }) | null | undefined;
+                  if (!fp) return null;
+                  // No entry => no ticket. Say so plainly rather than rendering empty fields.
+                  if (fp.entry == null) {
+                    return fp.scoreNote ? (
+                      <p className="rounded-lg bg-slate-100 px-2 py-1.5 text-[11px] font-bold text-slate-500">{fp.scoreNote}</p>
+                    ) : null;
+                  }
+                  const gradeCls = fp.setupGrade === 'A+' || fp.setupGrade === 'A' ? 'bg-emerald-600'
+                    : fp.setupGrade === 'B' ? 'bg-sky-600'
+                      : fp.setupGrade === 'C' ? 'bg-amber-600' : 'bg-rose-600';
+                  const row = (k: string, v: React.ReactNode) => (
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{k}</span>
+                      <span className="font-mono text-[11px] font-black text-slate-800">{v}</span>
+                    </div>
+                  );
+                  return (
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                      <div className="mb-1.5 flex items-center gap-2">
+                        {fp.setupGrade && (
+                          <span className={`rounded px-2 py-0.5 text-[11px] font-black text-white ${gradeCls}`}>{fp.setupGrade}</span>
+                        )}
+                        {fp.setupScore != null && (
+                          <span className="text-[11px] font-black text-slate-600">score {fp.setupScore}</span>
+                        )}
+                        {fp.riskReward != null && (
+                          <span className="ml-auto rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-black text-white">
+                            1:{fp.riskReward}
+                          </span>
+                        )}
+                      </div>
+                      <div className="space-y-0.5">
+                        {row('Entry', fp.entry)}
+                        {row('Stop loss', <span className="text-rose-600">{fp.stopLoss ?? '—'}</span>)}
+                        {fp.takeProfit1 != null && row('TP1', <span className="text-emerald-700">{fp.takeProfit1}</span>)}
+                        {fp.takeProfit2 != null && row('TP2', <span className="text-emerald-700">{fp.takeProfit2}</span>)}
+                        {fp.takeProfit3 != null && row('TP3', <span className="text-emerald-700">{fp.takeProfit3}</span>)}
+                        {/* Lot size. When the call is not tradeable the number is still shown —
+                            stop distance and risk-at-stop were already displayed on a HOLD, so
+                            hiding only the lot size was inconsistent rather than cautious — but
+                            it is labelled so it can never read as a live position. */}
+                        {fp.lots != null
+                          ? row('Lot size', fp.lots)
+                          : fp.suggestedLots != null && row(
+                            'Lot size (if taken)',
+                            <span className="text-slate-500">{fp.suggestedLots}</span>,
+                          )}
+                        {fp.stopPips != null && row('Stop', `${fp.stopPips} pips`)}
+                        {fp.lossAtStop != null && row('Risk at stop', `$${fp.lossAtStop}`)}
+                      </div>
+                      {/* Why this grade — an unexplained score is indistinguishable from a guess. */}
+                      {fp.scoreBreakdown && fp.scoreBreakdown.length > 0 && (
+                        <details className="mt-1.5">
+                          <summary className="cursor-pointer text-[10px] font-bold uppercase tracking-wider text-slate-400 hover:text-slate-600">
+                            why this grade
+                          </summary>
+                          <div className="mt-1 space-y-0.5">
+                            {fp.scoreBreakdown.map((b) => (
+                              <div key={b.factor} className="flex items-baseline gap-1.5 text-[10px]">
+                                <span className={`w-7 shrink-0 text-right font-mono font-black ${b.points >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                                  {b.points >= 0 ? '+' : ''}{b.points}
+                                </span>
+                                <span className="font-bold text-slate-600">{b.factor}</span>
+                                <span className="text-slate-400">{b.why}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Strategy agreement — INFORMATION. The AI read independently; this only says
+                    whether the deterministic engines happened to land the same way. */}
+                {aiOut.strategyMatch && (
+                  <div className={`rounded-lg border px-2 py-1.5 ${
+                    aiOut.strategyMatch.verdict === 'ALIGNED' ? 'border-emerald-200 bg-emerald-50'
+                      : aiOut.strategyMatch.verdict === 'CONTRARY' ? 'border-rose-200 bg-rose-50'
+                        : 'border-slate-200 bg-slate-50'
+                  }`}>
+                    <p className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                      Strategy match <span className="font-semibold normal-case tracking-normal text-slate-400">— information only</span>
+                    </p>
+                    <p className="mt-0.5 text-[11px] font-bold text-slate-700">{aiOut.strategyMatch.note}</p>
+                    {aiOut.strategyMatch.agreeing.length > 0 && (
+                      <p className="mt-1 text-[10px] font-bold text-emerald-700">
+                        agrees: {aiOut.strategyMatch.agreeing.map((x) => x.name || x.id).join(', ')}
+                      </p>
+                    )}
+                    {aiOut.strategyMatch.opposing.length > 0 && (
+                      <p className="mt-0.5 text-[10px] font-bold text-rose-700">
+                        disagrees: {aiOut.strategyMatch.opposing.map((x) => x.name || x.id).join(', ')}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* MARKET READ — the structured facts, as scannable chips. These come back as
+                    discrete fields, so rendering them as chips instead of leaving them buried
+                    in the prose is free readability. */}
+                {(() => {
+                  const d = aiOut.detection || {};
+                  const chips: Array<[string, string, string]> = [];
+                  if (d.trend) chips.push(['trend', String(d.trend), 'bg-slate-100 text-slate-700']);
+                  if (d.regime) chips.push(['regime', String(d.regime), 'bg-slate-100 text-slate-700']);
+                  // 'NONE' is the absence of a breakout, not a fact worth a chip.
+                  if (d.breakout?.phase && String(d.breakout.phase).toUpperCase() !== 'NONE') {
+                    chips.push(['breakout', `${d.breakout.phase}${d.breakout.direction ? ` ${d.breakout.direction}` : ''}`,
+                      d.breakout.phase === 'CONFIRMED' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-600']);
+                  }
+                  if (!chips.length && !(d.patterns || []).length) return null;
+                  return (
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Market read</p>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {chips.map(([k, v, cls]) => (
+                          <span key={k} className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${cls}`}>
+                            <span className="opacity-60">{k}</span> {v}
+                          </span>
+                        ))}
+                        {(d.patterns || []).slice(0, 4).map((pt) => (
+                          <span key={String(pt)} className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-bold text-indigo-700">{String(pt)}</span>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* WHY — the model already returns discrete key factors. Bullets are far easier
+                    to scan than the same points buried in a paragraph. */}
+                {(aiOut.keyFactors || []).length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Why</p>
+                    <ul className="mt-1 space-y-0.5">
+                      {(aiOut.keyFactors || []).slice(0, 6).map((f, i) => (
+                        <li key={i} className="flex gap-1.5 text-[11px] font-medium leading-snug text-slate-600">
+                          <span className="mt-[3px] h-1 w-1 shrink-0 rounded-full bg-violet-400" />
+                          <span>{f}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* INVALIDATION — what kills the idea. Distinct from the rationale and the most
+                    actionable line in the whole read, so it gets its own box. */}
+                {aiOut.forexPlan?.invalidation && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5">
+                    <p className="text-[10px] font-black uppercase tracking-wider text-amber-700">Invalidated if</p>
+                    <p className="mt-0.5 text-[11px] font-semibold leading-snug text-amber-900">{aiOut.forexPlan.invalidation}</p>
+                  </div>
+                )}
+
+                {/* The full rationale stays available but collapsed — it was dominating the panel
+                    as a wall of text, which is what made the read hard to use. */}
+                {aiOut.reasoning && (
+                  <details>
+                    <summary className="cursor-pointer text-[10px] font-black uppercase tracking-wider text-slate-400 hover:text-slate-600">
+                      full rationale
+                    </summary>
+                    <p className="mt-1 whitespace-pre-wrap text-[11px] font-medium leading-relaxed text-slate-600">{aiOut.reasoning}</p>
+                  </details>
+                )}
+
+                {aiOut.dataFresh === false && (
+                  <p className="rounded bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-800">
+                    Candles are not live — last-session study, not a live signal.
+                  </p>
+                )}
+                <p className="text-[10px] font-medium text-slate-400">
+                  An independent second opinion. It never places a trade and never feeds the auto-trader.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Chart canvas — always mounted so the chart instance never loses its container
             (prevents a blank chart if candles briefly empty then return). */}

@@ -28,6 +28,7 @@ import {
 import {
   emptyStats, recordScenario, partitionStrategies, placeboPrices, discriminationFor, VERDICT,
 } from './forecastDiscrimination.js';
+import { interleaveBySource } from './forecastLevels.js';
 
 const n = (v) => Number(v);
 // 5dp everywhere a price is carried: 2dp is lossy on forex, where it merges distinct levels.
@@ -37,7 +38,7 @@ export const DEFAULTS = {
   minLevelStrength: 2,
   maxDistanceAtr: 8,        // beyond this the arrival is too speculative to be worth ranking
   minDistanceAtr: 0.05,     // already there: it is a live signal, not a forecast
-  maxLevels: 14,            // evaluation cost is levels x scenarios x stages x strategies
+  maxLevels: 18,            // evaluation cost is levels x scenarios x stages x strategies
   scenarios: SCENARIOS,
 };
 
@@ -51,7 +52,7 @@ export function forecastableLevels(levels, { price, atr, options = {} } = {}) {
   const o = { ...DEFAULTS, ...options };
   const p = n(price), a = n(atr);
   if (!Array.isArray(levels) || !Number.isFinite(p) || !(a > 0)) return [];
-  return levels
+  const ranked = levels
     .filter((l) => {
       const lp = n(l.price);
       if (!Number.isFinite(lp) || lp <= 0) return false;
@@ -63,7 +64,28 @@ export function forecastableLevels(levels, { price, atr, options = {} } = {}) {
       return d >= o.minDistanceAtr && d <= o.maxDistanceAtr;
     })
     .sort((x, y) => Math.abs(n(x.price) - p) - Math.abs(n(y.price) - p))
-    .slice(0, o.maxLevels);
+    // Cap by round-robin across sources rather than by raw distance. Support/resistance zones are
+    // far denser than daily liquidity, so a plain nearest-N cut here would refill the pool with
+    // zones and quietly stop forecasting PDH/PDL — the same starvation the merge already guards
+    // against upstream, reintroduced after filtering. With a single source this is exactly
+    // `sort by distance, slice(maxLevels)`, so liquidity-only callers are unaffected.
+    ;
+  return interleaveBySource(ranked, { limit: o.maxLevels });
+}
+
+/**
+ * Grade a forecast on the SAME scale the strategies use (strategyLab.js), so an A+ forecast
+ * means the same score band as an A+ signal. Diverging here would make the two incomparable,
+ * and the challenge rules read grades from both.
+ */
+export function forecastGrade(score) {
+  // Explicit null guard, not a bare Number.isFinite: Number(null) is 0 and 0 is finite, so a
+  // MISSING score would be graded C — a failing grade — rather than reported as unknown. That
+  // exact conflation is what made the challenge guard refuse every forecast order.
+  if (score === null || score === undefined || score === '') return null;
+  const v = n(score);
+  if (!Number.isFinite(v)) return null;
+  return v >= 85 ? 'A+' : v >= 75 ? 'A' : v >= 65 ? 'B' : 'C';
 }
 
 /**
@@ -173,6 +195,10 @@ export function runScenario({
       // forecast's own direction, not the loudest voice regardless of which way it points.
       bestScore: backing[0]?.score ?? null,
       bestStrategy: backing[0]?.strategyId || null,
+      // The firing strategy's own grade when it reported one, else derived from the score on
+      // the shared scale — a forecast without a grade reads to the challenge guard as a
+      // FAILING grade, which is what blocked place-order.
+      grade: backing[0]?.grade || forecastGrade(backing[0]?.score),
       scenarioBars: bars,        // disclosed: the reader must be able to see what was assumed
       threw,
     },
@@ -233,6 +259,12 @@ export function runForecasts({
         f.levelType = lv.type || null;
         f.levelLabel = lv.label || null;
         f.levelStrength = n(lv.strength) || null;
+        // A level can be several things at once — a PDH that is also an order block edge. `type`
+        // names only the strongest, so the full list is carried separately: without it, merging
+        // would quietly reassign a hit away from the source that actually earned it, and the
+        // per-source track record would be measuring the wrong thing.
+        f.levelSources = Array.isArray(lv.sources) && lv.sources.length ? [...lv.sources] : (lv.type ? [lv.type] : []);
+        f.levelConfluence = n(lv.confluence) > 0 ? n(lv.confluence) : 1;
         f.fires.forEach((x) => everFired.add(x.strategyId));
         forecasts.push(f);
       }

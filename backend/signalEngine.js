@@ -514,7 +514,7 @@ function getTradingSessionContext(symbol, now = new Date()) {
   };
 }
 
-function detectCandlestickPatterns(candles, atr = null, levels = []) {
+export function detectCandlestickPatterns(candles, atr = null, levels = []) {
   const out = [];
   if (!candles || candles.length < 2) return out;
   const data = candles.slice(-6).map((c) => ({

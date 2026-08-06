@@ -4,6 +4,17 @@ import type {
   PredictionReportResponse,
   SetupForecastResponse,
   SetupForecastReportResponse,
+  AutoTradePendingResponse,
+  ForecastAiResponse,
+  StrategyRatesResponse,
+  TrackedForecastResponse,
+  ForecastPendingResponse,
+  IctPredictionResponse,
+  IctTrackedResponse,
+  IctPendingResponse,
+  IctTrackRecordResponse,
+  IctAiResponse,
+  RepriceResponse,
   LiquidityChartResponse,
   LiquidityRankResponse,
   Alert,
@@ -80,6 +91,7 @@ import type {
   BreakoutLiveResponse,
   BreakoutAlertsResponse,
   BreakoutTrackingResponse,
+  WouldTradeResponse,
 } from './types';
 import { playAlertSound, showBrowserNotification } from './utils/notifications';
 
@@ -315,11 +327,16 @@ export async function triggerAiAnalysis(symbol: string, timeframe = 'M5'): Promi
 
 // Upload a chart screenshot (base64) → AI vision trade plan, with deterministic fallback.
 export async function fetchChartAnalysis(payload: {
-  imageBase64: string;
+  imageBase64?: string;
   mimeType: string;
   symbol: string;
   timeframe: string;
   tradeMode: 'FOREX' | 'FTT' | 'BOTH';
+  // Professional-trader mode. Omit both and the original generic prompt is used.
+  // imageBase64 may be empty: the server then renders the chart itself from the same candles
+  // it analyses, so the AI sees the live market without anyone uploading a screenshot.
+  style?: 'SCALP' | 'DAY';
+  bias?: 'LONG' | 'SHORT' | 'BOTH';
 }): Promise<ChartAnalysisResponse> {
   const response = await fetch('/api/ai/analyze-chart', {
     method: 'POST',
@@ -1317,6 +1334,19 @@ export async function fetchForexBacktestReport(options?: {
   return fetchJson<ForexBacktestResponse>(`/api/reports/backtest/forex${qs ? `?${qs}` : ''}`);
 }
 
+export async function fetchWouldTradeReport(options?: {
+  days?: number;
+  minTrades?: number;
+  account?: string;
+}): Promise<WouldTradeResponse> {
+  const params = new URLSearchParams();
+  if (options?.days) params.set('days', String(options.days));
+  if (options?.minTrades) params.set('minTrades', String(options.minTrades));
+  if (options?.account) params.set('account', options.account);
+  const qs = params.toString();
+  return fetchJson<WouldTradeResponse>(`/api/reports/would-trade${qs ? `?${qs}` : ''}`);
+}
+
 export async function fetchTradeNewsForex(options?: {
   minConfidence?: number;
   activeOnly?: boolean;
@@ -1521,4 +1551,391 @@ export async function fetchSetupForecasts(): Promise<SetupForecastResponse> {
 /** How the setup forecasts actually resolved: arrivals, matches, timing. */
 export async function fetchSetupForecastReport(days = 14): Promise<SetupForecastReportResponse> {
   return fetchJson<SetupForecastReportResponse>(`/api/reports/setup-forecasts?days=${encodeURIComponent(String(days))}`);
+}
+
+/** Trades waiting on your approval before they can be sent to MT5. */
+export async function fetchAutoTradePending(): Promise<AutoTradePendingResponse> {
+  return fetchJson<AutoTradePendingResponse>('/api/auto-trade/pending');
+}
+
+/** AI second opinion on one setup forecast. Read-only — it can never place a trade. */
+export async function analyseForecastWithAi(id: string, force = false): Promise<ForecastAiResponse> {
+  return fetchJson<ForecastAiResponse>(
+    `/api/setup-forecasts/${encodeURIComponent(id)}/analyze${force ? '?force=1' : ''}`,
+    { method: 'POST' },
+  );
+}
+
+/** Per-strategy forecast match rates over a window (powers the star and the 100% filter). */
+export async function fetchStrategyRates(range: string, from?: string, to?: string): Promise<StrategyRatesResponse> {
+  const q = new URLSearchParams({ range, offsetMinutes: String(-new Date().getTimezoneOffset()) });
+  if (from) q.set('from', from);
+  if (to) q.set('to', to);
+  return fetchJson<StrategyRatesResponse>(`/api/setup-forecasts/strategy-rates?${q.toString()}`);
+}
+
+/** Pin or unpin a forecast for tracking. */
+export async function trackForecast(id: string, tracked: boolean): Promise<{ ok: boolean; tracked: boolean }> {
+  return fetchJson(`/api/setup-forecasts/${encodeURIComponent(id)}/track`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tracked }),
+  });
+}
+
+/** Tracked forecasts with a live health read. */
+export async function fetchTrackedForecasts(): Promise<TrackedForecastResponse> {
+  return fetchJson<TrackedForecastResponse>('/api/setup-forecasts/tracked');
+}
+
+/** Rest a LIMIT order at the forecast level. Places a REAL order on MT5. */
+export async function placeForecastOrder(id: string, expiryMinutes?: number) {
+  return fetchJson<{ ok: boolean; id: string; direction: string; entry: number; lots: number; expiresInMinutes: number; warnings: string[]; note: string }>(
+    `/api/setup-forecasts/${encodeURIComponent(id)}/place-order`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expiryMinutes }) },
+  );
+}
+
+/** Resting orders placed from forecasts. */
+export async function fetchForecastPendingOrders(): Promise<ForecastPendingResponse> {
+  return fetchJson<ForecastPendingResponse>('/api/setup-forecasts/pending-orders');
+}
+
+/** Pull a resting order off the broker. */
+export async function cancelForecastOrder(orderId: string) {
+  return fetchJson<{ ok: boolean; cancelled: boolean; atBroker: boolean; note?: string }>(
+    `/api/setup-forecasts/order/${encodeURIComponent(orderId)}/cancel`, { method: 'POST' },
+  );
+}
+
+/** Re-anchor a stale proposal to the live market before approving it. */
+export async function repriceAutoTrade(id: string): Promise<RepriceResponse> {
+  return fetchJson<RepriceResponse>(`/api/auto-trade/${encodeURIComponent(id)}/reprice`, { method: 'POST' });
+}
+
+// ─── ICT Predict ─────────────────────────────────────────────────────────────
+
+/**
+ * Active ICT predictions. Every filter is applied SERVER-side so the page and the API cannot
+ * disagree about what "within 50 pips" means — pip distance is measured to the resting entry.
+ */
+export async function fetchIctPredictions(filters: {
+  symbol?: string; timeframe?: string; setup?: string; direction?: string;
+  grade?: string; strategy?: string; proOnly?: boolean;
+  minScore?: number; minRR?: number; maxPips?: number; minPips?: number;
+} = {}): Promise<IctPredictionResponse> {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) {
+    if (v === undefined || v === null || v === '' || v === false) continue;
+    q.set(k, v === true ? '1' : String(v));
+  }
+  const qs = q.toString();
+  return fetchJson<IctPredictionResponse>(`/api/ict-predictions${qs ? `?${qs}` : ''}`);
+}
+
+/** Pin or unpin an ICT prediction for tracking. */
+export async function trackIctPrediction(id: string, tracked: boolean) {
+  return fetchJson<{ ok: boolean; tracked: boolean }>(`/api/ict-predictions/${encodeURIComponent(id)}/track`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tracked }),
+  });
+}
+
+/** Tracked predictions with a live ICT health read (approaching / swept / confirmed / failed). */
+export async function fetchTrackedIctPredictions(): Promise<IctTrackedResponse> {
+  return fetchJson<IctTrackedResponse>('/api/ict-predictions/tracked');
+}
+
+export interface IctResizeInput {
+  lots?: number;
+  /** Solve for lots from a stop distance instead of naming a lot size. */
+  stopPips?: number;
+  slUsd: number;
+  tpUsd?: number | null;
+  tp2Usd?: number | null;
+  tp3Usd?: number | null;
+}
+
+export interface IctResizePreview {
+  ok: boolean;
+  symbol: string; timeframe: string; direction: string; entry: number;
+  ticket: {
+    ok: boolean; lots: number;
+    stopLoss: number; takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+    stopPips: number; tp1Pips: number | null; tp3Pips: number | null;
+    riskUsd: number; rewardUsd: number | null; rr: number | null;
+  };
+  validation: {
+    verdict: 'OK' | 'RISKY' | 'REJECT' | 'INVALID';
+    errors: string[]; warnings: string[]; notes: string[];
+    /** Advisory only — a manual ticket over budget still places. */
+    overBudget?: boolean;
+  };
+  suggestion: { suggestedStopPips: number; suggestedLots: number | null; why: string } | null;
+  context: {
+    riskBudget: number | null;
+    riskPct: number | null;
+    /** Set when the budget is larger than today's remaining daily-loss / drawdown room. */
+    roomWarning: string | null;
+    safePerTradeRisk: number | null;
+    equity: number | null;
+    atrPips: number | null; spreadPips: number | null;
+    pipValuePerLot: number; pipSize: number; digits: number | null;
+    originalLots: number | null; originalStopPips: number | null;
+  };
+}
+
+
+
+// ── Liquidity events: alerted levels and what price did with them ────────────
+export interface LiquidityEvent {
+  id: string; symbol: string; timeframe: string;
+  level: number; levelType: string | null; levelLabel: string | null;
+  strength: number | null; side: string; tier: string | null;
+  alertPrice: number | null; distancePips: number | null; emailed: boolean;
+  status: 'WAITING' | 'RECLAIMED' | 'BROKE_AND_HELD' | 'NO_FOLLOW_THROUGH' | 'DEAD';
+  /** Only true once displacement (reclaim) or a held retest (break) has appeared. */
+  confirmed: boolean;
+  direction: 'BUY' | 'SELL' | null;
+  barsToResolve: number | null;
+  followThroughPips: number | null;
+  adversePips: number | null;
+  touches: number | null; closesBeyond: number | null;
+  evidence: string | null;
+  alertedAt: string; resolvedAt: string | null;
+}
+export interface LiquidityEventsResponse {
+  days: number; symbol: string; confirmedOnly: boolean; generatedAt: string;
+  events: LiquidityEvent[];
+  summary: {
+    alerts: number; waiting: number; noFollowThrough: number; dead: number;
+    resolved: number; reclaimed: number; brokeAndHeld: number;
+    reclaimRate: number | null; avgFollowThroughPips: number | null;
+    confirmed: {
+      resolved: number; reclaimed: number; brokeAndHeld: number;
+      reclaimRate: number | null; avgFollowThroughPips: number | null;
+      confirmationRate: number | null;
+    };
+  };
+  symbols: string[];
+  legend: Record<string, string>;
+  note: string;
+}
+
+export async function fetchLiquidityEvents(options?: {
+  days?: number; symbol?: string; confirmedOnly?: boolean;
+}): Promise<LiquidityEventsResponse> {
+  const p = new URLSearchParams();
+  if (options?.days) p.set('days', String(options.days));
+  if (options?.symbol) p.set('symbol', options.symbol);
+  if (options?.confirmedOnly) p.set('confirmedOnly', '1');
+  const qs = p.toString();
+  return fetchJson<LiquidityEventsResponse>(`/api/liquidity/events${qs ? `?${qs}` : ''}`);
+}
+
+
+
+// ── AI chart analysis tracking ──────────────────────────────────────────────
+export interface AiTrack {
+  id: string; symbol: string; timeframe: string;
+  tradeMode: string | null; style: string | null; bias: string | null;
+  verdict: string | null; decision: string | null;
+  confidence: number | null;
+  score: number | null; grade: string | null;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit3: number | null;
+  lots: number | null; riskReward: number | null;
+  status: 'WAITING' | 'RUNNING' | 'TP1' | 'TP2' | 'TP3' | 'STOPPED' | 'EXPIRED' | 'NO_TRADE';
+  entered: boolean;
+  r: number | null; profitUsd: number | null;
+  /** Both excursions: a trade that ran your way then stopped is a different failure. */
+  mfeR: number | null; maeR: number | null;
+  currentPrice: number | null; exitPrice: number | null;
+  barsHeld: number | null; note: string | null;
+  createdAt: string; resolvedAt: string | null;
+}
+export interface AiTracksResponse {
+  days: number; symbol: string; generatedAt: string;
+  tracks: AiTrack[];
+  summary: {
+    tracked: number; waiting: number; open: number; settled: number;
+    wins: number; losses: number; winRate: number | null;
+    expectancyR: number; netR: number;
+    openProfitUsd: number; closedProfitUsd: number;
+    avgMfeR: number | null; avgMaeR: number | null;
+  };
+  calibration: { band: string; n: number; winRate: number | null; expectancyR: number | null; netR: number | null }[];
+  symbols: string[];
+  note: string;
+}
+
+export async function fetchAiTracks(options?: { days?: number; symbol?: string }): Promise<AiTracksResponse> {
+  const p = new URLSearchParams();
+  if (options?.days) p.set('days', String(options.days));
+  if (options?.symbol) p.set('symbol', options.symbol);
+  const qs = p.toString();
+  return fetchJson<AiTracksResponse>(`/api/ai/tracks${qs ? `?${qs}` : ''}`);
+}
+
+// ── ICT Sniper: immediate bare entry on an "enter now" ict-breaker signal ────
+export interface SniperConfig {
+  enabled: boolean;
+  symbols: string[];
+  timeframes: string[];
+  minGrade: string;
+  maxConcurrent: number;
+  maxPerDay: number;
+  /** Seconds the position runs with NO stop before one is attached. */
+  stopDelaySeconds: number;
+  /** This mode's own dollar risk, independent of Account & Sizing. */
+  riskUsd: number;
+}
+export interface SniperTrade {
+  id: string; symbol: string; timeframe: string; direction: string;
+  lots: number | null; riskUsd: number | null;
+  entry: number | null; fillPrice: number | null;
+  stopLoss: number | null; takeProfit1: number | null;
+  status: string; reason: string | null; ticket: string | null; positionId: string | null;
+  profit: number | null;
+  createdAt: string; filledAt: string | null; closedAt: string | null;
+  /** Filled, live, and no stop on it yet — the window this mode deliberately opens. */
+  unprotected: boolean;
+}
+export interface SniperDecision {
+  at: string; fired: boolean; symbol: string; timeframe: string;
+  strategy?: string; grade?: string | null; direction?: string; lots?: number; reason: string;
+}
+export interface SniperResponse {
+  config: SniperConfig;
+  interlocks: { autoTradeMode: string; bridgeReady: boolean; armedMatch: boolean; dispatchable: boolean };
+  trades: SniperTrade[];
+  decisions: SniperDecision[];
+  summary: {
+    openCount: number; unprotectedCount: number; todayCount: number;
+    closedCount: number; netProfit: number | null; wins: number;
+  };
+  available: { symbols: string[]; timeframes: string[] };
+  note: string;
+}
+
+export async function fetchSniper(): Promise<SniperResponse> {
+  return fetchJson<SniperResponse>('/api/auto-trade/sniper');
+}
+export async function saveSniper(config: Partial<SniperConfig>): Promise<{ ok: boolean; config: SniperConfig }> {
+  return fetchJson<{ ok: boolean; config: SniperConfig }>('/api/auto-trade/sniper', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config),
+  });
+}
+
+// ── Modify a resting limit order (shared by ICT setups and Setup Forecasts) ──
+export interface OrderModifyLeg {
+  price: number; pips: number | null; usd: number | null;
+  side: string; correctSide: boolean;
+}
+export interface OrderModifyOrder {
+  id: string | null; symbol: string | null; timeframe: string | null;
+  direction: string | null; orderType: string | null; status: string | null; ticket: string | null;
+  entry: number | null; lots: number | null;
+  stop: OrderModifyLeg | null; tp1: OrderModifyLeg | null;
+  tp2: OrderModifyLeg | null; tp3: OrderModifyLeg | null;
+  rr: number | null; riskUsd: number | null; rewardUsd: number | null;
+  notional: number | null; notionalMultiple: number | null;
+  modifiable: boolean;
+}
+export interface OrderModifyRead {
+  ok: boolean;
+  order: OrderModifyOrder;
+  context: {
+    pipSize: number; pipValuePerLot: number; digits: number | null;
+    contractSize: number; accountEquity: number | null; riskBudget: number | null;
+    minStopDistance: number | null; volMin: number; volMax: number | null; volStep: number;
+  };
+}
+/** Edits arrive in ONE unit per leg; the server recomputes the other three. */
+export interface OrderModifyChanges {
+  lots?: number; entry?: number;
+  slPrice?: number; slPips?: number; slUsd?: number;
+  tp1Price?: number; tp1Pips?: number; tp1Usd?: number;
+  tp3Price?: number; tp3Pips?: number; tp3Usd?: number;
+}
+export interface OrderModifyPreview {
+  ok: boolean; preview?: boolean;
+  plan: {
+    ok: boolean;
+    before: OrderModifyOrder; after: OrderModifyOrder;
+    changed: string[];
+    /** MT5 cannot change a resting order volume — a lot change is a cancel and a re-place. */
+    requiresReplace: boolean;
+    replaceWarning: string | null;
+    unchanged: boolean;
+  };
+  validation: { verdict: 'OK' | 'RISKY' | 'REJECT' | 'INVALID'; errors: string[]; warnings: string[] };
+  marketPrice?: number | null;
+}
+export interface OrderModifyResult extends OrderModifyPreview {
+  replaced: boolean; newId?: string; note: string;
+}
+
+export async function fetchOrderModify(id: string): Promise<OrderModifyRead> {
+  return fetchJson<OrderModifyRead>(`/api/orders/${encodeURIComponent(id)}/modify`);
+}
+export async function previewOrderModify(id: string, changes: OrderModifyChanges): Promise<OrderModifyPreview> {
+  return fetchJson<OrderModifyPreview>(`/api/orders/${encodeURIComponent(id)}/modify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ preview: true, changes }),
+  });
+}
+export async function commitOrderModify(id: string, changes: OrderModifyChanges): Promise<OrderModifyResult> {
+  return fetchJson<OrderModifyResult>(`/api/orders/${encodeURIComponent(id)}/modify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ changes }),
+  });
+}
+
+/** Price the resized ticket and judge it. Read-only — places nothing. */
+export async function previewIctOrder(id: string, input: IctResizeInput): Promise<IctResizePreview> {
+  return fetchJson<IctResizePreview>(
+    `/api/ict-predictions/${encodeURIComponent(id)}/preview-order`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) },
+  );
+}
+
+/** Rest the BUY/SELL LIMIT at the pool. Places a REAL order on MT5. */
+export async function placeIctOrder(id: string, expiryMinutes?: number, override?: IctResizeInput) {
+  return fetchJson<{
+    ok: boolean; id: string; orderType: string; direction: string;
+    entry: number; stopLoss: number; takeProfit: number | null; lots: number;
+    stopPips: number | null; expiresInMinutes: number; warnings: string[]; lossAtStop: number | null;
+    resized?: boolean; note: string;
+  }>(`/api/ict-predictions/${encodeURIComponent(id)}/place-order`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expiryMinutes, override }),
+  });
+}
+
+/** Resting orders placed from ICT predictions. */
+export async function fetchIctPendingOrders(): Promise<IctPendingResponse> {
+  return fetchJson<IctPendingResponse>('/api/ict-predictions/pending-orders');
+}
+
+/** Pull a resting ICT order off the broker. */
+export async function cancelIctOrder(orderId: string) {
+  return fetchJson<{ ok: boolean; cancelled: boolean; atBroker: boolean; note?: string }>(
+    `/api/ict-predictions/order/${encodeURIComponent(orderId)}/cancel`, { method: 'POST' },
+  );
+}
+
+/** How these predictions actually played out: arrival, reclaim, and what the resting order paid. */
+export async function fetchIctTrackRecord(days = 30): Promise<IctTrackRecordResponse> {
+  return fetchJson<IctTrackRecordResponse>(`/api/ict-predictions/track-record?days=${encodeURIComponent(String(days))}`);
+}
+
+/** ICT-specific AI second opinion on one prediction. Read-only; never trades or emails. */
+export async function analyseIctPredictionWithAi(id: string, force = false): Promise<IctAiResponse> {
+  return fetchJson<IctAiResponse>(
+    `/api/ict-predictions/${encodeURIComponent(id)}/analyze${force ? '?force=1' : ''}`, { method: 'POST' },
+  );
+}
+
+/** Kick a manual scan. Returns immediately; poll fetchIctPredictions and watch lastScan.at. */
+export async function scanIctPredictions() {
+  return fetchJson<{ ok: boolean; started: boolean; reason?: string; note?: string }>(
+    '/api/ict-predictions/scan', { method: 'POST' },
+  );
 }

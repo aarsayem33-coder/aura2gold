@@ -698,7 +698,7 @@ export default function StrategyLab() {
               <h3 className="text-xs font-black uppercase tracking-wider text-slate-500">Live signals · {liveTitle} · {liveTf}</h3>
               <span className="text-[11px] font-bold text-slate-400">{entries.length} signal{entries.length === 1 ? '' : 's'}{actionableOnly ? '' : ` · ${holdCount} hold`} · sorted: tradable first · auto-refresh 30s</span>
             </div>
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto [-webkit-overflow-scrolling:touch]">
               <table className="w-full min-w-[920px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
@@ -765,7 +765,7 @@ export default function StrategyLab() {
               </div>
               {historyFilters}
             </div>
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto [-webkit-overflow-scrolling:touch]">
               <table className="w-full min-w-[1000px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
@@ -825,7 +825,7 @@ export default function StrategyLab() {
               <h3 className="text-xs font-black uppercase tracking-wider text-violet-700">Live fixed-time calls · {liveTitle} · {liveTf}</h3>
               <span className="text-[11px] font-bold text-slate-400">{calls.length} call{calls.length === 1 ? '' : 's'} · sorted: enter-now first · expiry {ftLive?.expiryBars === 1 ? 'next candle' : `${ftLive?.expiryBars} candles`} · auto-refresh {liveTf === 'M1' || liveTf === 'M5' ? '10s' : '30s'}</span>
             </div>
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto [-webkit-overflow-scrolling:touch]">
               <table className="w-full min-w-[1000px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>
@@ -882,7 +882,7 @@ export default function StrategyLab() {
               </div>
               {historyFilters}
             </div>
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto [-webkit-overflow-scrolling:touch]">
               <table className="w-full min-w-[820px] text-left text-sm">
                 <thead className="border-b border-slate-100 text-[10px] uppercase tracking-[0.15em] text-slate-500">
                   <tr>

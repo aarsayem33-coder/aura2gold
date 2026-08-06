@@ -15,6 +15,10 @@ import LiveMarketTracker from './pages/LiveMarketTracker.tsx';
 import ChartStudio from './pages/ChartStudio.tsx';
 import LiquidityChart from './pages/LiquidityChart.tsx';
 import SetupForecasts from './pages/SetupForecasts.tsx';
+import IctPredict from './pages/IctPredict.tsx';
+import SniperMode from './pages/SniperMode.tsx';
+import AiTradeTracker from './pages/AiTradeTracker.tsx';
+import AutoTradeApprovals from './pages/AutoTradeApprovals.tsx';
 import ChallengeTracker from './pages/ChallengeTracker.tsx';
 import AutoTrading from './pages/AutoTrading.tsx';
 import SignalTracker from './pages/SignalTracker.tsx';
@@ -93,6 +97,7 @@ export default function App() {
           <Route path="fixed-time" element={<FixedTimeTrading />} />
           <Route path="future-predictions" element={<FuturePredictions />} />
           <Route path="future-predictions/setups" element={<SetupForecasts />} />
+          <Route path="future-predictions/ict" element={<IctPredict />} />
           <Route path="projections" element={<Projections />} />
           <Route path="calendar" element={<EconomicCalendar />} />
           <Route path="news-high-impact" element={<HighImpactNews />} />
@@ -101,9 +106,12 @@ export default function App() {
           <Route path="live-market-tracker" element={<LiveMarketTracker />} />
           <Route path="chart" element={<ChartStudio />} />
           <Route path="chart/liquidity" element={<LiquidityChart />} />
+          <Route path="chart/ai-tracker" element={<AiTradeTracker />} />
           <Route path="signal-tracker" element={<SignalTracker />} />
           <Route path="challenge" element={<ChallengeTracker />} />
           <Route path="auto-trading" element={<AutoTrading />} />
+          <Route path="auto-trading/approvals" element={<AutoTradeApprovals />} />
+          <Route path="auto-trading/sniper" element={<SniperMode />} />
           <Route path="breakout" element={<BreakoutTracker />} />
           <Route path="strategy-lab" element={<StrategyLab />} />
           <Route path="strategy-lab/reports" element={<StrategyLabReports />} />

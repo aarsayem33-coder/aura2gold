@@ -160,6 +160,9 @@ export function buildForecastPlan({
     plan: {
       strategyId: src.strategyId,
       direction: src.decision,
+      // The firing strategy's grade. Without it a challenge configured for A/A+ only reads a
+      // missing grade as a FAILING grade and refuses every forecast ticket.
+      grade: src.grade ?? null,
       entry, stopLoss: stop,
       takeProfit: target, takeProfit2: target2, takeProfit3: target3,
       profitAtFinalTp: profitAt(finalTarget),

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   forecastableLevels, forecastKey, runScenario, runForecasts, rankForecasts, groupByHorizon, DEFAULTS,
+  forecastGrade,
 } from './setupForecastRunner.js';
 import { HORIZON_BUCKETS } from './setupForecast.js';
 import { emptyStats } from './forecastDiscrimination.js';
@@ -431,4 +432,29 @@ test('an unknown or missing horizon falls into the furthest bucket, never disapp
   const groups = groupByHorizon([{ horizon: null }, { horizon: { key: 'nonsense' } }], HORIZON_BUCKETS);
   assert.equal(groups.at(-1).forecasts.length, 2);
   assert.equal(groups.reduce((s, g) => s + g.forecasts.length, 0), 2);
+});
+
+// ── grading ──────────────────────────────────────────────────────────────────
+
+test('forecasts grade on the same scale as signals', () => {
+  // Diverging from strategyLab's thresholds would make an "A+" forecast mean something
+  // different from an "A+" signal, while the challenge rules read grades from both.
+  assert.equal(forecastGrade(90), 'A+');
+  assert.equal(forecastGrade(85), 'A+');
+  assert.equal(forecastGrade(84), 'A');
+  assert.equal(forecastGrade(75), 'A');
+  assert.equal(forecastGrade(74), 'B');
+  assert.equal(forecastGrade(65), 'B');
+  assert.equal(forecastGrade(64), 'C');
+  assert.equal(forecastGrade(null), null, 'no score is not grade C');
+  assert.equal(forecastGrade('abc'), null);
+});
+
+test('a forecast carries a grade, preferring the strategy own', () => {
+  const stated = run({ evaluate: () => ({ decision: 'BUY', score: 70, grade: 'A+' }) });
+  assert.equal(stated.grade, 'A+', "the strategy's own grade wins");
+  const derived = run({ evaluate: () => ({ decision: 'BUY', score: 88 }) });
+  assert.equal(derived.grade, 'A+', 'derived from score when the strategy states none');
+  const low = run({ evaluate: () => ({ decision: 'BUY', score: 60 }) });
+  assert.equal(low.grade, 'C');
 });

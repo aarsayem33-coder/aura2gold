@@ -34,6 +34,7 @@ const defaultEmailAlertSettings: EmailAlertSettings = {
   keyLevelProximityAlerts: { enabled: false, sensitivity: 'NORMAL', symbols: [], levelTypes: [] },
   accountRisk: {
     balance: 5000, mode: 'NORMAL', normalRiskPct: 1,
+    signalSizing: { source: 'ACCOUNT' as const, equity: 10000, riskPct: 1 },
     challenge: {
       preset: 'HOLA_1STEP', phase: 'EVAL', initialBalance: 5000, profitTargetPct: 10,
       dailyLossPct: 3, maxDrawdownPct: 6, drawdownType: 'STATIC', maxRiskPerTradePct: 2,
@@ -1104,6 +1105,64 @@ export default function NotificationSettings() {
                   </div>
                 </div>
               )}
+
+              {/* Signal-card sizing basis. The lots printed on a Strategy Lab / forex signal
+                  used to be sized off a $1,000 placeholder while the auto-trader sized the real
+                  account, so the same ticket could read 0.16 on screen and fill 0.57 at the
+                  broker. "Follow account" keeps the two identical. */}
+              {(() => {
+                const ss = ar.signalSizing || { source: 'ACCOUNT' as const, equity: 10000, riskPct: 1 };
+                const custom = ss.source === 'CUSTOM';
+                const ch = ar.challenge;
+                const followEquity = (ar.mode === 'CHALLENGE' || ar.mode === 'BOTH') ? ch.initialBalance : ar.balance;
+                const followPct = (ar.mode === 'CHALLENGE' || ar.mode === 'BOTH') ? ch.riskPerTradePct : ar.normalRiskPct;
+                const eq = custom ? ss.equity : followEquity;
+                const pct = custom ? ss.riskPct : followPct;
+                const setSS = (patch: Partial<typeof ss>) => setAr({ signalSizing: { ...ss, ...patch } });
+                return (
+                  <div className="rounded-xl border border-indigo-200 bg-indigo-50/40 px-4 py-3">
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      Signal card sizing
+                      <span className="ml-1 font-semibold normal-case tracking-normal text-slate-400">
+                        — the equity the lots on each signal are calculated from
+                      </span>
+                    </p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      {([['ACCOUNT', 'Follow account'], ['CUSTOM', 'Custom']] as const).map(([v, label]) => (
+                        <button key={v} type="button" onClick={() => setSS({ source: v })}
+                          className={`rounded-lg border px-3 py-1.5 text-xs font-bold transition-colors ${
+                            ss.source === v ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-indigo-300'
+                          }`}>{label}</button>
+                      ))}
+                      {custom ? (
+                        <>
+                          <span className="text-xs font-bold text-slate-500">$</span>
+                          <input type="number" step={100} min={1} value={ss.equity}
+                            onChange={(e) => setSS({ equity: Number(e.target.value) })}
+                            className="w-28 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                          <span className="text-xs font-bold text-slate-500">at</span>
+                          <input type="number" step={0.05} min={0.05} max={10} value={ss.riskPct}
+                            onChange={(e) => setSS({ riskPct: Number(e.target.value) })}
+                            className="w-20 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" />
+                          <span className="text-xs font-bold text-slate-500">%</span>
+                        </>
+                      ) : (
+                        <span className="text-xs font-bold text-slate-500">
+                          uses {(ar.mode === 'CHALLENGE' || ar.mode === 'BOTH') ? 'challenge initial balance' : 'account balance'} and its risk %
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1.5 text-[11px] font-bold text-indigo-700">
+                      Signals size against ${Number(eq || 0).toLocaleString()} at {pct}% = ${Math.round(Number(eq || 0) * Number(pct || 0) / 100).toLocaleString()} risk per trade
+                    </p>
+                    {!custom && (
+                      <p className="mt-0.5 text-[10px] font-medium text-slate-400">
+                        Matches what the auto-trader would place, so the lots you see are the lots that trade.
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
 

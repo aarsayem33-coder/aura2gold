@@ -13,6 +13,9 @@ const px = (v: number | null | undefined, symbol: string) => {
 
 const SESSIONS: [string, string][] = [['SYDNEY', 'Sydney'], ['TOKYO', 'Tokyo (Asian)'], ['LONDON', 'London'], ['OVERLAP', 'LDN–NY Overlap'], ['NEWYORK', 'New York']];
 const TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+// A per-strategy approval override. Empty lists mean "any" on that axis; outside the scope
+// the strategy falls back to the desk mode rather than to the opposite live mode.
+type StrategyModeRule = { mode: 'AUTO' | 'ASK'; symbols?: string[]; timeframes?: string[]; sessions?: string[] };
 
 const STATUS_STYLE: Record<string, { chip: string; label: string }> = {
   SHADOW: { chip: 'bg-indigo-100 text-indigo-700', label: 'WOULD TRADE' },
@@ -30,6 +33,7 @@ const STATUS_STYLE: Record<string, { chip: string; label: string }> = {
 };
 
 export default function AutoTrading() {
+  const [expandedRule, setExpandedRule] = useState<string | null>(null);
   const [status, setStatus] = useState<AutoTradeStatus | null>(null);
   const [settings, setSettings] = useState<EmailAlertSettings | null>(null);
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
@@ -55,6 +59,8 @@ export default function AutoTrading() {
   const cfg: AutoTradeConfig = settings?.autoTrade || status?.config || {
     mode: 'OFF', strategies: [], symbols: [], timeframes: [], sessions: [],
     maxTradesPerDay: 3, maxConcurrent: 2, onePerSymbol: true, minGrade: 'A', minRR: 2,
+    maxSlippagePctOfStop: 25, resizeLotsOnSlippage: true, strategyModes: {},
+    ictBreakerExec: { enabled: false, minRemainingR: 1, maxLatePct: 250, minStopSpreadMult: 2, noTakeProfit: true },
     combos: [], selectionMode: null, execution: DEFAULT_EXEC,
   };
   const combos = cfg.combos || [];
@@ -530,6 +536,194 @@ export default function AutoTrading() {
               {!strategies.length && <p className="text-xs text-slate-400">Loading strategies…</p>}
             </div>
           </div>
+
+          {/* Per-strategy approval. The desk mode is the default; a strategy you trust can skip
+              the queue, and one you don't can be forced back into it even when the desk is on
+              AUTO. OFF and SHADOW stay absolute — they are not overridable here. */}
+          {cfg.strategies.length > 0 && (
+            <div className="rounded-xl border border-slate-200 bg-slate-50/60 px-4 py-3">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                Approval per strategy
+                <span className="ml-1 font-semibold normal-case tracking-normal text-slate-400">
+                  — desk is {cfg.mode}; these override it
+                </span>
+              </p>
+              {(cfg.mode === 'OFF' || cfg.mode === 'SHADOW') && (
+                <p className="mt-1 text-[11px] font-bold text-amber-700">
+                  Desk is {cfg.mode} — nothing trades regardless of these settings.
+                </p>
+              )}
+              <div className="mt-2 space-y-1">
+                {cfg.strategies.map((id) => {
+                  const s = strategies.find((x) => x.id === id);
+                  const raw = (cfg.strategyModes || {})[id] as StrategyModeRule | 'AUTO' | 'ASK' | undefined;
+                  // Saved settings may still hold the older plain-string form; read both.
+                  const rule: StrategyModeRule | undefined = typeof raw === 'string'
+                    ? { mode: raw, symbols: [], timeframes: [], sessions: [] } : raw;
+                  const m = rule?.mode;
+                  const eff = m || cfg.mode;
+                  const scoped = Boolean(rule && ((rule.symbols?.length || 0) + (rule.timeframes?.length || 0) + (rule.sessions?.length || 0)));
+                  const open = expandedRule === id;
+                  const write = (next: Record<string, unknown>) => patch({ strategyModes: next as never });
+                  const setMode = (v: 'AUTO' | 'ASK' | null) => {
+                    const next = { ...(cfg.strategyModes || {}) } as Record<string, unknown>;
+                    if (v === null) delete next[id];
+                    else next[id] = { mode: v, symbols: rule?.symbols || [], timeframes: rule?.timeframes || [], sessions: rule?.sessions || [] };
+                    write(next);
+                  };
+                  const toggleScope = (key: 'symbols' | 'timeframes' | 'sessions', val: string) => {
+                    if (!m) return;                       // nothing to scope while following the desk
+                    const cur: string[] = (rule?.[key] as string[]) || [];
+                    const next = { ...(cfg.strategyModes || {}) } as Record<string, unknown>;
+                    next[id] = {
+                      mode: m,
+                      symbols: rule?.symbols || [], timeframes: rule?.timeframes || [], sessions: rule?.sessions || [],
+                      [key]: cur.includes(val) ? cur.filter((x) => x !== val) : [...cur, val],
+                    };
+                    write(next);
+                  };
+                  const chipRow = (label: string, keyName: 'symbols' | 'timeframes' | 'sessions', opts: [string, string][]) => {
+                    const cur: string[] = (rule?.[keyName] as string[]) || [];
+                    return (
+                      <div className="mt-1.5">
+                        <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                          {label} {cur.length ? <span className="text-indigo-600">- {cur.join(', ')}</span> : <span className="text-slate-400">- any</span>}
+                        </p>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {opts.map(([val, text]) => (
+                            <button key={val} type="button" onClick={() => toggleScope(keyName, val)}
+                              className={`rounded-md border px-1.5 py-0.5 text-[10px] font-bold transition ${
+                                cur.includes(val) ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-200 bg-white text-slate-500 hover:border-indigo-300'
+                              }`}>{text}</button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  };
+                  return (
+                    <div key={id} className="rounded-lg bg-white px-2.5 py-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[12px] font-bold text-slate-700">{s?.name || id}</span>
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] font-black ${
+                          eff === 'AUTO' ? 'bg-rose-100 text-rose-700' : 'bg-sky-100 text-sky-700'
+                        }`}>
+                          {eff === 'AUTO' ? 'TRADES WITHOUT REVIEW' : 'NEEDS APPROVAL'}
+                        </span>
+                        {scoped && (
+                          <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[9px] font-black text-white"
+                            title="This override applies only inside its scope; everything else follows the desk mode">
+                            SCOPED
+                          </span>
+                        )}
+                        {m && (
+                          <button type="button" onClick={() => setExpandedRule(open ? null : id)}
+                            className="rounded-md border border-slate-200 px-1.5 py-0.5 text-[10px] font-bold text-slate-500 hover:border-indigo-300">
+                            {open ? 'Hide filters' : scoped ? 'Edit filters' : 'Add filters'}
+                          </button>
+                        )}
+                        <div className="ml-auto flex items-center gap-0.5 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+                          {([['ASK', 'Approve'], ['AUTO', 'Auto'], [null, 'Desk']] as const).map(([v, label]) => (
+                            <button key={label} type="button" onClick={() => setMode(v as 'AUTO' | 'ASK' | null)}
+                              className={`rounded-md px-2 py-0.5 text-[10px] font-black transition ${
+                                (v === null ? !m : m === v)
+                                  ? 'bg-indigo-600 text-white'
+                                  : 'text-slate-500 hover:bg-white'
+                              }`}>{label}</button>
+                          ))}
+                        </div>
+                      </div>
+                      {open && m && (
+                        <div className="mt-1.5 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 py-2">
+                          <p className="text-[10px] font-semibold text-slate-500">
+                            <b>{m}</b> applies only where ALL of these match. Empty = any.
+                            Outside the scope this strategy follows the desk ({cfg.mode}).
+                          </p>
+                          {chipRow('Symbols', 'symbols', symbols.map((x) => [x.toUpperCase(), x] as [string, string]))}
+                          {chipRow('Timeframes', 'timeframes', TFS.map((x) => [x, x] as [string, string]))}
+                          {chipRow('Sessions', 'sessions', SESSIONS)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="mt-1.5 text-[10px] font-medium text-slate-400">
+                <b>Desk</b> follows the mode above · <b>Approve</b> always waits for you ·
+                <b> Auto</b> sends straight to MT5 with no review.
+              </p>
+            </div>
+          )}
+
+          {/* ICT Breaker SL-only execution profile. Scoped to that strategy family alone; every
+              other strategy keeps its take profits and the standard slippage gate. */}
+          {(() => {
+            const ie = cfg.ictBreakerExec || { enabled: false, minRemainingR: 1, maxLatePct: 250, minStopSpreadMult: 2, noTakeProfit: true };
+            const setIe = (patchIn: Partial<typeof ie>) => patch({ ictBreakerExec: { ...ie, ...patchIn } });
+            const num = (label: string, key: 'minRemainingR' | 'maxLatePct', step: number, min: number, max: number, suffix: string, hint: string) => (
+              <label className="flex flex-wrap items-center gap-1.5 text-[11px] font-bold text-slate-500" title={hint}>
+                {label}
+                <input type="number" step={step} min={min} max={max} value={ie[key] as number}
+                  onChange={(e) => setIe({ [key]: Number(e.target.value) } as Partial<typeof ie>)}
+                  disabled={!ie.enabled}
+                  className="w-20 rounded-lg border border-slate-300 px-2 py-1 text-sm font-bold text-slate-800 disabled:bg-slate-100 disabled:text-slate-400" />
+                <span className="font-semibold text-slate-400">{suffix}</span>
+              </label>
+            );
+            return (
+              <div className={`rounded-xl border px-4 py-3 ${ie.enabled ? 'border-amber-300 bg-amber-50/60' : 'border-slate-200 bg-slate-50/60'}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                    ICT Breaker — SL-only orders
+                  </p>
+                  <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[9px] font-black text-white">
+                    ict-breaker + ict-break-pro ONLY
+                  </span>
+                  <button type="button" onClick={() => setIe({ enabled: !ie.enabled })}
+                    className={`ml-auto rounded-lg border px-3 py-1.5 text-xs font-black transition-colors ${
+                      ie.enabled ? 'border-amber-500 bg-amber-500 text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-amber-300'
+                    }`}>{ie.enabled ? 'ON' : 'OFF'}</button>
+                </div>
+
+                <p className="mt-1.5 text-[11px] font-semibold text-slate-500">
+                  Sends the order with a stop and <b>no take profit</b> — you add targets yourself in MT5.
+                  Measured cause: <b>29 of 29</b> of this strategy&apos;s <i>10016 Invalid stops</i> rejections were
+                  TP1 already sitting behind the market. None involved the stop.
+                </p>
+
+                <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2">
+                  {num('Min room to the draw', 'minRemainingR', 0.1, 0.5, 5, 'R',
+                    'Skip when less than this much R remains to TP3. 53% of alerts are already spent by this measure.')}
+                  {num('Give up past', 'maxLatePct', 5, 25, 400, '% late',
+                    'Beyond this, expectancy went negative even with the remaining-R filter applied.')}
+                </div>
+
+                {ie.enabled && (
+                  <div className="mt-2 space-y-1 rounded-lg border border-amber-200 bg-white px-3 py-2">
+                    <p className="text-[11px] font-bold text-amber-800">
+                      No take profit means the exit is entirely yours.
+                    </p>
+                    <p className="text-[10px] font-medium text-slate-500">
+                      The stop still caps the loss and lot size still respects your challenge risk, so the
+                      downside stays bounded. But a position with no target sits open until you close it or
+                      it stops out — and the replay showed late entries are thin-to-negative when exited
+                      mechanically, so the trade quality after entry rests on your management, not on a
+                      measured edge.
+                    </p>
+                    {cfg.mode === 'AUTO' && (
+                      <p className="text-[10px] font-bold text-rose-700">
+                        Desk is AUTO — these will go straight to MT5 with no review. Consider SHADOW first
+                        to see which setups it takes before any real order changes.
+                      </p>
+                    )}
+                  </div>
+                )}
+                <p className="mt-1.5 text-[10px] font-medium text-slate-400">
+                  The stop is never moved — lot size absorbs the distance instead. Every other strategy keeps
+                  its take profits and the normal slippage gate.
+                </p>
+              </div>
+            );
+          })()}
           <div className="grid gap-4 lg:grid-cols-2">
             <div>
               <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-500">Symbols {cfg.symbols.length ? <span className="text-emerald-600">— {cfg.symbols.length}</span> : <span className="text-slate-400">— all</span>}</p>
@@ -576,6 +770,14 @@ export default function AutoTrading() {
               <input type="number" min={1} max={100} value={cfg.maxConcurrent} onChange={(e) => patch({ maxConcurrent: Number(e.target.value) })} className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
             <div><label className="block text-[11px] font-semibold text-slate-500">One per symbol</label>
               <button type="button" onClick={() => patch({ onePerSymbol: !cfg.onePerSymbol })} className={`mt-0.5 w-full rounded-lg border px-2.5 py-1.5 text-sm font-bold ${cfg.onePerSymbol ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-300 bg-white text-slate-600'}`}>{cfg.onePerSymbol ? 'YES' : 'NO'}</button></div>
+            {/* Slippage gate. A MARKET order fills at the live price while SL/TP stay at the
+                planned ones, so a late fill silently moves the risk up and the reward down. */}
+            <div><label className="block text-[11px] font-semibold text-slate-500">Max slippage <span className="text-slate-400">(% of stop)</span></label>
+              <input type="number" min={0} max={100} step={1} value={cfg.maxSlippagePctOfStop ?? 25}
+                onChange={(e) => patch({ maxSlippagePctOfStop: Math.max(0, Math.min(100, Number(e.target.value))) })}
+                className="mt-0.5 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-bold text-slate-800" /></div>
+            <div><label className="block text-[11px] font-semibold text-slate-500">Resize lots on slippage</label>
+              <button type="button" onClick={() => patch({ resizeLotsOnSlippage: !cfg.resizeLotsOnSlippage })} className={`mt-0.5 w-full rounded-lg border px-2.5 py-1.5 text-sm font-bold ${cfg.resizeLotsOnSlippage ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-300 bg-white text-slate-600'}`}>{cfg.resizeLotsOnSlippage ? 'YES' : 'NO'}</button></div>
             <div><label className="block text-[11px] font-semibold text-slate-500">Min grade</label>
               <div className="mt-0.5 flex gap-1">{(['A', 'A+'] as const).map((g) => (
                 <button key={g} type="button" onClick={() => patch({ minGrade: g })} className={`flex-1 rounded-lg border px-2 py-1.5 text-sm font-bold ${cfg.minGrade === g ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-slate-300 bg-white text-slate-600'}`}>{g}</button>
@@ -618,7 +820,7 @@ export default function AutoTrading() {
         </div>
         {!status?.decisions.length && <p className="px-5 py-8 text-center text-xs font-medium text-slate-400">No decisions yet. With SHADOW on and strategies selected, qualifying signals will appear here.</p>}
         {Boolean(status?.decisions.length) && (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto [-webkit-overflow-scrolling:touch]">
             <table className="w-full text-left text-xs">
               <thead><tr className="border-b border-slate-100 text-[10px] font-black uppercase tracking-wider text-slate-400">
                 <th className="px-4 py-2">Time</th><th className="px-2 py-2">Status</th><th className="px-2 py-2">Signal</th><th className="px-2 py-2">Ticket</th><th className="px-2 py-2">Lots</th><th className="px-2 py-2">Risk</th><th className="px-2 py-2">Session</th><th className="px-2 py-2">Note</th>

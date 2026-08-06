@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
 import { 
   LayoutDashboard,
+  Home,
   Activity,
+  Target,
   BarChart3,
   Brain,
   BookOpen,
@@ -35,7 +37,8 @@ import {
   CandlestickChart,
   Droplets,
   ChevronDown,
-  X
+  X,
+  ShieldQuestion,
 } from 'lucide-react';
 import { useMt5Stream } from '../mt5Api';
 import type { TopbarMarketAlert } from '../types';
@@ -298,6 +301,15 @@ function NavGroup({ item, pathname, onNavigate }: { item: NavGroupItem; pathname
   );
 }
 
+// The four routes worth a permanent thumb-tap while trading, plus More. `match` makes a tab
+// stay lit across its child routes (e.g. /auto-trading/approvals still highlights Auto).
+const BOTTOM_TABS: Array<{ path: string; icon: typeof Home; label: string; match?: string }> = [
+  { path: '/', icon: Home, label: 'Home' },
+  { path: '/strategy-lab', icon: FlaskConical, label: 'Strategy', match: '/strategy-lab' },
+  { path: '/chart', icon: CandlestickChart, label: 'Charts', match: '/chart' },
+  { path: '/auto-trading', icon: Bot, label: 'Auto', match: '/auto-trading' },
+];
+
 export default function Layout({ onLogout }: LayoutProps) {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [now, setNow] = useState(() => new Date());
@@ -321,9 +333,17 @@ export default function Layout({ onLogout }: LayoutProps) {
       children: [
         { path: '/chart', icon: CandlestickChart, label: 'Price Chart', end: true },
         { path: '/chart/liquidity', icon: Droplets, label: 'Liquidity Chart' },
+        { path: '/chart/ai-tracker', icon: Brain, label: 'AI Tracker' },
       ],
     },
-    { path: '/auto-trading', icon: Bot, label: 'Auto Trading' },
+    {
+      path: '/auto-trading', icon: Bot, label: 'Auto Trading',
+      children: [
+        { path: '/auto-trading', icon: Bot, label: 'Controller', end: true },
+        { path: '/auto-trading/approvals', icon: ShieldQuestion, label: 'Request Approval' },
+        { path: '/auto-trading/sniper', icon: Crosshair, label: 'Sniper Mode' },
+      ],
+    },
     {
       path: '/strategy-lab', icon: FlaskConical, label: 'Strategy Lab',
       children: [
@@ -344,6 +364,7 @@ export default function Layout({ onLogout }: LayoutProps) {
       children: [
         { path: '/future-predictions', icon: Brain, label: 'Execution Forecast', end: true },
         { path: '/future-predictions/setups', icon: Crosshair, label: 'Setup Forecasts' },
+        { path: '/future-predictions/ict', icon: Target, label: 'ICT Predict' },
       ],
     },
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },
@@ -446,7 +467,7 @@ export default function Layout({ onLogout }: LayoutProps) {
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Topbar */}
-        <header className="z-10 flex h-20 shrink-0 items-center justify-between border-b border-slate-200 bg-white/90 px-6 shadow-sm lg:px-10">
+        <header className="z-10 flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white/90 px-3 shadow-sm sm:h-20 sm:px-6 lg:px-10">
           <div className="flex items-center gap-4">
             <button 
               onClick={toggleMobileMenu}
@@ -515,11 +536,54 @@ export default function Layout({ onLogout }: LayoutProps) {
         {/* Top padding lives on the INNER div, not the scroll container: a sticky child cannot
             stick above a scroll container's own padding, which let content scroll through a
             see-through strip above sticky toolbars. Visual spacing is identical. */}
-        <main className="flex-1 overflow-y-auto px-6 pb-6 lg:px-10 lg:pb-10">
-          <div className={location.pathname === '/signals' ? 'flex min-h-full w-full max-w-none flex-col pt-6 lg:pt-10' : 'mx-auto max-w-7xl pt-6 lg:pt-10'}>
+        {/* Mobile padding is deliberately tighter than desktop: 24px of gutter on a 390px
+            phone spends 12% of the screen on whitespace. pb-24 clears the bottom tab bar. */}
+        <main className="flex-1 overflow-y-auto px-3 pb-24 sm:px-6 sm:pb-6 lg:px-10 lg:pb-10">
+          <div className={location.pathname === '/signals' ? 'flex min-h-full w-full max-w-none flex-col pt-4 sm:pt-6 lg:pt-10' : 'mx-auto max-w-7xl pt-4 sm:pt-6 lg:pt-10'}>
             <Outlet />
           </div>
         </main>
+
+        {/* ── Bottom tab bar (mobile only) ────────────────────────────────────
+            A hamburger drawer alone makes a site feel like a desktop page shrunk down. A
+            persistent bar puts the routes actually used while trading one thumb-tap away, and
+            keeps the current location visible without opening anything.
+
+            Five items is the ceiling — beyond that the targets fall under the ~44px minimum
+            that a thumb can hit reliably. Everything else stays in the drawer via "More". */}
+        <nav
+          className="fixed inset-x-0 bottom-0 z-40 border-t border-slate-200 bg-white/95 backdrop-blur-xl lg:hidden"
+          style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
+        >
+          <div className="flex items-stretch justify-around">
+            {BOTTOM_TABS.map((tab) => {
+              const active = tab.match
+                ? location.pathname.startsWith(tab.match)
+                : location.pathname === tab.path;
+              const Icon = tab.icon;
+              return (
+                <NavLink
+                  key={tab.path}
+                  to={tab.path}
+                  className={`flex min-h-[56px] flex-1 flex-col items-center justify-center gap-0.5 px-1 py-1.5 transition-colors ${
+                    active ? 'text-indigo-600' : 'text-slate-400 active:text-slate-600'
+                  }`}
+                >
+                  <Icon size={20} strokeWidth={active ? 2.5 : 2} />
+                  <span className={`text-[10px] leading-none ${active ? 'font-black' : 'font-bold'}`}>{tab.label}</span>
+                </NavLink>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => setIsMobileMenuOpen(true)}
+              className="flex min-h-[56px] flex-1 flex-col items-center justify-center gap-0.5 px-1 py-1.5 text-slate-400 transition-colors active:text-slate-600"
+            >
+              <Menu size={20} strokeWidth={2} />
+              <span className="text-[10px] font-bold leading-none">More</span>
+            </button>
+          </div>
+        </nav>
       </div>
     </div>
   );

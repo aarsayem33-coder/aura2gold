@@ -151,7 +151,9 @@ export function pickTriggerLevel({ breakout, supportResistance, direction, price
 export function assembleForexPlan({ systemDecision, sizing }) {
   const sd = systemDecision || {};
   if (!sd.decision || sd.decision === 'HOLD') {
-    return { decision: 'HOLD', entry: sd.entryPrice ?? null, stopLoss: null, takeProfit1: null, takeProfit2: null, takeProfit3: null, riskReward: null, lots: null, stopPips: null, lossAtStop: null, riskLevel: 'NONE', invalidation: sd.slReason || null, note: 'No deterministic forex setup — WAIT.' };
+    // Same keys on every branch: a caller that has to guess whether a field exists ends up
+    // reading `undefined` and rendering nothing, which is how the direction bug happened.
+    return { decision: 'HOLD', entry: sd.entryPrice ?? null, stopLoss: null, takeProfit1: null, takeProfit2: null, takeProfit3: null, riskReward: null, lots: null, suggestedLots: null, sizingIsHypothetical: true, stopPips: null, lossAtStop: null, riskLevel: 'NONE', invalidation: sd.slReason || null, note: 'No deterministic forex setup — WAIT.' };
   }
   return {
     decision: sd.decision,
@@ -162,6 +164,10 @@ export function assembleForexPlan({ systemDecision, sizing }) {
     takeProfit3: sd.takeProfit3 ?? null,
     riskReward: sd.riskRewardRatio ?? null,
     lots: sizing?.suggestedLots ?? null,
+    // Mirrors the vision path: the size this setup WOULD take, always present when it can be
+    // computed, so the panel can show a number without implying the call is live.
+    suggestedLots: sizing?.suggestedLots ?? null,
+    sizingIsHypothetical: false,
     stopPips: sizing?.stopPips ?? null,
     lossAtStop: sizing?.lossAtStop ?? null,
     riskLevel: sd.adrExhausted ? 'HIGH' : (sd.regime === 'trending' ? 'MEDIUM' : 'MEDIUM'),

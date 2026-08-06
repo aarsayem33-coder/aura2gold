@@ -19,15 +19,32 @@ import { WebSocketServer, WebSocket } from 'ws';
 import nodemailer from 'nodemailer';
 import mysql from 'mysql2/promise';
 import { aggregateSignals, detectSupportResistance, detectMarketStructure, detectLiquiditySweeps, detectOrderBlocks, detectFVGs, getTimeframeTrend } from './signalEngine.js';
-import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep } from './liquidityEngine.js';
+import { detectLiquidityPools, detectBreaker, buildLiquidityPlan, classifyDrive, detectKeyLiquidityLevels, gradeSweep, fractalSwings } from './liquidityEngine.js';
 import { atr14 as liquidityAtr14 } from './liquidityEngine.js';
+// ICT Predict: projected sweep -> breaker setups for ict-breaker / ict-break-pro only. Pure
+// engine + pure AI reviewer; server.js wires persistence, the scan interval and the API.
+import { runIctPredictions, filterIctPredictions, assessIctPrediction, shouldAlertIct, ICT_STRATEGIES } from './ictPredict.js';
+import { buildIctAiPrompt, normaliseIctAi, reconcileIctAi, deterministicIctView } from './ictPredictAi.js';
 // Setup forecasts: conditional level-based predictions. Pure modules; server.js only wires
 // persistence, the scan interval and the API. None of these touch the live signal path.
 import { HORIZON_BUCKETS as FORECAST_HORIZON_BUCKETS } from './setupForecast.js';
 import { runForecasts as runSetupForecasts, groupByHorizon as groupForecastsByHorizon } from './setupForecastRunner.js';
-import { emptyStats as emptyForecastStats, mergeStats as mergeForecastStats, discriminationReport as forecastDiscriminationReport } from './forecastDiscrimination.js';
+import { mergeForecastLevels, sourceGroup as forecastLevelSource } from './forecastLevels.js';
+import { emptyStats as emptyForecastStats, mergeStats as mergeForecastStats, discriminationReport as forecastDiscriminationReport, discriminationFor as forecastDiscriminationFor } from './forecastDiscrimination.js';
+import { forecastScoreBasis } from './forecastScoreBasis.js';
 import { buildForecastPlan } from './forecastTradePlan.js';
 import { LIFECYCLE as FORECAST_LIFECYCLE, driftEntry as forecastDriftEntry, applyDrift as applyForecastDrift, driftSummary as forecastDriftSummary, resolveForecast as resolveOneForecast } from './forecastLifecycle.js';
+import { settleForecastTicket, matchRealTrade, aggregateSettled } from './forecastSettlement.js';
+import { concurrencyVerdict, pendingCommands } from './autoTradeConcurrency.js';
+// Batched multi-symbol candle loading for the forecast sweeps — one round trip per series
+// instead of one per symbol. Pure + unit-tested (candleBatch.test.mjs).
+import { normaliseSymbols, buildBatchSql, buildBatchArgs, groupBatchRows, dedupeSeriesRequests, tailOf } from './candleBatch.js';
+import { resizeLotsToStop } from './slippageGate.js';
+import { buildForecastAiPrompt, normaliseForecastAi, reconcileForecastAi, deterministicForecastView } from './forecastAi.js';
+import { buildMarketRead, formatMarketRead } from './forecastMarketRead.js';
+import { matchTradeToForecast, strategyMatchRates, resolveWindow } from './forecastMatch.js';
+import { assessTracked, shouldAlert, TRACK_VERDICT } from './forecastTracking.js';
+import { renderCandleChart } from './chartRender.js';
 import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
 import { estimateEtaMinutes, estimateResolveMinutes, rankPredictions } from './strategyPredictions.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
@@ -35,10 +52,50 @@ import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STR
 import { symbolCapsFor, symbolAllowsSignalTf, symbolAllowsFixedTime, symbolAllowsForecast } from './instruments.js';
 import { findOrderFillIndex } from './orderFill.js';
 import { assessEntryReadiness, buildEntryReadyEmail } from './entryReadyAlert.js';
-import { autoTradeCombosAllow, normalizeAutoTradeCombo } from './autoTradeFilters.js';
+import { normaliseStyle, normaliseBias, matchStrategies, playbookFor } from './chartTraderPersona.js';
+import { scoreChartSetup } from './chartSetupScore.js';
+import {
+  resizeOrder as ictResizeOrder, validateResize as ictValidateResize,
+  suggestSizing as ictSuggestSizing, lotsForMoney as ictLotsForMoney,
+} from './ictOrderResize.js';
+import {
+  describeOrder as modDescribe, planModification as modPlan,
+  validateModification as modValidate,
+} from './orderModify.js';
+import {
+  resolveEvent as resolveLiquidityEvent, summariseEvents as summariseLiquidityEvents,
+} from './liquidityEvents.js';
+import {
+  convictionRisk, normalizeTiers as normalizeConvictionTiers, CONVICTION_TIERS,
+} from './convictionSizing.js';
+import {
+  writeIndicators, readIndicators as readLocalIndicators,
+  pruneOlderThan as pruneLocalIndicators, DEFAULT_RETENTION_DAYS as INDICATOR_KEEP_DAYS,
+} from './indicatorStore.mjs';
+import {
+  shouldFire as sniperShouldFire, sniperStop, normalizeSniperConfig,
+  SNIPER_DEFAULTS,
+} from './ictSniper.js';
+import {
+  evaluateTrack as evaluateAiTrack, scoreCalibration as aiScoreCalibration,
+  summariseTracks as summariseAiTracks,
+} from './aiTradeTracker.js';
+import {
+  buildTrackRecord, trackRecordFor, TRACK_DEFAULTS,
+} from './forecastTrackRecord.js';
+import {
+  decisionOf as wouldTradeDecision, tradeR as wouldTradeR, tradePips as wouldTradePips,
+  summarise as wouldTradeSummarise, groupBy as wouldTradeGroupBy,
+  notTakenBreakdown as wouldTradeNotTaken,
+} from './wouldTradeLedger.js';
+import {
+  replayDecision as wouldTradeReplayOne, summariseReplay as wouldTradeReplaySummary,
+} from './wouldTradeReplay.js';
+import { autoTradeCombosAllow, normalizeAutoTradeCombo, resolveStrategyMode, normalizeStrategyMode } from './autoTradeFilters.js';
+import { ictBreakerExecPlan, ICT_EXEC_DEFAULTS } from './ictBreakerExec.js';
 import { valuePerPricePerLot as specValuePerPricePerLot, minStopDistance as specMinStopDistance, spreadPrice as specSpreadPrice, assessMargin as specAssessMargin } from './brokerSpecs.js';
 import { MANUAL_STRATEGY_ID, normalizeManualTradeHistory } from './manualTradeHistory.js';
-import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini } from './geminiEngine.js';
+import { analyzeWithGemini, checkVertexAiHealth, analyzeFttWithGemini, analyzeProjectionWithGemini, analyzeAiSignalsWithGemini, analyzeChartImageWithGemini, analyzeForecastWithGemini } from './geminiEngine.js';
 import { buildSystemChartAnalysis, estimateDirectionalPersistence, buildConditionalTimeTrigger, pickTriggerLevel, normalizeDirection as normalizeChartDir } from './chartAnalysis.js';
 import { generateFttPrediction, buildFttAiPrompt } from './fttEngine.js';
 import { buildForecast as buildExecutionForecast, reforecast as reforecastExecution, FORECAST_TIMEFRAMES, timeframeSeconds as forecastTfSeconds, EXECUTABLE_SCORE as FC_EXECUTABLE_SCORE, WATCH_FLOOR as FC_WATCH_FLOOR, detectNewsReaction, buildNewsReactionLevels } from './executionForecastEngine.js';
@@ -195,12 +252,51 @@ function getDbPool() {
       password: DB_PASSWORD,
       database: DB_NAME,
       waitForConnections: true,
-      connectionLimit: 5,
+      // Sized against TWO host limits that pull in opposite directions:
+      //   wait_timeout = 20              → the server hangs up on any connection idle for 20s
+      //   max_connections_per_hour = 500 → but only 500 NEW connections may be opened per hour
+      // So the pool must neither hold dead sockets (hangs) nor churn through fresh ones
+      // (lockout: "has exceeded the max_connections_per_hour resource", which fails every
+      // write and resolver until the hour rolls over). The answer is a modest pool of
+      // long-lived connections kept warm by keepAlivePing below — replaced rarely, never
+      // recycled on a timer. 10 covers the scanners plus a UI read without racing the cap.
+      connectionLimit: Number(process.env.DB_POOL_SIZE || 10),
       ssl: DB_SSL ? { rejectUnauthorized: false } : undefined,
       timezone: 'Z',
+      // The shared host runs wait_timeout=interactive_timeout=20s, so it hangs up on any
+      // connection idle for 20 seconds. mysql2's default idleTimeout is 60s, so the pool
+      // used to keep sockets the server had already closed, hand one out, write a query
+      // into it, and never receive a reply — the promise never settles, the connection is
+      // never returned, and after 5 of those the whole pool is wedged. Symptom: every
+      // DB-backed endpoint hangs forever while in-memory ones stay fast, candle/signal
+      // writes stop, and pending requests pile up until the heap OOMs (~15-20 min).
+      // Idle sockets are NOT recycled on a timer. Doing that (idleTimeout 10s) cured the
+      // hangs but opened a fresh connection every 10s per slot, which tripped the 500/hour
+      // cap within minutes. keepAlivePing keeps them under wait_timeout instead, so a
+      // connection stays the same connection for hours.
+      idleTimeout: 600000,
+      maxIdle: Number(process.env.DB_POOL_SIZE || 10),
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 5000,
+      connectTimeout: 15000,
     });
+    startDbKeepAlive();
   }
   return dbPool;
+}
+
+// Touch the pool every 12s — comfortably inside the host's wait_timeout=20 — so idle
+// connections stay logged in rather than being hung up on and re-opened. One trivial query
+// per interval (300/hour) is far cheaper than the reconnect storm it prevents, and it is what
+// makes long-lived connections viable against max_connections_per_hour=500.
+let dbKeepAliveTimer = null;
+function startDbKeepAlive() {
+  if (dbKeepAliveTimer) return;
+  dbKeepAliveTimer = setInterval(() => {
+    if (!dbPool) return;
+    dbPool.query('SELECT 1').catch(() => { /* a failed ping must never surface as an app error */ });
+  }, 12000);
+  if (typeof dbKeepAliveTimer.unref === 'function') dbKeepAliveTimer.unref();
 }
 
 async function addColumnIfMissing(pool, table, column, definition) {
@@ -752,11 +848,170 @@ async function initializeDatabase() {
           matched TINYINT NULL,
           actual_minutes INT NULL,
           mfe_pips DOUBLE NULL, mae_pips DOUBLE NULL,
+          -- What the forecast was WORTH once price arrived. hit_* is the hypothetical ticket
+          -- replayed against real candles; real_* is a trade actually placed, linked only when
+          -- the evidence is unambiguous (see forecastSettlement.matchRealTrade).
+          hit_outcome VARCHAR(12) NULL,
+          hit_pips DOUBLE NULL, hit_r DOUBLE NULL, hit_profit DOUBLE NULL,
+          hit_tp_level INT NULL, hit_at DATETIME(3) NULL,
+          real_ticket BIGINT NULL, real_pnl DOUBLE NULL, real_lots DOUBLE NULL,
+          real_entry_gap_pips DOUBLE NULL, real_link_note VARCHAR(160) NULL,
           INDEX idx_sf_key (fkey),
           INDEX idx_sf_status (status),
           INDEX idx_sf_created (created_at)
         )
       `);
+      // Settlement columns arrived after the table shipped, so CREATE TABLE IF NOT EXISTS
+      // alone would leave existing installs without them.
+      for (const [col, def] of [
+        ['hit_outcome', 'VARCHAR(12) NULL'],
+        ['hit_pips', 'DOUBLE NULL'], ['hit_r', 'DOUBLE NULL'], ['hit_profit', 'DOUBLE NULL'],
+        ['hit_tp_level', 'INT NULL'], ['hit_at', 'DATETIME(3) NULL'],
+        ['real_ticket', 'BIGINT NULL'], ['real_pnl', 'DOUBLE NULL'], ['real_lots', 'DOUBLE NULL'],
+        ['real_entry_gap_pips', 'DOUBLE NULL'], ['real_link_note', 'VARCHAR(160) NULL'],
+        // Tracking: user-pinned forecasts get a health read and exactly ONE adverse alert.
+        ['grade', 'VARCHAR(4) NULL'],
+        ['tracked', 'TINYINT NOT NULL DEFAULT 0'], ['tracked_at', 'DATETIME(3) NULL'],
+        ['alerted_at', 'DATETIME(3) NULL'], ['alert_verdict', 'VARCHAR(16) NULL'],
+        // Every source that named this level, comma-separated. `level_type` holds only the
+        // strongest, so grouping a report by it alone would credit an order block for a hit that
+        // a PDH at the same price equally predicted.
+        ['level_sources', 'VARCHAR(160) NULL'], ['level_confluence', 'INT NULL'],
+      ]) {
+        try { await addColumnIfMissing(pool, 'mt5_setup_forecasts', col, def); } catch { /* pre-existing */ }
+      }
+      // Pending orders placed FROM a forecast keep a link back to it, so the Pending tab
+      // can show which prediction each resting order came from.
+      try { await addColumnIfMissing(pool, 'mt5_auto_trades', 'forecast_id', 'VARCHAR(200) NULL'); } catch { /* pre-existing */ }
+
+      // Every scored chart AI analysis, followed to an outcome. Narrow on purpose: the
+      // indicator table reached 1.3 GB and locked the database, so this stores the ticket and
+      // the result, not the analysis text.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_ai_chart_tracks (
+          id VARCHAR(160) PRIMARY KEY,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          trade_mode VARCHAR(16) NULL,
+          style VARCHAR(16) NULL,
+          bias VARCHAR(16) NULL,
+          verdict VARCHAR(24) NULL,
+          decision VARCHAR(24) NULL,
+          confidence INT NULL,
+          setup_score INT NULL,
+          setup_grade VARCHAR(4) NULL,
+          entry_price DOUBLE NULL,
+          stop_loss DOUBLE NULL,
+          take_profit_1 DOUBLE NULL,
+          take_profit_2 DOUBLE NULL,
+          take_profit_3 DOUBLE NULL,
+          lots DOUBLE NULL,
+          risk_reward DOUBLE NULL,
+          status VARCHAR(16) NOT NULL DEFAULT 'WAITING',
+          entered TINYINT(1) NOT NULL DEFAULT 0,
+          r_multiple DOUBLE NULL,
+          profit_usd DOUBLE NULL,
+          mfe_r DOUBLE NULL,
+          mae_r DOUBLE NULL,
+          current_price DOUBLE NULL,
+          exit_price DOUBLE NULL,
+          bars_held INT NULL,
+          note VARCHAR(200) NULL,
+          expires_at DATETIME NULL,
+          resolved_at DATETIME NULL,
+          updated_at DATETIME NULL,
+          created_at DATETIME NOT NULL,
+          INDEX idx_ait_status (status),
+          INDEX idx_ait_created (created_at),
+          INDEX idx_ait_score (setup_score)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+
+      // Liquidity events: every key-level alert and what price did with the level afterwards.
+      // Exists because buildLiquidityChart recomputes from candles on every request and keeps no
+      // memory — an alert that fired at 13:15 left no trace of whether the level was reclaimed
+      // or broken and held. The provisional status is refreshed on each scan; `confirmed` only
+      // turns true once displacement (reclaim) or a held retest (break) has appeared.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_liquidity_events (
+          id VARCHAR(200) PRIMARY KEY,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          level_price DOUBLE NOT NULL,
+          level_type VARCHAR(40) NULL,
+          level_label VARCHAR(80) NULL,
+          level_strength TINYINT NULL,
+          side VARCHAR(8) NOT NULL,
+          tier VARCHAR(16) NULL,
+          alert_price DOUBLE NULL,
+          distance_pips DOUBLE NULL,
+          delivery_signal_id VARCHAR(200) NULL,
+          emailed TINYINT(1) NOT NULL DEFAULT 0,
+          status VARCHAR(24) NOT NULL DEFAULT 'WAITING',
+          confirmed TINYINT(1) NOT NULL DEFAULT 0,
+          direction VARCHAR(8) NULL,
+          bars_to_resolve INT NULL,
+          follow_through_pips DOUBLE NULL,
+          adverse_pips DOUBLE NULL,
+          touches INT NULL,
+          closes_beyond INT NULL,
+          evidence VARCHAR(255) NULL,
+          alerted_at DATETIME NOT NULL,
+          resolved_at DATETIME NULL,
+          updated_at DATETIME NULL,
+          INDEX idx_le_sym (symbol, alerted_at),
+          INDEX idx_le_status (status, confirmed)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      `);
+
+      // ICT Predict. Compact by design (golden rule #6): the projected bars are the only JSON of
+      // any size and they are three to nine rows, not a blob. Retention-pruned like the forecasts.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_ict_predictions (
+          id VARCHAR(200) PRIMARY KEY,
+          pkey VARCHAR(160) NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          setup VARCHAR(24) NOT NULL,
+          direction VARCHAR(8) NOT NULL,
+          side VARCHAR(8) NOT NULL,
+          level DOUBLE NOT NULL,
+          structure_level DOUBLE NOT NULL,
+          level_type VARCHAR(32) NULL, level_label VARCHAR(64) NULL, level_strength INT NULL,
+          atr DOUBLE NULL, price_at_forecast DOUBLE NULL,
+          distance_pips DOUBLE NULL, distance_atr DOUBLE NULL,
+          eta_min INT NULL, eta_mid INT NULL, eta_max INT NULL,
+          rank_score DECIMAL(7,2) NULL, best_score DECIMAL(6,1) NULL,
+          best_strategy VARCHAR(48) NULL, grade VARCHAR(4) NULL, rr DOUBLE NULL,
+          pro_qualified TINYINT NOT NULL DEFAULT 0,
+          -- The resting order the prediction implies: anchored to the real level, not to the
+          -- strategy's synthetic breaker entry (see ictPredict.ictLimitOrder).
+          order_type VARCHAR(12) NULL,
+          limit_entry DOUBLE NULL, limit_stop DOUBLE NULL,
+          limit_tp1 DOUBLE NULL, limit_tp2 DOUBLE NULL, limit_tp3 DOUBLE NULL,
+          limit_rr DOUBLE NULL, limit_stop_pips DOUBLE NULL,
+          fires_json TEXT NULL, plan_json TEXT NULL, measure_json TEXT NULL, bars_json TEXT NULL,
+          created_at DATETIME(3) NOT NULL,
+          updated_at DATETIME(3) NOT NULL,
+          status VARCHAR(12) NOT NULL DEFAULT 'WAITING',
+          resolved_at DATETIME(3) NULL,
+          -- How it actually played out. "swept" and "reclaimed" are separate on purpose: a sweep
+          -- that never reclaims is the failure mode this model has, and collapsing the two into
+          -- one "hit" flag would hide exactly the case worth measuring.
+          arrived TINYINT NULL, swept TINYINT NULL, reclaimed TINYINT NULL,
+          arrived_minutes INT NULL,
+          outcome VARCHAR(16) NULL,
+          outcome_pips DOUBLE NULL, outcome_r DOUBLE NULL, outcome_tp_level INT NULL,
+          mfe_pips DOUBLE NULL, mae_pips DOUBLE NULL,
+          tracked TINYINT NOT NULL DEFAULT 0, tracked_at DATETIME(3) NULL,
+          alerted_at DATETIME(3) NULL, alert_verdict VARCHAR(16) NULL,
+          INDEX idx_ict_key (pkey),
+          INDEX idx_ict_status (status),
+          INDEX idx_ict_created (created_at)
+        )
+      `);
+      try { await addColumnIfMissing(pool, 'mt5_auto_trades', 'ict_prediction_id', 'VARCHAR(200) NULL'); } catch { /* pre-existing */ }
+
       await pool.query(`
         CREATE TABLE IF NOT EXISTS mt5_execution_forecasts (
           id VARCHAR(96) PRIMARY KEY,
@@ -884,6 +1139,19 @@ async function initializeDatabase() {
       // Step-2 bridge columns (idempotent adds for pre-existing tables).
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'expires_at', 'DATETIME(3) NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'sent_at', 'DATETIME(3) NULL');
+      // ── Latency instrumentation (ict-breaker family only) ───────────────────
+      // Every timestamp stored before this described a BAR, not a clock moment, which is why
+      // "where do the 5 minutes go?" was unanswerable — two earlier attempts measured setup
+      // AGE and a column that was a copy of another. These three record actual wall-clock
+      // instants, splitting the path into four measurable segments:
+      //   bar_close_at -> detected_at  scan latency (is the scanner on a timer or on bar close?)
+      //   detected_at  -> created_at   persistence (expected: milliseconds)
+      //   created_at   -> sent_at      EA pickup (InpTradePollSec = 3s)
+      //   sent_at      -> filled_at    broker fill (nothing we control)
+      // Pure measurement: nothing reads these to make a decision.
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'bar_close_at', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'detected_at', 'DATETIME(3) NULL');
+      await addColumnIfMissing(pool, 'mt5_auto_trades', 'filled_at', 'DATETIME(3) NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'position_id', 'BIGINT NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'account', 'VARCHAR(32) NULL');
       await addColumnIfMissing(pool, 'mt5_auto_trades', 'source', "VARCHAR(16) NOT NULL DEFAULT 'AUTO'");
@@ -1324,83 +1592,53 @@ async function pruneOldAccountSnapshots() {
   }
 }
 
-// Retention for mt5_indicators — the table that tripped the hosting DB quota.
+// Retention for the LOCAL indicator store.
 //
-// Measured 2026-07-30: 3,381,508 rows / 1450 MB, i.e. 83% of a 1.74 GB database. Once the
-// quota is exceeded the provider revokes SELECT, which takes down every report that reads the
-// DB (predictions, setup forecasts, calibration) with a bare "SELECT command denied".
+// The hosted mt5_indicators table is no longer written (see persistIndicator) — it reached
+// 1,298.9 MB / 1,622,555 rows and revoked every privilege on the database. Indicators now live
+// in backend/.cache/indicators.db, where the same volume measures 240.7 MB.
 //
-// Nothing reads past the newest MAX_INDICATORS (100k) rows — line ~1533 is the only reader and
-// it is a `ORDER BY candle_time DESC LIMIT ?`. So roughly 3.28M rows are permanently
-// unreachable, and pruning them is recoverable-by-recomputation telemetry, not trade history.
-//
-// DISABLED BY DEFAULT. This deletes millions of rows, which is the user's decision, not a side
-// effect of shipping a feature. Enable with INDICATOR_RETENTION_ENABLED=1 in backend/.env.local
-// (optionally INDICATOR_RETENTION_DAYS, default 30). Batched to stay under the statement
-// timeout, so it drains gradually rather than locking the table in one statement.
-const INDICATOR_RETENTION_ENABLED = String(process.env.INDICATOR_RETENTION_ENABLED || '') === '1';
-const INDICATOR_RETENTION_DAYS = Math.max(1, Number(process.env.INDICATOR_RETENTION_DAYS || 30));
+// ENABLED BY DEFAULT, unlike the hosted version. Deleting millions of rows from a shared
+// database was the user's call; pruning a local cache file that the EA rebuilds within a poll
+// cycle is not the same decision. Leaving it off is what let the old table grow unbounded.
+const INDICATOR_RETENTION_DAYS = Math.max(1, Number(process.env.INDICATOR_RETENTION_DAYS || INDICATOR_KEEP_DAYS));
 let lastIndicatorPruneMs = 0;
-let indicatorPruneNagged = false;
-async function pruneOldIndicators() {
-  if (!INDICATOR_RETENTION_ENABLED) {
-    if (!indicatorPruneNagged) {
-      indicatorPruneNagged = true;
-      console.log('[Indicators] retention is OFF. mt5_indicators grows without bound and has tripped the DB quota before (1.45GB / 3.4M rows). Set INDICATOR_RETENTION_ENABLED=1 to prune rows older than %dd.', INDICATOR_RETENTION_DAYS);
-    }
-    return;
-  }
+function pruneOldIndicators() {
   const nowMs = Date.now();
   if (nowMs - lastIndicatorPruneMs < 3600000) return;   // at most hourly
   lastIndicatorPruneMs = nowMs;
-  const pool = await initializeDatabase();
-  if (!pool) return;
   try {
-    const [r] = await pool.execute(
-      'DELETE FROM mt5_indicators WHERE created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT 20000',
-      [INDICATOR_RETENTION_DAYS]);
-    if (r.affectedRows) console.log(`[Indicators] pruned ${r.affectedRows} rows older than ${INDICATOR_RETENTION_DAYS}d`);
+    const r = pruneLocalIndicators(INDICATOR_RETENTION_DAYS);
+    if (r.deleted) console.log(`[Indicators] pruned ${r.deleted} local readings older than ${INDICATOR_RETENTION_DAYS}d (${r.remaining} kept)`);
   } catch (err) {
     console.error('[Indicators] retention prune failed:', err.message);
   }
 }
 
-async function persistIndicator(indicator) {
-  const pool = await initializeDatabase();
-  if (!pool) return;
-  void pruneOldIndicators();
-
-  await pool.execute(
-    `INSERT INTO mt5_indicators (
-      id, symbol, timeframe, candle_time, indicator_name, value_1, value_2, value_3, value_4, value_5, created_at, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      symbol = VALUES(symbol),
-      timeframe = VALUES(timeframe),
-      candle_time = VALUES(candle_time),
-      indicator_name = VALUES(indicator_name),
-      value_1 = VALUES(value_1),
-      value_2 = VALUES(value_2),
-      value_3 = VALUES(value_3),
-      value_4 = VALUES(value_4),
-      value_5 = VALUES(value_5),
-      created_at = VALUES(created_at),
-      raw_json = VALUES(raw_json)`,
-    [
-      indicator.id,
-      indicator.symbol,
-      indicator.timeframe,
-      indicator.candleTime,
-      indicator.indicator,
-      indicator.value1,
-      indicator.value2,
-      indicator.value3,
-      indicator.value4,
-      indicator.value5,
-      toMysqlDate(indicator.createdAt),
-      JSON.stringify(indicator.raw || {}),
-    ]
-  );
+/**
+ * Indicators go to the LOCAL SQLite store, not the hosted database.
+ *
+ * The hosted table reached 1,298.9 MB across 1,622,555 rows — 78% of the database — and tripped
+ * the account into a full privilege lockout that took candles, signals, reports and the EA
+ * bridge down together. Nothing remote reads these rows: the EA posts them in, the server reads
+ * them back once at startup to warm an in-memory array. That belongs in a local file.
+ *
+ * The `raw` payload is deliberately dropped rather than carried across. It duplicated a JSON
+ * blob of values already parsed into value1..value5, and `indicator.raw` is written but never
+ * read anywhere in this codebase — it was most of the 1.3 GB.
+ *
+ * Same 1.62M readings measured locally: 240.7 MB, and a 500-row read in 3 ms.
+ */
+function persistIndicator(indicator) {
+  try {
+    // Self-throttled to hourly, so calling it on every write costs a timestamp comparison.
+    pruneOldIndicators();
+    writeIndicators(indicator);
+  } catch (error) {
+    // A failed indicator write must never break the POST that carried it. The in-memory array
+    // is already updated by the caller, so the live signal path is unaffected either way.
+    console.error('[Indicators] local write failed:', error.message);
+  }
 }
 
 async function persistAiDecision(decision) {
@@ -1572,7 +1810,9 @@ async function loadSignalCacheFromDatabase() {
   const [candleRows] = await pool.query('SELECT * FROM mt5_candles ORDER BY candle_time DESC LIMIT ?', [MAX_CANDLES]);
   const [tradeRows] = await pool.query('SELECT * FROM mt5_trades ORDER BY received_at DESC LIMIT ?', [MAX_TRADES]);
   const [snapshotRows] = await pool.query('SELECT * FROM mt5_account_snapshots ORDER BY received_at DESC LIMIT 1');
-  const [indicatorRows] = await pool.query('SELECT * FROM mt5_indicators ORDER BY candle_time DESC LIMIT ?', [MAX_INDICATORS]);
+  // Indicators come from the LOCAL store — see persistIndicator. This used to pull 100k rows
+  // across the network from a table that grew to 1.3 GB and locked the whole database.
+  const indicatorRows = readLocalIndicators({ limit: MAX_INDICATORS });
   const [decisionRows] = await pool.query('SELECT * FROM mt5_ai_decisions ORDER BY created_at DESC LIMIT 500');
   const [levelRows] = await pool.query('SELECT * FROM mt5_market_levels ORDER BY created_at DESC LIMIT 200');
   const [ruleRows] = await pool.query('SELECT * FROM mt5_signal_rules ORDER BY updated_at DESC LIMIT 200');
@@ -1721,20 +1961,9 @@ async function loadSignalCacheFromDatabase() {
     mt5State.accountSnapshot = accountSnapshots[0];
   }
 
-  indicators.splice(0, indicators.length, ...indicatorRows.map((row) => ({
-    id: row.id,
-    symbol: row.symbol,
-    timeframe: row.timeframe,
-    candleTime: row.candle_time,
-    indicator: row.indicator_name,
-    value1: row.value_1 === null ? null : Number(row.value_1),
-    value2: row.value_2 === null ? null : Number(row.value_2),
-    value3: row.value_3 === null ? null : Number(row.value_3),
-    value4: row.value_4 === null ? null : Number(row.value_4),
-    value5: row.value_5 === null ? null : Number(row.value_5),
-    createdAt: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
-    raw: parseJsonField(row.raw_json, {}),
-  })));
+  // readLocalIndicators already returns the exact shape this array holds (camelCase, ISO times),
+  // so there is nothing to re-map. The raw payload is absent by design — nothing reads it.
+  indicators.splice(0, indicators.length, ...indicatorRows);
 
   aiDecisions.splice(0, aiDecisions.length, ...decisionRows.map((row) => ({
     id: row.id,
@@ -1844,12 +2073,22 @@ const mt5State = {
   activeTimeframe: 'M5',
 };
 
+// Carries the winning timestamp forward instead of re-deriving it. The previous version
+// re-read and re-parsed the incumbent on EVERY element, so a 60k-candle scan cost 120k
+// Date.parse calls; profiling put this single function at 32.9% of all backend CPU because
+// getMt5Status runs it over the whole candle buffer on every candle POST. Same result,
+// exactly one parse per element.
 function latestByDate(items, getValue) {
-  return items.reduce((latest, item) => {
-    const itemTime = Date.parse(getValue(item) || '');
-    const latestTime = latest ? Date.parse(getValue(latest) || '') : Number.NEGATIVE_INFINITY;
-    return Number.isFinite(itemTime) && itemTime > latestTime ? item : latest;
-  }, null);
+  let latest = null;
+  let latestTime = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < items.length; i++) {
+    const itemTime = Date.parse(getValue(items[i]) || '');
+    if (Number.isFinite(itemTime) && itemTime > latestTime) {
+      latest = items[i];
+      latestTime = itemTime;
+    }
+  }
+  return latest;
 }
 
 function isWeekend() {
@@ -2419,9 +2658,9 @@ function addAccountSnapshot(snapshot) {
 
 function addIndicator(indicator) {
   upsertRecord(indicators, indicator, (item) => item.id, MAX_INDICATORS);
-  void persistIndicator(indicator).catch((error) => {
-    console.error('[MySQL] Failed to persist indicator:', error.message);
-  });
+  // persistIndicator is synchronous now (a local SQLite write, not a network round trip) and
+  // swallows its own errors, so there is no promise to catch here.
+  persistIndicator(indicator);
 }
 
 function addAiDecision(decision) {
@@ -2764,7 +3003,31 @@ function formatTrackedProjectionEmailHtml(tracked) {
     </div>`;
 }
 
+// getMt5Status is called from ~80 sites, including the candle POST handler the EA hits
+// continuously. Each call scans the WHOLE candle buffer (60k rows) twice to build the
+// symbol/timeframe sets, plus four latestByDate passes over it. Profiling attributed ~55% of
+// all backend CPU to this one function: it saturated the event loop (462ms average lag), so
+// every page request queued behind it and DB-backed endpoints timed out at 60s while the
+// database itself sat completely idle.
+//
+// A short TTL collapses a burst of calls into a single computation. 400ms is far below any
+// interval that consumes this — scanners run every 60s and the connection timeout is 120s —
+// so nothing can observe the difference; only serverTime and the last-seen timestamps age,
+// by under half a second. A shallow copy is handed out so a caller writing to the object it
+// receives cannot poison the cached one.
+let mt5StatusCache = null;
+let mt5StatusCacheAt = 0;
+const MT5_STATUS_TTL_MS = Number(process?.env?.MT5_STATUS_TTL_MS || 400);
+
 function getMt5Status() {
+  const now = Date.now();
+  if (mt5StatusCache && now - mt5StatusCacheAt < MT5_STATUS_TTL_MS) return { ...mt5StatusCache };
+  mt5StatusCache = computeMt5Status();
+  mt5StatusCacheAt = now;
+  return { ...mt5StatusCache };
+}
+
+function computeMt5Status() {
   const connected = isMt5Connected();
   const liveAccountSnapshot = connected && mt5State.accountSnapshot?.account === mt5State.account ? mt5State.accountSnapshot : null;
   const snapshotSymbols = Array.isArray(liveAccountSnapshot?.symbols) ? liveAccountSnapshot.symbols : [];
@@ -3461,7 +3724,25 @@ app.post('/api/mt5/signals', async (req, res) => {
 
   const shouldEmail = process?.env?.EMAIL_ON_SIGNAL !== 'false';
   const to = signal.raw.emailTo || process?.env?.EMAIL_TO || process?.env?.SMTP_USER;
-  if (shouldEmail && to) {
+
+  // ONE email per real fill, not one per EA instance.
+  //
+  // The EA reports ACCOUNT-level deal events, but it runs on every attached chart, so a single
+  // trade arrives here once per chart. Measured over 24h: ~41 real trades produced 572 events
+  // and 661 emails — every deal ticket posted exactly 14 times inside the same second.
+  //
+  // The broker's deal ticket is the fill's unique identity, so it is the dedup key: however
+  // many charts report ticket #491950914, it is emailed once. minGapMs is 0 deliberately —
+  // genuine trades can be seconds apart, so only the ticket may suppress, never a time
+  // window. Ingest is untouched: every event is still recorded and streamed, and this does
+  // not touch strategy-signal emails, which run through their own gates.
+  const ticket = String(signal.message || '').match(/#(\d+)/);
+  const dealKey = ticket
+    ? `mt5deal:${ticket[1]}`
+    : `mt5event:${signal.account || 'na'}:${signal.symbol}:${signal.type}:${signal.message || ''}`;
+  const alreadyEmailed = !canAlert(dealKey, dealKey, { minGapMs: 0 });
+
+  if (shouldEmail && to && !alreadyEmailed) {
     try {
       const info = await sendNotificationEmail({
         to,
@@ -3469,6 +3750,9 @@ app.post('/api/mt5/signals', async (req, res) => {
         subject: `[Aura Gold] ${signal.symbol} ${signal.timeframe} ${signal.type}`,
         text: formatSignalEmail(signal),
       });
+      // Only after a confirmed send, so a failed delivery can still be retried by the next
+      // duplicate rather than being silently swallowed by the dedup.
+      recordAlert(dealKey, dealKey);
       signal.status = 'Delivered';
       signal.delivery = { channel: 'Email', recipient: to, messageId: info.messageId };
     } catch (error) {
@@ -3482,6 +3766,9 @@ app.post('/api/mt5/signals', async (req, res) => {
         error: error.message,
       });
     }
+  } else if (alreadyEmailed) {
+    // No delivery log here: 13 "suppressed" rows per trade would just move the flood.
+    signal.status = 'Duplicate';
   } else {
     signal.status = 'Pending';
   }
@@ -3753,12 +4040,180 @@ app.post('/api/mt5/snapshot', async (req, res) => {
 // unavailable it falls back to pure deterministic system analysis of the LIVE data (it
 // cannot read the image without a vision model). READ-ONLY + ISOLATED: it reuses the live
 // engines but never writes signals, never changes scoring, never touches the scanners.
+// ── AI chart analysis tracking ──────────────────────────────────────────────
+//
+// Every scored analysis is recorded and followed to an outcome. Tracking is AUTOMATIC rather
+// than a button: tracking only the calls you choose to save measures your filtering as much as
+// the model's scoring, and the whole point is to answer "does a high setup score actually
+// predict a better result?" — which needs an unbiased sample.
+//
+// HOLD calls are stored too, marked NO_TRADE. They cost nothing to keep and they are the
+// denominator for "how often does this thing actually find a trade".
+
+/** Record an analysis so its outcome can be measured. Never throws into the analysis path. */
+async function trackAiAnalysis(pool, { symbol, timeframe, tradeMode, style, bias, verdict, confidence, plan, setup }) {
+  try {
+    if (!pool || !plan) return null;
+    const id = `aitrack:${symbol}:${timeframe}:${Date.now()}`;
+    const sizing = strategyLabSizing(symbol, plan.entry, plan.stopLoss, {
+      tp1: plan.takeProfit1, tp2: plan.takeProfit2, tp3: plan.takeProfit3,
+    });
+    // The window a day-trade read is meant to resolve in. Beyond it the call is stale rather
+    // than wrong, and EXPIRED says so instead of scoring it as a loss.
+    const holdHours = /H4|D1/i.test(String(timeframe)) ? 72 : /H1|M30/i.test(String(timeframe)) ? 24 : 8;
+    await pool.execute(
+      `INSERT IGNORE INTO mt5_ai_chart_tracks
+         (id, symbol, timeframe, trade_mode, style, bias, verdict, decision, confidence,
+          setup_score, setup_grade, entry_price, stop_loss, take_profit_1, take_profit_2,
+          take_profit_3, lots, risk_reward, status, expires_at, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'WAITING', ?, ?)`,
+      [id, String(symbol).toUpperCase(), String(timeframe).toUpperCase(), tradeMode || null,
+        style || null, bias || null, verdict || null,
+        plan.decision || null, Number(confidence) || null,
+        setup?.score ?? null, setup?.grade ?? null,
+        plan.entry ?? null, plan.stopLoss ?? null,
+        plan.takeProfit1 ?? null, plan.takeProfit2 ?? null, plan.takeProfit3 ?? null,
+        plan.lots ?? plan.suggestedLots ?? sizing?.suggestedLots ?? null,
+        plan.riskReward ?? null,
+        toMysqlDate(new Date(Date.now() + holdHours * 3600000).toISOString()), toMysqlDate()]);
+    return id;
+  } catch (error) {
+    console.error('[AiTrack] record failed:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Re-walk the candles since each unsettled analysis and update where it stands.
+ *
+ * Settled rows are never revisited: once a trade hit its stop or its final target the result
+ * happened, and letting a later candle rewrite it would make the history unstable.
+ */
+async function runAiTrackScan() {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_ai_chart_tracks
+        WHERE status IN ('WAITING','RUNNING','TP1','TP2')
+          AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+        ORDER BY created_at DESC LIMIT 200`);
+    if (!rows.length) return;
+
+    let updated = 0;
+    for (const row of rows) {
+      try {
+        const candles = getRecentCandles(row.symbol, row.timeframe, 500);
+        if (!Array.isArray(candles) || candles.length < 2) continue;
+        // Only the candles from the analysis onward: what price did BEFORE the call is not its
+        // result, and including it would credit moves that had already happened.
+        const fromMs = Date.parse(row.created_at);
+        const after = candles.filter((c) => Date.parse(c.time ?? c.candle_time ?? 0) >= fromMs);
+        if (!after.length) continue;
+
+        const ev = evaluateAiTrack({
+          decision: row.decision, entry: row.entry_price, stopLoss: row.stop_loss,
+          takeProfit1: row.take_profit_1, takeProfit2: row.take_profit_2, takeProfit3: row.take_profit_3,
+          lots: row.lots, pipSize: forexSizingPipSize(row.symbol),
+          pipValuePerLot: forexSizingPipValuePerLot(row.symbol),
+          expiresAt: row.expires_at,
+        }, after);
+
+        await pool.execute(
+          `UPDATE mt5_ai_chart_tracks
+              SET status=?, entered=?, r_multiple=?, profit_usd=?, mfe_r=?, mae_r=?,
+                  current_price=?, exit_price=?, bars_held=?, note=?,
+                  resolved_at=COALESCE(resolved_at, ?), updated_at=?
+            WHERE id=?`,
+          [ev.status, ev.entered ? 1 : 0, ev.r, ev.profitUsd, ev.mfeR, ev.maeR,
+            ev.currentPrice, ev.exitPrice, ev.barsHeld, String(ev.note || '').slice(0, 180),
+            ev.settled ? toMysqlDate() : null, toMysqlDate(), row.id]);
+        updated += 1;
+      } catch (error) {
+        console.error(`[AiTrack] resolve failed for ${row.id}:`, error.message);
+      }
+    }
+    if (updated) console.log(`[AiTrack] refreshed ${updated} tracked analyses`);
+  } catch (error) {
+    console.error('[AiTrack] scan failed:', error.message);
+  }
+}
+
+/**
+ * GET /api/ai/tracks — what every AI analysis actually did.
+ *
+ * The calibration table is the point: it answers whether the setup score predicts anything, and
+ * it ships alongside the P&L rather than behind it so a good-looking total cannot be read
+ * without the evidence for it.
+ */
+app.get('/api/ai/tracks', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 14));
+    const symbol = String(req.query.symbol || '').trim().toUpperCase();
+
+    const params = [days];
+    let where = 'created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)';
+    if (symbol && symbol !== 'ALL') { where += ' AND symbol = ?'; params.push(symbol); }
+
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_ai_chart_tracks WHERE ${where} ORDER BY created_at DESC LIMIT 500`, params);
+
+    const tracks = rows.map((r) => ({
+      id: r.id, symbol: r.symbol, timeframe: r.timeframe,
+      tradeMode: r.trade_mode, style: r.style, bias: r.bias,
+      verdict: r.verdict, decision: r.decision,
+      confidence: r.confidence === null ? null : Number(r.confidence),
+      score: r.setup_score === null ? null : Number(r.setup_score),
+      grade: r.setup_grade,
+      entry: r.entry_price === null ? null : Number(r.entry_price),
+      stopLoss: r.stop_loss === null ? null : Number(r.stop_loss),
+      takeProfit1: r.take_profit_1 === null ? null : Number(r.take_profit_1),
+      takeProfit3: r.take_profit_3 === null ? null : Number(r.take_profit_3),
+      lots: r.lots === null ? null : Number(r.lots),
+      riskReward: r.risk_reward === null ? null : Number(r.risk_reward),
+      status: r.status,
+      entered: r.entered === 1,
+      r: r.r_multiple === null ? null : Number(r.r_multiple),
+      profitUsd: r.profit_usd === null ? null : Number(r.profit_usd),
+      mfeR: r.mfe_r === null ? null : Number(r.mfe_r),
+      maeR: r.mae_r === null ? null : Number(r.mae_r),
+      currentPrice: r.current_price === null ? null : Number(r.current_price),
+      exitPrice: r.exit_price === null ? null : Number(r.exit_price),
+      barsHeld: r.bars_held,
+      note: r.note,
+      createdAt: r.created_at, resolvedAt: r.resolved_at,
+    }));
+
+    res.json({
+      days, symbol: symbol || 'ALL',
+      generatedAt: new Date().toISOString(),
+      tracks,
+      summary: summariseAiTracks(tracks),
+      // Does the score predict the outcome? Banded, not fitted — a curve over a few dozen
+      // analyses would describe noise and look precise doing it.
+      calibration: aiScoreCalibration(tracks),
+      symbols: [...new Set(rows.map((r) => r.symbol))].sort(),
+      note: 'Every scored analysis is tracked automatically, including HOLD calls. R leads because a gold call and a EURUSD call move different dollar amounts for the same quality of read. Open positions are marked to the last close.',
+    });
+  } catch (error) {
+    console.error('[AiTrack] report failed:', error.message);
+    res.status(500).json({ error: 'failed to load AI tracks' });
+  }
+});
+
 app.post('/api/ai/analyze-chart', async (req, res) => {
   try {
     const body = parseMt5Body(req.body);
-    const imageBase64 = String(body.imageBase64 || body.image || '').replace(/^data:[^;]+;base64,/, '');
-    const mimeType = String(body.mimeType || 'image/jpeg');
+    let imageBase64 = String(body.imageBase64 || body.image || '').replace(/^data:[^;]+;base64,/, '');
+    let mimeType = String(body.mimeType || 'image/jpeg');
     const tradeMode = String(body.tradeMode || 'BOTH').toUpperCase();
+    // Professional-trader mode: a scalper and a day trader take different trades off the same
+    // chart, and a LONG/SHORT request is an ask to EVALUATE that side, never to justify it.
+    // Absent => the original generic prompt is used unchanged.
+    const style = body.style ? normaliseStyle(body.style) : null;
+    const bias = body.bias ? normaliseBias(body.bias) : null;
     const rawSymbol = String(body.symbol || '').trim();
     const timeframe = String(body.timeframe || 'M15').toUpperCase();
     if (!rawSymbol) return res.status(400).json({ error: 'symbol is required — it grounds the AI read and powers the deterministic fallback.' });
@@ -3777,6 +4232,21 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
     // block — a weekend/last-session chart can still be studied, but the response says plainly
     // whether the underlying math ran on live or stored candles.
     const fresh = candleFreshness(candleList[candleList.length - 1], timeframe);
+
+    // No image supplied => this is the LIVE-CHART button, not an upload. Render the chart
+    // server-side from the same candles the engines just analysed, so the picture the model
+    // sees and the maths it reconciles against are guaranteed to be the same data. A real
+    // screenshot could drift from it (different TF loaded, stale render, indicator toggled).
+    if (!imageBase64) {
+      try {
+        const drawn = renderCandleChart({
+          candles: candleList.slice(-90),
+          digits: brokerSpecFor(symbol)?.digits ?? null,
+          width: 900, height: 420,
+        });
+        if (drawn) { imageBase64 = drawn.png.toString('base64'); mimeType = 'image/png'; }
+      } catch (e) { console.warn('[AI Chart] server-side render failed:', e.message); }
+    }
 
     // ── Deterministic GROUND TRUTH from the live engines (read-only) ──
     const indicators = getRecentIndicators(symbol, timeframe, 500);
@@ -3820,16 +4290,42 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
     const systemAnalysis = buildSystemChartAnalysis({ symbol, timeframe, tradeMode, systemDecision: sd, fttPrediction, breakout, sizing, candles: candleList, strategies, supportResistance: sd.supportResistance, timezone: process.env.APP_TIME_ZONE || 'Asia/Dhaka' });
 
     // ── PRIMARY: Gemini vision ──
-    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: GEMINI_MODEL, imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth });
+    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: GEMINI_MODEL, imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth, style, bias });
 
     if (vision.available) {
       // Recompute lots server-side from the vision entry/SL (never trust the model's lot).
       const vSizing = strategyLabSizing(symbol, vision.forexPlan?.entry, vision.forexPlan?.stopLoss, { tp1: vision.forexPlan?.takeProfit1, tp2: vision.forexPlan?.takeProfit2, tp3: vision.forexPlan?.takeProfit3 });
+      const vMatch = matchStrategies(vision.forexPlan?.decision || vision.verdict, strategies);
+      // Scored from CHECKABLE evidence, not from the model's own confidence: geometry, R:R
+      // measured to the final target, independent engine agreement, HTF alignment, stop sanity
+      // and freshness. The model's riskReward is discarded and recomputed — it does its own
+      // arithmetic on prices it also chose.
+      const setup = scoreChartSetup({
+        direction: vision.forexPlan?.decision,
+        entry: vision.forexPlan?.entry, stopLoss: vision.forexPlan?.stopLoss,
+        takeProfit1: vision.forexPlan?.takeProfit1, takeProfit2: vision.forexPlan?.takeProfit2,
+        takeProfit3: vision.forexPlan?.takeProfit3,
+        aiConfidence: vision.confidence, strategyMatch: vMatch, htfBias: sd.htfBias,
+        atr: sd.atr ?? null, spread: brokerSpecFor(symbol)?.spread ?? null,
+        dataFresh: fresh.dataFresh,
+      });
       const forexPlan = (tradeMode === 'FTT') ? null : {
         ...vision.forexPlan,
-        lots: vSizing?.suggestedLots ?? sizing?.suggestedLots ?? null,
+        // `lots` stays null when the ticket is not tradeable — printing "0.01 lots" beside a
+        // NO_TRADE verdict reads as a live position, which is how a HOLD becomes a trade.
+        lots: setup.score === null ? null : (vSizing?.suggestedLots ?? sizing?.suggestedLots ?? null),
+        // The size the setup WOULD take, always computed from the plan's own entry and stop.
+        // Kept separate from `lots` so the UI can show the number without implying a call:
+        // stopPips and lossAtStop were already being returned on a HOLD, so suppressing only
+        // the lot size made the panel inconsistent rather than careful.
+        suggestedLots: vSizing?.suggestedLots ?? sizing?.suggestedLots ?? null,
+        sizingIsHypothetical: setup.score === null,
         stopPips: vSizing?.stopPips ?? null,
         lossAtStop: vSizing?.lossAtStop ?? null,
+        // The measured figure replaces the model's self-reported one.
+        riskReward: setup.rr ?? vision.forexPlan?.riskReward ?? null,
+        setupScore: setup.score, setupGrade: setup.grade,
+        scoreBreakdown: setup.breakdown, scoreNote: setup.note,
       };
       const fttPlan = (tradeMode === 'FOREX') ? null : {
         ...vision.fttPlan,
@@ -3837,11 +4333,24 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
         persistenceRange: persistence.p25 != null ? { low: persistence.p25, high: persistence.p75, basis: persistence.basis } : null,
         timeTrigger: vision.fttPlan?.timeTrigger ?? timeTrigger,
       };
+      // Recorded before the response so the analysis the user sees is the one that gets
+      // measured. Automatic, including HOLD: tracking only the calls you choose to save
+      // measures your filtering as much as the model's scoring.
+      const trackId = await trackAiAnalysis(await initializeDatabase(), {
+        symbol, timeframe, tradeMode, style, bias,
+        verdict: vision.verdict, confidence: vision.confidence, plan: forexPlan, setup,
+      });
       return res.json({
-        ok: true, source: 'gemini-vision', symbol, timeframe, tradeMode,
+        ok: true, source: 'gemini-vision', symbol, timeframe, tradeMode, trackId,
         verdict: vision.verdict, confidence: vision.confidence,
         detection: vision.detection, forexPlan, fttPlan,
         breakout: systemAnalysis.breakout, strategies,
+        // Strategy agreement is INFORMATION, not a verdict: the AI read independently, and
+        // showing whether the deterministic engines happened to land the same way is useful
+        // precisely because it is not what produced the AI answer. Disagreement is reported
+        // just as plainly as agreement — hiding it would be the dishonest option.
+        strategyMatch: vMatch,
+        style, bias, instrument: playbookFor(symbol).label,
         reasoning: vision.reasoning, keyFactors: vision.key_factors,
         system: systemAnalysis, // deterministic read alongside, for comparison
         dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds, marketStatus: fresh.marketStatus,
@@ -4363,12 +4872,18 @@ function completeForexRiskPlan(result) {
   if (!sd?.riskPlan) return result;
 
   const risk = { ...sd.riskPlan };
+  // The CONFIGURED basis wins over whatever the upstream engine guessed. It used to lose:
+  // `risk.equity` was taken first and fell through to a $1,000 env placeholder, so a card
+  // sized a $1,000 practice account while the auto-trader sized the real $10,000 challenge
+  // — the same ticket read 0.16 lots on screen and filled 0.57 at the broker. The env vars
+  // remain only as a last resort for an unconfigured install.
+  const basis = signalSizingBasis();
   const configuredFallbackEquity = Number(process.env.FOREX_SIGNAL_DEFAULT_EQUITY || 1000);
   const fallbackEquity = Number.isFinite(configuredFallbackEquity) && configuredFallbackEquity > 0 ? configuredFallbackEquity : 1000;
   const accountEquity = finitePositive(mt5State.accountSnapshot?.equity);
   const accountBalance = finitePositive(mt5State.accountSnapshot?.balance);
-  const equity = finitePositive(risk.equity) ?? accountEquity ?? accountBalance ?? fallbackEquity;
-  const riskPercent = finitePositive(risk.riskPercent) ?? Math.min(2, Math.max(0.1, Number(process.env.FOREX_SIGNAL_RISK_PERCENT || 1)));
+  const equity = finitePositive(basis.equity) ?? finitePositive(risk.equity) ?? accountEquity ?? accountBalance ?? fallbackEquity;
+  const riskPercent = finitePositive(basis.riskPct) ?? finitePositive(risk.riskPercent) ?? Math.min(2, Math.max(0.1, Number(process.env.FOREX_SIGNAL_RISK_PERCENT || 1)));
   const leverage = finitePositive(risk.leverage) ?? Math.max(1, Number(process.env.FOREX_SIGNAL_LEVERAGE || 500));
   const entry = Number(sd.entryPrice);
   const stop = Number(sd.stopLoss);
@@ -4377,8 +4892,13 @@ function completeForexRiskPlan(result) {
   const contractSize = forexSizingContractSize(result.symbol);
   const stopDistance = Number.isFinite(entry) && Number.isFinite(stop) ? Math.abs(entry - stop) : Number(risk.stopDistance);
   const stopPips = finitePositive(risk.stopPips) ?? (Number.isFinite(stopDistance) && stopDistance > 0 ? Math.round((stopDistance / pipSize) * 10) / 10 : null);
-  const riskAmount = finitePositive(risk.riskAmount ?? risk.amountToRisk) ?? Math.round(equity * (riskPercent / 100) * 100) / 100;
-  const suggestedLotSize = finitePositive(risk.suggestedLotSize) ?? (riskAmount > 0 && stopPips > 0 ? Math.max(0.01, Math.round((riskAmount / (stopPips * pipValue)) * 100) / 100) : null);
+  // Derived from the configured basis, not read back from the engine: taking the engine's
+  // riskAmount/lot here would re-introduce the placeholder sizing through the back door and
+  // leave the equity above cosmetic.
+  const riskAmount = Math.round(equity * (riskPercent / 100) * 100) / 100;
+  const suggestedLotSize = riskAmount > 0 && stopPips > 0
+    ? Math.max(0.01, Math.round((riskAmount / (stopPips * pipValue)) * 100) / 100)
+    : null;
   const notionalValue = finitePositive(risk.notionalValue) ?? (Number.isFinite(entry) && suggestedLotSize !== null ? Math.round(entry * contractSize * suggestedLotSize * 100) / 100 : null);
   const marginRequired = finitePositive(risk.marginRequired ?? risk.amountToInvestApprox) ?? (notionalValue !== null ? Math.round((notionalValue / leverage) * 100) / 100 : null);
   const calcProfit = (target, existing) => {
@@ -4408,6 +4928,9 @@ function completeForexRiskPlan(result) {
         stopPips,
         estimatedPipValuePerLot: pipValue,
         suggestedLotSize,
+        // Surfaced so the card can say WHICH account the lots were sized against.
+        sizingBasis: basis.label,
+        sizingSource: basis.source,
         notionalValue,
         marginRequired,
         amountToInvestApprox: marginRequired,
@@ -7658,6 +8181,13 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
   // scales the band. symbols/levelTypes empty = all. Delivery-only; nothing else affected.
   //   levelTypes ⊆ ['PDH_PDL','ASIAN','LONDON','NY']
   keyLevelProximityAlerts: { enabled: false, sensitivity: 'NORMAL', symbols: [], levelTypes: [] },
+  // ICT Sniper — immediate bare market entry on an "enter now" ict-breaker signal, stop attached
+  // seconds later. OFF by default and empty lists mean NONE: this places live market orders.
+  ictSniper: { ...SNIPER_DEFAULTS },
+  // Conviction sizing: scale per-trade risk by setup quality instead of booking the full
+  // configured budget on every trade. ON by default — the previous behaviour (every setup at
+  // 100% of budget) is the thing being fixed, so opting IN to the fix would leave it unused.
+  convictionSizing: { enabled: true, floorUsd: 0, tiers: null },
   // Account & position-sizing. `balance` (USD) drives lot sizing on every emailed signal.
   // mode: NORMAL (size by normalRiskPct) | CHALLENGE (prop-firm rules) | BOTH (show both).
   // challenge = Hola Prime 1-Step preset (editable). Sizing/labels only — never changes
@@ -7666,6 +8196,20 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
     balance: 5000,
     mode: 'NORMAL',
     normalRiskPct: 1,
+    // Sizing basis for the lots printed on STRATEGY LAB / forex signal cards and emails.
+    //
+    // This exists because the signal card and the auto-trader used to size off completely
+    // unrelated numbers: the card fell back to a $1,000 placeholder equity (env
+    // FOREX_SIGNAL_DEFAULT_EQUITY) while the auto-trader sized the real challenge account.
+    // The same GBPJPY ticket therefore read 0.16 lots on screen and filled 0.57 at the
+    // broker — a 4x gap that looked like the EA inflating size when in fact the DISPLAY was
+    // wrong. Defaulting to ACCOUNT makes the number you see the number that trades.
+    //
+    //   ACCOUNT — follow the configured account: CHALLENGE mode uses the challenge initial
+    //             balance + riskPerTradePct, otherwise balance + normalRiskPct.
+    //   CUSTOM  — an explicit equity/risk pair, for sizing a signal against an account the
+    //             app is not connected to.
+    signalSizing: { source: 'ACCOUNT', equity: 10000, riskPct: 1 },
     challenge: {
       preset: 'HOLA_1STEP',
       phase: 'EVAL',                 // EVAL | FUNDED
@@ -7704,6 +8248,25 @@ const DEFAULT_EMAIL_ALERT_SETTINGS = {
     onePerSymbol: true,
     minGrade: 'A',
     minRR: 2,
+    // Max adverse move between signal and fill, as a % of the planned stop distance.
+    // A MARKET order fills at the live price while SL/TP stay at the planned prices, so any
+    // gap comes out of the reward and goes into the risk. Measured on live tickets: 508993270
+    // went from a stated RR 5.44 to a real 0.24, and 507898267 lost $114 against a $50 budget.
+    // A PERCENTAGE of the stop, not a pip count: 3 pips is noise on a 300-pip gold stop and
+    // fatal on a 4-pip EURUSD one. 0 = only equal-or-better fills.
+    // Per-strategy approval override: { 'ict-break-pro': 'AUTO' } lets a proven strategy skip
+    // the approval queue while the desk stays on ASK, or forces review on one while the desk is
+    // on AUTO. OFF and SHADOW are master switches this can never override.
+    strategyModes: {},
+    // ict-breaker only: place with a stop and NO take profit, so the leg MT5 was rejecting
+    // (TP behind the market, 29/29 of its 10016s) is simply not sent. OFF by default — it
+    // changes how real orders reach the broker.
+    ictBreakerExec: { enabled: false, ...ICT_EXEC_DEFAULTS },
+    maxSlippagePctOfStop: 25,
+    // Re-size lots against the REAL distance to the (unchanged) structural stop, so the money
+    // risked stays at budget when the fill is worse than planned. The stop itself is never
+    // moved — it sits where the analysis put it.
+    resizeLotsOnSlippage: true,
     // PRECISION MODE — exact strategy × symbol × timeframe triples, e.g.
     //   'forex-confluence|GBPUSDM|M15'  ·  'forex-confluence|XAUUSDM|M30'
     // SYMBOL and/or TIMEFRAME may be '*' to mean "any". When this list is NON-EMPTY it
@@ -7880,6 +8443,23 @@ function saveEmailAlertSettings(nextSettings) {
       timeframes: Array.isArray(src.timeframes) ? [...new Set(src.timeframes.map((x) => String(x || '').trim().toUpperCase()))].filter((x) => KNOWN_TFS.includes(x)) : [],
     };
   }
+  // ICT Sniper controller — normalised on save so a bad edit cannot widen what trades.
+  if (nextSettings && nextSettings.ictSniper && typeof nextSettings.ictSniper === 'object') {
+    sanitized.ictSniper = normalizeSniperConfig(nextSettings.ictSniper);
+  }
+
+  // Conviction sizing controller. Tiers are normalised on save so a bad edit cannot produce a
+  // fraction above 1 — that would risk MORE than the configured budget, the one thing this must
+  // never do.
+  if (nextSettings && nextSettings.convictionSizing && typeof nextSettings.convictionSizing === 'object') {
+    const src = nextSettings.convictionSizing;
+    sanitized.convictionSizing = {
+      enabled: src.enabled !== false,
+      floorUsd: Math.max(0, Number(src.floorUsd) || 0),
+      tiers: Array.isArray(src.tiers) && src.tiers.length ? normalizeConvictionTiers(src.tiers) : null,
+    };
+  }
+
   // Key-level proximity alert controller — replace whole object on save.
   if (nextSettings && nextSettings.keyLevelProximityAlerts && typeof nextSettings.keyLevelProximityAlerts === 'object') {
     const src = nextSettings.keyLevelProximityAlerts;
@@ -7903,10 +8483,19 @@ function saveEmailAlertSettings(nextSettings) {
       const mode = String(o?.mode || 'NORMAL').toUpperCase();
       const ch = (o?.challenge && typeof o.challenge === 'object') ? o.challenge : {};
       const cb = b.challenge;
+      // NOTE: this sanitizer REBUILDS the leg from the fields named here, so anything not
+      // listed is silently dropped on save. signalSizing must stay in this list.
+      const ss = (o?.signalSizing && typeof o.signalSizing === 'object') ? o.signalSizing : {};
+      const sb = b.signalSizing || DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk.signalSizing;
       return {
         balance: clampNum(o?.balance, 1, 100000000, b.balance),
         mode: ['NORMAL', 'CHALLENGE', 'BOTH'].includes(mode) ? mode : 'NORMAL',
         normalRiskPct: clampNum(o?.normalRiskPct, 0.05, 10, b.normalRiskPct),
+        signalSizing: {
+          source: String(ss.source || sb.source).toUpperCase() === 'CUSTOM' ? 'CUSTOM' : 'ACCOUNT',
+          equity: clampNum(ss.equity, 1, 100000000, sb.equity),
+          riskPct: clampNum(ss.riskPct, 0.05, 10, sb.riskPct),
+        },
         challenge: {
           preset: String(ch.preset || cb.preset).slice(0, 32).toUpperCase(),
           phase: ['EVAL', 'FUNDED'].includes(String(ch.phase || '').toUpperCase()) ? String(ch.phase).toUpperCase() : cb.phase,
@@ -7963,6 +8552,45 @@ function saveEmailAlertSettings(nextSettings) {
       onePerSymbol: src.onePerSymbol !== false,
       minGrade: ['A', 'A+'].includes(String(src.minGrade || '').toUpperCase()) ? String(src.minGrade).toUpperCase() : 'A',
       minRR: (() => { const n = Number(src.minRR); return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : base.minRR; })(),
+      // NOTE: this sanitizer REBUILDS autoTrade from an explicit whitelist, so any field not
+      // named here is silently dropped on save. Three settings were added without being listed
+      // and could never persist. Anything new must be added below.
+      //
+      // Per-strategy approval override. Only AUTO/ASK are storable — OFF and SHADOW are desk-wide
+      // master switches and must not be settable per strategy, or "stop trading" stops meaning it.
+      // ict-breaker SL-only profile. Named here or the whole-object rebuild drops it on save.
+      ictBreakerExec: (() => {
+        const e = (src.ictBreakerExec && typeof src.ictBreakerExec === 'object') ? src.ictBreakerExec : {};
+        const num = (v, lo, hi, d) => { const x = Number(v); return Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : d; };
+        return {
+          enabled: e.enabled === true,
+          // Bounds are the measured ones: below 1R the setup is spent, and past ~250% past
+          // the entry expectancy went negative even with the remaining-R filter applied.
+          minRemainingR: num(e.minRemainingR, 0.5, 5, ICT_EXEC_DEFAULTS.minRemainingR),
+          maxLatePct: num(e.maxLatePct, 25, 400, ICT_EXEC_DEFAULTS.maxLatePct),
+          minStopSpreadMult: num(e.minStopSpreadMult, 1, 10, ICT_EXEC_DEFAULTS.minStopSpreadMult),
+          noTakeProfit: e.noTakeProfit !== false,
+        };
+      })(),
+      strategyModes: (() => {
+        const src2 = (src.strategyModes && typeof src.strategyModes === 'object' && !Array.isArray(src.strategyModes))
+          ? src.strategyModes : {};
+        const out = {};
+        for (const [id, v] of Object.entries(src2)) {
+          if (!validIds.has(String(id))) continue;            // unknown strategy: drop it
+          // normalizeStrategyMode is the SAME validator the resolver's contract is written
+          // against, so a rule that saves is a rule that actually takes effect. It accepts
+          // the legacy plain-string form and upgrades it to the scoped object.
+          const rule = normalizeStrategyMode(v, { knownTimeframes: KNOWN_TFS, knownSessions: KNOWN_SESSIONS });
+          if (rule) out[String(id)] = rule;
+        }
+        return out;
+      })(),
+      maxSlippagePctOfStop: (() => {
+        const n = Number(src.maxSlippagePctOfStop);
+        return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : base.maxSlippagePctOfStop;
+      })(),
+      resizeLotsOnSlippage: src.resizeLotsOnSlippage !== false,
       // Only ever store an explicit choice; anything else stays null so the inference
       // in autoTradeSelectionMode() keeps deciding.
       selectionMode: ['COMBOS', 'BROAD'].includes(String(src.selectionMode || '').toUpperCase())
@@ -8879,6 +9507,152 @@ async function processTrackedOrderAlerts() {
 // makes the one-email rule durable across restarts.
 // The Notification Settings controller (entryReadyAlerts) narrows which strategies /
 // symbols / timeframes may send it, and per-recipient routing still applies.
+
+// ── ICT Sniper ──────────────────────────────────────────────────────────────
+//
+// Enters the market the moment an ict-breaker setup reports "enter now", with NO stop attached,
+// then places the stop a few seconds later.
+//
+// The bare entry is not carelessness. 29 of 29 of this account's MT5 rejections were "10016
+// invalid stops" — the stop or target unusable at the instant of sending — and the ict-breaker
+// edge measurably dies inside the first five minutes (+2.2R ideal, -0.03R with real delay). A
+// market order with sl=0 cannot be rejected for that reason and fills immediately. The stop
+// follows on the next sweep.
+//
+// Everything about this mode is opt-in: OFF by default, empty symbol and timeframe lists mean
+// NONE rather than all, and it refuses to trade a signal that carries no lot size.
+
+function sniperConfig() {
+  const raw = loadEmailAlertSettings().ictSniper || {};
+  return normalizeSniperConfig(raw);
+}
+
+/**
+ * Queue a bare market order for an "enter now" signal.
+ *
+ * Called from the entry-ready sweep at the same moment the email is accepted, so the trade and
+ * the alert can never disagree about what "enter now" meant. Never throws into the alert path —
+ * a failed sniper entry must not stop the email that triggered it.
+ */
+async function sniperFireOnEntryReady(pool, row, { fillPrice, orderType }) {
+  try {
+    const cfg = sniperConfig();
+    if (!cfg.enabled) return;
+
+    // Open positions come from the EA's own report, not our row count: the rule is "this symbol
+    // is already running", and only the broker knows that for certain.
+    const openSymbols = [...(tradeBridge.positions || []), ...(tradeBridge.orders || [])]
+      .map((p) => String(p.symbol || '').toUpperCase()).filter(Boolean);
+
+    const [firedRows] = await pool.query(
+      "SELECT id, reason FROM mt5_auto_trades WHERE strategy='ict-sniper' AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)");
+    const firedIds = firedRows.map((r) => String(r.reason || '').replace(/^sniper:/, '')).filter(Boolean);
+    const [todayRows] = await pool.query(
+      "SELECT COUNT(*) n FROM mt5_auto_trades WHERE strategy='ict-sniper' AND DATE(created_at)=UTC_DATE()");
+
+    const decision = sniperShouldFire({
+      id: row.id, strategy: row.strategy, symbol: row.symbol, timeframe: row.timeframe,
+      grade: row.latest_grade || row.grade,
+      lots: strategyLabSizing(row.symbol, row.entry_price, row.stop_loss, {})?.suggestedLotSize
+        ?? Number(row.lots) ?? null,
+    }, cfg, { openSymbols, firedIds, todayCount: Number(todayRows[0]?.n) || 0 });
+
+    if (!decision.fire) {
+      console.log(`[Sniper] skip ${row.symbol} ${row.timeframe} — ${decision.reason}`);
+      recordSniperDecision({ fired: false, symbol: row.symbol, timeframe: row.timeframe, strategy: row.strategy, grade: row.latest_grade || row.grade, reason: decision.reason });
+      return;
+    }
+
+    // The interlocks that protect the account still apply: no bridge, no armed match, no order.
+    // The CHALLENGE guard is deliberately not consulted here — the user asked for this mode to
+    // bypass it.
+    const atCfg = autoTradeConfig();
+    const mode = autoTradeEffectiveMode(atCfg);
+    if (mode !== 'ASK' && mode !== 'AUTO') {
+      console.log(`[Sniper] skip ${row.symbol} — auto-trade is ${mode}`);
+      return;
+    }
+    if (!autoTradeArmedMatch()) {
+      console.log(`[Sniper] skip ${row.symbol} — armed account does not match MT5`);
+      return;
+    }
+
+    const id = `sniper:${row.id}`;
+    await pool.execute(
+      `INSERT IGNORE INTO mt5_auto_trades
+         (id, strategy, symbol, timeframe, direction, order_type, entry_price,
+          stop_loss, take_profit_1, take_profit_2, take_profit_3,
+          lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, created_at)
+       VALUES (?, 'ict-sniper', ?,?,?, 'MARKET', ?, NULL, NULL, NULL, NULL, ?,?, 'CHALLENGE', ?,?,?,?,?, 'QUEUED', ?, ?)`,
+      [id, row.symbol, row.timeframe, row.direction, fillPrice ?? row.entry_price,
+        decision.lots, cfg.riskUsd,
+        Math.round(Number(row.score) || 0), row.latest_grade || row.grade || null, null,
+        strategyLabSession(new Date().toISOString())?.key || null, mode,
+        `sniper:${row.id}`.slice(0, 255), toMysqlDate()]);
+
+    console.log(`[Sniper] QUEUED ${row.symbol} ${row.timeframe} ${row.direction} ${decision.lots} lots — bare, stop in ${cfg.stopDelaySeconds}s`);
+    recordSniperDecision({ fired: true, symbol: row.symbol, timeframe: row.timeframe, strategy: row.strategy, grade: row.latest_grade || row.grade, direction: row.direction, lots: decision.lots, reason: decision.reason });
+  } catch (error) {
+    // A tracking or trading failure must never break the alert that triggered it.
+    console.error('[Sniper] fire failed:', error.message);
+  }
+}
+
+/**
+ * Attach the protective stop to sniper positions that have been open long enough.
+ *
+ * Runs on the bridge poll. The delay is the whole point: the position is deliberately naked at
+ * entry so the fill cannot be rejected for invalid stops, and this is what ends that window.
+ *
+ * The stop distance is DERIVED BACKWARDS — lots are already fixed by the fill and the risk is a
+ * fixed dollar amount, so distance is the only free variable. A large position therefore gets a
+ * TIGHT stop, which is surfaced as a warning rather than silently widened.
+ */
+async function sniperAttachStops(pool) {
+  try {
+    const cfg = sniperConfig();
+    if (!cfg.enabled) return [];
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_auto_trades
+        WHERE strategy='ict-sniper' AND status='FILLED' AND stop_loss IS NULL
+          AND position_id IS NOT NULL
+          AND filled_at IS NOT NULL AND filled_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)
+        LIMIT 5`, [cfg.stopDelaySeconds]);
+
+    const lines = [];
+    for (const r of rows) {
+      const stop = sniperStop({
+        fillPrice: Number(r.fill_price) || Number(r.entry_price),
+        direction: r.direction,
+        lots: Number(r.lots),
+        riskUsd: cfg.riskUsd,
+        pipSize: forexSizingPipSize(r.symbol),
+        pipValuePerLot: forexSizingPipValuePerLot(r.symbol),
+        digits: brokerSpecFor(r.symbol)?.digits ?? null,
+      });
+      if (!stop.ok) {
+        console.error(`[Sniper] cannot size a stop for ${r.symbol}: ${stop.error}`);
+        continue;
+      }
+      if (stop.warning) console.warn(`[Sniper] ${r.symbol}: ${stop.warning}`);
+
+      // Written BEFORE the command is sent so a crash between the two leaves the intended stop
+      // on the record rather than a position that looks like it never had one planned.
+      await pool.execute(
+        'UPDATE mt5_auto_trades SET stop_loss=?, reason=CONCAT(COALESCE(reason,""), ?), updated_at=? WHERE id=?',
+        [stop.stopLoss, ` | stop ${stop.stopPips}p ($${stop.riskUsd})${stop.tooTight ? ' TIGHT' : ''}`.slice(0, 120),
+          toMysqlDate(), r.id]);
+
+      lines.push(['SLTP', r.id, r.position_id, r.symbol, stop.stopLoss, 0].join('|'));
+      console.log(`[Sniper] stop for ${r.symbol} at ${stop.stopLoss} (${stop.stopPips}p / $${stop.riskUsd})`);
+    }
+    return lines;
+  } catch (error) {
+    console.error('[Sniper] stop attach failed:', error.message);
+    return [];
+  }
+}
+
 const ENTRY_READY_MAX_FILL_AGE_MS = Math.max(60000, Number(process.env.ENTRY_READY_MAX_FILL_AGE_MIN || 10) * 60000);
 const entryReadyNotified = new Map(); // hot-path cache; mt5_delivery_logs is the durable dedup source
 
@@ -9000,6 +9774,9 @@ async function processEntryReadyAlerts() {
         await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: deliverySignalId });
         smtpAccepted = true;
         await pool.execute('UPDATE mt5_strategy_signals SET entry_ready_email_sent=1 WHERE id=?', [id]);
+        // Same trigger as the alert, so the trade and the email can never disagree about what
+        // "enter now" meant. Awaited but internally guarded — it cannot throw into this path.
+        await sniperFireOnEntryReady(pool, row, { fillPrice: readiness?.fillPrice, orderType });
       } catch (error) {
         // Release only when SMTP itself failed. If SMTP accepted the message but the
         // final DB write failed, keep -1 claimed so a retry cannot duplicate the email.
@@ -9087,6 +9864,12 @@ async function processKeyLevelProximityAlerts() {
         const email = buildKeyLevelProximityEmail(sym, view, lv);
         await sendNotificationEmail({ to, subject: email.subject, text: email.text, html: email.html, signalId: deliverySignalId });
         keyLevelNotified.set(deliverySignalId, now);
+        // Record the alert so its outcome can be tracked. Awaited but never allowed to throw —
+        // a tracking write must not break the alert that triggered it.
+        await recordLiquidityEvent(pool, {
+          symbol: sym, timeframe: view.timeframe || 'M15', level: lv, view,
+          deliverySignalId, emailed: true,
+        });
         console.log(`[KeyLevel] Emailed ${sym} ${lv.tier} ${lv.label} (${lv.distancePips}p)`);
       }
     } catch (error) { console.error('[KeyLevel] alert failed:', error.message); }
@@ -9095,6 +9878,172 @@ async function processKeyLevelProximityAlerts() {
     if (now - at > 36 * 3600 * 1000) keyLevelNotified.delete(k);
   }
 }
+
+// ── Liquidity event tracking ────────────────────────────────────────────────
+//
+// The proximity alert says price ARRIVED at a level. What matters next is whether the level was
+// taken and reclaimed (fade it) or broken and held (follow it) — and until now nothing recorded
+// either, because the chart recomputes from candles on every request and keeps no memory.
+//
+// The classifier is borrowed from liquidityChart.js rather than rewritten, so this table and the
+// chart can never disagree about the same level.
+
+/** Record an alerted level so its outcome can be tracked. Never throws into the alert path. */
+async function recordLiquidityEvent(pool, { symbol, timeframe, level, view, deliverySignalId, emailed }) {
+  try {
+    if (!pool || !level || !Number.isFinite(Number(level.price))) return;
+    // One row per level per tier per day, matching the email's own dedupe key so the table and
+    // the inbox stay one-to-one.
+    const id = deliverySignalId || `liqevent:${symbol}:${level.type}:${level.price}:${Date.now()}`;
+    await pool.execute(
+      `INSERT IGNORE INTO mt5_liquidity_events
+         (id, symbol, timeframe, level_price, level_type, level_label, level_strength, side, tier,
+          alert_price, distance_pips, delivery_signal_id, emailed, status, alerted_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'WAITING', ?, ?)`,
+      [id, String(symbol).toUpperCase(), timeframe || 'M15', Number(level.price),
+        level.type ?? null, level.label ?? null, Number(level.strength) || null,
+        level.side === 'above' || level.side === 'below' ? level.side : (Number(level.price) >= Number(view?.price ?? 0) ? 'above' : 'below'),
+        level.tier ?? null, Number(view?.price) || null, Number(level.distancePips) || null,
+        deliverySignalId ?? null, emailed ? 1 : 0, toMysqlDate(), toMysqlDate()]);
+  } catch (error) {
+    // A tracking write must never break the alert that triggered it.
+    console.error('[LiquidityEvent] record failed:', error.message);
+  }
+}
+
+/**
+ * Re-read the candles after each unresolved alert and update its status.
+ *
+ * Runs on the same cadence as the other scanners. Events that have already CONFIRMED are left
+ * alone: confirmation is the point at which the outcome stopped being provisional, and letting a
+ * later candle rewrite it would make the history unstable.
+ */
+async function runLiquidityEventScan() {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_liquidity_events
+        WHERE confirmed = 0 AND alerted_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+        ORDER BY alerted_at DESC LIMIT 200`);
+    if (!rows.length) return;
+
+    let updated = 0;
+    for (const row of rows) {
+      try {
+        const candles = getRecentCandles(row.symbol, row.timeframe, 200);
+        if (!Array.isArray(candles) || candles.length < 10) continue;
+        // Only the candles from the alert onward: what price did BEFORE the level was alerted
+        // is not follow-through, and including it would credit moves that already happened.
+        const alertMs = Date.parse(row.alerted_at);
+        const startIdx = candles.findIndex((c) => Date.parse(c.time ?? c.candle_time ?? 0) >= alertMs);
+        const after = startIdx >= 0 ? candles.slice(Math.max(0, startIdx - 1)) : candles.slice(-40);
+        if (after.length < 3) continue;
+
+        const atr = liquidityAtr14(after) || 0;
+        const r = resolveLiquidityEvent(row, after, {
+          atr, pipSize: forexSizingPipSize(row.symbol),
+        });
+        const settled = r.status === 'RECLAIMED' || r.status === 'BROKE_AND_HELD';
+        await pool.execute(
+          `UPDATE mt5_liquidity_events
+              SET status=?, confirmed=?, direction=?, bars_to_resolve=?, follow_through_pips=?,
+                  adverse_pips=?, touches=?, closes_beyond=?, evidence=?,
+                  resolved_at=COALESCE(resolved_at, ?), updated_at=?
+            WHERE id=?`,
+          [r.status, r.confirmed ? 1 : 0, r.direction, r.barsToResolve,
+            r.followThroughPips, r.adversePips, r.touches, r.closesBeyond,
+            String(r.evidence || '').slice(0, 255),
+            settled ? toMysqlDate() : null, toMysqlDate(), row.id]);
+        updated += 1;
+      } catch (error) {
+        console.error(`[LiquidityEvent] resolve failed for ${row.id}:`, error.message);
+      }
+    }
+    if (updated) console.log(`[LiquidityEvent] refreshed ${updated} event(s)`);
+  } catch (error) {
+    console.error('[LiquidityEvent] scan failed:', error.message);
+  }
+}
+
+/**
+ * GET /api/liquidity/events — the alert log with outcomes.
+ *
+ * `confirmedOnly` filters to events whose outcome carries the evidence the playbook actually
+ * trades. The summary always reports BOTH populations so the gap between them stays visible: a
+ * low confirmation rate means the alerts are firing on levels that mostly do nothing either way,
+ * and pooling the two would hide exactly that.
+ */
+app.get('/api/liquidity/events', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 14));
+    const symbol = String(req.query.symbol || '').trim().toUpperCase();
+    const confirmedOnly = req.query.confirmedOnly === '1' || req.query.confirmedOnly === 'true';
+
+    const params = [days];
+    let where = 'alerted_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)';
+    if (symbol && symbol !== 'ALL') { where += ' AND symbol = ?'; params.push(symbol); }
+    if (confirmedOnly) where += ' AND confirmed = 1';
+
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_liquidity_events WHERE ${where} ORDER BY alerted_at DESC LIMIT 500`, params);
+
+    const events = rows.map((r) => ({
+      id: r.id, symbol: r.symbol, timeframe: r.timeframe,
+      level: Number(r.level_price), levelType: r.level_type, levelLabel: r.level_label,
+      strength: r.level_strength === null ? null : Number(r.level_strength),
+      side: r.side, tier: r.tier,
+      alertPrice: r.alert_price === null ? null : Number(r.alert_price),
+      distancePips: r.distance_pips === null ? null : Number(r.distance_pips),
+      emailed: r.emailed === 1,
+      status: r.status, confirmed: r.confirmed === 1, direction: r.direction,
+      barsToResolve: r.bars_to_resolve,
+      followThroughPips: r.follow_through_pips === null ? null : Number(r.follow_through_pips),
+      adversePips: r.adverse_pips === null ? null : Number(r.adverse_pips),
+      touches: r.touches, closesBeyond: r.closes_beyond,
+      evidence: r.evidence,
+      alertedAt: r.alerted_at, resolvedAt: r.resolved_at,
+    }));
+
+    // The summary is built over the UNFILTERED window so the confirmation rate is honest even
+    // when the table itself is filtered to confirmed rows.
+    const [allRows] = confirmedOnly
+      ? await pool.query(
+        `SELECT status, confirmed, follow_through_pips FROM mt5_liquidity_events
+          WHERE alerted_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)${symbol && symbol !== 'ALL' ? ' AND symbol = ?' : ''}`,
+        symbol && symbol !== 'ALL' ? [days, symbol] : [days])
+      : [rows];
+    const summary = summariseLiquidityEvents(allRows.map((r) => ({
+      status: r.status,
+      confirmed: r.confirmed === 1,
+      followThroughPips: r.follow_through_pips === null ? null : Number(r.follow_through_pips),
+    })));
+
+    const [syms] = await pool.query(
+      `SELECT DISTINCT symbol FROM mt5_liquidity_events
+        WHERE alerted_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) ORDER BY symbol`, [days]);
+
+    res.json({
+      days, symbol: symbol || 'ALL', confirmedOnly,
+      generatedAt: new Date().toISOString(),
+      events, summary,
+      symbols: syms.map((s) => s.symbol),
+      legend: {
+        RECLAIMED: 'liquidity taken, price rejected back inside — fade the level',
+        BROKE_AND_HELD: 'body closed through and held — follow the break',
+        NO_FOLLOW_THROUGH: 'price touched but never traded beyond',
+        WAITING: 'not resolved yet',
+        DEAD: 'broken and left far behind; the liquidity there is spent',
+      },
+      note: 'Confirmed means the evidence the playbook trades has appeared: displacement away from a reclaim, or a retest that held after a break. Unconfirmed rows are real outcomes, but not yet tradeable ones.',
+    });
+  } catch (error) {
+    console.error('[LiquidityEvent] report failed:', error.message);
+    res.status(500).json({ error: 'failed to load liquidity events' });
+  }
+});
 
 // GET /api/key-level-proximity — all streamed symbols' approaching key levels + plans.
 app.get('/api/key-level-proximity', (req, res) => {
@@ -9136,6 +10085,9 @@ app.get('/api/auto-trade', async (req, res) => {
         mode: r.mode, status: r.status, reason: r.reason,
         ticket: r.ticket, fillPrice: r.fill_price, closePrice: r.close_price, profit: r.profit,
         createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        // The real server-enforced deadline. Without it the UI derived a countdown from
+        // createdAt + a hardcoded 10 min, which disagrees with the configurable window.
+        expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
         closedAt: r.closed_at ? new Date(r.closed_at).toISOString() : null,
       }));
     }
@@ -9265,6 +10217,106 @@ function parseAutoTradeReportAccountKey(value) {
 // GET /api/auto-trade/report?from=&to= — full auto-trade performance report:
 // summary, per-day (calendar), per-strategy/symbol/timeframe/session/direction/hour
 // breakdowns, and every trade with pips, R-multiple and duration. Read-only.
+/**
+ * Recent sniper decisions, including the ones that did NOT trade.
+ *
+ * In memory rather than a table: a skip is diagnostic, not a record of anything that happened,
+ * and writing every "symbol not enabled" to the database would recreate the growth problem that
+ * just locked the account. 200 entries is a few hours of decisions, which is the window in which
+ * "why didn't that fire?" is actually asked.
+ */
+const sniperDecisions = [];
+const SNIPER_DECISION_LOG = 200;
+
+function recordSniperDecision(entry) {
+  sniperDecisions.unshift({ at: new Date().toISOString(), ...entry });
+  if (sniperDecisions.length > SNIPER_DECISION_LOG) sniperDecisions.length = SNIPER_DECISION_LOG;
+}
+
+/**
+ * GET /api/auto-trade/sniper — controller state, live positions, and the decision trail.
+ *
+ * Fires and skips ship together on purpose. A page that showed only what traded would make an
+ * over-tight filter look like a quiet market.
+ */
+app.get('/api/auto-trade/sniper', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const cfg = sniperConfig();
+    const atCfg = autoTradeConfig();
+
+    const [rows] = await pool.query(
+      `SELECT id, symbol, timeframe, direction, lots, risk_amount, entry_price, fill_price,
+              stop_loss, take_profit_1, status, reason, ticket, position_id, profit,
+              created_at, filled_at, closed_at
+         FROM mt5_auto_trades WHERE strategy='ict-sniper'
+        ORDER BY created_at DESC LIMIT 100`);
+
+    const trades = rows.map((r) => ({
+      id: r.id, symbol: r.symbol, timeframe: r.timeframe, direction: r.direction,
+      lots: r.lots === null ? null : Number(r.lots),
+      riskUsd: r.risk_amount === null ? null : Number(r.risk_amount),
+      entry: r.entry_price === null ? null : Number(r.entry_price),
+      fillPrice: r.fill_price === null ? null : Number(r.fill_price),
+      stopLoss: r.stop_loss === null ? null : Number(r.stop_loss),
+      takeProfit1: r.take_profit_1 === null ? null : Number(r.take_profit_1),
+      status: r.status, reason: r.reason, ticket: r.ticket, positionId: r.position_id,
+      profit: r.profit === null ? null : Number(r.profit),
+      createdAt: r.created_at, filledAt: r.filled_at, closedAt: r.closed_at,
+      // The window this mode deliberately opens: filled, live, and no stop on it yet.
+      unprotected: r.status === 'FILLED' && r.stop_loss === null,
+    }));
+
+    const open = trades.filter((t) => t.status === 'FILLED');
+    const closed = trades.filter((t) => t.status === 'CLOSED' && t.profit !== null);
+
+    res.json({
+      config: cfg,
+      // What the sniper cannot override — surfaced so "enabled but nothing fires" is explainable.
+      interlocks: {
+        autoTradeMode: autoTradeEffectiveMode(atCfg),
+        bridgeReady: autoTradeBridgeReady(),
+        armedMatch: autoTradeArmedMatch(),
+        dispatchable: ['ASK', 'AUTO'].includes(autoTradeEffectiveMode(atCfg)) && autoTradeArmedMatch(),
+      },
+      trades,
+      decisions: sniperDecisions.slice(0, 60),
+      summary: {
+        openCount: open.length,
+        unprotectedCount: open.filter((t) => t.unprotected).length,
+        todayCount: trades.filter((t) => String(t.createdAt).slice(0, 10) === new Date().toISOString().slice(0, 10)).length,
+        closedCount: closed.length,
+        netProfit: closed.length ? Math.round(closed.reduce((a, t) => a + t.profit, 0) * 100) / 100 : null,
+        wins: closed.filter((t) => t.profit > 0).length,
+      },
+      // Available symbols/timeframes for the controller, from what is actually streaming.
+      available: {
+        symbols: getCuratedSymbols(getMt5Status().symbols || []),
+        timeframes: ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'],
+      },
+      note: 'Entries are placed with NO stop and protected seconds later. The window between the two is real — if the EA or MT5 drops during it, the position stays unprotected until you act.',
+    });
+  } catch (error) {
+    console.error('[Sniper] report failed:', error.message);
+    res.status(500).json({ error: 'failed to load sniper state' });
+  }
+});
+
+/** PUT /api/auto-trade/sniper — save the controller. Normalised so a bad edit cannot widen it. */
+app.put('/api/auto-trade/sniper', (req, res) => {
+  try {
+    const next = normalizeSniperConfig(req.body || {});
+    const settings = loadEmailAlertSettings();
+    saveEmailAlertSettings({ ...settings, ictSniper: next });
+    console.log(`[Sniper] controller saved — ${next.enabled ? 'ON' : 'OFF'}, ${next.symbols.length} symbols, ${next.timeframes.length} timeframes, $${next.riskUsd}/trade`);
+    res.json({ ok: true, config: next });
+  } catch (error) {
+    console.error('[Sniper] save failed:', error.message);
+    res.status(500).json({ error: 'failed to save sniper settings' });
+  }
+});
+
 app.get('/api/auto-trade/report', async (req, res) => {
   try {
     const pool = await initializeDatabase();
@@ -9560,6 +10612,200 @@ app.delete('/api/auto-trade/combo-sets/:name', async (req, res) => {
 
 // Approve / reject a PROPOSED (ASK-mode) trade. Approval re-checks expiry, cap and
 // concurrency at click time — the market has moved since the email went out.
+// GET /api/auto-trade/pending — everything waiting on the user's approval before it can be
+// sent to MT5, plus what was recently decided.
+//
+// Deliberately NOT reusing /api/auto-trade's decision list: that is the last 50 rows of ALL
+// activity, so on a busy scan a proposal can fall off the end and silently become
+// unapprovable from the UI. This queries the PROPOSED status directly.
+//
+// `expiresAt` is the row's real expiry, not a client-side guess. The inline panel assumed a
+// flat 10 minutes while the window is configurable (AUTO_TRADE_APPROVAL_MIN), so its countdown
+// could disagree with the server that actually enforces it.
+app.get('/api/auto-trade/pending', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const map = (r) => ({
+      id: r.id, strategy: r.strategy, strategyName: STRATEGY_LAB_REGISTRY[r.strategy]?.name || r.strategy,
+      symbol: r.symbol, timeframe: r.timeframe, direction: r.direction, orderType: r.order_type,
+      entry: r.entry_price, stopLoss: r.stop_loss,
+      takeProfit1: r.take_profit_1, takeProfit2: r.take_profit_2, takeProfit3: r.take_profit_3,
+      lots: r.lots, riskAmount: r.risk_amount, riskMode: r.risk_mode,
+      score: r.score, grade: r.grade, rr: r.rr, session: r.session,
+      mode: r.mode, status: r.status, reason: r.reason,
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+      expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
+      updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+      ticket: r.ticket, fillPrice: r.fill_price, profit: r.profit,
+    });
+
+    const [proposed] = await pool.query(
+      "SELECT * FROM mt5_auto_trades WHERE status='PROPOSED' ORDER BY created_at ASC LIMIT 100");
+    const now = Date.now();
+    // A proposal past its window cannot be approved — the server rejects it with 410 — so it is
+    // separated here rather than shown as actionable.
+    const live = [];
+    const stale = [];
+    for (const r of proposed) {
+      const row = map(r);
+      const exp = row.expiresAt ? Date.parse(row.expiresAt) : null;
+      (exp !== null && now > exp ? stale : live).push(row);
+    }
+
+    const [recent] = await pool.query(
+      `SELECT * FROM mt5_auto_trades
+        WHERE status IN ('QUEUED','SENT','FILLED','REJECTED','EXPIRED','ERROR','CLOSED')
+          AND mode='ASK' AND updated_at IS NOT NULL
+        ORDER BY updated_at DESC LIMIT 30`);
+
+    // Does anything waiting for approval correspond to a setup the system already forecast?
+    // Knowing "this is the PDL sweep it predicted 40 minutes ago" is materially different from
+    // approving a trade that appeared out of nowhere. Best-effort: the label is a bonus, and a
+    // failure here must never block the approval queue from loading.
+    if (live.length) {
+      try {
+        const [fRows] = await pool.query(
+          "SELECT id, symbol, timeframe, scenario, level, atr, level_type, level_label, expected_direction, best_score, best_strategy, fires_json, plan_json FROM mt5_setup_forecasts WHERE status='WAITING'");
+        const forecasts = fRows.map((f) => {
+          const parse = (x, fb) => { try { return JSON.parse(x) || fb; } catch { return fb; } };
+          return {
+            id: f.id, symbol: f.symbol, timeframe: f.timeframe, scenario: f.scenario,
+            level: f.level, atr: f.atr, levelType: f.level_type, levelLabel: f.level_label,
+            expectedDirection: f.expected_direction, bestScore: f.best_score, bestStrategy: f.best_strategy,
+            fires: parse(f.fires_json, []), plan: parse(f.plan_json, null),
+          };
+        });
+        for (const t of live) {
+          t.forecastMatch = matchTradeToForecast(t, forecasts, { pip: forexSizingPipSize(t.symbol) });
+        }
+      } catch (e) { console.warn('[Approvals] forecast match failed:', e.message); }
+    }
+
+    const cfg = autoTradeConfig();
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      // Approving only queues the order; the EA must be live for it to reach MT5 at all.
+      mode: autoTradeEffectiveMode(cfg),
+      bridgeReady: autoTradeBridgeReady(),
+      armedMatch: autoTradeArmedMatch(),
+      approvalWindowMinutes: Math.round(AUTO_TRADE_APPROVAL_MS / 60000),
+      pending: live,
+      expired: stale,
+      recent: recent.map(map),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/auto-trade/:id/reprice — rebuild a stale proposal against the live market.
+//
+// A proposal is priced when the signal fires and then waits for you. Meanwhile price moves, and
+// approving it sends stops that were drawn around a price that no longer exists — measured on
+// this account as RR 5.44 collapsing to 0.24, and as the 10016 rejections.
+//
+// This re-anchors the ticket to the current price, PRESERVING the original risk and reward
+// DISTANCES so the trade keeps its shape and its R-multiple. The lot size is then recomputed so
+// the money at risk stays on budget.
+//
+// The honest cost, reported in the response: the stop no longer sits on the structural level the
+// strategy chose — it sits the same DISTANCE from a different price. If the level was the reason
+// for the trade, re-pricing does not restore that; it only restores the arithmetic.
+app.post('/api/auto-trade/:id/reprice', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'no database' });
+    const [rows] = await pool.query("SELECT * FROM mt5_auto_trades WHERE id=? AND status='PROPOSED' LIMIT 1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'not found or no longer awaiting approval' });
+    const r = rows[0];
+
+    const symbol = r.symbol;
+    const buy = String(r.direction).toUpperCase() === 'BUY';
+    const pip = forexSizingPipSize(symbol);
+    const pipValue = forexSizingPipValuePerLot(symbol);
+    if (!(pip > 0) || !(pipValue > 0)) return res.status(422).json({ error: `no pip value known for ${symbol}` });
+
+    // Live price: the EA's spec feed carries the spread, and the candle feed the last close.
+    const [c] = await pool.query(
+      'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+      [String(symbol).toUpperCase(), r.timeframe]);
+    const market = c.length ? Number(c[0].close_price) : null;
+    if (!(market > 0)) return res.status(422).json({ error: `no live price available for ${symbol} ${r.timeframe}` });
+
+    const oldEntry = Number(r.entry_price);
+    const oldSl = Number(r.stop_loss);
+    const oldTp1 = Number(r.take_profit_1);
+    const riskDist = Math.abs(oldEntry - oldSl);
+    if (!(riskDist > 0)) return res.status(422).json({ error: 'original ticket has no stop distance' });
+
+    // Same distances, new anchor.
+    const tpDist = (t) => (Number.isFinite(Number(t)) ? Math.abs(Number(t) - oldEntry) : null);
+    const shift = (d) => (d === null ? null : (buy ? market + d : market - d));
+    const newSl = buy ? market - riskDist : market + riskDist;
+    const newTp1 = shift(tpDist(r.take_profit_1));
+    const newTp2 = shift(tpDist(r.take_profit_2));
+    const newTp3 = shift(tpDist(r.take_profit_3));
+
+    const budget = Number(r.risk_amount) > 0 ? Number(r.risk_amount) : (computeChallengeDashboard()?.safePerTradeRisk || null);
+    const spec = brokerSpecFor(symbol);
+    const sized = resizeLotsToStop({
+      riskAmount: budget, livePrice: market, stopLoss: newSl,
+      pip, pipValuePerLot: pipValue,
+      volMin: spec?.volMin, volStep: spec?.volStep, volMax: spec?.volMax,
+    });
+    const newLots = sized?.lots ?? Number(r.lots);
+
+    const usd = (dist, lots) => (dist === null ? null : Math.round((dist / pip) * pipValue * lots * 100) / 100);
+    const pips = (dist) => (dist === null ? null : Math.round((dist / pip) * 10) / 10);
+    const finalTp = newTp3 ?? newTp2 ?? newTp1;
+    const newRr = finalTp === null ? null : Math.round((Math.abs(finalTp - market) / riskDist) * 100) / 100;
+
+    const drift = buy ? market - oldEntry : oldEntry - market;
+    const guard = challengeSignalGuard(usd(riskDist, newLots), r.grade, newRr);
+
+    const round = (v) => (v === null || v === undefined ? null : Number(Number(v).toFixed(spec?.digits ?? 5)));
+    await pool.execute(
+      `UPDATE mt5_auto_trades SET entry_price=?, stop_loss=?, take_profit_1=?, take_profit_2=?, take_profit_3=?,
+         lots=?, rr=?, reason=?, updated_at=? WHERE id=? AND status='PROPOSED'`,
+      [round(market), round(newSl), round(newTp1), round(newTp2), round(newTp3),
+        newLots, newRr,
+        `re-priced to market (was ${oldEntry}, drifted ${pips(Math.abs(drift))}p)`.slice(0, 255),
+        toMysqlDate(), r.id],
+    );
+
+    res.json({
+      ok: true,
+      symbol, direction: r.direction, timeframe: r.timeframe,
+      market: round(market),
+      driftPips: pips(drift),
+      // The stop keeps its DISTANCE, not its level — say so rather than implying the setup is intact.
+      structuralWarning: Math.abs(drift) > riskDist * 0.25
+        ? `Price drifted ${pips(Math.abs(drift))} pips (${Math.round((Math.abs(drift) / riskDist) * 100)}% of the stop). The stop keeps its distance but no longer sits on the level the strategy chose.`
+        : null,
+      before: {
+        entry: oldEntry, stopLoss: oldSl, takeProfit1: oldTp1,
+        lots: Number(r.lots), rr: Number(r.rr),
+        stopPips: pips(riskDist), riskUsd: usd(riskDist, Number(r.lots)),
+        rewardUsd: usd(tpDist(r.take_profit_1), Number(r.lots)),
+      },
+      after: {
+        entry: round(market), stopLoss: round(newSl),
+        takeProfit1: round(newTp1), takeProfit2: round(newTp2), takeProfit3: round(newTp3),
+        lots: newLots, rr: newRr,
+        stopPips: pips(riskDist),
+        riskUsd: usd(riskDist, newLots),
+        rewardUsd: usd(tpDist(r.take_profit_1), newLots),
+        rewardFinalUsd: finalTp === null ? null : usd(Math.abs(finalTp - market), newLots),
+        budget,
+        overBudget: Boolean(sized?.overBudget),
+        minForced: Boolean(sized?.minForced),
+      },
+      challenge: { eligible: guard.eligible, warnings: guard.warnings },
+      note: 'Entry moved to market; risk and reward distances preserved; lots resized to hold the budget.',
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.post('/api/auto-trade/:id/approve', async (req, res) => {
   try {
     const pool = await initializeDatabase();
@@ -9572,7 +10818,10 @@ app.post('/api/auto-trade/:id/approve', async (req, res) => {
       return res.status(410).json({ error: 'approval window elapsed — the setup is stale' });
     }
     const cfg = autoTradeConfig();
-    const conc = autoTradeConcurrencyBlock(cfg, row.symbol);
+    // Count everything already committed — QUEUED included. Approving three proposals in
+    // quick succession used to queue all three, because none of them was a broker position
+    // yet and each approval only looked at the EA's last report.
+    const conc = autoTradeConcurrencyBlock(cfg, row.symbol, await autoTradeInFlight(pool, { excludeId: row.id }));
     if (conc) {
       await pool.execute("UPDATE mt5_auto_trades SET status='GUARD_SKIP', reason=?, updated_at=? WHERE id=?", [conc.slice(0, 255), toMysqlDate(), row.id]);
       return res.status(409).json({ error: conc });
@@ -9644,15 +10893,29 @@ app.post('/api/mt5/trade-bridge', async (req, res) => {
         const pos = tradeBridge.positions.find((p) => Number(p.id) === t || Number(p.ticket) === t);
         const stillPending = tradeBridge.orders.some((o) => Number(o.ticket) === t);
         if (pos) {
-          await pool.execute("UPDATE mt5_auto_trades SET status='FILLED', position_id=?, fill_price=COALESCE(fill_price, ?), updated_at=? WHERE id=?",
+          // Guarded on status: two overlapping polls both SELECT this PLACED row, and an
+          // unguarded UPDATE let BOTH of them email. affectedRows is the claim — only the poll
+          // that actually flipped the status sends the notification.
+          const [claim] = await pool.execute("UPDATE mt5_auto_trades SET status='FILLED', position_id=?, fill_price=COALESCE(fill_price, ?), updated_at=? WHERE id=? AND status='PLACED'",
             [Number(pos.id) || t, Number(pos.openPrice) || null, toMysqlDate(), row.id]);
-          void autoTradeLifecycleEmail(row, 'FILLED', { price: Number(pos.openPrice) || row.entry_price });
+          if (claim.affectedRows) void autoTradeLifecycleEmail(row, 'FILLED', { price: Number(pos.openPrice) || row.entry_price });
         } else if (!stillPending) {
           await pool.execute("UPDATE mt5_auto_trades SET status='EXPIRED', reason='pending order expired/cancelled at broker', updated_at=? WHERE id=?", [toMysqlDate(), row.id]);
         }
       }
       // Expire overdue PROPOSED/QUEUED.
       await pool.execute("UPDATE mt5_auto_trades SET status='EXPIRED', reason=CONCAT('window elapsed (was ', status, ')'), updated_at=? WHERE status IN ('PROPOSED','QUEUED') AND expires_at IS NOT NULL AND expires_at < UTC_TIMESTAMP()", [toMysqlDate()]);
+      // Un-strand MODIFYING rows the EA can never act on. The MOD feed requires a ticket, so a
+      // row that reached MODIFYING without one is invisible to it forever. Returned to PLACED
+      // with the reason recorded rather than left in a state nothing will ever clear.
+      await pool.execute(
+        "UPDATE mt5_auto_trades SET status='PLACED', reason='modify abandoned — no broker ticket to modify', updated_at=? WHERE status='MODIFYING' AND ticket IS NULL",
+        [toMysqlDate()]);
+      // A MODIFYING row the EA never answered goes back to PLACED too: the broker still holds the
+      // ORIGINAL order, so leaving it in MODIFYING would misreport a change that never happened.
+      await pool.execute(
+        "UPDATE mt5_auto_trades SET status='PLACED', reason='modify not acknowledged — original order still resting', updated_at=? WHERE status='MODIFYING' AND updated_at < UTC_TIMESTAMP() - INTERVAL 5 MINUTE",
+        [toMysqlDate()]);
       // Dead-letter SENT commands the EA never answered (crash between pickup & result).
       await pool.execute("UPDATE mt5_auto_trades SET status='ERROR', reason='EA picked the command up but never reported a result', updated_at=? WHERE status='SENT' AND sent_at IS NOT NULL AND sent_at < UTC_TIMESTAMP() - INTERVAL 3 MINUTE", [toMysqlDate()]);
 
@@ -9660,9 +10923,35 @@ app.post('/api/mt5/trade-bridge', async (req, res) => {
       const cfg = autoTradeConfig();
       const live = autoTradeEffectiveMode(cfg);
       if ((live === 'ASK' || live === 'AUTO') && autoTradeArmedMatch()) {
+        // Cancellations first: pulling a resting order should never wait behind new ones.
+        const [toCancel] = await pool.query(
+          "SELECT id, ticket, symbol FROM mt5_auto_trades WHERE status='CANCELLING' AND ticket IS NOT NULL LIMIT 5");
+        for (const row of toCancel) lines.push(['DEL', row.id, row.ticket, row.symbol].join('|'));
+
+        // In-place modifications of resting orders. Sent alongside cancellations and before new
+        // orders: an edit to something already at the broker should not queue behind fresh
+        // placements. Volume is deliberately absent — MT5 cannot change a pending order's lot
+        // size, so those arrive as a CANCELLING row plus a QUEUED replacement instead.
+        // Sniper stops: positions that entered bare and have now been open long enough. Sent
+        // alongside cancels and modifies, ahead of new orders — protecting an open position
+        // outranks opening another.
+        for (const line of await sniperAttachStops(pool)) lines.push(line);
+
+        const [toModify] = await pool.query(
+          "SELECT id, ticket, symbol, entry_price, stop_loss, take_profit_1 FROM mt5_auto_trades WHERE status='MODIFYING' AND ticket IS NOT NULL LIMIT 5");
+        for (const row of toModify) {
+          lines.push(['MOD', row.id, row.ticket, row.symbol,
+            row.entry_price ?? 0, row.stop_loss ?? 0, row.take_profit_1 ?? 0].join('|'));
+        }
+
         const [queued] = await pool.query("SELECT * FROM mt5_auto_trades WHERE status='QUEUED' AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) ORDER BY created_at ASC LIMIT 3");
+        // Commands already SENT/PLACED that the broker has not reported back yet. Without this
+        // the loop below re-checks every queued row against the same pre-dispatch snapshot.
+        const inFlight = await autoTradeInFlight(pool, { includeQueued: false });
         for (const row of queued) {
-          const conc = autoTradeConcurrencyBlock(cfg, row.symbol);
+          // `inFlight` grows as this loop dispatches, so the second and third rows are judged
+          // against the orders the first one just put in the air — not against a stale count.
+          const conc = autoTradeConcurrencyBlock(cfg, row.symbol, inFlight);
           if (conc) { await pool.execute("UPDATE mt5_auto_trades SET status='GUARD_SKIP', reason=?, updated_at=? WHERE id=?", [conc.slice(0, 255), toMysqlDate(), row.id]); continue; }
           // CLAIM THE COMMAND BEFORE SENDING IT. Two overlapping polls (a second EA
           // instance, or one EA whose poll overlaps the previous) both SELECT the same
@@ -9676,7 +10965,17 @@ app.post('/api/mt5/trade-bridge', async (req, res) => {
           const [claim] = await pool.execute("UPDATE mt5_auto_trades SET status='SENT', sent_at=?, account=?, updated_at=? WHERE id=? AND status='QUEUED'", [toMysqlDate(), tradeBridge.account, toMysqlDate(), row.id]);
           if (!claim?.affectedRows) continue;   // another poll already owns this command
           const expMs = row.expires_at ? new Date(row.expires_at).getTime() : Date.now() + 5 * 60 * 1000;
-          lines.push(['CMD', row.id, row.symbol, row.direction, row.order_type, row.lots, row.stop_loss ?? 0, row.take_profit_1 ?? 0, row.entry_price ?? 0, expMs].join('|'));
+          // Fields 10 and 11 are additive: an EA built before this change reads f[0..9] and
+          // ignores them, and a new EA against an older server sees 0 and leaves both gates off.
+          lines.push([
+            'CMD', row.id, row.symbol, row.direction, row.order_type, row.lots,
+            row.stop_loss ?? 0, row.take_profit_1 ?? 0, row.entry_price ?? 0, expMs,
+            Number(cfg.maxSlippagePctOfStop ?? 25),
+            cfg.resizeLotsOnSlippage === false ? 0 : (Number(row.risk_amount) || 0),
+          ].join('|'));
+          // Count it immediately. This order is now real as far as the cap is concerned, even
+          // though the EA has not filled it and the next bridge report is a poll away.
+          inFlight.push({ symbol: row.symbol, id: row.id, status: 'SENT' });
         }
       }
     }
@@ -9827,9 +11126,24 @@ function buildAutoTradeEmail(o) {
 }
 
 // Lifecycle emails for real executions. Fire-and-forget; failures only log.
+// One lifecycle email per trade per phase. Pruned hourly so a long-running process cannot grow
+// it without bound; 12 hours is far longer than any trade takes to move through its phases.
+const autoTradeEmailSent = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 12 * 3600 * 1000;
+  for (const [k, at] of autoTradeEmailSent) if (at < cutoff) autoTradeEmailSent.delete(k);
+}, 3600 * 1000);
+
 async function autoTradeLifecycleEmail(row, phase, extra = {}) {
   try {
     if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
+    // Backstop against duplicates. Every call site now claims its row with a guarded UPDATE, so
+    // this should never fire — but an email is the one output the user cannot un-see, and a
+    // second layer costs a Map lookup. Keyed on the trade AND the phase so a genuine
+    // PLACED -> FILLED -> CLOSED sequence still sends three separate mails.
+    const dedupeKey = `${row.id}|${phase}`;
+    if (autoTradeEmailSent.has(dedupeKey)) return;
+    autoTradeEmailSent.set(dedupeKey, Date.now());
     const to = signalEmailToFor(row.symbol, row.timeframe);
     if (!to) return;
     const strategyName = strategyDisplayName(row.strategy);
@@ -9899,21 +11213,81 @@ app.post('/api/mt5/trade-result', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'unknown command id' });
     const row = rows[0];
     const ok = b.ok === true || b.ok === 'true' || b.ok === 1;
+    // A cancel confirmation is not a fill — it ends the order's life rather than starting one.
+    if (String(b.action || '').toUpperCase() === 'CANCEL') {
+      await pool.execute(
+        ok ? "UPDATE mt5_auto_trades SET status='CANCELLED', reason='cancelled at the broker', updated_at=? WHERE id=?"
+           : "UPDATE mt5_auto_trades SET status='PLACED', reason=?, updated_at=? WHERE id=?",
+        ok ? [toMysqlDate(), row.id]
+           : [`cancel failed: ${String(b.message || '').slice(0, 180)}`, toMysqlDate(), row.id]);
+      return res.json({ ok: true, cancelled: ok });
+    }
+    // A sniper stop attaching to an already-open position. The row stays FILLED either way —
+    // this reports whether the position is now protected, it does not change its lifecycle.
+    if (String(b.action || '').toUpperCase() === 'SLTP') {
+      await pool.execute(
+        'UPDATE mt5_auto_trades SET reason=CONCAT(COALESCE(reason,""), ?), updated_at=? WHERE id=?',
+        [ok ? ' | stop attached' : ` | STOP FAILED: ${String(b.message || '').slice(0, 90)}`,
+          toMysqlDate(), row.id]);
+      if (!ok) {
+        // A naked position that could not be protected is the one failure in this mode that
+        // must be loud — it is running with no floor under it.
+        console.error(`[Sniper] STOP FAILED on ${row.symbol} ${row.direction} ${row.lots} lots — position is UNPROTECTED: ${b.message}`);
+        void autoTradeLifecycleEmail(row, 'ERROR', { message: `sniper stop could not be attached: ${b.message}` });
+      }
+      return res.json({ ok: true, stopAttached: ok });
+    }
+    // A modify confirmation, like a cancel, changes an EXISTING order rather than creating one.
+    // Either way the row returns to PLACED: on success carrying its new levels (already written
+    // when the modify was requested), on failure carrying the old ones still live at the broker.
+    // Leaving it in MODIFYING would strand the order in a state the EA re-sends forever.
+    if (String(b.action || '').toUpperCase() === 'MODIFY') {
+      if (ok) {
+        await pool.execute(
+          "UPDATE mt5_auto_trades SET status='PLACED', reason='modified at the broker', updated_at=? WHERE id=?",
+          [toMysqlDate(), row.id]);
+        return res.json({ ok: true, modified: true });
+      }
+      // The broker refused, so it still holds the ORIGINAL order. The row was written
+      // optimistically when the modify was requested, so it must be rolled back to what the
+      // broker actually has — a row showing levels that were never accepted is worse than no
+      // feature at all. The previous values were stashed in the reason column for exactly this.
+      const stash = /\|prev:([^|]*)$/.exec(String(row.reason || ''));
+      const prev = stash ? stash[1].split(',').map((v) => (v === '' ? null : Number(v))) : null;
+      if (prev && prev.length === 6) {
+        await pool.execute(
+          `UPDATE mt5_auto_trades
+              SET entry_price=?, stop_loss=?, take_profit_1=?, take_profit_2=?, take_profit_3=?,
+                  rr=?, status='PLACED', reason=?, updated_at=? WHERE id=?`,
+          [...prev, `modify REFUSED, original order still resting: MT5 ${b.retcode ?? '?'} ${String(b.message || '').slice(0, 120)}`.slice(0, 255),
+            toMysqlDate(), row.id]);
+      } else {
+        await pool.execute(
+          "UPDATE mt5_auto_trades SET status='PLACED', reason=?, updated_at=? WHERE id=?",
+          [`modify REFUSED (levels may be out of sync — re-read from MT5): ${b.retcode ?? '?'}`.slice(0, 255), toMysqlDate(), row.id]);
+      }
+      return res.json({ ok: true, modified: false });
+    }
     if (!ok) {
-      await pool.execute("UPDATE mt5_auto_trades SET status='ERROR', reason=?, updated_at=? WHERE id=?",
+      const [errClaim] = await pool.execute("UPDATE mt5_auto_trades SET status='ERROR', reason=?, updated_at=? WHERE id=? AND status<>'ERROR'",
         [`MT5 error ${b.retcode ?? '?'}: ${String(b.message || '').slice(0, 200)}`, toMysqlDate(), row.id]);
-      void autoTradeLifecycleEmail(row, 'ERROR', { retcode: b.retcode, message: b.message });
+      if (errClaim.affectedRows) void autoTradeLifecycleEmail(row, 'ERROR', { retcode: b.retcode, message: b.message });
       return res.json({ ok: true });
     }
     const ticket = Number(b.ticket) || null;
     const price = Number(b.price) || null;
     if (String(row.order_type).toUpperCase() === 'MARKET') {
-      await pool.execute("UPDATE mt5_auto_trades SET status='FILLED', ticket=?, position_id=?, fill_price=?, updated_at=? WHERE id=?",
-        [ticket, ticket, price, toMysqlDate(), row.id]);
-      void autoTradeLifecycleEmail({ ...row, ticket }, 'FILLED', { ticket, price });
+      // filled_at, not updated_at: updated_at is rewritten by every later status change, so it
+      // cannot answer "when did this actually fill?" after the trade closes.
+      // Guarded so a retried result POST cannot email twice. The EA now retries this call four
+      // times when the server is slow, which makes duplicate delivery of the SAME result normal
+      // rather than exceptional.
+      const [fillClaim] = await pool.execute("UPDATE mt5_auto_trades SET status='FILLED', ticket=?, position_id=?, fill_price=?, filled_at=COALESCE(filled_at, ?), updated_at=? WHERE id=? AND status<>'FILLED'",
+        [ticket, ticket, price, toMysqlDate(), toMysqlDate(), row.id]);
+      if (fillClaim.affectedRows) void autoTradeLifecycleEmail({ ...row, ticket }, 'FILLED', { ticket, price });
     } else {
-      await pool.execute("UPDATE mt5_auto_trades SET status='PLACED', ticket=?, updated_at=? WHERE id=?", [ticket, toMysqlDate(), row.id]);
-      void autoTradeLifecycleEmail({ ...row, ticket }, 'PLACED', { ticket });
+      const [placeClaim] = await pool.execute("UPDATE mt5_auto_trades SET status='PLACED', ticket=?, updated_at=? WHERE id=? AND status<>'PLACED'", [ticket, toMysqlDate(), row.id]);
+      if (placeClaim.affectedRows) void autoTradeLifecycleEmail({ ...row, ticket }, 'PLACED', { ticket });
     }
     res.json({ ok: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -9946,14 +11320,17 @@ app.post('/api/mt5/trade-closed', async (req, res) => {
     const closePrice = Number(b.closePrice) || null;
     // Keep the trail when we are rescuing a row the bookkeeping had already written off.
     const rescued = ['ERROR', 'EXPIRED'].includes(String(row.status).toUpperCase());
-    await pool.execute("UPDATE mt5_auto_trades SET status='CLOSED', profit=?, close_price=?, closed_at=?, updated_at=?, reason=? WHERE id=?",
+    // Guarded on status for the same reason as the fill path: the EA re-reports closed positions
+    // until acknowledged, and the check above is a check-then-act that two concurrent reports
+    // both pass. Only the UPDATE that actually changes the row may email.
+    const [closeClaim] = await pool.execute("UPDATE mt5_auto_trades SET status='CLOSED', profit=?, close_price=?, closed_at=?, updated_at=?, reason=? WHERE id=? AND status<>'CLOSED'",
       [Number.isFinite(profit) ? profit : null, closePrice, toMysqlDate(), toMysqlDate(),
        (rescued ? `recovered from ${row.status}: position did close at the broker · ${row.reason || ''}` : (row.reason || '')).slice(0, 255), row.id]);
     if (rescued) console.warn(`[AutoTrade] recovered ${row.symbol} ${row.timeframe} from ${row.status} — position ${posId} closed for ${profit}`);
     if (Number.isFinite(profit) && String(row.risk_mode).toUpperCase() === 'CHALLENGE') {
       applyChallengeTradeResult(profit, `auto-trade ${row.direction} ${row.symbol} ${row.timeframe}`);
     }
-    void autoTradeLifecycleEmail(row, 'CLOSED', { profit, closePrice });
+    if (closeClaim.affectedRows) void autoTradeLifecycleEmail(row, 'CLOSED', { profit, closePrice });
     res.json({ ok: true, matched: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -13362,7 +14739,13 @@ function strategyLabSizing(symbol, entry, stop, targets = {}) {
 // and the selected mode(s). NORMAL = normalRiskPct of balance. CHALLENGE = riskPerTradePct
 // of the challenge initial balance (Hola-style conservative default 0.5%). BOTH = both legs.
 // Pure sizing math — never gates a signal. Educational, not financial advice.
-function computeModeSizing(symbol, entry, stop, targets = {}) {
+/**
+ * The `setup` argument (grade/score/rr) is optional. When supplied, per-trade risk is scaled by the
+ * conviction ladder — the configured percentage becomes a CEILING for the best setups rather
+ * than the amount every trade books. Omitting it preserves the original full-budget behaviour,
+ * so callers that have no quality signal are unaffected.
+ */
+function computeModeSizing(symbol, entry, stop, targets = {}, setup = null) {
   const e = Number(entry), s = Number(stop);
   if (!Number.isFinite(e) || !Number.isFinite(s) || e === s) return null;
   const pipSize = forexSizingPipSize(symbol);
@@ -13373,12 +14756,22 @@ function computeModeSizing(symbol, entry, stop, targets = {}) {
   const cfg = activeAccountRisk();
   const mode = ['NORMAL', 'CHALLENGE', 'BOTH'].includes(String(cfg.mode).toUpperCase()) ? String(cfg.mode).toUpperCase() : 'NORMAL';
   const balance = finitePositive(cfg.balance) ?? 5000;
+  // Conviction scales the risk DOWN for weaker setups. Computed once so both legs and the
+  // reported tier agree.
+  const conv = setup ? setupRisk(setup) : null;
   const leg = (riskPct, refBalance) => {
-    const riskAmount = Math.round(refBalance * (riskPct / 100) * 100) / 100;
+    const full = Math.round(refBalance * (riskPct / 100) * 100) / 100;
+    const riskAmount = (conv && Number.isFinite(conv.fraction))
+      ? Math.round(full * conv.fraction * 100) / 100
+      : full;
     const lots = Math.max(0.01, Math.round((riskAmount / (stopPips * pipValue)) * 100) / 100);
     const profitAt = (tp) => { const t = Number(tp); return Number.isFinite(t) ? Math.round((Math.abs(t - e) / pipSize) * pipValue * lots * 100) / 100 : null; };
     return {
       riskPct, refBalance, riskAmount, lots, stopPips, pipValuePerLot: pipValue,
+      // Carried through so an approval card can say WHY the size is what it is.
+      fullRiskAmount: full,
+      convictionTier: conv?.tier ?? null, convictionLabel: conv?.label ?? null,
+      convictionFraction: conv?.fraction ?? null, convictionWhy: conv?.why ?? null,
       lossAtStop: Math.round(stopPips * pipValue * lots * 100) / 100,
       profitAtTp1: profitAt(targets.tp1), profitAtTp2: profitAt(targets.tp2), profitAtTp3: profitAt(targets.tp3),
     };
@@ -13484,6 +14877,35 @@ function challengeRules() {
   const cfg = activeAccountRisk();
   return { ...DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk.challenge, ...(cfg.challenge || {}) };
 }
+
+/**
+ * The equity and risk % the SIGNAL CARDS size against.
+ *
+ * Returns `{ equity, riskPct, source, label }` — `label` is shown next to the lot size so
+ * the number is never ambiguous again. On ACCOUNT the basis follows the configured mode, so
+ * the lots on a card match what the auto-trader would place; a divergence here is exactly
+ * what made one GBPJPY ticket read 0.16 on screen and fill 0.57 at the broker.
+ */
+function signalSizingBasis() {
+  const cfg = activeAccountRisk();
+  const dflt = DEFAULT_EMAIL_ALERT_SETTINGS.accountRisk.signalSizing;
+  const ss = { ...dflt, ...(cfg.signalSizing || {}) };
+  if (String(ss.source).toUpperCase() === 'CUSTOM') {
+    const equity = finitePositive(ss.equity) ?? dflt.equity;
+    const riskPct = finitePositive(ss.riskPct) ?? dflt.riskPct;
+    return { equity, riskPct, source: 'CUSTOM', label: `custom $${equity} @ ${riskPct}%` };
+  }
+  const mode = String(cfg.mode || 'NORMAL').toUpperCase();
+  if (mode === 'CHALLENGE' || mode === 'BOTH') {
+    const ch = challengeRules();
+    const equity = finitePositive(ch.initialBalance) ?? finitePositive(cfg.balance) ?? dflt.equity;
+    const riskPct = finitePositive(ch.riskPerTradePct) ?? dflt.riskPct;
+    return { equity, riskPct, source: 'ACCOUNT', label: `challenge $${equity} @ ${riskPct}%` };
+  }
+  const equity = finitePositive(cfg.balance) ?? dflt.equity;
+  const riskPct = finitePositive(cfg.normalRiskPct) ?? dflt.riskPct;
+  return { equity, riskPct, source: 'ACCOUNT', label: `account $${equity} @ ${riskPct}%` };
+}
 function freshChallengeState(initialBalance) {
   const bal = finitePositive(initialBalance) ?? finitePositive(challengeRules().initialBalance) ?? 5000;
   return {
@@ -13546,6 +14968,56 @@ function rolloverChallengeState(state, accountKey = activeAccountKey()) {
   }
   return state;
 }
+/**
+ * The per-trade risk budget the USER configured, in money.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM safePerTradeRisk
+ * `safePerTradeRisk` is the largest loss that still fits inside today's remaining daily-loss and
+ * drawdown room, minus a 0.5% cushion. That is a useful number, but it is NOT a sizing budget:
+ * as room runs down it collapses toward zero, and sizing from it silently produced 0.01-lot
+ * tickets on a $10,000 account with a configured 0.8% risk. The user asked why their setting was
+ * being ignored, and this was the answer — two different budgets lived in two different paths.
+ *
+ * Sizing therefore uses the configured percentage of the INITIAL balance, which is what the
+ * user set and what stays stable trade to trade. Remaining room is not discarded: it comes back
+ * as `roomWarning`, so a budget larger than the room left is surfaced loudly rather than being
+ * quietly shrunk behind the user's back.
+ */
+function configuredPerTradeRisk(dash = computeChallengeDashboard()) {
+  const r = dash?.rules || {};
+  const initial = finitePositive(r.initialBalance) ?? finitePositive(dash?.initialBalance) ?? null;
+  const pct = finitePositive(r.riskPerTradePct) ?? null;
+  if (initial === null || pct === null) return { budget: null, pct: null, initial, roomWarning: null };
+  const budget = Math.round(initial * (pct / 100) * 100) / 100;
+
+  // The cap the user set as their ceiling still binds — it is their own upper bound.
+  const maxPct = finitePositive(r.maxRiskPerTradePct);
+  const capped = maxPct !== null ? Math.min(budget, Math.round(initial * (maxPct / 100) * 100) / 100) : budget;
+
+  const safe = finitePositive(dash?.safePerTradeRisk);
+  const roomWarning = safe !== null && capped > safe
+    ? `this risks $${capped} while only $${safe} keeps you inside today's daily-loss and drawdown room`
+    : null;
+  return { budget: capped, pct, initial, roomWarning, safePerTradeRisk: safe };
+}
+
+/**
+ * The risk for THIS setup: the configured budget scaled by how good the setup is.
+ *
+ * Every sizing path funnels through here so predictions, auto-trade and ask-mode cannot drift
+ * apart — three copies of a risk rule is three different answers to the same question. The
+ * configured per-trade budget remains an absolute ceiling; conviction only ever reduces it.
+ */
+function setupRisk(setup, dash = computeChallengeDashboard()) {
+  const cfg = loadEmailAlertSettings().convictionSizing || {};
+  const budget = configuredPerTradeRisk(dash).budget;
+  return convictionRisk(setup || {}, budget, {
+    enabled: cfg.enabled !== false,
+    tiers: cfg.tiers ? normalizeConvictionTiers(cfg.tiers) : CONVICTION_TIERS,
+    floorUsd: Number(cfg.floorUsd) > 0 ? Number(cfg.floorUsd) : null,
+  });
+}
+
 function computeChallengeDashboard(accountKey = activeAccountKey()) {
   const state = rolloverChallengeState(loadChallengeState(accountKey), accountKey);
   const r = challengeRules();
@@ -13637,6 +15109,9 @@ function challengeSignalGuard(lossAtStop, grade, rr) {
 // account to MATCH the user-armed account (the broker switcher's safety interlock):
 // log into a different account in MT5 and dispatch pauses automatically.
 const AUTO_TRADE_BRIDGE_STALE_MS = 90 * 1000;
+// Only these get the SL-only execution profile. Naming them explicitly (rather than a
+// prefix match) keeps a future 'ict-something' strategy from inheriting it by accident.
+const ICT_EXEC_STRATEGIES = new Set(['ict-breaker', 'ict-break-pro']);
 const AUTO_TRADE_APPROVAL_MS = Math.max(60, Number(process.env.AUTO_TRADE_APPROVAL_MIN || 10) * 60) * 1000;
 const tradeBridge = { lastSeenAt: 0, account: null, broker: null, server: null, demo: null, balance: null, equity: null, leverage: null, marginFree: null, positions: [], orders: [] };
 // Authoritative per-symbol contract specs reported by the EA (tick value, tick size,
@@ -13718,17 +15193,36 @@ function autoTradeEffectiveMode(cfg = autoTradeConfig()) {
   if ((cfg.mode === 'ASK' || cfg.mode === 'AUTO') && (!autoTradeBridgeReady() || !autoTradeArmedMatch())) return 'SHADOW';
   return cfg.mode;
 }
-// Live concurrency guard from the EA's own position/order report (magic-filtered EA-side).
-function autoTradeConcurrencyBlock(cfg, symbol) {
+// Live concurrency guard from the EA's own position/order report (magic-filtered EA-side)
+// PLUS any command already committed but not yet visible there.
+//
+// `inFlight` is not optional in spirit: the EA's report lags every command by at least one
+// poll, so a guard that trusts it alone will happily send a second, third and fourth order
+// into the gap. Callers that dispatch or approve MUST pass what they already have in the air —
+// see autoTradeInFlight().
+function autoTradeConcurrencyBlock(cfg, symbol, inFlight = []) {
   if (!autoTradeBridgeReady()) return null;      // shadow paths don't need it
-  const openCount = (tradeBridge.positions?.length || 0) + (tradeBridge.orders?.length || 0);
-  if (openCount >= cfg.maxConcurrent) return `max concurrent (${cfg.maxConcurrent}) reached — ${openCount} open`;
-  if (cfg.onePerSymbol) {
-    const sym = String(symbol).toUpperCase();
-    const has = [...(tradeBridge.positions || []), ...(tradeBridge.orders || [])].some((p) => String(p.symbol || '').toUpperCase() === sym);
-    if (has) return `already a position/order on ${sym} (one-per-symbol)`;
-  }
-  return null;
+  return concurrencyVerdict({
+    cfg,
+    symbol,
+    open: [...(tradeBridge.positions || []), ...(tradeBridge.orders || [])],
+    inFlight,
+  });
+}
+
+// Commands the broker cannot see yet. `includeQueued` is the difference between the two
+// callers: the dispatch loop is deciding on the QUEUED rows themselves (so it excludes them
+// and accumulates as it sends), while approving must count them, because an approved QUEUED
+// row is already committed to trade.
+async function autoTradeInFlight(pool, { includeQueued = true, excludeId = null } = {}) {
+  if (!pool) return [];
+  const statuses = includeQueued ? ['QUEUED', 'SENT', 'PLACED'] : ['SENT', 'PLACED'];
+  const [rows] = await pool.query(
+    `SELECT id, symbol, ticket, position_id, status FROM mt5_auto_trades
+      WHERE COALESCE(source,'AUTO') <> 'MANUAL' AND status IN (${statuses.map(() => '?').join(',')})`,
+    statuses,
+  );
+  return pendingCommands(rows, [...(tradeBridge.positions || []), ...(tradeBridge.orders || [])], { excludeId });
 }
 // Build the FINAL ticket (lots / SL / TP1-3) for an auto-trade under the chosen execution
 // mode, and validate every override against what the strategy actually analysed.
@@ -13890,8 +15384,33 @@ async function autoTradesToday(pool) {
 }
 async function considerAutoTrade(strategy, symbol, tf, sig) {
   try {
+    // ── Latency instrumentation, ict-breaker family only ─────────────────────
+    // Captured FIRST so it is the moment the scanner reached this setup, before any gate
+    // spends time. Measurement only — nothing below reads these to decide anything.
+    //
+    // barCloseAt is derived from the clock, not from sig.barIso: barIso is the BREAKER bar and
+    // maxAgeBars:3 lets it be three bars old, which is what made two earlier attempts measure
+    // setup AGE instead of delay. The most recent bar boundary is the moment this candle's data
+    // actually became available.
+    const latencyTracked = ICT_EXEC_STRATEGIES.has(strategy);
+    const detectedAtMs = Date.now();
+    let barCloseAtMs = null;
+    if (latencyTracked) {
+      const tfMs = Math.max(1, timeframeMinutes(tf)) * 60000;
+      barCloseAtMs = Math.floor(detectedAtMs / tfMs) * tfMs;
+    }
     const cfg = autoTradeConfig();
-    const mode = autoTradeEffectiveMode(cfg);
+    // The desk-wide mode first (it also degrades ASK/AUTO to SHADOW when the EA bridge is down
+    // or the armed account does not match), THEN the per-strategy override on top of it. Order
+    // matters: the interlocks have to survive an override, or a per-strategy AUTO would dispatch
+    // to an account nobody armed.
+    const deskMode = autoTradeEffectiveMode(cfg);
+    // Session is resolved BEFORE the mode because a per-strategy rule may be scoped to one
+    // (e.g. "ict-breaker trades unattended during London, but asks me in Tokyo"). It is a
+    // pure function of the clock, so hoisting it changes nothing else.
+    const session = strategyLabSession(new Date().toISOString());
+    const mode = resolveStrategyMode(deskMode, cfg.strategyModes, strategy,
+      { symbol, timeframe: tf, session: session.key });
     if (mode === 'OFF') return;
     // Trading needs a full forex ticket. (Fixed-time-only calls have no SL/TP to place.)
     const entry = Number(sig.entry), sl = Number(sig.stopLoss), tp1 = Number(sig.takeProfit1);
@@ -13901,7 +15420,7 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
     // Otherwise fall back to the broad lists, where NO strategies selected = nothing
     // trades — an "empty = all" default on real orders would be a loaded gun.
     if (!autoTradeCombosAllow(cfg, strategy, symbol, tf)) return;
-    const session = strategyLabSession(new Date().toISOString());
+    // `session` is resolved above, before the per-strategy mode that may be scoped to it.
     if (cfg.sessions.length && !cfg.sessions.includes(session.key)) return;
     const gradeRankOf = (g) => (g === 'A+' ? 2 : g === 'A' ? 1 : 0);
     if (gradeRankOf(String(sig.grade || '').toUpperCase()) < gradeRankOf(cfg.minGrade)) return;
@@ -13917,7 +15436,10 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
 
     // Sizing from the user's Account & Sizing settings — challenge leg when the user is
     // in CHALLENGE/BOTH mode (its guard also applies), else the normal leg.
-    const ms = computeModeSizing(symbol, entry, sl, { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 });
+    const ms = computeModeSizing(symbol, entry, sl,
+      { tp1: sig.takeProfit1, tp2: sig.takeProfit2, tp3: sig.takeProfit3 },
+      // Quality inputs — this is what makes an A+ book more than a C in AUTO and ASK alike.
+      { grade: sig.grade, score: sig.score, rr: sig.riskRewardRatio });
     const leg = ms?.challenge || ms?.normal;
     if (!leg) return;
     const riskMode = ms.challenge ? 'CHALLENGE' : 'NORMAL';
@@ -13942,10 +15464,66 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
       baseLots: leg.lots, baseRiskAmount: leg.riskAmount,
       riskRefBalance: leg.refBalance,
     });
-    const useLots = ticket.lots, useSl = ticket.sl, useTp1 = ticket.tp1;
-    const useTp2 = ticket.tp2 ?? sig.takeProfit2 ?? null, useTp3 = ticket.tp3 ?? sig.takeProfit3 ?? null;
+    let useLots = ticket.lots, useSl = ticket.sl, useTp1 = ticket.tp1;
+    let useTp2 = ticket.tp2 ?? sig.takeProfit2 ?? null, useTp3 = ticket.tp3 ?? sig.takeProfit3 ?? null;
     const useRr = ticket.rr ?? (Number.isFinite(rr) ? rr : null);
     const orderType = strategySignalOrderType({ ...(sig.meta || {}), strategy });
+
+    // ── ict-breaker SL-only execution profile ─────────────────────────────────
+    //
+    // Scoped to the ict-breaker family AND to an explicit opt-in flag. Every other strategy
+    // falls straight through with its ticket, its take profits and the standard slippage gate
+    // untouched — this block simply does not execute for them.
+    //
+    // Rationale, from 650 replayed signals: 29/29 of this strategy's MT5 "10016 Invalid stops"
+    // rejections were caused by TP1 already sitting behind the market; 0/29 had any problem
+    // with the stop. Sending no take profit removes the only invalid leg. The gate is
+    // remaining-R to the draw rather than slippage %, because bucketing by lateness showed win
+    // rate rising to 97% while average R went NEGATIVE — lateness is highest exactly where the
+    // win rate looks best, so it is a misleading filter on its own.
+    let ictExec = null;
+    if (ICT_EXEC_STRATEGIES.has(strategy) && cfg.ictBreakerExec?.enabled) {
+      // The live price, taken the same way the lab records at_ref_price (last closed bar), so
+      // the gate is measured on the basis the thresholds were derived from.
+      const lastBar = getRecentCandles(symbol, tf, 1);
+      const live = Number(lastBar?.[lastBar.length - 1]?.close);
+      // Budget comes from the LIVE challenge dashboard, never from the ticket: a stored
+      // risk figure can outlive the config that produced it and silently over-size.
+      const dash = ms.challenge ? computeChallengeDashboard() : null;
+      const budget = Number(dash?.safePerTradeRisk) > 0
+        ? Math.min(Number(dash.safePerTradeRisk), Number(ticket.riskAmount) || Infinity)
+        : Number(ticket.riskAmount);
+      const spec = brokerSpecFor(symbol);
+      ictExec = ictBreakerExecPlan({
+        direction: sig.decision,
+        plannedEntry: entry, plannedStop: useSl,
+        target: useTp3 ?? sig.takeProfit3, price: live,
+        riskAmount: budget,
+        pipSize: forexSizingPipSize(symbol),
+        pipValuePerLot: forexSizingPipValuePerLot(symbol),
+        spread: Number(spec?.spread) || 0,
+        volumeStep: Number(spec?.volumeStep) || 0.01,
+        volumeMin: Number(spec?.volumeMin) || 0.01,
+        volumeMax: Number(spec?.volumeMax) || 100,
+        options: cfg.ictBreakerExec,
+      });
+      if (!ictExec.allow) {
+        await pool.execute(
+          `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [id, strategy, symbol, tf, sig.decision, orderType, entry, useSl, useTp1, useTp2, useTp3,
+            useLots, ticket.riskAmount, riskMode, Math.round(sig.score ?? 0), sig.grade ?? null, useRr, session.key,
+            mode, 'GUARD_SKIP', `ict-breaker SL-only: ${ictExec.reason}`.slice(0, 255), toMysqlDate()],
+        );
+        console.log(`[AutoTrade] SKIP ${symbol} ${tf} — ict-breaker SL-only: ${ictExec.reason}`);
+        return;
+      }
+      // No take profit reaches MT5. The EA reads tp<=0 as "none" (AuraGoldSignals.mq5:2570),
+      // so the targets are cleared rather than sent as zero-ish prices.
+      useLots = ictExec.lots;
+      useSl = ictExec.stopLoss;
+      useTp1 = null; useTp2 = null; useTp3 = null;
+    }
 
     // Hard geometry errors, or warnings while "trade anyway" is off → log and stop.
     const blockedByWarnings = ticket.warnings.length > 0 && !ticket.allowWarnedTrades && ticket.mode !== 'AUTO';
@@ -13968,6 +15546,11 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
     const todayCount = await autoTradesToday(pool);
     const capped = todayCount >= cfg.maxTradesPerDay;
     // Live concurrency guard (ASK/AUTO only — needs the EA's position report).
+    // Intentionally WITHOUT in-flight accounting, unlike the approve and dispatch paths.
+    // This is the proposal moment, not the commit moment: a desk that is full right now may
+    // have room by the time the user approves, and counting in-flight here would throw away
+    // setups that were still valid. The binding gates are approve() and the dispatch loop,
+    // and both do count in-flight — so nothing can reach MT5 through this looser check.
     const concBlock = (mode === 'ASK' || mode === 'AUTO') ? autoTradeConcurrencyBlock(cfg, symbol) : null;
     const status = capped ? 'CAP_ALERT'
       : concBlock ? 'GUARD_SKIP'
@@ -13979,11 +15562,14 @@ async function considerAutoTrade(strategy, symbol, tf, sig) {
     const expiresAt = status === 'PROPOSED' ? new Date(Date.now() + AUTO_TRADE_APPROVAL_MS)
       : status === 'QUEUED' ? new Date(Date.now() + 5 * 60 * 1000) : null; // a QUEUED order the EA never picks up dies in 5 min
     await pool.execute(
-      `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, expires_at, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT IGNORE INTO mt5_auto_trades (id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode, status, reason, expires_at, bar_close_at, detected_at, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [id, strategy, symbol, tf, sig.decision, orderType, entry, useSl, useTp1, useTp2, useTp3,
        useLots, ticket.riskAmount, riskMode, Math.round(sig.score ?? 0), sig.grade ?? null, useRr, session.key,
-       mode, status, `${reason}${ticket.changed.length ? ` · ${ticket.mode}: ${ticket.changed.join(', ')}` : ''}${ticket.warnings.length ? ` · ⚠ ${ticket.warnings.join('; ')}` : ''}`.slice(0, 255), expiresAt ? toMysqlDate(expiresAt) : null, toMysqlDate()],
+       mode, status, `${reason}${ticket.changed.length ? ` · ${ticket.mode}: ${ticket.changed.join(', ')}` : ''}${ticket.warnings.length ? ` · ⚠ ${ticket.warnings.join('; ')}` : ''}`.slice(0, 255), expiresAt ? toMysqlDate(expiresAt) : null,
+       barCloseAtMs === null ? null : toMysqlDate(new Date(barCloseAtMs)),
+       latencyTracked ? toMysqlDate(new Date(detectedAtMs)) : null,
+       toMysqlDate()],
     );
 
     if (!SIGNAL_ALERTS_ENABLED || !signalEmailTo()) return;
@@ -16398,6 +17984,10 @@ app.get('/api/strategy-predictions', async (req, res) => {
 // the scan/resolve intervals and the API. It never touches the live signal path, never
 // writes to mt5_strategy_signals, and never reaches the auto-trader or email.
 const SETUP_FORECAST_TFS = ['M15', 'H1'];
+// The merge hands the runner a generous pool; the runner applies its own filters (swept, side,
+// distance band) and then does the real quota-balanced cut. Cutting hard here instead would
+// spend quota slots on levels the runner is about to reject anyway.
+const SETUP_FORECAST_LEVEL_LIMIT = 40;
 const SETUP_FORECAST_SCAN_MS = Math.max(5, Number(process.env.SETUP_FORECAST_SCAN_MIN || 15)) * 60000;
 const SETUP_FORECAST_DISC_FILE = path.join(__dirname, '.cache', 'setup_forecast_discrimination.json');
 
@@ -16420,7 +18010,9 @@ function saveForecastDiscrimination(stats) {
 
 async function setupForecastSeries(pool, symbol, series, want) {
   const [rows] = await pool.query(
-    'SELECT candle_time, open_price, high, low, close_price, volume FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?',
+    // `symbol=?` not `UPPER(symbol)=?` — see candleBatch.buildBatchSql. The function call made
+    // the index unusable and cost 689ms/1.06M rows examined instead of 64ms/8.9k.
+    'SELECT candle_time, open_price, high, low, close_price, volume FROM mt5_candles WHERE symbol=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?',
     [symbol.toUpperCase(), series, want],
   );
   return rows.reverse().map((r) => ({
@@ -16428,6 +18020,98 @@ async function setupForecastSeries(pool, symbol, series, want) {
     open: Number(r.open_price), high: Number(r.high),
     low: Number(r.low), close: Number(r.close_price), volume: Number(r.volume) || 0,
   }));
+}
+
+/**
+ * One series, for MANY symbols, in ONE round trip.
+ *
+ * The sweeps were issuing 6 queries per symbol per timeframe — 240 for a 10-symbol × 4-timeframe
+ * ICT scan. Each one pays a measured ~47ms network floor to the hosted database before it does
+ * any work, which is where most of a 130-second sweep was going.
+ *
+ * UNION ALL of per-symbol subqueries, rather than `symbol IN (...)`: the LIMIT has to apply per
+ * symbol, and `IN` with one ORDER BY/LIMIT would return N rows across ALL symbols. This returns
+ * byte-for-byte the same rows the individual queries did, just without the per-symbol round trip.
+ * Deliberately not a window function — that would add a MariaDB-version dependency for no gain.
+ *
+ * Returns Map<UPPERCASE symbol, candles[]> in ascending time order.
+ */
+async function setupForecastSeriesBatch(pool, symbols, series, want) {
+  const list = normaliseSymbols(symbols);
+  const sql = buildBatchSql(list.length);
+  if (!sql) return new Map();
+  const [rows] = await pool.query(sql, buildBatchArgs(list, series, want));
+  return groupBatchRows(rows);
+}
+
+/**
+ * Batched twin of setupForecastContext: same contexts, ~6 queries per timeframe instead of 6 per
+ * symbol per timeframe.
+ *
+ * The single-symbol version below is kept unchanged — the analyze endpoints call it for one
+ * symbol at a time, where batching would only add complexity.
+ *
+ * Returns Map<UPPERCASE symbol, prep> and simply omits symbols with too little history, exactly
+ * as the per-symbol version returns null for them.
+ */
+async function setupForecastContextBatch(pool, symbols, tf) {
+  const out = new Map();
+  const list = normaliseSymbols(symbols);
+  if (!list.length) return out;
+  // The map is KEYED uppercase (storage is uppercased by normalizeCandle), but the context must
+  // carry the caller's original casing — the broker's real symbol is `XAUUSDm`, and handing an
+  // uppercased name downstream is precisely Trap #2. Only the lookup is case-normalised.
+  const original = new Map(list.map((u) => [u, u]));
+  for (const s of symbols || []) {
+    const u = String(s).toUpperCase();
+    if (original.has(u)) original.set(u, s);
+  }
+
+  const htfTf = NEXT_HIGHER_TF[tf] || null;
+  const ltfTf = NEXT_LOWER_TF[tf] || null;
+  // Deduped by series, taking the deepest request (see candleBatch.dedupeSeriesRequests).
+  const need = dedupeSeriesRequests([
+    [tf, 400], ['H4', 150], ['H1', 150], ['D1', 8], [htfTf, 200], [ltfTf, 200],
+  ]);
+
+  // SEQUENTIAL, not Promise.all. Firing all six series at once took up to six connections from
+  // a pool of five, so a background sweep could hold every connection and starve user-facing
+  // requests — the chart endpoint timed out entirely while a sweep was running. The sweep is a
+  // background job and the chart is someone waiting at a screen; the sweep yields.
+  const fetched = new Map();
+  for (const [series, n] of need) {
+    fetched.set(series, await setupForecastSeriesBatch(pool, list, series, n));
+  }
+  for (const key of list) {
+    const symbol = original.get(key) || key;          // broker casing for everything downstream
+    const pick = (s, n) => (s ? tailOf(fetched.get(s)?.get(key) || [], n) : null);
+    const candles = closedBarsOnly(pick(tf, 400), tf);
+    if (!candles || candles.length < 60) continue;
+
+    const ctx = {
+      symbol, timeframe: tf, candles, candlesIncludeFormingBar: false, pip: pipSizeForSymbol(symbol),
+      h4Trend: getTimeframeTrend(closedBarsOnly(pick('H4', 150), 'H4')),
+      h1Trend: getTimeframeTrend(closedBarsOnly(pick('H1', 150), 'H1')),
+      dailyCandles: pick('D1', 8),
+      htfTimeframe: htfTf, htfCandles: htfTf ? closedBarsOnly(pick(htfTf, 200), htfTf) : null,
+      ltfTimeframe: ltfTf, ltfCandles: ltfTf ? closedBarsOnly(pick(ltfTf, 200), ltfTf) : null,
+    };
+    const price = Number(candles[candles.length - 1]?.close);
+    const atr = Number(liquidityAtr14(candles)) || null;
+    if (!(price > 0) || !(atr > 0)) continue;
+
+    const { levels: keyLevels } = detectKeyLiquidityLevels(candles, { symbol, dailyCandles: ctx.dailyCandles });
+    const merged = mergeForecastLevels({
+      keyLevels,
+      orderBlocks: detectOrderBlocks(candles),
+      supportResistance: detectSupportResistance(candles, atr),
+      candles,
+      price, atr, pip: pipSizeForSymbol(symbol),
+      limit: SETUP_FORECAST_LEVEL_LIMIT,
+    });
+    out.set(key, { ctx, price, atr, levels: merged.levels, levelCounts: merged.counts });
+  }
+  return out;
 }
 
 // Context from the DATABASE, like the predictions page: the in-memory ring buffer holds only
@@ -16456,8 +18140,22 @@ async function setupForecastContext(pool, symbol, tf) {
   const price = Number(candles[candles.length - 1]?.close);
   const atr = Number(liquidityAtr14(candles)) || null;
   if (!(price > 0) || !(atr > 0)) return null;
-  const { levels } = detectKeyLiquidityLevels(candles, { symbol, dailyCandles });
-  return { ctx, price, atr, levels };
+  // The forecastable set is deliberately wider than resting liquidity. Strategies do not only
+  // wait at PDH/PDL — they wait at unmitigated order block edges, at zones price has held
+  // repeatedly, and at broken levels that flipped polarity and have not been retested yet.
+  // mergeForecastLevels collapses the overlap (a PDH that IS an order block edge is one level,
+  // not two) and guarantees each source a share of the pool so the dense sources cannot
+  // silently crowd out daily liquidity.
+  const { levels: keyLevels } = detectKeyLiquidityLevels(candles, { symbol, dailyCandles });
+  const merged = mergeForecastLevels({
+    keyLevels,
+    orderBlocks: detectOrderBlocks(candles),
+    supportResistance: detectSupportResistance(candles, atr),
+    candles,
+    price, atr, pip: pipSizeForSymbol(symbol),
+    limit: SETUP_FORECAST_LEVEL_LIMIT,
+  });
+  return { ctx, price, atr, levels: merged.levels, levelCounts: merged.counts };
 }
 
 let setupForecastScanBusy = false;
@@ -16476,7 +18174,26 @@ async function runSetupForecastScan({ reason = 'interval' } = {}) {
     const allIds = enabledStrategyIds().filter((id) => STRATEGY_LAB_REGISTRY[id] && !STRATEGY_LAB_REGISTRY[id].measureFixedTime);
     const discrimination = loadForecastDiscrimination();
     const dashboard = computeChallengeDashboard();
-    const riskBudget = Number(dashboard?.safePerTradeRisk) > 0 ? Number(dashboard.safePerTradeRisk) : null;
+    // The CONFIGURED percentage of the initial balance, not the room-clamped figure — sizing
+    // from remaining room collapses to 0.01 lots as room runs down and ignores the user's own
+    // setting. Room is surfaced as a warning instead of silently shrinking the budget.
+    // Sized per forecast by its own quality — see setupRisk.
+    // R:R does NOT live on a setup forecast the way it does on an ICT prediction — it belongs to
+    // the individual strategy reads in `fires`, and the plan picks the best agreeing one. Reading
+    // `f.rr` here found undefined on all 182 forecasts, so every tier above MINIMUM failed its
+    // R:R bar and every setup was sized at 20% ($8) regardless of quality. Take it from the same
+    // fire the plan will use.
+    const forecastRr = (f) => {
+      const agreeing = (f?.fires || []).filter((x) => x?.agrees && Number.isFinite(Number(x.rr)));
+      if (!agreeing.length) return null;
+      // The best-scoring agreeing read, matching how buildForecastPlan chooses its ticket.
+      const best = agreeing.reduce((a, b) => ((Number(b.score) || 0) > (Number(a.score) || 0) ? b : a));
+      return Number(best.rr);
+    };
+    const riskFor = (f) => setupRisk(
+      { grade: f?.grade, score: f?.bestScore ?? f?.best_score, rr: f?.rr ?? forecastRr(f) },
+      dashboard,
+    );
 
     let fresh = emptyForecastStats();
     const now = Date.now();
@@ -16485,12 +18202,16 @@ async function runSetupForecastScan({ reason = 'interval' } = {}) {
     const droppedReport = [];
 
     for (const tf of SETUP_FORECAST_TFS) {
+      const ids = allIds.filter((id) => strategyTimeframes(id).includes(tf));
+      if (!ids.length) continue;                       // hoisted: it never varied by symbol
+      // One batched load per timeframe instead of six queries per symbol.
+      let preps = new Map();
+      try { preps = await setupForecastContextBatch(pool, symbols, tf); }
+      catch (e) { console.error(`[SetupForecast] context load failed for ${tf}:`, e.message); continue; }
+
       for (const symbol of symbols) {
-        let prep = null;
-        try { prep = await setupForecastContext(pool, symbol, tf); } catch { prep = null; }
+        const prep = preps.get(String(symbol).toUpperCase());
         if (!prep) continue;
-        const ids = allIds.filter((id) => strategyTimeframes(id).includes(tf));
-        if (!ids.length) continue;
 
         const out = runSetupForecasts({
           base: prep.ctx, levels: prep.levels, atr: prep.atr, price: prep.price,
@@ -16505,16 +18226,27 @@ async function runSetupForecastScan({ reason = 'interval' } = {}) {
         // old row already resolved legitimately starts a NEW row — the level came back into
         // play — so the PK is key + first-seen, not the key alone.
         for (const f of out.forecasts) {
+          const conviction = riskFor(f);
           const { plan } = buildForecastPlan({
             forecast: f,
             pipSize: forexSizingPipSize(symbol),
             pipValuePerLot: forexSizingPipValuePerLot(symbol),
-            riskBudget, dashboard,
+            riskBudget: conviction.riskUsd, dashboard,
           });
           const [activeRows] = await pool.query(
             "SELECT id, drift_json FROM mt5_setup_forecasts WHERE fkey=? AND status='WAITING' LIMIT 1", [f.key]);
           const firesJson = JSON.stringify(f.fires.slice(0, 12));
-          const planJson = plan ? JSON.stringify(plan) : null;
+          // Carry the conviction decision on the plan so the card can explain a small position
+          // instead of it looking like a bug — the same fields the ICT cards already show.
+          const planJson = plan ? JSON.stringify({
+            ...plan,
+            convictionTier: conviction.tier,
+            convictionLabel: conviction.label,
+            convictionFraction: conviction.fraction,
+            fullBudget: conviction.budget,
+            heldBackUsd: conviction.heldBackUsd,
+            convictionWhy: conviction.why,
+          }) : null;
           const point = forecastDriftEntry(f, now);
           if (activeRows.length) {
             let drift = [];
@@ -16524,13 +18256,15 @@ async function runSetupForecastScan({ reason = 'interval' } = {}) {
               `UPDATE mt5_setup_forecasts SET
                  consensus_direction=?, distance_pips=?, distance_atr=?,
                  eta_min=?, eta_mid=?, eta_max=?, horizon=?,
-                 rank_score=?, best_score=?, best_strategy=?, agree_count=?, dissent_count=?,
+                 rank_score=?, best_score=?, best_strategy=?, grade=?, agree_count=?, dissent_count=?,
                  fires_json=?, plan_json=?, drift_json=?, atr=?,
+                 level_sources=?, level_confluence=?,
                  updated_at=? WHERE id=?`,
               [f.consensusDirection, f.distance?.pips ?? null, f.distance?.atr ?? null,
                 f.eta?.minMinutes ?? null, f.eta?.midMinutes ?? null, f.eta?.maxMinutes ?? null, f.horizon?.key || null,
-                f.rankScore ?? null, f.bestScore ?? null, f.bestStrategy || null, f.agreeCount ?? 0, f.dissentCount ?? 0,
+                f.rankScore ?? null, f.bestScore ?? null, f.bestStrategy || null, f.grade || null, f.agreeCount ?? 0, f.dissentCount ?? 0,
                 firesJson, planJson, JSON.stringify(drift), f.atr ?? prep.atr,
+                (f.levelSources || []).join(',') || null, f.levelConfluence ?? 1,
                 toMysqlDate(nowIso), activeRows[0].id],
             );
             updated += 1;
@@ -16538,17 +18272,19 @@ async function runSetupForecastScan({ reason = 'interval' } = {}) {
             await pool.query(
               `INSERT INTO mt5_setup_forecasts
                  (id, fkey, symbol, timeframe, scenario, side, level, level_type, level_label, level_strength,
+                  level_sources, level_confluence,
                   atr, price_at_forecast, expected_direction, consensus_direction,
                   distance_pips, distance_atr, eta_min, eta_mid, eta_max, horizon,
-                  rank_score, best_score, best_strategy, agree_count, dissent_count,
+                  rank_score, best_score, best_strategy, grade, agree_count, dissent_count,
                   fires_json, plan_json, bars_json, drift_json, created_at, updated_at, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'WAITING')`,
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'WAITING')`,
               [`${f.key}|${now}`, f.key, symbol, tf, f.scenario, f.side, f.level,
                 f.levelType || null, f.levelLabel || null, f.levelStrength ?? null,
+                (f.levelSources || []).join(',') || null, f.levelConfluence ?? 1,
                 prep.atr, prep.price, f.expectedDirection, f.consensusDirection,
                 f.distance?.pips ?? null, f.distance?.atr ?? null,
                 f.eta?.minMinutes ?? null, f.eta?.midMinutes ?? null, f.eta?.maxMinutes ?? null, f.horizon?.key || null,
-                f.rankScore ?? null, f.bestScore ?? null, f.bestStrategy || null, f.agreeCount ?? 0, f.dissentCount ?? 0,
+                f.rankScore ?? null, f.bestScore ?? null, f.bestStrategy || null, f.grade || null, f.agreeCount ?? 0, f.dissentCount ?? 0,
                 firesJson, planJson, JSON.stringify(f.scenarioBars), JSON.stringify([point]),
                 toMysqlDate(nowIso), toMysqlDate(nowIso)],
             );
@@ -16590,7 +18326,7 @@ async function resolveSetupForecasts({ limit = 300 } = {}) {
   const pool = await initializeDatabase();
   if (!pool) return { resolved: 0 };
   const [rows] = await pool.query(
-    "SELECT id, symbol, timeframe, scenario, side, level, atr, expected_direction, eta_max, created_at FROM mt5_setup_forecasts WHERE status='WAITING' ORDER BY created_at ASC LIMIT ?",
+    "SELECT id, symbol, timeframe, scenario, side, level, atr, expected_direction, eta_max, created_at, plan_json FROM mt5_setup_forecasts WHERE status='WAITING' ORDER BY created_at ASC LIMIT ?",
     [limit]);
   let resolved = 0, expired = 0;
   for (const row of rows) {
@@ -16608,11 +18344,53 @@ async function resolveSetupForecasts({ limit = 300 } = {}) {
         scenario: row.scenario, expectedDirection: row.expected_direction, etaMaxMinutes: Number(row.eta_max) || null,
       }, since, { pip: forexSizingPipSize(row.symbol) });
       if (!outcome) continue;
+
+      // What was it WORTH? Only meaningful once price actually arrived: replay the forecast's own
+      // ticket over the candles from the arrival bar onward, then see whether a real trade was
+      // taken on it. Both are best-effort — a settlement failure must not block the resolution.
+      let hit = null;
+      let link = null;
+      if (outcome.status === FORECAST_LIFECYCLE.RESOLVED) {
+        try {
+          const plan = row.plan_json ? JSON.parse(row.plan_json) : null;
+          if (plan) {
+            const arriveMs = Date.parse(outcome.arrivedIso || '');
+            const after = Number.isFinite(arriveMs) ? since.filter((c) => Date.parse(c.time) >= arriveMs) : since;
+            hit = settleForecastTicket({
+              plan: { ...plan, pipValuePerLot: forexSizingPipValuePerLot(row.symbol) },
+              candles: after, pip: forexSizingPipSize(row.symbol),
+            });
+            // Trades actually placed on this symbol around the arrival, from the auto-trade log
+            // (which also holds adopted/manual "By Own" fills).
+            const [tr] = await pool.query(
+              `SELECT ticket, symbol, direction, strategy, lots, fill_price, profit, created_at AS opened_at, closed_at
+                 FROM mt5_auto_trades
+                WHERE UPPER(symbol)=? AND ticket IS NOT NULL AND created_at BETWEEN DATE_SUB(?, INTERVAL 10 MINUTE) AND DATE_ADD(?, INTERVAL 4 HOUR)`,
+              [String(row.symbol).toUpperCase(), toMysqlDate(outcome.arrivedIso), toMysqlDate(outcome.arrivedIso)]);
+            link = matchRealTrade({
+              forecast: { symbol: row.symbol, expectedDirection: row.expected_direction, arrivedIso: outcome.arrivedIso, plan },
+              trades: tr.map((t) => ({ ...t, openedAt: t.opened_at ? new Date(t.opened_at).toISOString() : null, fillPrice: t.fill_price })),
+              pip: forexSizingPipSize(row.symbol),
+            });
+          }
+        } catch (e) { console.error('[SetupForecast] settle failed for', row.id, e.message); }
+      }
+      const linked = link && !link.ambiguous ? link : null;
+
       await pool.query(
-        `UPDATE mt5_setup_forecasts SET status=?, resolved_at=?, actual=?, matched=?, actual_minutes=?, mfe_pips=?, mae_pips=? WHERE id=? AND status='WAITING'`,
+        `UPDATE mt5_setup_forecasts SET status=?, resolved_at=?, actual=?, matched=?, actual_minutes=?, mfe_pips=?, mae_pips=?,
+           hit_outcome=?, hit_pips=?, hit_r=?, hit_profit=?, hit_tp_level=?, hit_at=?,
+           real_ticket=?, real_pnl=?, real_lots=?, real_entry_gap_pips=?, real_link_note=?
+         WHERE id=? AND status='WAITING'`,
         [outcome.status, toMysqlDate(outcome.resolvedAt), outcome.actual || null,
           outcome.matched === undefined ? null : outcome.matched ? 1 : 0,
-          outcome.actualMinutes ?? null, outcome.mfePips ?? null, outcome.maePips ?? null, row.id]);
+          outcome.actualMinutes ?? null, outcome.mfePips ?? null, outcome.maePips ?? null,
+          hit?.outcome ?? null, hit?.pips ?? null, hit?.rMultiple ?? null, hit?.estimatedProfit ?? null,
+          hit?.tpLevel ?? null, hit?.resolvedAt ? toMysqlDate(hit.resolvedAt) : null,
+          linked?.ticket ?? null, linked?.profit ?? null, linked?.lots ?? null,
+          linked?.entryGapPips ?? null,
+          (linked?.reason || (link?.ambiguous ? link.reason : null) || '').slice(0, 160) || null,
+          row.id]);
       if (outcome.status === FORECAST_LIFECYCLE.EXPIRED) expired += 1; else resolved += 1;
     } catch (e) { console.error('[SetupForecast] resolve failed for', row.id, e.message); }
   }
@@ -16620,7 +18398,100 @@ async function resolveSetupForecasts({ limit = 300 } = {}) {
   return { resolved, expired, checked: rows.length };
 }
 
+// Settle forecasts that resolved BEFORE settlement existed, and any whose ticket was still
+// running last time. Without this, every already-matched forecast reads "0 settled" forever and
+// the accuracy report looks broken rather than young. An OPEN ticket is re-checked each pass, so
+// a trade that needed more bars eventually lands on a real result.
+async function backfillForecastSettlement({ limit = 200 } = {}) {
+  const pool = await initializeDatabase();
+  if (!pool) return { settled: 0 };
+  const [rows] = await pool.query(
+    `SELECT id, symbol, timeframe, level, side, expected_direction, plan_json, created_at, actual_minutes
+       FROM mt5_setup_forecasts
+      -- Every arrival, NOT just matched ones. Settling only matches makes the win rate
+      -- tautological: a matched SWEEP_REJECT means price rejected and ran, which is very nearly
+      -- the same event as the ticket reaching its target. The honest denominator is "price got
+      -- there" — the mismatches are exactly the cases that lose.
+      WHERE status='RESOLVED' AND plan_json IS NOT NULL
+        AND (hit_outcome IS NULL OR hit_outcome='OPEN')
+      ORDER BY resolved_at DESC LIMIT ?`, [limit]);
+  let settled = 0;
+  for (const row of rows) {
+    try {
+      const plan = JSON.parse(row.plan_json);
+      // Arrival is not stored separately; it is the forecast time plus the measured delay.
+      const arrivedMs = Date.parse(new Date(row.created_at).toISOString()) + (Number(row.actual_minutes) || 0) * 60000;
+      const arrivedIso = new Date(arrivedMs).toISOString();
+      const [cr] = await pool.query(
+        'SELECT candle_time, open_price, high, low, close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? AND candle_time >= ? ORDER BY candle_time ASC LIMIT 200',
+        [String(row.symbol).toUpperCase(), row.timeframe, toMysqlDate(arrivedIso)]);
+      if (!cr.length) continue;
+      const after = closedBarsOnly(cr.map((r) => ({
+        time: new Date(r.candle_time).toISOString(),
+        open: Number(r.open_price), high: Number(r.high), low: Number(r.low), close: Number(r.close_price),
+      })), row.timeframe);
+      const hit = settleForecastTicket({
+        plan: { ...plan, pipValuePerLot: forexSizingPipValuePerLot(row.symbol) },
+        candles: after, pip: forexSizingPipSize(row.symbol),
+      });
+      if (!hit) continue;
+      const [tr] = await pool.query(
+        `SELECT ticket, symbol, direction, strategy, lots, fill_price, profit, created_at AS opened_at, closed_at
+           FROM mt5_auto_trades
+          WHERE UPPER(symbol)=? AND ticket IS NOT NULL AND created_at BETWEEN DATE_SUB(?, INTERVAL 10 MINUTE) AND DATE_ADD(?, INTERVAL 4 HOUR)`,
+        [String(row.symbol).toUpperCase(), toMysqlDate(arrivedIso), toMysqlDate(arrivedIso)]);
+      const link = matchRealTrade({
+        forecast: { symbol: row.symbol, expectedDirection: row.expected_direction, arrivedIso, plan },
+        trades: tr.map((t) => ({ ...t, openedAt: t.opened_at ? new Date(t.opened_at).toISOString() : null, fillPrice: t.fill_price })),
+        pip: forexSizingPipSize(row.symbol),
+      });
+      const linked = link && !link.ambiguous ? link : null;
+      await pool.query(
+        `UPDATE mt5_setup_forecasts SET hit_outcome=?, hit_pips=?, hit_r=?, hit_profit=?, hit_tp_level=?, hit_at=?,
+           real_ticket=?, real_pnl=?, real_lots=?, real_entry_gap_pips=?, real_link_note=? WHERE id=?`,
+        [hit.outcome, hit.pips, hit.rMultiple, hit.estimatedProfit, hit.tpLevel,
+          hit.resolvedAt ? toMysqlDate(hit.resolvedAt) : null,
+          linked?.ticket ?? null, linked?.profit ?? null, linked?.lots ?? null, linked?.entryGapPips ?? null,
+          (linked?.reason || (link?.ambiguous ? link.reason : null) || '').slice(0, 160) || null,
+          row.id]);
+      if (hit.outcome !== 'OPEN') settled += 1;
+    } catch (e) { console.error('[SetupForecast] backfill settle failed for', row.id, e.message); }
+  }
+  if (settled) console.log(`[SetupForecast] settled ${settled} matched forecasts (of ${rows.length} checked)`);
+  return { settled, checked: rows.length };
+}
+setInterval(() => { backfillForecastSettlement().catch((e) => console.error('[SetupForecast] backfill failed:', e.message)); }, 10 * 60000);
+setTimeout(() => { backfillForecastSettlement().catch(() => {}); }, 120 * 1000);
+
 // GET /api/setup-forecasts — active forecasts, ranked and grouped into horizon buckets.
+// Resolved-forecast history for the card badge.
+//
+// Cached for five minutes because it reads every resolved row and the answer only moves when a
+// forecast settles. Without the cache a 200-card response would run the same scan 200 times.
+let forecastTrackCache = { at: 0, record: null };
+const FORECAST_TRACK_TTL_MS = 5 * 60 * 1000;
+
+async function loadForecastTrackRecord(pool) {
+  if (forecastTrackCache.record && Date.now() - forecastTrackCache.at < FORECAST_TRACK_TTL_MS) {
+    return forecastTrackCache.record;
+  }
+  try {
+    const [rows] = await pool.query(
+      `SELECT best_strategy, symbol, timeframe, level_type, matched, hit_r
+         FROM mt5_setup_forecasts WHERE status='RESOLVED' LIMIT 20000`);
+    const record = buildTrackRecord(rows.map((r) => ({
+      strategy: r.best_strategy, symbol: r.symbol, timeframe: r.timeframe,
+      levelType: r.level_type, matched: r.matched === 1, hitR: r.hit_r,
+    })), { minSample: TRACK_DEFAULTS.minSample });
+    forecastTrackCache = { at: Date.now(), record };
+    return record;
+  } catch (error) {
+    // A missing badge is a far better failure than a broken forecasts page.
+    console.error('[TrackRecord] load failed:', error.message);
+    return null;
+  }
+}
+
 app.get('/api/setup-forecasts', async (req, res) => {
   try {
     const pool = await initializeDatabase();
@@ -16633,22 +18504,38 @@ app.get('/api/setup-forecasts', async (req, res) => {
     if (q(req.query.scenario)) { where.push('scenario=?'); args.push(q(req.query.scenario).toUpperCase()); }
     if (q(req.query.strategy)) { where.push('best_strategy=?'); args.push(q(req.query.strategy)); }
     if (Number(req.query.minScore) > 0) { where.push('best_score>=?'); args.push(Number(req.query.minScore)); }
+    if (q(req.query.grade)) { where.push('grade=?'); args.push(q(req.query.grade)); }
     if (q(req.query.bucket)) { where.push('horizon=?'); args.push(q(req.query.bucket)); }
     const [rows] = await pool.query(
       `SELECT * FROM mt5_setup_forecasts WHERE ${where.join(' AND ')} ORDER BY rank_score DESC LIMIT 200`, args);
 
     const parse = (s, fallback) => { try { return JSON.parse(s) || fallback; } catch { return fallback; } };
+    // Loaded once, not per row: the placebo measurement is a single file read and the "where the
+    // score comes from" panel needs it for every card.
+    const discriminationStats = loadForecastDiscrimination();
+    // History for the badge. Loaded once for the whole response and cached briefly: it reads
+    // every resolved forecast, and recomputing it per card would be 200 identical scans.
+    const trackHistory = await loadForecastTrackRecord(pool);
     const forecasts = rows.map((r) => {
       const drift = parse(r.drift_json, []);
-      return {
+      const track = trackHistory
+        ? trackRecordFor({ bestStrategy: r.best_strategy, symbol: r.symbol, timeframe: r.timeframe, levelType: r.level_type }, trackHistory)
+        : { qualifies: false, reason: 'history unavailable' };
+      const shaped = {
+        // Has this KIND of setup worked before? Deliberately not on the exact
+        // strategy x symbol x timeframe x level slice — that grouping has a median sample of 1
+        // here, so a tick on it would be noise. See forecastTrackRecord.js.
+        trackRecord: track,
         id: r.id, key: r.fkey, symbol: r.symbol, timeframe: r.timeframe,
         scenario: r.scenario, side: r.side, level: Number(r.level),
         levelType: r.level_type, levelLabel: r.level_label, levelStrength: r.level_strength,
+        levelSources: levelSourceFamilies(r), levelConfluence: r.level_confluence ?? 1,
         expectedDirection: r.expected_direction, consensusDirection: r.consensus_direction,
         distance: { pips: r.distance_pips, atr: r.distance_atr },
         eta: { minMinutes: r.eta_min, midMinutes: r.eta_mid, maxMinutes: r.eta_max },
         horizon: { key: r.horizon, label: (FORECAST_HORIZON_BUCKETS.find((b) => b.key === r.horizon) || {}).label || r.horizon },
         rankScore: Number(r.rank_score), bestScore: Number(r.best_score), bestStrategy: r.best_strategy,
+        grade: r.grade || null,
         agreeCount: r.agree_count, dissentCount: r.dissent_count,
         fires: parse(r.fires_json, []),
         plan: parse(r.plan_json, null),
@@ -16657,9 +18544,20 @@ app.get('/api/setup-forecasts', async (req, res) => {
         createdAt: new Date(r.created_at).toISOString(),
         updatedAt: new Date(r.updated_at).toISOString(),
       };
+      // Which parts of that score came from the market and which from the assumption, in plain
+      // English. Computed server-side so the page cannot invent its own version of the answer.
+      return {
+        ...shaped,
+        scoreBasis: forecastScoreBasis({
+          forecast: shaped,
+          discrimination: shaped.bestStrategy
+            ? forecastDiscriminationFor(discriminationStats, shaped.bestStrategy)
+            : null,
+        }),
+      };
     });
 
-    const discrimination = loadForecastDiscrimination();
+    const discrimination = discriminationStats;
     const allIds = enabledStrategyIds().filter((id) => STRATEGY_LAB_REGISTRY[id] && !STRATEGY_LAB_REGISTRY[id].measureFixedTime);
     // The in-memory scan record is lost on restart, which made the page claim "no scan yet"
     // while displaying 150 stored forecasts. Fall back to the data's own freshness.
@@ -16692,6 +18590,558 @@ app.get('/api/setup-forecasts', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// POST /api/setup-forecasts/:id/track — pin or unpin a forecast for tracking.
+app.post('/api/setup-forecasts/:id/track', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const on = req.body?.tracked !== false;
+    const [r] = await pool.execute(
+      // Clearing alerted_at on re-track is deliberate: pinning something again is a fresh
+      // request to be told when it turns, not a continuation of the old one.
+      on
+        ? 'UPDATE mt5_setup_forecasts SET tracked=1, tracked_at=?, alerted_at=NULL, alert_verdict=NULL WHERE id=?'
+        : 'UPDATE mt5_setup_forecasts SET tracked=0 WHERE id=?',
+      on ? [toMysqlDate(), req.params.id] : [req.params.id],
+    );
+    if (!r.affectedRows) return res.status(404).json({ error: 'forecast not found' });
+    res.json({ ok: true, tracked: on });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/setup-forecasts/tracked — the Tracked tab: every pinned forecast with a live health
+// read (still valid / strengthening / weakening / don't chase / reversed), score drift and time
+// left. Closed ones are kept until unpinned so you can see how they ended.
+app.get('/api/setup-forecasts/tracked', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query(
+      'SELECT * FROM mt5_setup_forecasts WHERE tracked=1 ORDER BY tracked_at DESC LIMIT 100');
+    const parse = (x, fb) => { try { return JSON.parse(x) || fb; } catch { return fb; } };
+
+    const priceCache = new Map();
+    const livePrice = async (symbol, tf) => {
+      const k = `${symbol}|${tf}`;
+      if (priceCache.has(k)) return priceCache.get(k);
+      let v = null;
+      try {
+        const [c] = await pool.query(
+          'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+          [String(symbol).toUpperCase(), tf]);
+        v = c.length ? Number(c[0].close_price) : null;
+      } catch { v = null; }
+      priceCache.set(k, v);
+      return v;
+    };
+
+    const out = [];
+    for (const r of rows) {
+      const drift = parse(r.drift_json, []);
+      const forecast = {
+        id: r.id, symbol: r.symbol, timeframe: r.timeframe, status: r.status,
+        scenario: r.scenario, side: r.side, level: Number(r.level), atr: Number(r.atr),
+        levelType: r.level_type, levelLabel: r.level_label,
+        expectedDirection: r.expected_direction, bestScore: r.best_score, bestStrategy: r.best_strategy,
+        grade: r.grade || null,
+        eta: { minMinutes: r.eta_min, midMinutes: r.eta_mid, maxMinutes: r.eta_max },
+        plan: parse(r.plan_json, null), fires: parse(r.fires_json, []),
+        drift, createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+      };
+      const price = await livePrice(r.symbol, r.timeframe);
+      const health = assessTracked({ forecast, price });
+      out.push({
+        ...forecast,
+        price,
+        trackedAt: r.tracked_at ? new Date(r.tracked_at).toISOString() : null,
+        alertedAt: r.alerted_at ? new Date(r.alerted_at).toISOString() : null,
+        alertVerdict: r.alert_verdict || null,
+        actual: r.actual, matched: r.matched === 1,
+        health,
+      });
+    }
+    // Trouble first: the whole point is surfacing the ones that turned against you.
+    const rank = { REVERSED: 0, DONT_CHASE: 1, WEAKENING: 2, STALE: 3, HOLDING: 4, STRENGTHENING: 5, CLOSED: 6 };
+    out.sort((a, b) => (rank[a.health.verdict] ?? 9) - (rank[b.health.verdict] ?? 9));
+    res.json({ ok: true, generatedAt: new Date().toISOString(), count: out.length, tracked: out });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Watch tracked forecasts and send ONE alert each when the setup turns against you.
+//
+// Exactly one per forecast, ever: a tracked setup that wobbles for an hour would otherwise send
+// a dozen mails and train the reader to ignore all of them. Good news never sends anything.
+async function checkTrackedForecastAlerts() {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [rows] = await pool.query(
+      "SELECT * FROM mt5_setup_forecasts WHERE tracked=1 AND alerted_at IS NULL AND status='WAITING' LIMIT 50");
+    if (!rows.length) return;
+    const parse = (x, fb) => { try { return JSON.parse(x) || fb; } catch { return fb; } };
+    const esc = (v) => String(v ?? '').replace(/[<>&]/g, (ch) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch]));
+
+    for (const r of rows) {
+      try {
+        const [c] = await pool.query(
+          'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+          [String(r.symbol).toUpperCase(), r.timeframe]);
+        const price = c.length ? Number(c[0].close_price) : null;
+        if (price === null) continue;
+
+        const forecast = {
+          id: r.id, symbol: r.symbol, timeframe: r.timeframe, status: r.status,
+          scenario: r.scenario, side: r.side, level: Number(r.level), atr: Number(r.atr),
+          levelLabel: r.level_label, expectedDirection: r.expected_direction,
+          bestScore: r.best_score, bestStrategy: r.best_strategy,
+          eta: { maxMinutes: r.eta_max },
+          plan: parse(r.plan_json, null), drift: parse(r.drift_json, []),
+          createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        };
+        const health = assessTracked({ forecast, price });
+        if (!shouldAlert(health, { alertedAt: r.alerted_at })) continue;
+
+        // Claim the alert BEFORE sending. If the send throws, the row still shows as alerted —
+        // deliberately: one missed mail beats a retry loop mailing the same warning repeatedly.
+        const [claim] = await pool.execute(
+          'UPDATE mt5_setup_forecasts SET alerted_at=?, alert_verdict=? WHERE id=? AND alerted_at IS NULL',
+          [toMysqlDate(), health.verdict, r.id]);
+        if (!claim.affectedRows) continue;
+
+        const dirWord = String(r.expected_direction || '').toUpperCase();
+        const title = health.verdict === TRACK_VERDICT.REVERSED ? 'Setup invalidated'
+          : health.verdict === TRACK_VERDICT.DONT_CHASE ? 'Do not chase this one'
+            : 'Tracked setup is weakening';
+        const html = `<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:560px">
+          <div style="background:#0f172a;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0">
+            <div style="font-size:11px;letter-spacing:.08em;opacity:.75">TRACKED FORECAST</div>
+            <div style="font-size:19px;font-weight:800">${title}</div>
+          </div>
+          <div style="border:1px solid #e2e8f0;border-top:0;padding:16px 18px;border-radius:0 0 10px 10px">
+            <p style="margin:0 0 10px;font-size:15px;font-weight:700;color:#0f172a">
+              ${r.symbol} ${r.timeframe} · ${dirWord} · ${String(r.scenario || '').replace(/_/g, ' ').toLowerCase()}
+              at ${r.level_label || 'level'} ${r.level}
+            </p>
+            <p style="margin:0 0 10px;font-size:13px;color:#334155">${esc(health.suggestion || '')}</p>
+            <ul style="margin:0 0 12px;padding-left:18px;font-size:12px;color:#475569">
+              ${(health.reasons || []).map((x) => `<li>${esc(x)}</li>`).join('')}
+            </ul>
+            <table style="font-size:12px;color:#475569">
+              <tr><td style="padding:2px 12px 2px 0">Score change</td><td><b>${health.scoreChange > 0 ? '+' : ''}${health.scoreChange}</b></td></tr>
+              <tr><td style="padding:2px 12px 2px 0">Price now</td><td><b>${price}</b></td></tr>
+              <tr><td style="padding:2px 12px 2px 0">Distance to level</td><td><b>${health.distanceAtr ?? '?'} ATR</b></td></tr>
+              <tr><td style="padding:2px 12px 2px 0">Time left</td><td><b>${health.timeLeftMinutes ?? '?'} min</b></td></tr>
+            </table>
+            <p style="margin:12px 0 0;font-size:11px;color:#94a3b8">
+              This is the only alert for this forecast — you will not be mailed about it again.
+              Analysis only; nothing was traded.
+            </p>
+          </div></div>`;
+        // Same per-symbol recipient routing as every other alert; nobody matching means
+        // nobody is mailed, which is the configured intent rather than a failure.
+        const to = signalEmailToFor(r.symbol, r.timeframe);
+        if (!to) { console.log(`[SetupForecast] tracked alert suppressed — no recipient for ${r.symbol} ${r.timeframe}`); continue; }
+        await sendNotificationEmail({
+          to,
+          subject: `${title} · ${r.symbol} ${r.timeframe} ${dirWord} @ ${r.level}`,
+          html,
+          text: `${title}: ${r.symbol} ${r.timeframe} ${dirWord} at ${r.level}. ${health.suggestion || ''} ${(health.reasons || []).join('; ')}`,
+        });
+        console.log(`[SetupForecast] tracked alert sent (${health.verdict}) for ${r.symbol} ${r.timeframe} @ ${r.level}`);
+      } catch (e) { console.error('[SetupForecast] tracked alert failed for', r.id, e.message); }
+    }
+  } catch (e) { console.error('[SetupForecast] tracked alert sweep failed:', e.message); }
+}
+setInterval(() => { checkTrackedForecastAlerts().catch(() => {}); }, 3 * 60000);
+
+// POST /api/setup-forecasts/:id/place-order — rest a LIMIT order at the forecast level.
+//
+// This puts a REAL order on the account, so it goes through the same gates as the auto-trader
+// rather than around them: challenge sizing and guard, concurrency, the armed-account
+// interlock, and an expiry. It is written as a normal QUEUED row in mt5_auto_trades, so the
+// existing dispatch loop and result handling own it from there — no separate execution path
+// that could drift from the tested one.
+//
+// LIMIT specifically, never MARKET: the whole premise is that price has NOT arrived yet. That
+// also sidesteps the 10016 failures, which on this account are 23-of-158 on market orders and
+// 0-of-35 on pendings.
+app.post('/api/setup-forecasts/:id/place-order', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_setup_forecasts WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'forecast not found' });
+    const f = rows[0];
+    // A finished forecast is no longer a prediction, but the LEVEL it named still exists and a
+    // limit resting there can be perfectly sensible — a setup that already ran is exactly the
+    // case for waiting on a pullback. So this warns rather than refuses; the checks that
+    // actually protect money (correct side of market, challenge rules, concurrency) are below
+    // and still binding.
+    const staleForecast = f.status !== 'WAITING' ? `forecast is ${String(f.status).toLowerCase()} — the level is still there, but the prediction has ended` : null;
+
+    const parse = (x, fb) => { try { return JSON.parse(x) || fb; } catch { return fb; } };
+    const plan = parse(f.plan_json, null);
+    if (!plan?.entry || !plan?.stopLoss) return res.status(422).json({ error: 'this forecast has no sized ticket to place' });
+
+    const cfg = autoTradeConfig();
+    const mode = autoTradeEffectiveMode(cfg);
+    if (mode !== 'ASK' && mode !== 'AUTO') {
+      return res.status(409).json({ error: `auto-trading is ${mode} — the EA bridge will not dispatch orders` });
+    }
+    if (!autoTradeArmedMatch()) return res.status(409).json({ error: 'the armed account does not match the account logged into MT5' });
+
+    // A limit must rest on the correct side of the market. If price has already passed the
+    // entry, this is no longer the setup that was forecast — refuse rather than convert it
+    // into a stop order the user did not ask for.
+    const [c] = await pool.query(
+      'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+      [String(f.symbol).toUpperCase(), f.timeframe]);
+    const price = c.length ? Number(c[0].close_price) : null;
+    const buy = String(plan.direction).toUpperCase() === 'BUY';
+
+    // LIMIT or STOP depends on which SIDE the entry sits, and that follows the scenario.
+    //
+    // SWEEP_REJECT and TOUCH_REJECT are FADE setups: price travels to the level and turns, so the
+    // entry is on the far side of the market and a limit rests there waiting. BREAK_HOLD is a
+    // CONTINUATION setup: price breaks THROUGH the level and keeps going, so the entry sits
+    // BEYOND the market in the direction of travel — which is a stop order, not a limit.
+    //
+    // Hardcoding 'LIMIT' made every BREAK_HOLD forecast fail the side check below: 25 of 25 were
+    // unplaceable, returning 422 no matter how good the setup was. The side is derived from the
+    // prices rather than the scenario name so a mis-labelled scenario still produces a valid
+    // ticket.
+    const orderType = price === null
+      ? 'LIMIT'
+      : (buy ? (plan.entry < price ? 'LIMIT' : 'STOP') : (plan.entry > price ? 'LIMIT' : 'STOP'));
+
+    // With the type chosen from the side, the only genuine refusal left is an entry sitting
+    // exactly at the market — neither a limit nor a stop can rest there.
+    if (price !== null && Math.abs(plan.entry - price) < 1e-12) {
+      return res.status(422).json({ error: `entry ${plan.entry} is exactly at the market — nothing to rest` });
+    }
+
+    const conc = autoTradeConcurrencyBlock(cfg, f.symbol, await autoTradeInFlight(pool));
+    if (conc) return res.status(409).json({ error: conc });
+
+    const dash = computeChallengeDashboard();
+    // Grade comes from the strategy that produced the ticket. Passing null here made the
+    // challenge guard read "no grade" as "below A grade" and refuse every forecast order —
+    // the fires carry it, and plans stored before the fix fall back to the best agreeing one.
+    const fires = parse(f.fires_json, []);
+    const grade = plan.grade
+      ?? fires.filter((x) => x.agrees && x.grade).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0]?.grade
+      ?? null;
+    const guard = challengeSignalGuard(plan.lossAtStop, grade, plan.rr);
+    if (!guard.eligible) return res.status(409).json({ error: `challenge guard: ${guard.warnings.join('; ')}` });
+
+    const id = `forecastorder:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const holdMin = Math.max(15, Math.min(720, Number(req.body?.expiryMinutes) || Number(f.eta_max) || 180));
+    await pool.execute(
+      `INSERT INTO mt5_auto_trades
+         (id, forecast_id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss,
+          take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr,
+          session, mode, status, reason, expires_at, created_at)
+       VALUES (?,?,?,?,?,?, ?, ?,?,?,?,?,?,?,?,?,?,?,?,?, 'QUEUED', ?, ?, ?)`,
+      [id, f.id, f.best_strategy || 'forecast', f.symbol, f.timeframe, plan.direction, orderType,
+        plan.entry, plan.stopLoss, plan.takeProfit ?? null, plan.takeProfit2 ?? null, plan.takeProfit3 ?? null,
+        plan.lots, plan.riskBudget ?? dash?.safePerTradeRisk ?? null, 'CHALLENGE',
+        Math.round(Number(f.best_score) || 0), null, plan.rr ?? null,
+        strategyLabSession(new Date().toISOString())?.key || null, mode,
+        `resting ${orderType.toLowerCase()} from forecast ${f.scenario} @ ${f.level}`.slice(0, 255),
+        toMysqlDate(new Date(Date.now() + holdMin * 60000).toISOString()), toMysqlDate()],
+    );
+    // Placing an order is an explicit decision to act, so the forecast is tracked from here on.
+    await pool.execute('UPDATE mt5_setup_forecasts SET tracked=1, tracked_at=COALESCE(tracked_at, ?) WHERE id=?', [toMysqlDate(), f.id]);
+
+    res.json({
+      ok: true, id, orderType: 'LIMIT', direction: plan.direction,
+      entry: plan.entry, stopLoss: plan.stopLoss, takeProfit: plan.takeProfit ?? null, lots: plan.lots,
+      expiresInMinutes: holdMin,
+      warnings: [...(staleForecast ? [staleForecast] : []), ...guard.warnings],
+      note: 'Queued for the EA. It rests at the broker until price reaches the level or it expires.',
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/setup-forecasts/pending-orders — resting orders placed from forecasts.
+app.get('/api/setup-forecasts/pending-orders', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query(
+      `SELECT a.*, f.scenario, f.level, f.level_label, f.best_score AS forecast_score, f.status AS forecast_status
+         FROM mt5_auto_trades a
+         LEFT JOIN mt5_setup_forecasts f ON f.id = a.forecast_id
+        WHERE a.forecast_id IS NOT NULL
+        ORDER BY a.created_at DESC LIMIT 60`);
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      bridgeReady: autoTradeBridgeReady(),
+      armedMatch: autoTradeArmedMatch(),
+      orders: rows.map((r) => ({
+        id: r.id, forecastId: r.forecast_id,
+        symbol: r.symbol, timeframe: r.timeframe, direction: r.direction, orderType: r.order_type,
+        entry: r.entry_price, stopLoss: r.stop_loss, takeProfit1: r.take_profit_1,
+        lots: r.lots, riskAmount: r.risk_amount, rr: r.rr,
+        status: r.status, reason: r.reason, ticket: r.ticket, fillPrice: r.fill_price, profit: r.profit,
+        scenario: r.scenario, level: r.level, levelLabel: r.level_label,
+        forecastScore: r.forecast_score, forecastStatus: r.forecast_status,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
+        // Only a resting order can be pulled; a filled one is a position, not an order.
+        cancellable: ['QUEUED', 'SENT', 'PLACED'].includes(String(r.status)),
+      })),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/setup-forecasts/order/:id/cancel — pull a resting order off the broker.
+//
+// QUEUED has not left the building, so it is simply dropped. Anything already PLACED at the
+// broker needs the EA to delete it, which is queued as a DEL command and confirmed on the next
+// poll — the row is not marked cancelled until the broker says so.
+app.post('/api/setup-forecasts/order/:id/cancel', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_auto_trades WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'order not found' });
+    const r = rows[0];
+
+    if (r.status === 'QUEUED') {
+      const [u] = await pool.execute(
+        "UPDATE mt5_auto_trades SET status='REJECTED', reason='cancelled before it left the server', updated_at=? WHERE id=? AND status='QUEUED'",
+        [toMysqlDate(), r.id]);
+      return res.json({ ok: true, cancelled: Boolean(u.affectedRows), atBroker: false });
+    }
+    if (!r.ticket) return res.status(409).json({ error: `order is ${r.status} with no broker ticket — nothing to cancel` });
+    if (!['PLACED', 'SENT'].includes(String(r.status))) {
+      return res.status(409).json({ error: `order is ${String(r.status).toLowerCase()} — only a resting order can be cancelled` });
+    }
+    await pool.execute(
+      "UPDATE mt5_auto_trades SET status='CANCELLING', reason='cancel requested — waiting for the EA', updated_at=? WHERE id=?",
+      [toMysqlDate(), r.id]);
+    res.json({ ok: true, cancelled: false, atBroker: true, note: 'Cancel queued; the EA removes it on its next poll.' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/setup-forecasts/strategy-rates?range=today|yesterday|7d|30d|custom&from=&to=
+//
+// How often each strategy's forecasts actually played out, over a window. Powers the star on
+// strategies with a perfect record and the "100% only" filter.
+//
+// `perfect` requires a minimum sample as well as a 100% rate: one lucky forecast reads as 100%
+// and would decorate a strategy that has never been tested, which misleads worse than showing
+// nothing. Those are returned as `provisional` instead — visible, but unstarred.
+app.get('/api/setup-forecasts/strategy-rates', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    // Day boundaries follow the viewer's clock; a UTC "today" would roll over at 6am here.
+    const offsetMinutes = Number.isFinite(Number(req.query.offsetMinutes)) ? Number(req.query.offsetMinutes) : 0;
+    const win = resolveWindow(String(req.query.range || '30d'), {
+      offsetMinutes, from: req.query.from || null, to: req.query.to || null,
+    });
+    if (!win) return res.status(400).json({ error: 'invalid custom range — supply from and to, with to after from' });
+    const minSample = Math.max(1, Math.min(50, Number(req.query.minSample) || 3));
+
+    const [rows] = await pool.query(
+      `SELECT best_strategy, matched FROM mt5_setup_forecasts
+        WHERE status='RESOLVED' AND best_strategy IS NOT NULL
+          AND resolved_at >= ? AND resolved_at < ?`,
+      [toMysqlDate(new Date(win.from).toISOString()), toMysqlDate(new Date(win.to).toISOString())]);
+
+    const rates = strategyMatchRates(rows, { minSample });
+    res.json({
+      ok: true,
+      range: String(req.query.range || '30d'),
+      label: win.label,
+      from: new Date(win.from).toISOString(),
+      to: new Date(win.to).toISOString(),
+      resolved: rows.length,
+      minSample,
+      strategies: rates,
+      perfect: rates.filter((r) => r.perfect).map((r) => r.strategy),
+      note: `A strategy is starred only at 100% over at least ${minSample} resolved forecasts.`,
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/setup-forecasts/:id/analyze — AI second opinion on ONE forecast.
+//
+// The forecast itself stays deterministic. This asks a model to review the same situation and
+// return its own direction, score and ticket, then reconciles that answer against arithmetic
+// (forecastAi.js) before it is shown. Read-only: the result is never written to the forecast
+// row, never reaches the auto-trader or email, and cannot place an order.
+//
+// Cached per forecast: the underlying level and strategy set only change when the scan
+// re-scores, so re-clicking the button should not spend quota on an identical question.
+const forecastAiCache = new Map();
+const FORECAST_AI_TTL_MS = 10 * 60 * 1000;
+app.post('/api/setup-forecasts/:id/analyze', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_setup_forecasts WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'forecast not found' });
+    const r = rows[0];
+    const parse = (s, fb) => { try { return JSON.parse(s) || fb; } catch { return fb; } };
+
+    const forecast = {
+      id: r.id, symbol: r.symbol, timeframe: r.timeframe,
+      scenario: r.scenario, side: r.side, level: Number(r.level), atr: Number(r.atr),
+      levelType: r.level_type, levelLabel: r.level_label, levelStrength: r.level_strength,
+      levelSources: levelSourceFamilies(r), levelConfluence: r.level_confluence ?? 1,
+      expectedDirection: r.expected_direction,
+      distance: { pips: r.distance_pips, atr: r.distance_atr },
+      eta: { minMinutes: r.eta_min, midMinutes: r.eta_mid, maxMinutes: r.eta_max },
+      bestScore: r.best_score, bestStrategy: r.best_strategy,
+      fires: parse(r.fires_json, []),
+      plan: parse(r.plan_json, null),
+    };
+
+    // Re-scoring changes the answer, so the cache key follows the row's freshness.
+    const cacheKey = `${r.id}|${r.updated_at ? new Date(r.updated_at).getTime() : 0}`;
+    const hit = forecastAiCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < FORECAST_AI_TTL_MS && !req.query.force) {
+      return res.json({ ...hit.payload, cached: true });
+    }
+
+    // Live context. Best-effort: a missing piece degrades the prompt, it does not fail the call.
+    const market = { session: strategyLabSession(new Date().toISOString())?.key || null };
+    let marketRead = '';
+    let chart = null;
+    // Overlay data for the chart, taken from the same market read the prompt text uses.
+    let chartOrderBlocks = [], chartZones = [], chartRetests = [];
+    try {
+      const prep = await setupForecastContext(pool, r.symbol, r.timeframe);
+      if (prep) {
+        market.price = prep.price;
+        market.atr = Math.round(prep.atr * 1e5) / 1e5;
+        market.h1Trend = prep.ctx.h1Trend;
+        market.h4Trend = prep.ctx.h4Trend;
+        // Levels keep their swept/fresh status: which liquidity is still live changes the read
+        // entirely, and a bare price list throws that away.
+        market.nearbyLevels = (prep.levels || [])
+          .filter((l) => Number.isFinite(Number(l.price)) && Math.abs(Number(l.price) - Number(r.level)) <= prep.atr * 3)
+          .slice(0, 10)
+          .map((l) => ({ type: l.type, label: l.label, price: l.price, swept: Boolean(l.swept), status: l.status || null }));
+
+        // Everything the strategies look at: real OHLC, patterns, wicks, order blocks, FVGs,
+        // structure, sweeps, S/R, breaker and retests of this level.
+        const read = buildMarketRead({ candles: prep.ctx.candles, symbol: r.symbol, level: Number(r.level), atr: prep.atr });
+        marketRead = formatMarketRead(read, { symbol: r.symbol, timeframe: r.timeframe });
+
+        // The chart is drawn from the SAME read the prompt text describes, so the image and
+        // the words can never disagree. Indices are rebased onto the 80-bar slice the chart
+        // shows — a retest at index 250 of the full series is off the drawn window entirely.
+        const CHART_BARS = 80;
+        const chartCandles = prep.ctx.candles.slice(-CHART_BARS);
+        const rebase = prep.ctx.candles.length - chartCandles.length;
+        chartOrderBlocks = (read?.orderBlocks || [])
+          .filter((b) => Number(b?.top) > Number(b?.bottom))
+          // Three, not four: overlapping blocks merge into one grey mass and stop reading as
+          // distinct zones. The most recent are the ones still in play.
+          .slice(-3)
+          .map((b) => ({ top: b.top, bottom: b.bottom, type: b.type }));
+        chartZones = [
+          ...(read?.support || []).map((z) => ({ price: Number(z?.level ?? z?.price), kind: 'SUPPORT' })),
+          ...(read?.resistance || []).map((z) => ({ price: Number(z?.level ?? z?.price), kind: 'RESISTANCE' })),
+        ].filter((z) => Number.isFinite(z.price) && z.price > 0).slice(0, 6);
+        // detectRetests returns a SUMMARY with a  array — not an array itself.
+        chartRetests = (Array.isArray(read?.retests?.bars) ? read.retests.bars : [])
+          .map((t) => ({ index: Number(t?.index) - rebase, price: Number(t?.price ?? r.level) }))
+          .filter((t) => Number.isFinite(t.index) && t.index >= 0 && t.index < chartCandles.length)
+          .slice(0, 8);
+
+        // The chart the model looks at, drawn from those same candles — no upload, no
+        // screenshot of the UI that could have drifted from the data actually analysed.
+        const planForChart = parse(r.plan_json, null);
+        chart = renderCandleChart({
+          candles: chartCandles,
+          orderBlocks: chartOrderBlocks,
+          zones: chartZones,
+          retests: chartRetests,
+          levels: market.nearbyLevels,
+          focusLevel: Number(r.level),
+          entry: planForChart?.entry ?? null,
+          stopLoss: planForChart?.stopLoss ?? null,
+          takeProfit: planForChart?.takeProfit ?? null,
+          takeProfit2: planForChart?.takeProfit2 ?? planForChart?.takeProfit3 ?? null,
+          // The broker's own digit count, so gold reads 4065.00 and EURUSD 1.15044 rather than
+          // both being guessed from magnitude.
+          digits: brokerSpecFor(r.symbol)?.digits ?? null,
+        });
+      }
+    } catch (e) { console.warn('[ForecastAI] context build failed:', e.message); }
+
+    let news = [];
+    try {
+      news = getUpcomingForSymbol(r.symbol || '', Date.now(), 12).map((e) => ({
+        currency: e.currency, impact: e.impact, title: e.title,
+        in_minutes: Math.round((e.timestampUtc - Date.now()) / 60000),
+      })).slice(0, 6);
+    } catch { /* news optional */ }
+
+    const wantVision = String(req.query.vision || '1') !== '0' && Boolean(chart);
+    const prompt = buildForecastAiPrompt({ forecast, market, news, marketRead, hasImage: wantVision });
+    const out = await analyzeForecastWithGemini({
+      projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION,
+      model: String(req.query.model || 'gemini-2.5-flash'),
+      prompt,
+      imageBase64: wantVision ? chart.png.toString('base64') : null,
+    });
+
+    let payload;
+    if (!out.available) {
+      payload = {
+        ok: true, id: r.id,
+        ai: deterministicForecastView(forecast, out.reason || 'AI unavailable'),
+        market, news,
+      };
+    } else {
+      const spec = brokerSpecFor(r.symbol);
+      const reconciled = reconcileForecastAi(
+        normaliseForecastAi(out.parsed),
+        {
+          forecast,
+          pip: forexSizingPipSize(r.symbol),
+          minStopDistance: spec ? specMinStopDistance(spec) : null,
+        },
+      );
+      payload = {
+        ok: true, id: r.id, model: out.model,
+        ai: { available: true, ...reconciled },
+        system: {
+          direction: forecast.expectedDirection,
+          score: forecast.bestScore,
+          strategy: forecast.bestStrategy,
+          plan: forecast.plan,
+          backing: forecast.fires.filter((f) => f.agrees).length,
+          against: forecast.fires.filter((f) => !f.agrees).length,
+        },
+        market, news,
+        // What the model was actually given, so the page can say so rather than implying more.
+        saw: {
+          bars: chart?.bars ?? 0,
+          vision: wantVision,
+          chartPng: wantVision ? `data:image/png;base64,${chart.png.toString('base64')}` : null,
+          sections: marketRead ? marketRead.split('\n').filter((l) => /^[A-Z][a-z].*:/.test(l)).length : 0,
+        },
+        analysedAt: new Date().toISOString(),
+        caveats: [
+          'A second opinion on a conditional setup — the scenario has not happened yet.',
+          'Prices returned by the model are checked against arithmetic; anything unsound is flagged and the ticket marked unusable.',
+          'This never reaches the auto-trader, the approval queue or email.',
+        ],
+      };
+    }
+    forecastAiCache.set(cacheKey, { at: Date.now(), payload });
+    res.json(payload);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // POST /api/setup-forecasts/scan — manual trigger (page refresh button / testing).
 //
 // Returns immediately rather than awaiting the scan. A full sweep is ~2 minutes (10 symbols x
@@ -16705,19 +19155,1524 @@ app.post('/api/setup-forecasts/scan', (req, res) => {
     try {
       await runSetupForecastScan({ reason: 'manual' });
       await resolveSetupForecasts();
+      await backfillForecastSettlement();
     } catch (e) { console.error('[SetupForecast] manual scan failed:', e.message); }
   })();
 });
 
-// GET /api/reports/setup-forecasts — how much was predicted, how much matched.
+// ─── ICT Predict: projected sweep → breaker setups, ict-breaker family only ───────────
+//
+// The narrower cousin of the setup forecaster. That one asks every strategy "what if price
+// arrives and rejects"; this one stages the full ICT sequence (sweep the pool, displace, close
+// back through the opposing structure) against the REAL structure and asks only the two ICT
+// engines what they make of it. The pure pipeline is ictPredict.js -> ictPredictAi.js; this
+// block is wiring only. It never touches the live signal path, never writes to
+// mt5_strategy_signals, and reaches the broker solely through the same QUEUED auto-trade row
+// every other order goes through.
+const ICT_PREDICT_TFS = String(process.env.ICT_PREDICT_TFS || 'M15,M30,H1,H4')
+  .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+const ICT_PREDICT_SCAN_MS = Math.max(5, Number(process.env.ICT_PREDICT_SCAN_MIN || 10)) * 60000;
+const ICT_PREDICT_RETENTION_DAYS = Math.max(1, Number(process.env.ICT_PREDICT_RETENTION_DAYS || 21));
+
+/** Which ICT engines may run here: registry timeframe contract first, controller state second. */
+function ictStrategiesFor(tf, { includeMuted = false } = {}) {
+  const enabled = includeMuted ? null : new Set(enabledStrategyIds());
+  return ICT_STRATEGIES.filter((id) => STRATEGY_LAB_REGISTRY[id]
+    && strategyTimeframes(id).includes(tf)
+    && (!enabled || enabled.has(id)));
+}
+
+let ictScanBusy = false;
+let ictLastScan = null;
+async function runIctPredictScan({ reason = 'interval' } = {}) {
+  if (ictScanBusy) return { skipped: 'busy' };
+  ictScanBusy = true;
+  const startedAt = Date.now();
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return { skipped: 'no database' };
+    const symbols = getCuratedSymbols(getMt5Status().symbols || []);
+    if (!symbols.length) return { skipped: 'no symbols' };
+
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    let inserted = 0, updated = 0, superseded = 0, total = 0, candidates = 0;
+    const unbuildable = [];
+    // Once per scan, not per prediction: the challenge dashboard reads account state and the
+    // budget is identical for every row in the sweep.
+    const ictDashboard = computeChallengeDashboard();
+    // The CONFIGURED percentage of the initial balance, not the room-clamped figure. Sizing from
+    // remaining room collapsed this to $3.07 on a $10,000 account with 0.8% set, which produced
+    // 0.01-lot tickets and ignored the user's own setting. Room is not discarded — it comes back
+    // as a warning on the ticket instead of silently shrinking the budget.
+    // Deliberately NOT one budget for the whole sweep any more: each prediction is sized by its
+    // own grade/score/RR, so a C setup no longer books the same risk as an A+.
+    const ictRiskFor = (p) => setupRisk(
+      { grade: p?.grade, score: p?.bestScore ?? p?.best_score, rr: p?.rr },
+      ictDashboard,
+    );
+
+    for (const tf of ICT_PREDICT_TFS) {
+      const ids = ictStrategiesFor(tf);
+      if (!ids.length) continue;
+      // Instrument caps are an execution contract, not a preference: USTEC has no M1/D1
+      // signals and no forecast variant at all.
+      const eligible = symbols.filter((s) => symbolAllowsForecast(s) && symbolAllowsSignalTf(s, tf));
+      if (!eligible.length) continue;
+      // One batched load per timeframe instead of six queries per symbol. The context builder is
+      // still shared with the setup forecaster — two loaders would eventually disagree about
+      // which candles are closed, and the predictions would drift apart for no visible reason.
+      let preps = new Map();
+      try { preps = await setupForecastContextBatch(pool, eligible, tf); }
+      catch (e) { console.error(`[IctPredict] context load failed for ${tf}:`, e.message); continue; }
+
+      for (const symbol of eligible) {
+        const prep = preps.get(String(symbol).toUpperCase());
+        if (!prep) continue;
+
+        const out = runIctPredictions({
+          base: prep.ctx, swings: fractalSwings(prep.ctx.candles),
+          atr: prep.atr, price: prep.price, pip: forexSizingPipSize(symbol),
+          symbol, timeframe: tf, levels: prep.levels,
+          strategyIds: ids, evaluate: evaluateStrategy, stageOf: computeStage,
+        });
+        candidates += out.candidates;
+        total += out.predictions.length;
+        for (const u of out.unbuildable) {
+          if (unbuildable.length < 20) unbuildable.push({ symbol, timeframe: tf, ...u });
+        }
+
+        for (const p of out.predictions) {
+          const lo = p.limitOrder || {};
+          // Size the RESTING order at scan time, so the card can show lots and dollar risk
+          // instead of only revealing them after you commit to placing. Sized off the limit
+          // prices (entry at the real level), NOT the strategy's breaker entry — the limit is
+          // the order that would actually go to the broker, and the two have different stops.
+          //
+          // This is an estimate pinned to the risk budget at scan time; place-order re-sizes
+          // against the live budget, which is why the card says so rather than implying it is
+          // locked in.
+          let sizing = null;
+          if (lo.entry && lo.stopLoss) {
+            const ictConviction = ictRiskFor({ grade: p.grade, bestScore: p.bestScore, rr: p.rr });
+            const { plan: sized, reason } = buildForecastPlan({
+              forecast: {
+                symbol, grade: p.grade,
+                expectedDirection: p.direction,
+                fires: [{
+                  agrees: true, decision: p.direction, strategyId: p.bestStrategy,
+                  score: p.bestScore, grade: p.grade,
+                  entry: lo.entry, stopLoss: lo.stopLoss,
+                  takeProfit: lo.takeProfit1, takeProfit2: lo.takeProfit2, takeProfit3: lo.takeProfit3,
+                  rr: lo.rr,
+                }],
+              },
+              pipSize: forexSizingPipSize(symbol),
+              pipValuePerLot: forexSizingPipValuePerLot(symbol),
+              riskBudget: ictConviction.riskUsd,
+              dashboard: ictDashboard,
+            });
+            sizing = sized
+              ? {
+                lots: sized.lots, lossAtStop: sized.lossAtStop, riskBudget: sized.riskBudget,
+                // What the conviction ladder decided and why, so a smaller-than-expected
+                // position is always explainable on the card rather than looking like a bug.
+                convictionTier: ictConviction.tier, convictionLabel: ictConviction.label,
+                convictionFraction: ictConviction.fraction, fullBudget: ictConviction.budget,
+                heldBackUsd: ictConviction.heldBackUsd, convictionWhy: ictConviction.why,
+                stopPips: sized.stopPips, profitAtTp: sized.profitAtTp, profitAtFinalTp: sized.profitAtFinalTp,
+                overBudget: sized.overBudget, minForced: sized.minForced,
+                warnings: sized.challenge?.warnings || [],
+              }
+              : { unavailable: reason };
+          }
+          const [active] = await pool.query(
+            "SELECT id FROM mt5_ict_predictions WHERE pkey=? AND status='WAITING' LIMIT 1", [p.key]);
+          const cols = [
+            p.direction, p.side, p.structureLevel,
+            p.levelType || null, p.levelLabel || null, p.levelStrength ?? null,
+            p.atr, p.priceAtForecast,
+            p.distance?.pips ?? null, p.distance?.atr ?? null,
+            p.eta?.minMinutes ?? null, p.eta?.midMinutes ?? null, p.eta?.maxMinutes ?? null,
+            p.rankScore ?? null, p.bestScore ?? null, p.bestStrategy || null, p.grade || null, p.rr ?? null,
+            p.proQualified ? 1 : 0,
+            lo.type || null, lo.entry ?? null, lo.stopLoss ?? null,
+            lo.takeProfit1 ?? null, lo.takeProfit2 ?? null, lo.takeProfit3 ?? null,
+            lo.rr ?? null, lo.stopPips ?? null,
+            JSON.stringify(p.fires.slice(0, 4)),
+            JSON.stringify({ strategyPlan: p.strategyPlan, scoreBasis: p.scoreBasis, projection: p.projection, refused: p.refused, sizing }),
+            JSON.stringify(p.measurements),
+            JSON.stringify(p.projectedBars),
+          ];
+          if (active.length) {
+            await pool.query(
+              `UPDATE mt5_ict_predictions SET
+                 direction=?, side=?, structure_level=?, level_type=?, level_label=?, level_strength=?,
+                 atr=?, price_at_forecast=?, distance_pips=?, distance_atr=?,
+                 eta_min=?, eta_mid=?, eta_max=?,
+                 rank_score=?, best_score=?, best_strategy=?, grade=?, rr=?, pro_qualified=?,
+                 order_type=?, limit_entry=?, limit_stop=?, limit_tp1=?, limit_tp2=?, limit_tp3=?,
+                 limit_rr=?, limit_stop_pips=?,
+                 fires_json=?, plan_json=?, measure_json=?, bars_json=?, updated_at=?
+               WHERE id=?`,
+              [...cols, toMysqlDate(nowIso), active[0].id]);
+            updated += 1;
+          } else {
+            await pool.query(
+              `INSERT INTO mt5_ict_predictions
+                 (id, pkey, symbol, timeframe, setup, level,
+                  direction, side, structure_level, level_type, level_label, level_strength,
+                  atr, price_at_forecast, distance_pips, distance_atr, eta_min, eta_mid, eta_max,
+                  rank_score, best_score, best_strategy, grade, rr, pro_qualified,
+                  order_type, limit_entry, limit_stop, limit_tp1, limit_tp2, limit_tp3,
+                  limit_rr, limit_stop_pips,
+                  fires_json, plan_json, measure_json, bars_json, created_at, updated_at, status)
+               VALUES (?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?, ?,?,?,?, ?,?, 'WAITING')`,
+              [`${p.key}|${now}`, p.key, symbol, tf, p.setup, p.level, ...cols,
+                toMysqlDate(nowIso), toMysqlDate(nowIso)]);
+            inserted += 1;
+          }
+        }
+
+        // A WAITING prediction this scan no longer produces has lost its premise — the pool was
+        // taken, price moved out of range, or the engines stopped backing it. Two missed scans of
+        // grace, so one noisy scan cannot kill a live prediction.
+        const [sup] = await pool.query(
+          `UPDATE mt5_ict_predictions SET status='SUPERSEDED', resolved_at=?
+             WHERE status='WAITING' AND symbol=? AND timeframe=? AND updated_at < ?`,
+          [toMysqlDate(nowIso), symbol, tf, toMysqlDate(new Date(now - 2 * ICT_PREDICT_SCAN_MS).toISOString())]);
+        superseded += sup.affectedRows || 0;
+      }
+    }
+
+    ictLastScan = {
+      at: nowIso, reason, ms: Date.now() - startedAt,
+      symbols: symbols.length, timeframes: ICT_PREDICT_TFS,
+      candidates, predictions: total, inserted, updated, superseded, unbuildable,
+    };
+    console.log(`[IctPredict] scan (${reason}): ${total} predictions from ${candidates} candidates, +${inserted} new, ~${updated} updated, ${superseded} superseded in ${ictLastScan.ms}ms`);
+    return ictLastScan;
+  } finally {
+    ictScanBusy = false;
+  }
+}
+
+/**
+ * Resolve WAITING predictions against the candles that closed since each was made.
+ *
+ * Three questions, kept separate because collapsing them would hide the interesting failure:
+ *   arrived    did price reach the pool at all?
+ *   swept      did it trade through — the liquidity grab itself?
+ *   reclaimed  did a bar CLOSE back through the structure level — the breaker confirming?
+ *
+ * A sweep that never reclaims is this model's characteristic loss, and a single "hit" flag would
+ * report it identically to a clean win.
+ */
+async function resolveIctPredictions({ limit = 300 } = {}) {
+  const pool = await initializeDatabase();
+  if (!pool) return { resolved: 0 };
+  const [rows] = await pool.query(
+    `SELECT id, symbol, timeframe, direction, level, structure_level, atr, eta_max, created_at,
+            limit_entry, limit_stop, limit_tp1, limit_tp2, limit_tp3
+       FROM mt5_ict_predictions WHERE status='WAITING' ORDER BY created_at ASC LIMIT ?`, [limit]);
+  let resolved = 0, expired = 0;
+
+  for (const row of rows) {
+    try {
+      const createdIso = new Date(row.created_at).toISOString();
+      const [cr] = await pool.query(
+        'SELECT candle_time, open_price, high, low, close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? AND candle_time > ? ORDER BY candle_time ASC LIMIT 600',
+        [String(row.symbol).toUpperCase(), row.timeframe, toMysqlDate(createdIso)]);
+      const since = closedBarsOnly(cr.map((r) => ({
+        time: new Date(r.candle_time).toISOString(),
+        open: Number(r.open_price), high: Number(r.high), low: Number(r.low), close: Number(r.close_price),
+      })), row.timeframe);
+
+      const buy = String(row.direction).toUpperCase() === 'BUY';
+      const level = Number(row.level);
+      const struct = Number(row.structure_level);
+      const atr = Number(row.atr) || 0;
+      let arrivedIdx = -1, sweptIdx = -1, reclaimedIdx = -1;
+      for (let i = 0; i < since.length; i++) {
+        const c = since[i];
+        const touched = buy ? c.low <= level : c.high >= level;
+        if (touched && arrivedIdx < 0) arrivedIdx = i;
+        // The grab is a wick event: judging on the close would miss most real sweeps.
+        const through = buy ? c.low <= level - atr * 0.05 : c.high >= level + atr * 0.05;
+        if (through && sweptIdx < 0) sweptIdx = i;
+        // The reclaim is close-confirmed, exactly as detectBreaker requires.
+        if (sweptIdx >= 0 && i >= sweptIdx && reclaimedIdx < 0
+          && (buy ? c.close > struct : c.close < struct)) reclaimedIdx = i;
+      }
+
+      const etaMax = Number(row.eta_max) || null;
+      const ageMin = Math.round((Date.now() - Date.parse(createdIso)) / 60000);
+      // Nothing has happened and the window is still open: leave it alone.
+      if (arrivedIdx < 0) {
+        if (etaMax === null || ageMin <= etaMax) continue;
+        await pool.query(
+          "UPDATE mt5_ict_predictions SET status='EXPIRED', resolved_at=?, arrived=0, swept=0, reclaimed=0 WHERE id=? AND status='WAITING'",
+          [toMysqlDate(), row.id]);
+        expired += 1;
+        continue;
+      }
+
+      // Price got there. Settle the RESTING order — the ticket a user would actually have had
+      // working — from the bar it would have filled on.
+      let hit = null;
+      try {
+        if (Number(row.limit_entry) > 0 && Number(row.limit_stop) > 0) {
+          hit = settleForecastTicket({
+            plan: {
+              direction: row.direction, entry: Number(row.limit_entry), stopLoss: Number(row.limit_stop),
+              takeProfit: Number(row.limit_tp1) || null,
+              takeProfit2: Number(row.limit_tp2) || null,
+              takeProfit3: Number(row.limit_tp3) || null,
+              pipValuePerLot: forexSizingPipValuePerLot(row.symbol),
+            },
+            candles: since.slice(arrivedIdx),
+            pip: forexSizingPipSize(row.symbol),
+          });
+        }
+      } catch (e) { console.error('[IctPredict] settle failed for', row.id, e.message); }
+
+      // OPEN means the trade is still running — do not finalise a row whose answer is not in yet.
+      if (hit && hit.outcome === 'OPEN') continue;
+
+      const arrivedMinutes = Math.round(
+        (Date.parse(since[arrivedIdx].time) - Date.parse(createdIso)) / 60000);
+      await pool.query(
+        `UPDATE mt5_ict_predictions SET status='RESOLVED', resolved_at=?, arrived=1, swept=?, reclaimed=?,
+           arrived_minutes=?, outcome=?, outcome_pips=?, outcome_r=?, outcome_tp_level=?, mfe_pips=?, mae_pips=?
+         WHERE id=? AND status='WAITING'`,
+        [toMysqlDate(), sweptIdx >= 0 ? 1 : 0, reclaimedIdx >= 0 ? 1 : 0,
+          arrivedMinutes, hit?.outcome ?? null, hit?.pips ?? null, hit?.rMultiple ?? null,
+          hit?.tpLevel ?? null, hit?.mfePips ?? null, hit?.maePips ?? null, row.id]);
+      resolved += 1;
+    } catch (e) { console.error('[IctPredict] resolve failed for', row.id, e.message); }
+  }
+  if (resolved || expired) console.log(`[IctPredict] resolved ${resolved}, expired ${expired}`);
+  return { resolved, expired, checked: rows.length };
+}
+
+/** Shared row → API shape, so the list, the tracked tab and the AI endpoint cannot disagree. */
+function ictRowToPrediction(r) {
+  const parse = (s, fb) => { try { return JSON.parse(s) ?? fb; } catch { return fb; } };
+  const extra = parse(r.plan_json, {});
+  return {
+    id: r.id, key: r.pkey, symbol: r.symbol, timeframe: r.timeframe,
+    setup: r.setup, direction: r.direction, side: r.side,
+    level: Number(r.level), structureLevel: Number(r.structure_level),
+    levelType: r.level_type, levelLabel: r.level_label, levelStrength: r.level_strength,
+    atr: r.atr === null ? null : Number(r.atr),
+    priceAtForecast: r.price_at_forecast === null ? null : Number(r.price_at_forecast),
+    distance: { pips: r.distance_pips, atr: r.distance_atr },
+    eta: { minMinutes: r.eta_min, midMinutes: r.eta_mid, maxMinutes: r.eta_max },
+    rankScore: r.rank_score === null ? null : Number(r.rank_score),
+    bestScore: r.best_score === null ? null : Number(r.best_score),
+    bestStrategy: r.best_strategy, grade: r.grade, rr: r.rr === null ? null : Number(r.rr),
+    proQualified: r.pro_qualified === 1,
+    limitOrder: r.limit_entry === null ? null : {
+      type: r.order_type, direction: r.direction,
+      entry: Number(r.limit_entry), stopLoss: Number(r.limit_stop),
+      takeProfit1: r.limit_tp1, takeProfit2: r.limit_tp2, takeProfit3: r.limit_tp3,
+      rr: r.limit_rr, stopPips: r.limit_stop_pips,
+    },
+    strategyPlan: extra.strategyPlan || null,
+    scoreBasis: extra.scoreBasis || null,
+    projection: extra.projection || null,
+    refused: extra.refused || [],
+    // Lots and dollar risk for the resting order, sized at scan time. Re-checked on place.
+    sizing: extra.sizing || null,
+    fires: parse(r.fires_json, []),
+    measurements: parse(r.measure_json, null),
+    projectedBars: parse(r.bars_json, []),
+    status: r.status,
+    tracked: r.tracked === 1,
+    arrived: r.arrived === null ? null : r.arrived === 1,
+    swept: r.swept === null ? null : r.swept === 1,
+    reclaimed: r.reclaimed === null ? null : r.reclaimed === 1,
+    outcome: r.outcome || null, outcomePips: r.outcome_pips, outcomeR: r.outcome_r,
+    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+  };
+}
+
+// GET /api/ict-predictions — active predictions, ranked, with every filter the page offers.
+app.get('/api/ict-predictions', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const q = (v) => String(v || '').trim();
+    const where = ["status='WAITING'"];
+    const args = [];
+    if (q(req.query.symbol)) { where.push('UPPER(symbol)=?'); args.push(q(req.query.symbol).toUpperCase()); }
+    if (q(req.query.timeframe)) { where.push('timeframe=?'); args.push(q(req.query.timeframe).toUpperCase()); }
+    if (q(req.query.setup)) { where.push('setup=?'); args.push(q(req.query.setup).toUpperCase()); }
+    if (q(req.query.direction)) { where.push('direction=?'); args.push(q(req.query.direction).toUpperCase()); }
+    if (q(req.query.grade)) { where.push('grade=?'); args.push(q(req.query.grade)); }
+    if (q(req.query.strategy)) { where.push('best_strategy=?'); args.push(q(req.query.strategy)); }
+    if (String(req.query.proOnly) === '1') where.push('pro_qualified=1');
+    const [rows] = await pool.query(
+      `SELECT * FROM mt5_ict_predictions WHERE ${where.join(' AND ')} ORDER BY rank_score DESC LIMIT 300`, args);
+
+    // Whether the resting order could actually be placed. The ICT stop hugs the projected sweep,
+    // which on a low-ATR pair can fall inside the broker's minimum distance — the page should say
+    // so up front rather than let the user find out when place-order refuses.
+    const withPlaceable = rows.map(ictRowToPrediction).map((p) => {
+      const spec = brokerSpecFor(p.symbol);
+      const minStop = spec ? specMinStopDistance(spec) : null;
+      const risk = p.limitOrder ? Math.abs(p.limitOrder.entry - p.limitOrder.stopLoss) : null;
+      return {
+        ...p,
+        placeable: !(minStop !== null && risk !== null && risk < minStop),
+        placeableNote: minStop !== null && risk !== null && risk < minStop
+          ? `stop is inside this broker's minimum distance (${minStop}) — the order would be rejected`
+          : null,
+      };
+    });
+
+    // Pip distance and score/RR floors run through the SAME pure filter the engine exports, so
+    // the page cannot drift from the API on what "within 50 pips" means.
+    const predictions = filterIctPredictions(withPlaceable, {
+      minScore: req.query.minScore, minRR: req.query.minRR,
+      maxPips: req.query.maxPips, minPips: req.query.minPips,
+    });
+
+    let lastScan = ictLastScan;
+    if (!lastScan) {
+      const [[fresh]] = await pool.query(
+        "SELECT MAX(updated_at) AS at, COUNT(*) AS n FROM mt5_ict_predictions WHERE status='WAITING'");
+      if (fresh?.at) lastScan = { at: new Date(fresh.at).toISOString(), predictions: Number(fresh.n) || 0, fromStoredRows: true };
+    }
+
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      lastScan,
+      count: predictions.length,
+      timeframes: ICT_PREDICT_TFS,
+      strategies: ICT_STRATEGIES.map((id) => ({
+        id,
+        name: STRATEGY_LAB_REGISTRY[id]?.name || id,
+        enabled: enabledStrategyIds().includes(id),
+        timeframes: strategyTimeframes(id),
+      })),
+      predictions,
+      caveats: [
+        'Conditional: every price assumes the projected sweep → displacement → reclaim sequence actually happens.',
+        'The structure, the pool and the target are read from live candles. Only the path between them is constructed — inspect it in projectedBars.',
+        'The score assumes a textbook 1x ATR displacement and a brand-new breaker. It is an upper bound, not a probability — see scoreBasis.',
+        'The resting order is anchored to the real level; the strategy\'s own entry is a market fill at the breaker and is shown separately.',
+      ],
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ict-predictions/:id/track — pin or unpin.
+app.post('/api/ict-predictions/:id/track', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const on = req.body?.tracked !== false;
+    // Clearing alerted_at on re-track is deliberate: pinning something again is a fresh request
+    // to be told when it turns, not a continuation of the old one.
+    const [r] = await pool.execute(
+      on
+        ? 'UPDATE mt5_ict_predictions SET tracked=1, tracked_at=?, alerted_at=NULL, alert_verdict=NULL WHERE id=?'
+        : 'UPDATE mt5_ict_predictions SET tracked=0 WHERE id=?',
+      on ? [toMysqlDate(), req.params.id] : [req.params.id]);
+    if (!r.affectedRows) return res.status(404).json({ error: 'prediction not found' });
+    res.json({ ok: true, tracked: on });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+/** Live price plus the extreme traded since a prediction was made — the sweep is a wick event. */
+async function ictLiveState(pool, row) {
+  const [c] = await pool.query(
+    'SELECT high, low, close_price, candle_time FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? AND candle_time > ? ORDER BY candle_time ASC LIMIT 400',
+    [String(row.symbol).toUpperCase(), row.timeframe, toMysqlDate(new Date(row.created_at).toISOString())]);
+  if (!c.length) {
+    const [[latest]] = await pool.query(
+      'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+      [String(row.symbol).toUpperCase(), row.timeframe]);
+    const p = latest ? Number(latest.close_price) : null;
+    return { price: p, extreme: p, reclaimed: false };
+  }
+  const buy = String(row.direction).toUpperCase() === 'BUY';
+  const struct = Number(row.structure_level);
+  const level = Number(row.level);
+  const atr = Number(row.atr) || 0;
+  let extreme = buy ? Infinity : -Infinity;
+  let swept = false, reclaimed = false;
+  for (const r of c) {
+    const hi = Number(r.high), lo = Number(r.low), cl = Number(r.close_price);
+    extreme = buy ? Math.min(extreme, lo) : Math.max(extreme, hi);
+    if (!swept && (buy ? lo <= level - atr * 0.05 : hi >= level + atr * 0.05)) swept = true;
+    if (swept && !reclaimed && (buy ? cl > struct : cl < struct)) reclaimed = true;
+  }
+  return { price: Number(c[c.length - 1].close_price), extreme: Number.isFinite(extreme) ? extreme : null, reclaimed };
+}
+
+// GET /api/ict-predictions/tracked — pinned predictions with a live ICT health read.
+app.get('/api/ict-predictions/tracked', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_ict_predictions WHERE tracked=1 ORDER BY tracked_at DESC LIMIT 100');
+    const out = [];
+    for (const r of rows) {
+      const p = ictRowToPrediction(r);
+      const live = await ictLiveState(pool, r);
+      out.push({
+        ...p, price: live.price,
+        trackedAt: r.tracked_at ? new Date(r.tracked_at).toISOString() : null,
+        alertedAt: r.alerted_at ? new Date(r.alerted_at).toISOString() : null,
+        health: assessIctPrediction({ prediction: p, price: live.price, extreme: live.extreme, reclaimed: live.reclaimed }),
+      });
+    }
+    // Action first: a confirmed breaker and a failed sweep are both things you need to see now.
+    const rank = { CONFIRMED: 0, SWEPT_WAITING: 1, AT_THE_POOL: 2, FAILED_SWEEP: 3, DRIFTED_AWAY: 4, STALE: 5, APPROACHING: 6, CLOSED: 7 };
+    out.sort((a, b) => (rank[a.health.verdict] ?? 9) - (rank[b.health.verdict] ?? 9));
+    res.json({ ok: true, generatedAt: new Date().toISOString(), count: out.length, tracked: out });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// One alert per tracked prediction, ever, and only when there is something to do about it.
+async function checkIctPredictionAlerts() {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [rows] = await pool.query(
+      "SELECT * FROM mt5_ict_predictions WHERE tracked=1 AND alerted_at IS NULL AND status='WAITING' LIMIT 50");
+    if (!rows.length) return;
+    const esc = (v) => String(v ?? '').replace(/[<>&]/g, (ch) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch]));
+
+    for (const r of rows) {
+      try {
+        const p = ictRowToPrediction(r);
+        const live = await ictLiveState(pool, r);
+        if (live.price === null) continue;
+        const health = assessIctPrediction({ prediction: p, price: live.price, extreme: live.extreme, reclaimed: live.reclaimed });
+        if (!shouldAlertIct(health, { alertedAt: r.alerted_at })) continue;
+
+        // Claim BEFORE sending: if the send throws the row still reads as alerted, deliberately.
+        // One missed mail beats a retry loop mailing the same warning over and over.
+        const [claim] = await pool.execute(
+          'UPDATE mt5_ict_predictions SET alerted_at=?, alert_verdict=? WHERE id=? AND alerted_at IS NULL',
+          [toMysqlDate(), health.verdict, r.id]);
+        if (!claim.affectedRows) continue;
+
+        const title = health.verdict === 'CONFIRMED' ? 'ICT breaker confirmed'
+          : health.verdict === 'SWEPT_WAITING' ? 'Liquidity taken — waiting on the reclaim'
+            : health.verdict === 'FAILED_SWEEP' ? 'Sweep failed — price accepted through'
+              : 'Price is at the pool';
+        const lo = p.limitOrder;
+        const html = `<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:560px">
+          <div style="background:#0f172a;color:#fff;padding:14px 18px;border-radius:10px 10px 0 0">
+            <div style="font-size:11px;letter-spacing:.08em;opacity:.75">ICT PREDICTION</div>
+            <div style="font-size:19px;font-weight:800">${title}</div>
+          </div>
+          <div style="border:1px solid #e2e8f0;border-top:0;padding:16px 18px;border-radius:0 0 10px 10px">
+            <p style="margin:0 0 10px;font-size:15px;font-weight:700;color:#0f172a">
+              ${r.symbol} ${r.timeframe} · ${r.direction} · ${String(r.setup || '').replace(/_/g, ' ').toLowerCase()}
+              at ${r.level_label || 'swing'} ${r.level}
+            </p>
+            <p style="margin:0 0 10px;font-size:13px;color:#334155">${esc(health.suggestion || '')}</p>
+            <ul style="margin:0 0 12px;padding-left:18px;font-size:12px;color:#475569">
+              ${(health.reasons || []).map((x) => `<li>${esc(x)}</li>`).join('')}
+            </ul>
+            ${lo ? `<table style="font-size:12px;color:#475569">
+              <tr><td style="padding:2px 12px 2px 0">Resting order</td><td><b>${lo.type} @ ${lo.entry}</b></td></tr>
+              <tr><td style="padding:2px 12px 2px 0">Stop</td><td><b>${lo.stopLoss}</b> (${lo.stopPips ?? '?'} pips)</td></tr>
+              <tr><td style="padding:2px 12px 2px 0">Targets</td><td><b>${lo.takeProfit1 ?? '—'} / ${lo.takeProfit2 ?? '—'} / ${lo.takeProfit3 ?? '—'}</b></td></tr>
+              <tr><td style="padding:2px 12px 2px 0">Price now</td><td><b>${live.price}</b></td></tr>
+            </table>` : ''}
+            <p style="margin:12px 0 0;font-size:11px;color:#94a3b8">
+              This is the only alert for this prediction — you will not be mailed about it again.
+              Conditional analysis; nothing was traded automatically.
+            </p>
+          </div></div>`;
+        const to = signalEmailToFor(r.symbol, r.timeframe);
+        if (!to) { console.log(`[IctPredict] alert suppressed — no recipient for ${r.symbol} ${r.timeframe}`); continue; }
+        await sendNotificationEmail({
+          to,
+          subject: `${title} · ${r.symbol} ${r.timeframe} ${r.direction} @ ${r.level}`,
+          html,
+          text: `${title}: ${r.symbol} ${r.timeframe} ${r.direction} at ${r.level}. ${health.suggestion || ''} ${(health.reasons || []).join('; ')}`,
+        });
+        console.log(`[IctPredict] alert sent (${health.verdict}) for ${r.symbol} ${r.timeframe} @ ${r.level}`);
+      } catch (e) { console.error('[IctPredict] alert failed for', r.id, e.message); }
+    }
+  } catch (e) { console.error('[IctPredict] alert sweep failed:', e.message); }
+}
+
+// POST /api/ict-predictions/:id/place-order — rest the BUY/SELL LIMIT at the pool.
+//
+// A REAL order, so it goes through the same gates as the auto-trader rather than around them:
+// mode, armed-account interlock, correct side of market, concurrency, challenge guard, expiry.
+// It is written as a normal QUEUED row in mt5_auto_trades so the existing dispatch loop owns it
+// from there — no second execution path that could drift from the tested one.
+/**
+ * Preview a resized resting order BEFORE anything is sent to MT5.
+ *
+ * The user types money — "risk $50, target $150" — and this returns the price levels that
+ * produce it plus a verdict on whether the resulting ticket is a good idea. Deliberately a
+ * separate read-only endpoint from place-order: the whole point is to see the consequences,
+ * including the refusals, without committing.
+ *
+ * The judgement is the valuable half. Converting money to prices always succeeds; it succeeded
+ * for the live tickets that ended up 5 lots on a 1.7-pip stop at 65x the account in notional.
+ */
+app.post('/api/ict-predictions/:id/preview-order', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_ict_predictions WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'prediction not found' });
+    const f = rows[0];
+
+    const entry = Number(req.body?.entry) > 0 ? Number(req.body.entry) : Number(f.limit_entry);
+    if (!(entry > 0)) return res.status(422).json({ error: 'this prediction has no resting order to size' });
+
+    const spec = brokerSpecFor(f.symbol);
+    const pipSize = forexSizingPipSize(f.symbol);
+    const pipValuePerLot = forexSizingPipValuePerLot(f.symbol);
+    const dash = computeChallengeDashboard();
+    const configured = configuredPerTradeRisk(dash);
+    const riskBudget = configured.budget ?? (Number(dash?.safePerTradeRisk) > 0 ? Number(dash.safePerTradeRisk) : null);
+    const equity = Number(dash?.equity) > 0 ? Number(dash.equity)
+      : Number(dash?.balance) > 0 ? Number(dash.balance) : null;
+
+    // ATR and spread in pips — the two yardsticks that decide whether a stop is inside noise.
+    const atrPrice = Number(f.atr) > 0 ? Number(f.atr) : null;
+    const atrPips = atrPrice !== null && pipSize > 0 ? atrPrice / pipSize : null;
+    const spreadPrice = spec ? specSpreadPrice(spec) : null;
+    const spreadPips = spreadPrice !== null && pipSize > 0 ? spreadPrice / pipSize : null;
+
+    // Either the user names a lot size, or they name a stop distance and we solve for lots.
+    const slUsd = Number(req.body?.slUsd);
+    let lots = Number(req.body?.lots);
+    if (!(lots > 0) && Number(req.body?.stopPips) > 0 && slUsd > 0) {
+      lots = ictLotsForMoney({
+        usd: slUsd, pips: Number(req.body.stopPips), pipValuePerLot,
+        volStep: spec?.volStep, volMin: spec?.volMin, volMax: spec?.volMax,
+      });
+    }
+
+    const ticket = ictResizeOrder({
+      entry, direction: f.direction, lots,
+      slUsd, tpUsd: req.body?.tpUsd ?? null,
+      tp2Usd: req.body?.tp2Usd ?? null, tp3Usd: req.body?.tp3Usd ?? null,
+      pipValuePerLot, pipSize, digits: spec?.digits ?? null,
+    });
+    if (!ticket.ok) return res.status(422).json({ error: ticket.error });
+
+    const validation = ictValidateResize({
+      ticket, symbol: f.symbol, riskBudget, accountEquity: equity,
+      minStopDistance: spec ? specMinStopDistance(spec) : null,
+      pipSize, spreadPips, atrPips, entryPrice: entry,
+      volMin: spec?.volMin, volMax: spec?.volMax, volStep: spec?.volStep,
+      contractSize: spec?.contractSize ?? 100000,
+    });
+
+    res.json({
+      ok: true,
+      symbol: f.symbol, timeframe: f.timeframe, direction: f.direction, entry,
+      ticket, validation,
+      // Offered whenever the user's numbers trip a warning, so "is my lot size right?" gets a
+      // number back rather than a lecture.
+      suggestion: ictSuggestSizing({
+        riskUsd: slUsd > 0 ? slUsd : riskBudget, pipValuePerLot, atrPips, spreadPips,
+        // Passed so a healthy ticket gets no suggestion at all rather than advice to tighten.
+        currentStopPips: ticket.stopPips,
+        volStep: spec?.volStep, volMin: spec?.volMin, volMax: spec?.volMax,
+      }),
+      context: {
+        riskBudget,
+        // The configured percentage, stated plainly so the number is traceable to a setting.
+        riskPct: configured.pct,
+        // Remaining room is surfaced rather than silently shrinking the budget — the user asked
+        // why their 0.8% setting had become $3.07, and this is where that answer belongs.
+        roomWarning: configured.roomWarning,
+        safePerTradeRisk: configured.safePerTradeRisk,
+        equity, atrPips: atrPips === null ? null : Math.round(atrPips * 10) / 10,
+        spreadPips: spreadPips === null ? null : Math.round(spreadPips * 10) / 10,
+        pipValuePerLot, pipSize, digits: spec?.digits ?? null,
+        // What the untouched forecast would have sized, so the override is a comparison.
+        originalLots: Number(f.limit_lots) || null,
+        originalStopPips: Number(f.limit_stop_pips) || null,
+      },
+    });
+  } catch (error) {
+    console.error('[IctResize] preview failed:', error.message);
+    res.status(500).json({ error: 'failed to preview the resized order' });
+  }
+});
+
+app.post('/api/ict-predictions/:id/place-order', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_ict_predictions WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'prediction not found' });
+    const f = rows[0];
+    // A finished prediction is no longer a forecast, but the POOL it named still exists and a
+    // limit resting there can be perfectly sensible. Warn rather than refuse; the checks that
+    // actually protect money are below and still binding.
+    const stale = f.status !== 'WAITING'
+      ? `prediction is ${String(f.status).toLowerCase()} — the level is still there, but the forecast has ended` : null;
+
+    const entry = Number(f.limit_entry), stopLoss = Number(f.limit_stop);
+    if (!(entry > 0) || !(stopLoss > 0)) return res.status(422).json({ error: 'this prediction has no resting order to place' });
+
+    const cfg = autoTradeConfig();
+    const mode = autoTradeEffectiveMode(cfg);
+    if (mode !== 'ASK' && mode !== 'AUTO') {
+      return res.status(409).json({ error: `auto-trading is ${mode} — the EA bridge will not dispatch orders` });
+    }
+    if (!autoTradeArmedMatch()) return res.status(409).json({ error: 'the armed account does not match the account logged into MT5' });
+
+    // A limit must rest on the correct side of the market. If price already passed the pool this
+    // is no longer the setup that was predicted — refuse rather than silently turn it into a
+    // stop order the user never asked for.
+    const [c] = await pool.query(
+      'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+      [String(f.symbol).toUpperCase(), f.timeframe]);
+    const price = c.length ? Number(c[0].close_price) : null;
+    const buy = String(f.direction).toUpperCase() === 'BUY';
+    if (price !== null) {
+      if (buy && entry >= price) return res.status(422).json({ error: `price ${price} is already at or below the buy-limit entry ${entry} — the sweep has started without you` });
+      if (!buy && entry <= price) return res.status(422).json({ error: `price ${price} is already at or above the sell-limit entry ${entry} — the sweep has started without you` });
+    }
+
+    const conc = autoTradeConcurrencyBlock(cfg, f.symbol, await autoTradeInFlight(pool));
+    if (conc) return res.status(409).json({ error: conc });
+
+    // The ICT stop is deliberately tight — it sits just beyond the projected sweep — which on a
+    // low-ATR pair can land inside the broker's minimum stop distance. The broker would reject
+    // that order outright, so it is caught here rather than discovered as a 10016 at the EA.
+    const spec = brokerSpecFor(f.symbol);
+    const minStop = spec ? specMinStopDistance(spec) : null;
+    if (minStop !== null && Math.abs(entry - stopLoss) < minStop) {
+      return res.status(422).json({
+        error: `the stop is ${Math.abs(entry - stopLoss).toFixed(5)} from entry, inside this broker's minimum of ${minStop} — the order would be rejected`,
+      });
+    }
+
+    // Size to the challenge rules with the same formula the live path uses.
+    const dash = computeChallengeDashboard();
+    const pip = forexSizingPipSize(f.symbol);
+    const stopPips = Number(f.limit_stop_pips) || (pip > 0 ? Math.abs(entry - stopLoss) / pip : null);
+    const { plan } = buildForecastPlan({
+      forecast: {
+        symbol: f.symbol, grade: f.grade,
+        // The RESTING order's prices, not the strategy's breaker entry — this is the ticket that
+        // will actually go to the broker, so it is the one that must be sized.
+        fires: [{
+          agrees: true, decision: f.direction, strategyId: f.best_strategy,
+          score: Number(f.best_score) || null, grade: f.grade,
+          entry, stopLoss,
+          takeProfit: f.limit_tp1, takeProfit2: f.limit_tp2, takeProfit3: f.limit_tp3,
+          rr: f.limit_rr,
+        }],
+        expectedDirection: f.direction,
+      },
+      pipSize: pip,
+      pipValuePerLot: forexSizingPipValuePerLot(f.symbol),
+      riskBudget: configuredPerTradeRisk(dash).budget
+        ?? (Number(dash?.safePerTradeRisk) > 0 ? Number(dash.safePerTradeRisk) : null),
+      dashboard: dash,
+    });
+    if (!plan?.lots) return res.status(422).json({ error: 'the resting order could not be sized against the current risk budget' });
+
+    // ── Manual override ──────────────────────────────────────────────────────
+    //
+    // The user may have resized this ticket in dollars via preview-order. Their numbers replace
+    // the auto-sized plan, but every gate below still applies: an override is permission to
+    // choose a different ticket, not permission to skip the checks. In particular the broker
+    // rules and the challenge guard are re-run against the OVERRIDDEN loss, not the original —
+    // sizing up and keeping the old guard result is how a budget gets silently exceeded.
+    let useLots = plan.lots;
+    let useStop = stopLoss;
+    let useTp1 = f.limit_tp1, useTp2 = f.limit_tp2, useTp3 = f.limit_tp3;
+    let useLoss = plan.lossAtStop;
+    // Recorded risk stays exactly what the auto-sized path always wrote (the BUDGET, not the
+    // loss at stop) so an un-overridden order is byte-for-byte what it was before resizing
+    // existed. risk_amount is the denominator for R in the reports — quietly swapping it would
+    // have re-based every ICT order's measured performance.
+    let useRiskAmount = plan.riskBudget ?? dash?.safePerTradeRisk ?? null;
+    let overridden = null;
+
+    if (req.body?.override) {
+      const o = req.body.override;
+      const spec2 = brokerSpecFor(f.symbol);
+      const ticket = ictResizeOrder({
+        entry, direction: f.direction,
+        lots: Number(o.lots),
+        slUsd: Number(o.slUsd), tpUsd: o.tpUsd ?? null,
+        tp2Usd: o.tp2Usd ?? null, tp3Usd: o.tp3Usd ?? null,
+        pipValuePerLot: forexSizingPipValuePerLot(f.symbol),
+        pipSize: forexSizingPipSize(f.symbol),
+        digits: spec2?.digits ?? null,
+      });
+      if (!ticket.ok) return res.status(422).json({ error: ticket.error });
+
+      const v = ictValidateResize({
+        ticket, symbol: f.symbol,
+        riskBudget: Number(dash?.safePerTradeRisk) > 0 ? Number(dash.safePerTradeRisk) : null,
+        accountEquity: Number(dash?.equity) || Number(dash?.balance) || null,
+        minStopDistance: spec2 ? specMinStopDistance(spec2) : null,
+        pipSize: forexSizingPipSize(f.symbol), entryPrice: entry,
+        volMin: spec2?.volMin, volMax: spec2?.volMax, volStep: spec2?.volStep,
+        contractSize: spec2?.contractSize ?? 100000,
+      });
+      // ONLY broker-fatal problems block a manual ticket — a stop inside the broker's minimum,
+      // a lot size off the step, outside min/max. Passing those through would just produce a
+      // 10016 rejection at the EA, which helps nobody.
+      //
+      // Everything else, including exceeding the risk budget, is advisory. The user resizes
+      // from their own read of the market and asked for their numbers to be passed to MT5; the
+      // warnings are recorded on the order so the decision is on the record, not enforced.
+      if (v.errors.length) return res.status(422).json({ error: v.errors.join('; '), validation: v });
+
+      useLots = ticket.lots;
+      useStop = ticket.stopLoss;
+      useTp1 = ticket.takeProfit1 ?? f.limit_tp1;
+      useTp2 = ticket.takeProfit2 ?? f.limit_tp2;
+      useTp3 = ticket.takeProfit3 ?? f.limit_tp3;
+      useLoss = ticket.riskUsd;
+      // Only an overridden order records the user's own risk figure, because that IS the budget
+      // they chose for it.
+      useRiskAmount = ticket.riskUsd;
+      overridden = { ticket, validation: v };
+    }
+
+    const guard = challengeSignalGuard(useLoss, f.grade || null, Number(f.limit_rr) || null);
+    // The guard still BLOCKS an auto-sized order — nobody asked for that ticket, so refusing it
+    // costs nothing. On a MANUAL resize it only annotates: the user set those numbers from their
+    // own read and asked for them to be passed through. Their warnings ride along on the order
+    // (see `warnings` in the response) so the decision is recorded either way.
+    if (!guard.eligible && !overridden) {
+      return res.status(409).json({ error: `challenge guard: ${guard.warnings.join('; ')}` });
+    }
+
+    const id = `ictorder:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const holdMin = Math.max(15, Math.min(1440, Number(req.body?.expiryMinutes) || Number(f.eta_max) || 240));
+    await pool.execute(
+      `INSERT INTO mt5_auto_trades
+         (id, ict_prediction_id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss,
+          take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr,
+          session, mode, status, reason, expires_at, created_at)
+       VALUES (?,?,?,?,?,?, 'LIMIT', ?,?,?,?,?,?,?,?,?,?,?,?,?, 'QUEUED', ?, ?, ?)`,
+      [id, f.id, f.best_strategy || 'ict-breaker', f.symbol, f.timeframe, f.direction,
+        entry, useStop, useTp1, useTp2, useTp3,
+        useLots, useRiskAmount, 'CHALLENGE',
+        Math.round(Number(f.best_score) || 0), f.grade || null, f.limit_rr ?? null,
+        strategyLabSession(new Date().toISOString())?.key || null, mode,
+        `ICT ${f.setup} limit at ${f.level}${overridden ? ' (manually resized)' : ''}`.slice(0, 255),
+        toMysqlDate(new Date(Date.now() + holdMin * 60000).toISOString()), toMysqlDate()]);
+    // Placing an order is an explicit decision to act, so the prediction is tracked from here.
+    await pool.execute('UPDATE mt5_ict_predictions SET tracked=1, tracked_at=COALESCE(tracked_at, ?) WHERE id=?', [toMysqlDate(), f.id]);
+
+    res.json({
+      ok: true, id, orderType: f.order_type || (buy ? 'BUY_LIMIT' : 'SELL_LIMIT'),
+      // Reports what was ACTUALLY queued, not what the auto-sizer originally proposed — the EA
+      // reads the same overridden row, and a response that disagreed with it would be a lie.
+      direction: f.direction, entry, stopLoss: useStop, takeProfit: useTp1, lots: useLots,
+      stopPips: overridden ? overridden.ticket.stopPips
+        : (stopPips === null ? null : Math.round(stopPips * 10) / 10),
+      resized: Boolean(overridden),
+      expiresInMinutes: holdMin,
+      warnings: [
+        ...(stale ? [stale] : []), ...guard.warnings, ...(plan.challenge?.warnings || []),
+        // Advisory warnings the user already saw and accepted in the preview, carried through so
+        // the record of the decision includes them.
+        ...(overridden?.validation?.warnings || []),
+      ],
+      lossAtStop: useLoss,
+      note: 'Queued for the EA. It rests at the broker until price sweeps the pool or it expires.',
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/ict-predictions/pending-orders — resting orders placed from ICT predictions.
+/**
+ * Modify a RESTING limit order — shared by the ICT and Setup-Forecast pages.
+ *
+ * Both pages place into the same `mt5_auto_trades` table and both let the user edit in whatever
+ * unit they happen to be thinking in, so one endpoint serves both rather than two copies that
+ * drift apart.
+ *
+ * GET returns the order in all four units (price, pips, USD, lots) so the current state is
+ * legible before anything is typed. POST with `preview: true` prices a proposed change without
+ * sending it; POST without it commits.
+ *
+ * THE LOT-SIZE CAVEAT
+ * MT5's TRADE_ACTION_MODIFY cannot change a pending order's volume. A lot change is therefore a
+ * cancel and a re-place: the order loses queue position, and price can reach the entry between
+ * the two steps so the replacement is refused. `requiresReplace` says so, and the preview
+ * surfaces it before the user commits.
+ */
+async function loadModifiableOrder(pool, id) {
+  const [rows] = await pool.query('SELECT * FROM mt5_auto_trades WHERE id=? LIMIT 1', [id]);
+  return rows.length ? rows[0] : null;
+}
+
+function modifyContextFor(o) {
+  const spec = brokerSpecFor(o.symbol);
+  const dash = computeChallengeDashboard();
+  return {
+    ctx: {
+      pipSize: forexSizingPipSize(o.symbol),
+      pipValuePerLot: forexSizingPipValuePerLot(o.symbol),
+      digits: spec?.digits ?? null,
+      contractSize: spec?.contractSize ?? 100000,
+      accountEquity: Number(dash?.equity) || Number(dash?.currentBalance) || null,
+    },
+    spec,
+    riskBudget: configuredPerTradeRisk(dash).budget,
+  };
+}
+
+app.get('/api/orders/:id/modify', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const o = await loadModifiableOrder(pool, req.params.id);
+    if (!o) return res.status(404).json({ error: 'order not found' });
+    const { ctx, spec, riskBudget } = modifyContextFor(o);
+    res.json({
+      ok: true,
+      order: modDescribe(o, ctx),
+      context: {
+        ...ctx,
+        riskBudget,
+        minStopDistance: spec ? specMinStopDistance(spec) : null,
+        volMin: spec?.volMin ?? 0.01,
+        volMax: spec?.volMax ?? null,
+        volStep: spec?.volStep ?? 0.01,
+      },
+    });
+  } catch (error) {
+    console.error('[Modify] read failed:', error.message);
+    res.status(500).json({ error: 'failed to read the order' });
+  }
+});
+
+app.post('/api/orders/:id/modify', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const o = await loadModifiableOrder(pool, req.params.id);
+    if (!o) return res.status(404).json({ error: 'order not found' });
+    const { ctx, spec, riskBudget } = modifyContextFor(o);
+
+    const plan = modPlan(o, req.body?.changes || {}, ctx);
+    if (!plan.ok) return res.status(422).json({ error: plan.error });
+
+    // Current price, so a limit that would now fill instantly is caught before it is sent.
+    const [c] = await pool.query(
+      'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+      [String(o.symbol).toUpperCase(), o.timeframe]);
+    const marketPrice = c.length ? Number(c[0].close_price) : null;
+
+    const validation = modValidate(plan, {
+      minStopDistance: spec ? specMinStopDistance(spec) : null,
+      pipSize: ctx.pipSize,
+      volMin: spec?.volMin,
+      volMax: spec?.volMax,
+      volStep: spec?.volStep,
+      marketPrice,
+      riskBudget,
+    });
+
+    if (req.body?.preview) {
+      return res.json({ ok: true, preview: true, plan, validation, marketPrice });
+    }
+
+    // Only broker refusals block. Everything else is the user's call — they edit from their own
+    // read of the market and asked for their numbers to be passed to MT5.
+    if (validation.errors.length) {
+      return res.status(422).json({ error: validation.errors.join('; '), validation });
+    }
+    if (plan.unchanged) return res.status(422).json({ error: 'nothing changed' });
+
+    const now = toMysqlDate();
+    if (plan.requiresReplace) {
+      // Cancel + re-place, because MT5 will not change a resting order's volume. The replacement
+      // is queued immediately after the cancel so it cannot be lost if the cancel lands and
+      // nothing follows it.
+      if (!o.ticket) return res.status(409).json({ error: 'no broker ticket — cannot replace this order' });
+      await pool.execute(
+        "UPDATE mt5_auto_trades SET status='CANCELLING', reason='replacing: lot size changed', updated_at=? WHERE id=?",
+        [now, o.id]);
+      const newId = `${o.id}:re${Date.now().toString(36)}`;
+      await pool.execute(
+        `INSERT INTO mt5_auto_trades
+           (id, ict_prediction_id, forecast_id, strategy, symbol, timeframe, direction, order_type,
+            entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, lots, risk_amount,
+            risk_mode, score, grade, rr, session, mode, status, reason, expires_at, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'QUEUED', ?, ?, ?)`,
+        [newId, o.ict_prediction_id ?? null, o.forecast_id ?? null, o.strategy, o.symbol, o.timeframe,
+          o.direction, o.order_type, plan.next.entry, plan.next.stopLoss,
+          plan.next.takeProfit1, plan.next.takeProfit2, plan.next.takeProfit3,
+          plan.next.lots, plan.after.riskUsd ?? o.risk_amount, o.risk_mode, o.score, o.grade,
+          plan.after.rr ?? o.rr, o.session, o.mode,
+          `replaced ${o.id} (lot size ${o.lots} to ${plan.next.lots})`.slice(0, 255),
+          o.expires_at, now]);
+      return res.json({
+        ok: true, replaced: true, newId, plan, validation,
+        note: 'The old order is being cancelled and a new one queued. The EA does both on its next poll.',
+      });
+    }
+
+    // In-place modify needs a broker ticket: the MOD command feed selects on
+    // "status='MODIFYING' AND ticket IS NOT NULL", so a ticket-less row would sit in MODIFYING
+    // forever and never be sent. Observed live — one GBPUSD row stranded for 650 minutes.
+    if (!o.ticket) {
+      return res.status(409).json({ error: 'this order has no broker ticket yet — wait until it is PLACED before modifying' });
+    }
+
+    // In-place modify: the EA picks this up as a MOD command on its next poll.
+    await pool.execute(
+      `UPDATE mt5_auto_trades
+          SET entry_price=?, stop_loss=?, take_profit_1=?, take_profit_2=?, take_profit_3=?,
+              rr=?, status='MODIFYING', reason=?, updated_at=?
+        WHERE id=?`,
+      [plan.next.entry, plan.next.stopLoss, plan.next.takeProfit1, plan.next.takeProfit2,
+        plan.next.takeProfit3, plan.after.rr ?? o.rr,
+        // The PREVIOUS levels are stashed here so a refusal can be rolled back exactly. The row
+        // is written optimistically because the MOD command is built from it, but the broker may
+        // say no — and a row showing levels the broker never accepted is worse than no feature.
+        `modify requested: ${plan.changed.join(', ')} |prev:${[o.entry_price, o.stop_loss, o.take_profit_1, o.take_profit_2, o.take_profit_3, o.rr].map((v) => (v === null || v === undefined ? '' : v)).join(',')}`.slice(0, 255),
+        now, o.id]);
+    res.json({
+      ok: true, replaced: false, plan, validation,
+      note: 'Modification queued; the EA applies it on its next poll.',
+    });
+  } catch (error) {
+    console.error('[Modify] failed:', error.message);
+    res.status(500).json({ error: 'failed to modify the order' });
+  }
+});
+
+app.get('/api/ict-predictions/pending-orders', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query(
+      `SELECT a.*, p.setup, p.level, p.level_label, p.best_score AS prediction_score, p.status AS prediction_status,
+              p.pro_qualified, p.structure_level
+         FROM mt5_auto_trades a
+         LEFT JOIN mt5_ict_predictions p ON p.id = a.ict_prediction_id
+        WHERE a.ict_prediction_id IS NOT NULL
+        ORDER BY a.created_at DESC LIMIT 60`);
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      bridgeReady: autoTradeBridgeReady(),
+      armedMatch: autoTradeArmedMatch(),
+      orders: rows.map((r) => ({
+        id: r.id, predictionId: r.ict_prediction_id,
+        symbol: r.symbol, timeframe: r.timeframe, direction: r.direction, orderType: r.order_type,
+        entry: r.entry_price, stopLoss: r.stop_loss,
+        takeProfit1: r.take_profit_1, takeProfit2: r.take_profit_2, takeProfit3: r.take_profit_3,
+        lots: r.lots, riskAmount: r.risk_amount, rr: r.rr, strategy: r.strategy,
+        status: r.status, reason: r.reason, ticket: r.ticket, fillPrice: r.fill_price, profit: r.profit,
+        setup: r.setup, level: r.level, levelLabel: r.level_label, structureLevel: r.structure_level,
+        predictionScore: r.prediction_score, predictionStatus: r.prediction_status,
+        proQualified: r.pro_qualified === 1,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
+        // Only a resting order can be pulled; a filled one is a position, not an order.
+        cancellable: ['QUEUED', 'SENT', 'PLACED'].includes(String(r.status)),
+      })),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ict-predictions/order/:id/cancel — pull a resting order off the broker.
+app.post('/api/ict-predictions/order/:id/cancel', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_auto_trades WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'order not found' });
+    const r = rows[0];
+    if (r.status === 'QUEUED') {
+      const [u] = await pool.execute(
+        "UPDATE mt5_auto_trades SET status='REJECTED', reason='cancelled before it left the server', updated_at=? WHERE id=? AND status='QUEUED'",
+        [toMysqlDate(), r.id]);
+      return res.json({ ok: true, cancelled: Boolean(u.affectedRows), atBroker: false });
+    }
+    if (!r.ticket) return res.status(409).json({ error: `order is ${r.status} with no broker ticket — nothing to cancel` });
+    if (!['PLACED', 'SENT'].includes(String(r.status))) {
+      return res.status(409).json({ error: `order is ${String(r.status).toLowerCase()} — only a resting order can be cancelled` });
+    }
+    await pool.execute(
+      "UPDATE mt5_auto_trades SET status='CANCELLING', reason='cancel requested — waiting for the EA', updated_at=? WHERE id=?",
+      [toMysqlDate(), r.id]);
+    res.json({ ok: true, cancelled: false, atBroker: true, note: 'Cancel queued; the EA removes it on its next poll.' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// GET /api/ict-predictions/track-record — what these predictions have actually been worth.
+//
+// The three-way split is the point. "Reached the pool" is the cheap number; "swept and reclaimed"
+// is the model actually working; and the gap between them is the failure this page exists to
+// make visible. Reporting a single hit rate would hide it.
+app.get('/api/ict-predictions/track-record', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 30));
+    const [rows] = await pool.query(
+      `SELECT symbol, timeframe, setup, direction, best_strategy, pro_qualified, grade,
+              status, arrived, swept, reclaimed, arrived_minutes, outcome, outcome_pips, outcome_r
+         FROM mt5_ict_predictions
+        WHERE status IN ('RESOLVED','EXPIRED') AND resolved_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
+      [days]);
+
+    const blank = () => ({ n: 0, arrived: 0, swept: 0, reclaimed: 0, wins: 0, losses: 0, ambiguous: 0, pips: 0, r: 0, settled: 0 });
+    const add = (b, r) => {
+      b.n += 1;
+      if (r.arrived === 1) b.arrived += 1;
+      if (r.swept === 1) b.swept += 1;
+      if (r.reclaimed === 1) b.reclaimed += 1;
+      const o = String(r.outcome || '');
+      if (/^TP/.test(o)) { b.wins += 1; b.settled += 1; }
+      else if (o === 'LOSS') { b.losses += 1; b.settled += 1; }
+      else if (o === 'AMBIGUOUS') { b.ambiguous += 1; b.settled += 1; }
+      if (Number.isFinite(Number(r.outcome_pips))) b.pips += Number(r.outcome_pips);
+      if (Number.isFinite(Number(r.outcome_r))) b.r += Number(r.outcome_r);
+      return b;
+    };
+    const finish = (b) => ({
+      ...b,
+      pips: Math.round(b.pips * 10) / 10,
+      r: Math.round(b.r * 100) / 100,
+      arrivalRate: b.n ? Math.round((b.arrived / b.n) * 1000) / 10 : null,
+      // Denominator is arrivals, not predictions: whether the reclaim followed is only a
+      // question once price actually got to the pool.
+      reclaimRate: b.arrived ? Math.round((b.reclaimed / b.arrived) * 1000) / 10 : null,
+      // Ambiguous (stop and target on one bar) counts against, never as a win.
+      winRate: b.settled ? Math.round((b.wins / b.settled) * 1000) / 10 : null,
+    });
+
+    const overall = blank();
+    const by = { strategy: new Map(), timeframe: new Map(), setup: new Map(), symbol: new Map() };
+    const bump = (map, key, r) => { if (!key) return; if (!map.has(key)) map.set(key, blank()); add(map.get(key), r); };
+    const proBuckets = { pro: blank(), plain: blank() };
+    for (const r of rows) {
+      add(overall, r);
+      bump(by.strategy, r.best_strategy, r);
+      bump(by.timeframe, r.timeframe, r);
+      bump(by.setup, r.setup, r);
+      bump(by.symbol, r.symbol, r);
+      add(r.pro_qualified === 1 ? proBuckets.pro : proBuckets.plain, r);
+    }
+    const listOf = (map, name) => [...map].map(([k, v]) => ({ [name]: k, ...finish(v) }))
+      .sort((a, b) => b.n - a.n);
+
+    res.json({
+      ok: true,
+      days,
+      resolved: rows.length,
+      overall: finish(overall),
+      byStrategy: listOf(by.strategy, 'strategy'),
+      byTimeframe: listOf(by.timeframe, 'timeframe'),
+      bySetup: listOf(by.setup, 'setup'),
+      bySymbol: listOf(by.symbol, 'symbol'),
+      proComparison: { proQualified: finish(proBuckets.pro), notQualified: finish(proBuckets.plain) },
+      notes: [
+        'Arrival rate is out of every prediction; reclaim rate is out of ARRIVALS only — the reclaim question does not exist until price gets there.',
+        'Win rate settles the RESTING order (entry at the pool, stop beyond the sweep) against real candles. Stop and target on the same bar is AMBIGUOUS, never a win.',
+        'A young window is a small sample, not a track record. Read the counts before the percentages.',
+      ],
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ict-predictions/:id/analyze — AI second opinion on ONE prediction.
+//
+// The prediction stays deterministic. This asks a model the ICT question (does the sweep fail,
+// or does price accept through?) and reconciles the answer against arithmetic before it is
+// shown. Read-only: never written back, never reaches the auto-trader or email.
+const ictAiCache = new Map();
+const ICT_AI_TTL_MS = 10 * 60 * 1000;
+app.post('/api/ict-predictions/:id/analyze', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_ict_predictions WHERE id=? LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'prediction not found' });
+    const r = rows[0];
+    const prediction = ictRowToPrediction(r);
+
+    // Re-scoring changes the answer, so the cache key follows the row's freshness.
+    const cacheKey = `${r.id}|${r.updated_at ? new Date(r.updated_at).getTime() : 0}`;
+    const hit = ictAiCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < ICT_AI_TTL_MS && !req.query.force) return res.json({ ...hit.payload, cached: true });
+
+    const market = { session: strategyLabSession(new Date().toISOString())?.key || null };
+    let marketRead = '';
+    let chart = null;
+    try {
+      const prep = await setupForecastContext(pool, r.symbol, r.timeframe);
+      if (prep) {
+        market.price = prep.price;
+        market.atr = Math.round(prep.atr * 1e5) / 1e5;
+        market.h1Trend = prep.ctx.h1Trend;
+        market.h4Trend = prep.ctx.h4Trend;
+        // Levels keep their swept/fresh status: which liquidity is still live changes the ICT
+        // read entirely, and a bare price list throws that away.
+        market.nearbyLevels = (prep.levels || [])
+          .filter((l) => Number.isFinite(Number(l.price)) && Math.abs(Number(l.price) - Number(r.level)) <= prep.atr * 3)
+          .slice(0, 10)
+          .map((l) => ({ type: l.type, label: l.label, price: l.price, swept: Boolean(l.swept) }));
+
+        const read = buildMarketRead({ candles: prep.ctx.candles, symbol: r.symbol, level: Number(r.level), atr: prep.atr });
+        marketRead = formatMarketRead(read, { symbol: r.symbol, timeframe: r.timeframe });
+
+        // The chart is drawn from the SAME candles the prompt describes, so image and words can
+        // never disagree. The PROJECTED bars are deliberately NOT drawn — the model is judging
+        // whether the sequence will happen, and showing it as though it already had would be
+        // handing over the answer.
+        const chartCandles = prep.ctx.candles.slice(-80);
+        chart = renderCandleChart({
+          candles: chartCandles,
+          levels: market.nearbyLevels,
+          focusLevel: Number(r.level),
+          entry: Number(r.limit_entry) || null,
+          stopLoss: Number(r.limit_stop) || null,
+          takeProfit: r.limit_tp1 ?? null,
+          takeProfit2: r.limit_tp3 ?? r.limit_tp2 ?? null,
+          digits: brokerSpecFor(r.symbol)?.digits ?? null,
+        });
+      }
+    } catch (e) { console.warn('[IctPredictAI] context build failed:', e.message); }
+
+    let news = [];
+    try {
+      news = getUpcomingForSymbol(r.symbol || '', Date.now(), 12).map((e) => ({
+        currency: e.currency, impact: e.impact, title: e.title,
+        in_minutes: Math.round((e.timestampUtc - Date.now()) / 60000),
+      })).slice(0, 6);
+    } catch { /* news optional */ }
+
+    const wantVision = String(req.query.vision || '1') !== '0' && Boolean(chart);
+    const prompt = buildIctAiPrompt({ prediction, market, news, marketRead, hasImage: wantVision });
+    const out = await analyzeForecastWithGemini({
+      projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION,
+      model: String(req.query.model || 'gemini-2.5-flash'),
+      prompt,
+      imageBase64: wantVision ? chart.png.toString('base64') : null,
+    });
+
+    let payload;
+    if (!out.available) {
+      payload = { ok: true, id: r.id, ai: deterministicIctView(prediction, out.reason || 'AI unavailable'), market, news };
+    } else {
+      const spec = brokerSpecFor(r.symbol);
+      const reconciled = reconcileIctAi(normaliseIctAi(out.parsed), {
+        prediction,
+        pip: forexSizingPipSize(r.symbol),
+        minStopDistance: spec ? specMinStopDistance(spec) : null,
+      });
+      payload = {
+        ok: true, id: r.id, model: out.model,
+        ai: { available: true, ...reconciled },
+        system: {
+          direction: prediction.direction,
+          score: prediction.bestScore,
+          strategy: prediction.bestStrategy,
+          proQualified: prediction.proQualified,
+          limitOrder: prediction.limitOrder,
+          strategyPlan: prediction.strategyPlan,
+          backing: prediction.fires.length,
+        },
+        market, news,
+        // What the model was actually given, so "AI vision" is verifiable rather than a claim.
+        saw: {
+          bars: chart?.bars ?? 0,
+          vision: wantVision,
+          chartPng: wantVision ? `data:image/png;base64,${chart.png.toString('base64')}` : null,
+          projectedBarsShown: false,
+        },
+        analysedAt: new Date().toISOString(),
+        caveats: [
+          'A second opinion on a sequence that has not happened — the model was told which score components were assumed.',
+          'The chart shows the REAL candles only. The projected sweep/reclaim bars are withheld so the model is not handed the answer.',
+          'Prices returned by the model are checked against arithmetic; anything unsound is flagged and the ticket marked unusable.',
+          'This never reaches the auto-trader, the approval queue or email.',
+        ],
+      };
+    }
+    ictAiCache.set(cacheKey, { at: Date.now(), payload });
+    res.json(payload);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ict-predictions/scan — manual trigger. Returns immediately; a full sweep exceeds
+// every default HTTP client timeout, and awaiting it made the endpoint look broken while the
+// scan was in fact succeeding. Poll GET /api/ict-predictions and watch lastScan.at.
+app.post('/api/ict-predictions/scan', (req, res) => {
+  if (ictScanBusy) return res.json({ ok: true, started: false, reason: 'a scan is already running', lastScan: ictLastScan });
+  res.json({ ok: true, started: true, note: 'scan running in background; poll /api/ict-predictions for lastScan', lastScan: ictLastScan });
+  void (async () => {
+    try {
+      await runIctPredictScan({ reason: 'manual' });
+      await resolveIctPredictions();
+    } catch (e) { console.error('[IctPredict] manual scan failed:', e.message); }
+  })();
+});
+
+setInterval(() => { runIctPredictScan({ reason: 'interval' }).catch((e) => console.error('[IctPredict] scan failed:', e.message)); }, ICT_PREDICT_SCAN_MS);
+setInterval(() => { resolveIctPredictions().catch((e) => console.error('[IctPredict] resolve failed:', e.message)); }, 3 * 60000);
+setInterval(() => { checkIctPredictionAlerts().catch(() => {}); }, 3 * 60000);
+// Retention, per golden rule #6: compact rows AND a pruner, so this table can never become the
+// next mt5_account_snapshots.
+setInterval(async () => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [r] = await pool.query(
+      "DELETE FROM mt5_ict_predictions WHERE status<>'WAITING' AND tracked=0 AND resolved_at < DATE_SUB(NOW(), INTERVAL ? DAY)",
+      [ICT_PREDICT_RETENTION_DAYS]);
+    if (r.affectedRows) console.log(`[IctPredict] pruned ${r.affectedRows} rows older than ${ICT_PREDICT_RETENTION_DAYS}d`);
+  } catch (e) { console.error('[IctPredict] prune failed:', e.message); }
+}, 6 * 3600 * 1000);
+// First sweep shortly after boot, once candles have streamed in.
+setTimeout(() => { runIctPredictScan({ reason: 'startup' }).catch(() => {}); }, 90 * 1000);
+
+// GET /api/reports/setup-forecasts — how much was predicted, how much matched, what it paid.
+//
+// Cached: the aggregate scans up to 5k rows over a remote database and measured ~16s cold, which
+// leaves the page sitting on "n/a" long enough to look broken. Resolution only advances every
+// few minutes, so a 90s cache costs nothing in freshness.
+const setupForecastReportCache = new Map();
+const SETUP_FORECAST_REPORT_TTL_MS = 90 * 1000;
+
+/**
+ * Every source family a forecast row belongs to.
+ *
+ * Rows written before `level_sources` existed have only `level_type`, which still maps to a
+ * family — so history stays in the report instead of collapsing into an "unknown" bucket the day
+ * the column shipped.
+ */
+function levelSourceFamilies(row) {
+  const raw = String(row?.level_sources || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const types = raw.length ? raw : (row?.level_type ? [row.level_type] : []);
+  if (!types.length) return ['—'];
+  return [...new Set(types.map((t) => forecastLevelSource(t)))];
+}
+/**
+ * Would-Trade ledger — every signal, traded or not, ranked by what it actually made.
+ *
+ * WHY THE MONEY FIGURES ARE LABELLED SIMULATED
+ * The strategy log resolves each signal by holding it to its target or its stop. The live
+ * account does not behave that way: on 118 closed auto-trades, 49 exited somewhere other than
+ * either level (manual close, trail, expiry). Measured on 98 setups that appear in BOTH the log
+ * and MT5, the log recorded +1.007R average while the same setups paid -$807.80 in real money.
+ *
+ * That gap is not slippage — measured entry slippage is a median of 0 pips and costs are ~$5 per
+ * lot. It is the difference between a trade held to its plan and a trade closed early. So this
+ * report is honest for RANKING (every strategy is measured the same idealised way, so the
+ * comparison between them is fair) and dishonest for PROJECTION (the absolute totals describe a
+ * world where every trade runs to its target). Both facts ship with the payload rather than
+ * living in a comment, because a user reading "+$3.7M" without them would act on it.
+ */
+// The counterfactual replay reads every candle series the decisions touch, which costs ~20s
+// cold. The underlying rows only change when a trade closes, so a short TTL keeps the page
+// responsive without ever serving a stale trading decision.
+const wouldTradeCache = new Map();
+const WOULD_TRADE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Would-Trade ledger — every MT5 trade decision, taken or not, across all accounts.
+ *
+ * Sourced from `mt5_auto_trades`, the log of everything that reached the auto-trader: 592
+ * decisions over 10 accounts, of which 188 filled. Deliberately NOT the 56k strategy signal
+ * log — that resolves each signal by holding it to its target, which measured 1.21R per trade
+ * more optimistic than the account on identical trades. Every money figure here is what the
+ * broker actually paid.
+ *
+ * Not-taken decisions carry no P&L. Estimating what a trade that never existed would have made
+ * is precisely the assumption that made the signal log optimistic, so they are counted and
+ * explained by cause instead — which is the actionable form anyway.
+ */
+app.get('/api/reports/would-trade', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const days = Math.max(1, Math.min(400, Number(req.query.days) || 30));
+    const minTrades = Math.max(1, Number(req.query.minTrades) || 10);
+    const riskPerTrade = Math.max(1, Number(req.query.risk) || 80);
+    const account = String(req.query.account || '').trim();
+    const since = toMysqlDate(new Date(Date.now() - days * 86400000).toISOString());
+
+    const cacheKey = `${days}|${minTrades}|${riskPerTrade}|${account || 'all'}`;
+    const cached = wouldTradeCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < WOULD_TRADE_TTL_MS) {
+      return res.json({ ...cached.payload, cached: true });
+    }
+
+    const params = [since];
+    let where = 'created_at >= ?';
+    if (account && account !== 'all') { where += ' AND account = ?'; params.push(account); }
+
+    const [raw] = await pool.query(
+      `SELECT id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss,
+              take_profit_1, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr, session, mode,
+              status, reason, ticket, fill_price, close_price, profit, account, broker,
+              created_at, sent_at, filled_at, closed_at
+         FROM mt5_auto_trades
+        WHERE ${where}
+        ORDER BY created_at DESC LIMIT 20000`, params);
+
+    const rows = raw.map((t) => {
+      const d = wouldTradeDecision(t);
+      return {
+        id: t.id, strategy: t.strategy, symbol: t.symbol, timeframe: t.timeframe,
+        account: t.account || '(unassigned)', broker: t.broker || null,
+        direction: t.direction, orderType: t.order_type, session: t.session, mode: t.mode,
+        riskMode: t.risk_mode, score: t.score, grade: t.grade, rr: t.rr,
+        lots: t.lots === null ? null : Number(t.lots),
+        riskAmount: t.risk_amount === null ? null : Number(t.risk_amount),
+        entry: t.entry_price, stopLoss: t.stop_loss,
+        takeProfit1: t.take_profit_1, takeProfit3: t.take_profit_3,
+        fillPrice: t.fill_price,
+        closePrice: t.close_price,
+        profit: t.profit === null ? null : Number(t.profit),
+        ticket: t.ticket, createdAt: t.created_at, closedAt: t.closed_at,
+        status: d.status, decision: d.decision, reason: d.reason,
+        r: wouldTradeR(t), pips: wouldTradePips(t),
+      };
+    });
+
+    // Accounts are listed from the FULL window regardless of the account filter, so switching
+    // between them never empties the picker that got you there.
+    const [accts] = await pool.query(
+      `SELECT COALESCE(account,'(unassigned)') account, COUNT(*) decisions,
+              SUM(fill_price IS NOT NULL) filled, ROUND(SUM(COALESCE(profit,0)),2) profit,
+              MIN(created_at) firstSeen, MAX(created_at) lastSeen
+         FROM mt5_auto_trades WHERE created_at >= ?
+        GROUP BY account ORDER BY decisions DESC`, [since]);
+
+    // ── Counterfactual replay of the never-traded decisions ──────────────────
+    //
+    // Measured, not assumed: each decision is resolved against the candles that actually
+    // followed it, using the same rules as the backtest harness (straddling bar = LOSS, no
+    // lookahead, invalid geometry never scores).
+    //
+    // The guard that keeps it honest is the fill check. A pending order only produces a result
+    // if price came back to its entry, and 21 of the EXPIRED decisions never did — crediting
+    // those would flatter exactly the orders whose setup ran away.
+    const replayable = rows.filter((r) => r.decision === 'NOT_TAKEN'
+      && r.entry !== null && r.stopLoss !== null && r.takeProfit1 !== null);
+    const candleCache = new Map();
+    const barsFor = async (symbol, timeframe, fromIso) => {
+      const key = `${symbol}|${timeframe}`;
+      if (!candleCache.has(key)) {
+        const [cs] = await pool.query(
+          `SELECT candle_time, high, low FROM mt5_candles
+            WHERE symbol=? AND timeframe=? ORDER BY candle_time ASC`, [symbol, timeframe]);
+        candleCache.set(key, cs.map((x) => ({ ts: Date.parse(x.candle_time), high: Number(x.high), low: Number(x.low) })));
+      }
+      const all = candleCache.get(key);
+      const from = Date.parse(fromIso);
+      const i = all.findIndex((b) => b.ts >= from);
+      // 400 bars mirrors the window the live lab hands an engine, and bounds the work.
+      return i < 0 ? [] : all.slice(i, i + 400);
+    };
+    const replayed = [];
+    for (const r of replayable) {
+      const bars = await barsFor(r.symbol, r.timeframe, r.createdAt);
+      const res = wouldTradeReplayOne({
+        entry_price: r.entry, stop_loss: r.stopLoss, take_profit_1: r.takeProfit1,
+        take_profit_3: r.takeProfit3, direction: r.direction, order_type: r.orderType,
+      }, bars);
+      const enriched = { ...r, replay: res };
+      replayed.push(enriched);
+      r.replayOutcome = res.outcome;
+      r.replayR = res.r;
+    }
+    const byKey = (list, field) => {
+      const m = new Map();
+      for (const x of list) {
+        const k = x[field] || '—';
+        if (!m.has(k)) m.set(k, []);
+        m.get(k).push(x.replay);
+      }
+      return [...m.entries()]
+        .map(([key, rs]) => ({ key, ...wouldTradeReplaySummary(rs, { riskPerTrade }) }))
+        .sort((a, b) => (b.netR ?? 0) - (a.netR ?? 0));
+    };
+    const replay = {
+      riskPerTrade,
+      overall: wouldTradeReplaySummary(replayed.map((x) => x.replay), { riskPerTrade }),
+      byStatus: byKey(replayed, 'status'),
+      byOrderType: byKey(replayed, 'orderType'),
+      byStrategy: byKey(replayed, 'strategy'),
+      caveats: [
+        'Resolved to TP1, the nearest rung: the conservative read of what each decision was worth.',
+        'A pending order that price never returned to is NEVER_FILLED and carries no result — not a win, not a loss.',
+        'A bar touching both the stop and the target is scored a LOSS, because the order inside it is unknowable.',
+        'This is what the decisions were WORTH, at one constant risk. It is not money that was missed — position limits and margin would not have allowed all of them.',
+      ],
+    };
+
+    const payload = {
+      days, minTrades, riskPerTrade, account: account || 'all',
+      generatedAt: new Date().toISOString(),
+      totals: wouldTradeSummarise(rows),
+      accounts: accts.map((a) => ({
+        account: a.account, decisions: a.decisions, filled: a.filled,
+        profit: Number(a.profit), firstSeen: a.firstSeen, lastSeen: a.lastSeen,
+      })),
+      byAccount: wouldTradeGroupBy(rows, ['account'], { minTrades }),
+      byStrategy: wouldTradeGroupBy(rows, ['strategy'], { minTrades }),
+      byTimeframe: wouldTradeGroupBy(rows, ['timeframe'], { minTrades }),
+      bySymbol: wouldTradeGroupBy(rows, ['symbol'], { minTrades }),
+      byCombo: wouldTradeGroupBy(rows, ['strategy', 'symbol', 'timeframe'], { minTrades }),
+      // Why decisions never reached the market. Which cause dominates decides what to fix.
+      notTaken: wouldTradeNotTaken(rows),
+      // What those decisions WOULD have done, replayed against the candles that followed.
+      replay,
+      // The raw decisions, newest first, so any total can be traced to the trades behind it.
+      trades: rows.slice(0, 500),
+      caveats: [
+        'Money is REAL broker P&L on filled trades — not simulated, and not the strategy signal log.',
+        'Not-taken decisions carry no profit: estimating what a trade that never existed would have made is the assumption that makes backtests lie.',
+        'R is profit over the risk budgeted for that ticket, so accounts running different risk are comparable.',
+      ],
+    };
+    wouldTradeCache.set(cacheKey, { at: Date.now(), payload });
+    res.json(payload);
+  } catch (error) {
+    console.error('[WouldTrade] report failed:', error.message);
+    res.status(500).json({ error: 'failed to build would-trade report' });
+  }
+});
+
 app.get('/api/reports/setup-forecasts', async (req, res) => {
   try {
     const pool = await initializeDatabase();
     if (!pool) return res.status(503).json({ error: 'database unavailable' });
     const days = Math.max(1, Math.min(90, Number(req.query.days) || 14));
+    const cacheKey = String(days);
+    const cached = setupForecastReportCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < SETUP_FORECAST_REPORT_TTL_MS) {
+      return res.json({ ...cached.payload, cached: true });
+    }
     const since = toMysqlDate(new Date(Date.now() - days * 86400000).toISOString());
     const [rows] = await pool.query(
-      `SELECT symbol, timeframe, scenario, best_strategy, status, actual, matched, actual_minutes, eta_mid, mfe_pips, mae_pips, rank_score
+      `SELECT id, symbol, timeframe, scenario, side, level, level_type, level_label, level_strength, level_sources,
+              best_strategy, best_score, expected_direction, status, actual, matched, actual_minutes,
+              eta_mid, mfe_pips, mae_pips, rank_score, created_at, resolved_at,
+              hit_outcome, hit_pips, hit_r, hit_profit, hit_tp_level,
+              real_ticket, real_pnl, real_lots, real_entry_gap_pips, real_link_note
          FROM mt5_setup_forecasts WHERE created_at >= ? ORDER BY created_at DESC LIMIT 5000`, [since]);
 
     const total = rows.length;
@@ -16727,6 +20682,9 @@ app.get('/api/reports/setup-forecasts', async (req, res) => {
     const expired = rows.filter((r) => r.status === 'EXPIRED').length;
     const superseded = rows.filter((r) => r.status === 'SUPERSEDED').length;
     const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
+    // Number(null) is 0 and 0 is finite, so a bare isFinite check turns "no trade" into
+    // "a trade worth exactly nothing" and quietly dilutes every average below.
+    const num = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
 
     const groupBy = (keyFn) => {
       const m = new Map();
@@ -16745,7 +20703,7 @@ app.get('/api/reports/setup-forecasts', async (req, res) => {
       return v.length ? Math.round((v.reduce((a, b) => a + b, 0) / v.length) * 10) / 10 : null;
     };
 
-    res.json({
+    const payload = {
       ok: true, days,
       totals: {
         forecasts: total, waiting, resolved: resolvedRows.length,
@@ -16766,12 +20724,139 @@ app.get('/api/reports/setup-forecasts', async (req, res) => {
       byScenario: groupBy((r) => r.scenario),
       byStrategy: groupBy((r) => r.best_strategy),
       bySymbol: groupBy((r) => r.symbol),
+      byTimeframe: groupBy((r) => r.timeframe),
+      // Which KIND of level actually pays: PDH/PDL vs equal highs vs round numbers vs swings.
+      byLevelType: groupBy((r) => r.level_type),
+      // Same question one level up, by SOURCE FAMILY — resting liquidity vs order blocks vs
+      // support/resistance zones vs untested retests. A level is credited to every source that
+      // named it, so a row counts once per family and the families deliberately do NOT sum to
+      // the resolved total.
+      byLevelSource: (() => {
+        const m = new Map();
+        for (const r of resolvedRows) {
+          for (const g of levelSourceFamilies(r)) {
+            if (!m.has(g)) m.set(g, { key: g, resolved: 0, matched: 0 });
+            const e = m.get(g);
+            e.resolved += 1;
+            if (r.matched === 1) e.matched += 1;
+          }
+        }
+        return [...m.values()].map((g) => ({ ...g, matchRate: pct(g.matched, g.resolved) }))
+          .sort((a, b) => b.resolved - a.resolved);
+      })(),
+      // The cross-tab that answers "which strategy works best on retests / order blocks / zones".
+      // Sorted by match rate, but `resolved` is carried so a 100% off two samples is visibly
+      // thin rather than looking like a winner.
+      strategyByLevelSource: (() => {
+        const m = new Map();
+        for (const r of resolvedRows) {
+          const strat = r.best_strategy || '—';
+          for (const g of levelSourceFamilies(r)) {
+            const k = `${g}|${strat}`;
+            if (!m.has(k)) m.set(k, { source: g, strategyId: strat, resolved: 0, matched: 0, pips: [] });
+            const e = m.get(k);
+            e.resolved += 1;
+            if (r.matched === 1) e.matched += 1;
+            const p = num(r.hit_pips);
+            if (p !== null) e.pips.push(p);
+          }
+        }
+        return [...m.values()]
+          .map(({ pips, ...g }) => ({
+            ...g,
+            matchRate: pct(g.matched, g.resolved),
+            avgPips: pips.length ? Math.round((pips.reduce((a, b) => a + b, 0) / pips.length) * 10) / 10 : null,
+          }))
+          .sort((a, b) => (b.matchRate ?? -1) - (a.matchRate ?? -1) || b.resolved - a.resolved);
+      })(),
       actualsWhenMismatched: (() => {
         const m = new Map();
         for (const r of resolvedRows.filter((x) => x.matched !== 1)) m.set(r.actual || '—', (m.get(r.actual || '—') || 0) + 1);
         return [...m.entries()].map(([actual, count]) => ({ actual, count })).sort((a, b) => b.count - a.count);
       })(),
-    });
+
+      // ── What the hits were WORTH ────────────────────────────────────────────
+      // Everything below is drawn from MATCHED forecasts only. A matched scenario is not a won
+      // trade, so hypothetical replay (hit_*) and money actually made (real_*) are kept apart
+      // and never summed together.
+      // Two settlements, deliberately separate. `matchedOnly` is what the user asked for — how
+      // the hits paid — but on its own it is close to tautological: a matched SWEEP_REJECT means
+      // price rejected and ran, which is nearly the same event as the target being reached, so it
+      // trends toward 100%. `allArrived` is the honest denominator: every forecast price actually
+      // reached, mismatches included, which is what trading all of them would have returned.
+      settlement: (() => {
+        const sum = (a) => a.reduce((x, y) => x + y, 0);
+        const shape = (src) => {
+          const settledRows = src.filter((r) => r.hit_outcome && r.hit_outcome !== 'OPEN' && r.hit_outcome !== 'AMBIGUOUS');
+          const wins = settledRows.filter((r) => r.hit_outcome !== 'LOSS');
+          const pipsList = settledRows.map((r) => num(r.hit_pips)).filter((v) => v !== null);
+          const realList = src.map((r) => num(r.real_pnl)).filter((v) => v !== null);
+          const hypoList = src.map((r) => num(r.hit_profit)).filter((v) => v !== null);
+          return {
+            forecasts: src.length,
+            settled: settledRows.length,
+            open: src.filter((r) => !r.hit_outcome || r.hit_outcome === 'OPEN').length,
+            ambiguous: src.filter((r) => r.hit_outcome === 'AMBIGUOUS').length,
+            wins: wins.length,
+            losses: settledRows.length - wins.length,
+            winRate: settledRows.length ? Math.round((wins.length / settledRows.length) * 1000) / 10 : null,
+            totalPips: pipsList.length ? Math.round(sum(pipsList) * 10) / 10 : null,
+            avgPips: pipsList.length ? Math.round((sum(pipsList) / pipsList.length) * 10) / 10 : null,
+            hypotheticalProfit: hypoList.length ? Math.round(sum(hypoList) * 100) / 100 : null,
+            realTrades: realList.length,
+            realProfit: realList.length ? Math.round(sum(realList) * 100) / 100 : null,
+          };
+        };
+        const all = shape(resolvedRows);
+        const only = shape(matched);
+        return {
+          ...only,                       // back-compat: the matched view stays the default shape
+          matched: only.forecasts,
+          matchedOnly: only,
+          allArrived: all,
+          note: 'matchedOnly is conditioned on the scenario having played out and trends optimistic; allArrived is every forecast price reached.',
+        };
+      })(),
+      // The combo view asked for: strategy x timeframe x symbol, ranked by what it produced.
+      byCombo: aggregateSettled(
+        resolvedRows.map((r) => ({
+          hitOutcome: r.hit_outcome, hitPips: r.hit_pips, realPnl: r.real_pnl,
+          combo: [r.best_strategy || '—', r.timeframe, r.symbol, r.level_type || '—'].join(' · '),
+        })),
+        (r) => r.combo,
+      ).slice(0, 40),
+      settledByLevelType: aggregateSettled(
+        resolvedRows.map((r) => ({ hitOutcome: r.hit_outcome, hitPips: r.hit_pips, realPnl: r.real_pnl, k: r.level_type })),
+        (r) => r.k,
+      ),
+      settledByStrategy: aggregateSettled(
+        resolvedRows.map((r) => ({ hitOutcome: r.hit_outcome, hitPips: r.hit_pips, realPnl: r.real_pnl, k: r.best_strategy })),
+        (r) => r.k,
+      ),
+      // Every hit, itemised — the drill-down behind the aggregates.
+      hits: resolvedRows
+        .sort((a, b) => (num(b.hit_pips) ?? -1e9) - (num(a.hit_pips) ?? -1e9))
+        .slice(0, 200)
+        .map((r) => ({
+          matched: r.matched === 1, actual: r.actual,
+          id: r.id, symbol: r.symbol, timeframe: r.timeframe, scenario: r.scenario,
+          strategy: r.best_strategy, score: num(r.best_score),
+          direction: r.expected_direction,
+          level: num(r.level), levelType: r.level_type, levelLabel: r.level_label, levelStrength: r.level_strength,
+          levelSources: levelSourceFamilies(r),
+          predictedMinutes: num(r.eta_mid), actualMinutes: num(r.actual_minutes),
+          hitOutcome: r.hit_outcome, hitPips: num(r.hit_pips), hitR: num(r.hit_r),
+          hitProfit: num(r.hit_profit), tpLevel: num(r.hit_tp_level),
+          mfePips: num(r.mfe_pips), maePips: num(r.mae_pips),
+          realTicket: r.real_ticket ? String(r.real_ticket) : null,
+          realPnl: num(r.real_pnl), realLots: num(r.real_lots),
+          realEntryGapPips: num(r.real_entry_gap_pips), realLinkNote: r.real_link_note,
+          forecastAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+          resolvedAt: r.resolved_at ? new Date(r.resolved_at).toISOString() : null,
+        })),
+    };
+    setupForecastReportCache.set(cacheKey, { at: Date.now(), payload });
+    res.json(payload);
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
@@ -16796,6 +20881,15 @@ setInterval(pruneSetupForecasts, 6 * 3600 * 1000);
 setTimeout(() => { runSetupForecastScan({ reason: 'boot' }).catch((e) => console.error('[SetupForecast] boot scan failed:', e.message)); }, 90 * 1000);
 setInterval(() => { runSetupForecastScan({ reason: 'interval' }).catch((e) => console.error('[SetupForecast] scan failed:', e.message)); }, SETUP_FORECAST_SCAN_MS);
 setInterval(() => { resolveSetupForecasts().catch((e) => console.error('[SetupForecast] resolve failed:', e.message)); }, 5 * 60000);
+
+// Refresh the follow-through on every unresolved liquidity alert. Five minutes matches the
+// setup-forecast resolver: fast enough that a reclaim is visible while it still matters, slow
+// enough that it never competes with the scanners for the candle cache.
+setInterval(() => void runLiquidityEventScan(), 5 * 60000);
+
+// Follow every tracked AI analysis to its outcome. Two minutes: fast enough that an open
+// position's live P&L is current, slow enough not to compete with the scanners for candles.
+setInterval(() => void runAiTrackScan(), 2 * 60000);
 
 // GET /api/liquidity-chart?symbol=&timeframe= — the liquidity read behind /chart/liquidity.
 // Read-only: it reuses detectKeyLiquidityLevels for WHERE the liquidity sits and adds the
@@ -18073,11 +22167,17 @@ async function processTrackedAiProjectionsSafely() {
 }
 
 function startTrackedAiProjectionScheduler() {
-  const checkInterval = Number(process?.env?.AI_TRACKED_PROJECTION_INTERVAL_MS || 5000);
+  // 60s, not 5s. This watches PENDING projections for entry-touch / invalidation / expiry, and
+  // every input it reads changes only on CANDLE CLOSE — the feed sends closed bars only. At 5s it
+  // re-read identical rows ~60 times before an M5 bar even formed, costing 720 round trips an hour
+  // to a remote database (measured at a 47ms network floor per query) to learn nothing. Its output
+  // is a status flip and an email, not a live tick display, so a worst-case one-minute delay in
+  // noticing a transition is invisible to the user.
+  const checkInterval = Math.max(5000, Number(process?.env?.AI_TRACKED_PROJECTION_INTERVAL_MS || 60000));
   const timer = setInterval(() => void processTrackedAiProjectionsSafely(), checkInterval);
   if (typeof timer.unref === 'function') timer.unref();
   setTimeout(() => void processTrackedAiProjectionsSafely(), 3000);
-  console.log('[AI Signals Tracking] AI-free tracked projection scheduler started.');
+  console.log(`[AI Signals Tracking] AI-free tracked projection scheduler started (every ${Math.round(checkInterval / 1000)}s).`);
 }
 
 startTrackedAiProjectionScheduler();
@@ -18129,9 +22229,64 @@ async function runCandleRetention() {
   }
 }
 
+// ─── Abandoned-series retention ─────────────────────────────────────
+// runCandleRetention above caps each series by DEPTH but never removes a series that stopped
+// being fed entirely. Switching brokers leaves every old symbol behind forever: the move off
+// the `M`-suffixed feed (AUDUSDM, EURJPYM, ...) stranded 130 series / 542,385 rows — 54% of
+// mt5_candles — that no longer correspond to a tradable symbol. Dead rows are not inert: the
+// boot cache warm runs `ORDER BY candle_time DESC LIMIT 60000` across the whole table, so
+// abandoned data directly slows every restart.
+//
+// Deliberately conservative. A series is only dropped when it has received NOTHING for
+// STALE_SERIES_DAYS (default 30) — comfortably longer than any weekend, holiday or symbol the
+// EA temporarily stops polling, so a live instrument can never be pruned for going quiet.
+// D1/W1 depth is the reason for that margin: those series carry years of history that the EA
+// would not quickly rebuild, which is exactly what the depth-capped rule was written to
+// protect. Set MT5_PRUNE_STALE_SERIES=0 to disable.
+const STALE_SERIES_DAYS = Math.max(7, Number(process?.env?.MT5_STALE_SERIES_DAYS || 30));
+const PRUNE_STALE_SERIES = String(process?.env?.MT5_PRUNE_STALE_SERIES ?? '1') !== '0';
+
+async function pruneAbandonedCandleSeries() {
+  if (!PRUNE_STALE_SERIES) return;
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return;
+    const [series] = await pool.query(
+      `SELECT symbol, timeframe, COUNT(*) n, MAX(candle_time) newest
+         FROM mt5_candles
+        GROUP BY symbol, timeframe
+       HAVING newest < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)`,
+      [STALE_SERIES_DAYS]
+    );
+    if (!series.length) return;
+    let removed = 0;
+    for (const s of series) {
+      // Same batched delete as the depth cap: never exceed the server's statement timeout.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const [r] = await pool.query(
+          'DELETE FROM mt5_candles WHERE symbol=? AND timeframe=? LIMIT 20000',
+          [s.symbol, s.timeframe]
+        );
+        removed += r.affectedRows;
+        if (r.affectedRows < 20000) break;
+      }
+    }
+    if (removed > 0) {
+      const what = series.map((s) => `${s.symbol}|${s.timeframe}`).join(', ');
+      console.log(`[Retention] Dropped ${series.length} abandoned series (${removed} rows, nothing fed for ${STALE_SERIES_DAYS}d): ${what}`);
+    }
+  } catch (error) {
+    console.error('[Retention] Abandoned-series prune failed:', error.message);
+  }
+}
+
 // Run once shortly after boot, then on a recurring schedule.
 setTimeout(() => void runCandleRetention(), 90_000);
 setInterval(() => void runCandleRetention(), RETENTION_INTERVAL_MS);
+// Offset from the depth pass so the two never compete for pool connections.
+setTimeout(() => void pruneAbandonedCandleSeries(), 150_000);
+setInterval(() => void pruneAbandonedCandleSeries(), RETENTION_INTERVAL_MS);
 
 
 const wss = new WebSocketServer({ noServer: true });

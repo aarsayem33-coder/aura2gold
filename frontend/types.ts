@@ -420,6 +420,7 @@ export interface EmailAlertSettings {
     balance: number;
     mode: 'NORMAL' | 'CHALLENGE' | 'BOTH';
     normalRiskPct: number;
+    signalSizing?: { source: 'ACCOUNT' | 'CUSTOM'; equity: number; riskPct: number };
     challenge: {
       preset: string; phase: 'EVAL' | 'FUNDED'; initialBalance: number;
       profitTargetPct: number; dailyLossPct: number; maxDrawdownPct: number;
@@ -1502,6 +1503,12 @@ export interface AutoTradeConfig {
   mode: 'OFF' | 'SHADOW' | 'ASK' | 'AUTO';
   strategies: string[]; symbols: string[]; timeframes: string[]; sessions: string[];
   maxTradesPerDay: number; maxConcurrent: number; onePerSymbol: boolean;
+  maxSlippagePctOfStop: number; resizeLotsOnSlippage: boolean;
+  // ict-breaker family only: stop, no take profit. Gate is remaining-R to the draw.
+  ictBreakerExec?: { enabled: boolean; minRemainingR: number; maxLatePct: number; minStopSpreadMult: number; noTakeProfit: boolean };
+  // Either the legacy unscoped string or a scoped rule. Empty lists = any on that axis;
+  // outside the scope the strategy follows the desk mode.
+  strategyModes: Record<string, 'AUTO' | 'ASK' | { mode: 'AUTO' | 'ASK'; symbols?: string[]; timeframes?: string[]; sessions?: string[] }>;
   minGrade: 'A' | 'A+'; minRR: number;
   /**
    * Which selection model is live. Switching does not discard the other one.
@@ -2082,6 +2089,9 @@ export interface ChartForexPlan {
   takeProfit3: number | null;
   riskReward: number | null;
   lots: number | null;
+  /** The size this setup WOULD take. Present even when `lots` is null (no tradeable call). */
+  suggestedLots?: number | null;
+  sizingIsHypothetical?: boolean;
   stopPips?: number | null;
   lossAtStop?: number | null;
   riskLevel?: string;
@@ -2108,6 +2118,23 @@ export interface ChartFttPlan {
   reasoning?: string | null;
 }
 export interface ChartAnalysisResponse {
+  // Trader-mode fields (present when style/bias were requested).
+  style?: 'SCALP' | 'DAY' | null;
+  bias?: 'LONG' | 'SHORT' | 'BOTH' | null;
+  instrument?: string;
+  // Scored ticket fields, added server-side. riskReward is RECOMPUTED from the actual prices;
+  // the model's own figure is discarded. setupScore/setupGrade are null when there is no
+  // tradeable ticket — never a failing letter for "no setup".
+  // (forexPlan carries: setupScore, setupGrade, scoreBreakdown, scoreNote, lots, stopPips,
+  //  lossAtStop, riskReward)
+  // Strategy agreement — INFORMATION only, never a verdict.
+  strategyMatch?: {
+    aiDirection: string;
+    agreeing: Array<{ id: string; name?: string; decision: string; score?: number | null; grade?: string | null }>;
+    opposing: Array<{ id: string; name?: string; decision: string; score?: number | null; grade?: string | null }>;
+    verdict: 'ALIGNED' | 'MIXED' | 'CONTRARY' | 'SILENT' | 'NO_STRATEGIES' | 'NO_DIRECTION';
+    note: string;
+  } | null;
   ok: boolean;
   source: 'gemini-vision' | 'system-fallback';
   symbol: string;
@@ -2442,15 +2469,34 @@ export interface ForecastPlan {
   conditional: boolean;
 }
 export interface ForecastDriftPoint { ts: string; rankScore: number; bestScore: number; agree: number; etaMid: number | null }
+
+/** Has this KIND of setup worked before? See backend/forecastTrackRecord.js for why the badge
+ *  is not on the exact strategy x symbol x timeframe x level slice. */
+export interface ForecastTrackRecord {
+  qualifies: boolean;
+  basis?: 'win rate' | 'match rate' | 'both' | null;
+  /** The grouping the rate was actually measured on — never omitted when a rate is shown. */
+  grouping?: string | null;
+  groupingKey?: string;
+  n?: number;
+  settled?: number;
+  winRate?: number | null;
+  matchRate?: number | null;
+  thresholds?: { minWinRate: number; minMatchRate: number; minSample: number };
+  reason: string;
+}
+
 export interface SetupForecast {
+  trackRecord?: ForecastTrackRecord;
   id: string; key: string; symbol: string; timeframe: string;
   scenario: string; side: string; level: number;
   levelType: string | null; levelLabel: string | null; levelStrength: number | null;
   expectedDirection: string; consensusDirection: string | null;
+  levelSources?: string[] | null; levelConfluence?: number | null;
   distance: { pips: number | null; atr: number | null };
   eta: { minMinutes: number | null; midMinutes: number | null; maxMinutes: number | null };
   horizon: { key: string; label: string };
-  rankScore: number; bestScore: number; bestStrategy: string | null;
+  rankScore: number; bestScore: number; bestStrategy: string | null; grade: string | null;
   agreeCount: number; dissentCount: number;
   fires: ForecastFire[];
   plan: ForecastPlan | null;
@@ -2458,6 +2504,18 @@ export interface SetupForecast {
   drift: ForecastDriftPoint[];
   driftSummary: { rank: number; score: number; points: number };
   createdAt: string; updatedAt: string;
+  /** Plain-English split of which parts of the score came from the market vs the assumption. */
+  scoreBasis?: ForecastScoreBasis | null;
+}
+
+export interface ForecastBasisItem { label: string; detail: string }
+export interface ForecastScoreBasis {
+  scenario: { key: string; name: string; story: string; signalIs: string; wrongIf: string };
+  headline: string;
+  assumed: ForecastBasisItem[];
+  measured: ForecastBasisItem[];
+  evidence: { verdict: string | null; headline: string; detail: string; good: boolean | null };
+  caution: string;
 }
 export interface ForecastDiscriminationRow {
   strategyId: string; verdict: string; realRate: number; placeboRate: number;
@@ -2479,8 +2537,486 @@ export interface SetupForecastReportResponse {
   };
   timing: { avgActualMinutes: number | null; avgEtaMidMinutes: number | null };
   followThrough: { matchedAvgMfePips: number | null; matchedAvgMaePips: number | null };
-  byScenario: Array<{ key: string; resolved: number; matched: number; matchRate: number | null }>;
-  byStrategy: Array<{ key: string; resolved: number; matched: number; matchRate: number | null }>;
-  bySymbol: Array<{ key: string; resolved: number; matched: number; matchRate: number | null }>;
+  byScenario: ForecastGroupRow[];
+  byStrategy: ForecastGroupRow[];
+  bySymbol: ForecastGroupRow[];
+  byTimeframe: ForecastGroupRow[];
+  byLevelType: ForecastGroupRow[];
+  byLevelSource: ForecastGroupRow[];
+  strategyByLevelSource: Array<{ source: string; strategyId: string; resolved: number; matched: number; matchRate: number | null; avgPips: number | null }>;
   actualsWhenMismatched: Array<{ actual: string; count: number }>;
+  settlement: ForecastSettlementStats & {
+    matched: number;
+    matchedOnly: ForecastSettlementStats;
+    allArrived: ForecastSettlementStats;
+    note: string;
+  };
+  byCombo: ForecastSettledRow[];
+  settledByLevelType: ForecastSettledRow[];
+  settledByStrategy: ForecastSettledRow[];
+  hits: ForecastHit[];
+}
+
+/** Settlement summary for one denominator (every arrival, or matched only). */
+export interface ForecastSettlementStats {
+  forecasts: number; settled: number; open: number; ambiguous: number;
+  wins: number; losses: number; winRate: number | null;
+  totalPips: number | null; avgPips: number | null;
+  hypotheticalProfit: number | null;
+  realTrades: number; realProfit: number | null;
+}
+
+export interface ForecastGroupRow { key: string; resolved: number; matched: number; matchRate: number | null }
+
+/** A settled grouping: hypothetical replay result plus any real money attached. */
+export interface ForecastSettledRow {
+  key: string; matched: number; settled: number; wins: number; losses: number;
+  ambiguous: number; open: number; pips: number; realPnl: number; realTrades: number;
+  winRate: number | null;
+}
+
+/** One matched forecast, itemised. */
+export interface ForecastHit {
+  matched: boolean; actual: string | null;
+  id: string; symbol: string; timeframe: string; scenario: string;
+  strategy: string | null; score: number | null; direction: string;
+  level: number | null; levelType: string | null; levelLabel: string | null; levelStrength: number | null;
+  levelSources?: string[] | null;
+  predictedMinutes: number | null; actualMinutes: number | null;
+  hitOutcome: string | null; hitPips: number | null; hitR: number | null;
+  hitProfit: number | null; tpLevel: number | null;
+  mfePips: number | null; maePips: number | null;
+  realTicket: string | null; realPnl: number | null; realLots: number | null;
+  realEntryGapPips: number | null; realLinkNote: string | null;
+  forecastAt: string | null; resolvedAt: string | null;
+}
+
+// ── Auto-trade approval queue (ASK mode) ────────────────────────────────────
+export interface PendingAutoTrade {
+  id: string; strategy: string; strategyName: string;
+  symbol: string; timeframe: string; direction: string; orderType: string;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  lots: number | null; riskAmount: number | null; riskMode: string | null;
+  score: number | null; grade: string | null; rr: number | null; session: string | null;
+  mode: string; status: string; reason: string | null;
+  createdAt: string | null; expiresAt: string | null; updatedAt: string | null;
+  ticket: number | null; fillPrice: number | null; profit: number | null;
+  forecastMatch?: ForecastTradeMatch | null;
+}
+
+/** A pending trade recognised as a setup the system already forecast. */
+export interface ForecastTradeMatch {
+  forecastId: string; symbol: string; timeframe: string; scenario: string;
+  level: number | null; levelLabel: string | null; direction: string;
+  forecastScore: number | null; bestStrategy: string | null;
+  strength: 'STRONG' | 'CLOSE'; confidence: number;
+  entryGapPips: number | null; reasons: string[]; alternatives: number;
+}
+export interface AutoTradePendingResponse {
+  ok: boolean; generatedAt: string;
+  mode: string; bridgeReady: boolean; armedMatch: boolean;
+  approvalWindowMinutes: number;
+  pending: PendingAutoTrade[];
+  expired: PendingAutoTrade[];
+  recent: PendingAutoTrade[];
+}
+
+// ── AI review of a single setup forecast ────────────────────────────────────
+export interface ForecastAiVerdict {
+  available: boolean;
+  reason?: string;                 // present only when unavailable
+  direction: string | null;
+  agreesWithSystem?: boolean;
+  score: number | null;
+  confidence?: string;
+  entry?: number | null; stopLoss?: number | null;
+  takeProfit1?: number | null; takeProfit2?: number | null;
+  rr?: number | null; stopPips?: number | null;
+  expectedReaction?: string; invalidation?: string;
+  keyRisks?: string[]; rationale?: string;
+  verdict?: string;
+  ticketUsable?: boolean;
+  issues?: string[];
+  summary?: string;                // fallback view only
+}
+export interface ForecastAiResponse {
+  ok: boolean; id: string; model?: string;
+  ai: ForecastAiVerdict;
+  system?: {
+    direction: string; score: number | string | null; strategy: string | null;
+    plan: ForecastPlan | null; backing: number; against: number;
+  };
+  market?: { price?: number; atr?: number; h1Trend?: string; h4Trend?: string; session?: string | null };
+  news?: Array<{ currency: string; impact: string; title: string; in_minutes: number }>;
+  saw?: { bars: number; vision: boolean; chartPng: string | null; sections: number };
+  analysedAt?: string;
+  caveats?: string[];
+  cached?: boolean;
+}
+
+export interface StrategyRateRow {
+  strategy: string; resolved: number; matched: number;
+  matchRate: number | null; perfect: boolean; provisional: boolean; minSample: number;
+}
+export interface StrategyRatesResponse {
+  ok: boolean; range: string; label: string; from: string; to: string;
+  resolved: number; minSample: number;
+  strategies: StrategyRateRow[]; perfect: string[]; note: string;
+}
+
+// ── Tracked forecasts ───────────────────────────────────────────────────────
+export interface TrackedHealth {
+  verdict: 'STRENGTHENING' | 'HOLDING' | 'WEAKENING' | 'DONT_CHASE' | 'REVERSED' | 'STALE' | 'CLOSED';
+  scoreChange: number; rankChange: number; agreeChange: number;
+  timeLeftMinutes: number | null;
+  distanceNow: number | null; distanceAtr: number | null;
+  reasons: string[]; alertWorthy: boolean; suggestion?: string;
+}
+export interface TrackedForecast extends SetupForecast {
+  price: number | null;
+  trackedAt: string | null; alertedAt: string | null; alertVerdict: string | null;
+  actual: string | null; matched: boolean;
+  health: TrackedHealth;
+}
+export interface TrackedForecastResponse {
+  ok: boolean; generatedAt: string; count: number; tracked: TrackedForecast[];
+}
+
+export interface ForecastPendingOrder {
+  id: string; forecastId: string;
+  symbol: string; timeframe: string; direction: string; orderType: string;
+  entry: number | null; stopLoss: number | null; takeProfit1: number | null;
+  lots: number | null; riskAmount: number | null; rr: number | null;
+  status: string; reason: string | null; ticket: number | null;
+  fillPrice: number | null; profit: number | null;
+  scenario: string | null; level: number | null; levelLabel: string | null;
+  forecastScore: number | null; forecastStatus: string | null;
+  createdAt: string | null; expiresAt: string | null;
+  cancellable: boolean;
+}
+export interface ForecastPendingResponse {
+  ok: boolean; generatedAt: string; bridgeReady: boolean; armedMatch: boolean;
+  orders: ForecastPendingOrder[];
+}
+
+export interface RepriceLeg {
+  entry: number; stopLoss: number;
+  takeProfit1: number | null; takeProfit2?: number | null; takeProfit3?: number | null;
+  lots: number; rr: number | null; stopPips: number | null;
+  riskUsd: number | null; rewardUsd: number | null;
+  rewardFinalUsd?: number | null; budget?: number | null;
+  overBudget?: boolean; minForced?: boolean;
+}
+export interface RepriceResponse {
+  ok: boolean; symbol: string; direction: string; timeframe: string;
+  market: number; driftPips: number | null; structuralWarning: string | null;
+  before: RepriceLeg; after: RepriceLeg;
+  challenge: { eligible: boolean; warnings: string[] };
+  note: string;
+}
+
+// ─── ICT Predict (/future-predictions/ict) ───────────────────────────────────
+// Projected sweep → breaker setups for ict-breaker and ict-break-pro only. Every price is
+// conditional on the projected sequence happening; `scoreBasis` says which parts of the score
+// were assumed rather than measured.
+
+export interface IctGate { label: string; value: string | null; pass: boolean | null; detail: string }
+
+export interface IctMeasurements {
+  pro: boolean;
+  baseScore: number | null;
+  displacementAtr: number | null;
+  targetType: string | null;
+  targetEqual: boolean;
+  sweepLevel: number | null;
+  structureLevel: number | null;
+  gates: IctGate[];
+  bonuses: IctGate[];
+}
+
+export interface IctFire {
+  strategyId: string; decision: string;
+  score: number | null; grade: string | null;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  rr: number | null; reason: string; entryOrderType: string;
+}
+
+export interface IctLimitOrder {
+  type: string; direction: string;
+  entry: number; stopLoss: number;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  rr: number | null; stopPips: number | null;
+}
+
+/** Position size for the resting order, computed at scan time and re-checked when placed. */
+export interface IctSizing {
+  lots?: number; lossAtStop?: number; riskBudget?: number | null; stopPips?: number | null;
+  profitAtTp?: number | null; profitAtFinalTp?: number | null;
+  overBudget?: boolean; minForced?: boolean; warnings?: string[];
+  /** Present instead of the numbers when no size could be computed, saying why. */
+  unavailable?: string;
+}
+
+export interface IctStrategyPlan {
+  strategyId?: string; orderType: string; direction: string;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  rr: number | null; note: string;
+}
+
+export interface IctPrediction {
+  id: string; key: string; symbol: string; timeframe: string;
+  setup: string; direction: string; side: string;
+  level: number; structureLevel: number;
+  levelType: string | null; levelLabel: string | null; levelStrength: number | null;
+  atr: number | null; priceAtForecast: number | null;
+  distance: { pips: number | null; atr: number | null };
+  eta: { minMinutes: number | null; midMinutes: number | null; maxMinutes: number | null };
+  rankScore: number | null; bestScore: number | null; bestStrategy: string | null;
+  grade: string | null; rr: number | null; proQualified: boolean;
+  limitOrder: IctLimitOrder | null;
+  sizing: IctSizing | null;
+  strategyPlan: IctStrategyPlan | null;
+  scoreBasis: { assumed: string[]; measured: string[]; caution: string } | null;
+  projection: { walks: number; reclaimAtr: number; overshootAtr: number; bars: number } | null;
+  refused: Array<{ strategyId: string; reason: string }>;
+  fires: IctFire[];
+  measurements: IctMeasurements | null;
+  projectedBars: Array<{ time: string; open: number; high: number; low: number; close: number; synthetic?: boolean }>;
+  status: string; tracked: boolean;
+  arrived: boolean | null; swept: boolean | null; reclaimed: boolean | null;
+  outcome: string | null; outcomePips: number | null; outcomeR: number | null;
+  createdAt: string | null; updatedAt: string | null;
+  /** False when the resting stop is inside the broker's minimum distance — the order would be rejected. */
+  placeable?: boolean; placeableNote?: string | null;
+}
+
+export interface IctPredictionResponse {
+  ok: boolean; generatedAt: string;
+  lastScan: { at: string; ms?: number; predictions?: number; candidates?: number; inserted?: number; updated?: number; superseded?: number; fromStoredRows?: boolean } | null;
+  count: number;
+  timeframes: string[];
+  strategies: Array<{ id: string; name: string; enabled: boolean; timeframes: string[] }>;
+  predictions: IctPrediction[];
+  caveats: string[];
+}
+
+export interface IctTrackedHealth {
+  verdict: string;
+  timeLeftMinutes: number | null;
+  distanceAtr: number | null;
+  throughAtr: number | null;
+  reasons: string[];
+  alertWorthy: boolean;
+  suggestion?: string;
+}
+export interface IctTrackedPrediction extends IctPrediction {
+  price: number | null; trackedAt: string | null; alertedAt: string | null;
+  health: IctTrackedHealth;
+}
+export interface IctTrackedResponse {
+  ok: boolean; generatedAt: string; count: number; tracked: IctTrackedPrediction[];
+}
+
+export interface IctPendingOrder {
+  id: string; predictionId: string;
+  symbol: string; timeframe: string; direction: string; orderType: string;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  lots: number | null; riskAmount: number | null; rr: number | null; strategy: string | null;
+  status: string; reason: string | null; ticket: number | null;
+  fillPrice: number | null; profit: number | null;
+  setup: string | null; level: number | null; levelLabel: string | null; structureLevel: number | null;
+  predictionScore: number | null; predictionStatus: string | null; proQualified: boolean;
+  createdAt: string | null; expiresAt: string | null; cancellable: boolean;
+}
+export interface IctPendingResponse {
+  ok: boolean; generatedAt: string; bridgeReady: boolean; armedMatch: boolean; orders: IctPendingOrder[];
+}
+
+export interface IctRecordBucket {
+  n: number; arrived: number; swept: number; reclaimed: number;
+  wins: number; losses: number; ambiguous: number; settled: number;
+  pips: number; r: number;
+  arrivalRate: number | null; reclaimRate: number | null; winRate: number | null;
+}
+export interface IctTrackRecordResponse {
+  ok: boolean; days: number; resolved: number;
+  overall: IctRecordBucket;
+  byStrategy: Array<IctRecordBucket & { strategy: string }>;
+  byTimeframe: Array<IctRecordBucket & { timeframe: string }>;
+  bySetup: Array<IctRecordBucket & { setup: string }>;
+  bySymbol: Array<IctRecordBucket & { symbol: string }>;
+  proComparison: { proQualified: IctRecordBucket; notQualified: IctRecordBucket };
+  notes: string[];
+}
+
+export interface IctAiResponse {
+  ok: boolean; id: string; model?: string; cached?: boolean;
+  ai: {
+    available: boolean; reason?: string; summary?: string;
+    direction?: string; agreesWithSystem?: boolean; score?: number | null;
+    confidence?: string; reachLikelihood?: string; sweepOutcome?: string; orderType?: string;
+    entry?: number | null; stopLoss?: number | null;
+    takeProfit1?: number | null; takeProfit2?: number | null;
+    rr?: number | null; stopPips?: number | null; ticketUsable?: boolean;
+    drawOnLiquidity?: string; invalidation?: string; keyRisks?: string[];
+    rationale?: string; verdict?: string; issues?: string[];
+  };
+  system?: {
+    direction: string; score: number | null; strategy: string | null; proQualified: boolean;
+    limitOrder: IctLimitOrder | null; strategyPlan: IctStrategyPlan | null; backing: number;
+  };
+  market?: { price?: number; atr?: number; h1Trend?: string; h4Trend?: string; session?: string | null };
+  news?: Array<{ currency: string; impact: string; title: string; in_minutes: number }>;
+  saw?: { bars: number; vision: boolean; chartPng: string | null; projectedBarsShown: boolean };
+  analysedAt?: string;
+  caveats?: string[];
+}
+
+// ── Would-Trade ledger ───────────────────────────────────────────────────────
+// Every MT5 trade decision, taken or not, across all accounts. Sourced from the auto-trade
+// log, so money on filled trades is REAL broker P&L — not the strategy signal log.
+export interface WouldTradeStats {
+  decisions: number;
+  taken: number;
+  notTaken: number;
+  /** Share of decisions that ever became a trade. */
+  fillRate: number | null;
+  settled: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  netProfit: number;
+  grossWin: number;
+  grossLoss: number;
+  avgWin: number | null;
+  avgLoss: number | null;
+  profitFactor: number | null;
+  expectancy: number;
+  expectancyR: number;
+  netR: number;
+  netPips: number;
+  totalLots: number;
+  maxDrawdown: number;
+  worstLossStreak: number;
+}
+
+export interface WouldTradeGroupRow extends WouldTradeStats {
+  key: string;
+  account?: string | null;
+  strategy?: string | null;
+  symbol?: string | null;
+  timeframe?: string | null;
+  tStat: number | null;
+  /** Clears the multiple-comparison bar for the number of combos searched. */
+  significant: boolean;
+  /** What an uncorrected reading would have claimed — kept visible for contrast. */
+  nominallySignificant: boolean;
+  belowSampleFloor: boolean;
+}
+
+export interface WouldTradeGroup {
+  rows: WouldTradeGroupRow[];
+  bar: { combosTested: number; alpha: number; perTestAlpha: number; criticalT: number };
+}
+
+export interface WouldTradeAccount {
+  account: string;
+  decisions: number;
+  filled: number;
+  profit: number;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+export interface WouldTradeNotTaken {
+  status: string;
+  reason: string;
+  count: number;
+  share: number;
+  examples: string[];
+}
+
+export interface WouldTradeRow {
+  id: string;
+  strategy: string;
+  symbol: string;
+  timeframe: string;
+  account: string;
+  broker: string | null;
+  direction: string;
+  orderType: string | null;
+  session: string | null;
+  mode: string | null;
+  riskMode: string | null;
+  score: number | null;
+  grade: string | null;
+  rr: number | null;
+  lots: number | null;
+  riskAmount: number | null;
+  entry: number | null;
+  stopLoss: number | null;
+  fillPrice: number | null;
+  closePrice: number | null;
+  profit: number | null;
+  ticket: string | null;
+  createdAt: string;
+  closedAt: string | null;
+  status: string;
+  decision: 'TAKEN' | 'NOT_TAKEN';
+  reason: string | null;
+  r: number | null;
+  pips: number | null;
+  /** Present only on never-traded rows: what the replay found. */
+  replayOutcome?: string;
+  replayR?: number | null;
+}
+
+export interface WouldTradeReplayStats {
+  replayed: number;
+  settled: number;
+  wins: number;
+  losses: number;
+  /** Pending orders price never returned to — they carry no result at all. */
+  neverFilled: number;
+  stillOpen: number;
+  invalid: number;
+  noData: number;
+  winRate: number | null;
+  expectancyR: number;
+  netR: number;
+  /** Counterfactual money at one constant risk. What the decisions were WORTH, not money missed. */
+  estimatedProfit: number;
+  riskPerTrade: number;
+  fillRate: number | null;
+}
+
+export interface WouldTradeReplay {
+  riskPerTrade: number;
+  overall: WouldTradeReplayStats;
+  byStatus: (WouldTradeReplayStats & { key: string })[];
+  byOrderType: (WouldTradeReplayStats & { key: string })[];
+  byStrategy: (WouldTradeReplayStats & { key: string })[];
+  caveats: string[];
+}
+
+export interface WouldTradeResponse {
+  days: number;
+  minTrades: number;
+  account: string;
+  generatedAt: string;
+  totals: WouldTradeStats;
+  accounts: WouldTradeAccount[];
+  byAccount: WouldTradeGroup;
+  byStrategy: WouldTradeGroup;
+  byTimeframe: WouldTradeGroup;
+  bySymbol: WouldTradeGroup;
+  byCombo: WouldTradeGroup;
+  notTaken: WouldTradeNotTaken[];
+  replay: WouldTradeReplay;
+  trades: WouldTradeRow[];
+  caveats: string[];
 }

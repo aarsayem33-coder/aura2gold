@@ -3,6 +3,7 @@ import { Loader2, RefreshCw, Trophy, Clock, Coins, Target, Layers, Award, Globe,
 import { Link } from 'react-router-dom';
 import AutoTradeReport from './AutoTradeReport';
 import PredictionReport from './PredictionReport';
+import WouldTradeReport from './reports/WouldTradeReport';
 import { fetchStrategyBrokers, fetchStrategies, fetchStrategyPerformance, fetchStrategySignals, fetchStrategyConfluence, fetchBrokerSpecs, fetchAutoTradeStatus } from '../mt5Api';
 import type { StrategyBrokerRow } from '../mt5Api';
 import type {
@@ -14,7 +15,7 @@ import type {
 
 const REFRESH_MS = 60000;
 
-type SectionKey = 'overview' | 'rankings' | 'sessions' | 'combos' | 'deepdive' | 'log';
+type SectionKey = 'overview' | 'rankings' | 'sessions' | 'combos' | 'deepdive' | 'log' | 'wouldtrade';
 const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: 'overview', label: 'Overview' },
   { key: 'rankings', label: 'Rankings' },
@@ -22,6 +23,7 @@ const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: 'combos', label: 'Sharpest edges' },
   { key: 'deepdive', label: 'Deep dive' },
   { key: 'log', label: 'Signal log' },
+  { key: 'wouldtrade', label: 'Would Trade' },
 ];
 type Metric = 'forex' | 'ftt' | 'at';
 const metricLabel = (m: Metric) => (m === 'ftt' ? 'fixed-time' : m === 'at' ? 'as-traded' : 'forex');
@@ -940,6 +942,14 @@ export default function StrategyLabReports() {
 
       {perf?.note && <p className="text-[11px] font-medium text-slate-400 px-1">{perf.note}</p>}
       </>)}
+
+      {/* Would Trade — every signal the desk produced, not just the selected strategy's. It
+          reads the full log directly and carries its own range controls, so it deliberately
+          ignores the strategy/range pickers above rather than silently filtering to one
+          strategy. Rendered OUTSIDE the metric-tab block above: forex/fixed-time/as-traded are
+          a different axis from this, and gating on them would blank the section on Confluence
+          or Auto Trades for no reason. */}
+      {section === 'wouldtrade' && <WouldTradeReport />}
     </div>
   );
 }

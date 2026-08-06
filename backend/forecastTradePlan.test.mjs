@@ -243,3 +243,23 @@ test('genuinely unaffordable minimum is flagged and warned on', () => {
   assert.equal(plan.minForced, true);
   assert.ok(plan.challenge.warnings.some((w) => /above the safe per-trade risk/.test(w)));
 });
+
+test('the plan carries the firing strategy grade', () => {
+  // Without it, a challenge set to A/A+ only reads a missing grade as a failing grade and
+  // refuses every forecast order — observed live as a 409 on place-order.
+  const { plan } = buildForecastPlan({
+    forecast: forecast([fire({ grade: 'A+' })]), ...GOLD, riskBudget: 40, dashboard: DASH,
+  });
+  assert.equal(plan.grade, 'A+');
+  // A strategy that genuinely reports no grade stays null rather than inventing one.
+  const { plan: p2 } = buildForecastPlan({
+    forecast: forecast([fire({ grade: null })]), ...GOLD, riskBudget: 40, dashboard: DASH,
+  });
+  assert.equal(p2.grade, null);
+});
+
+test('an A-grade ticket passes an A-plus-only challenge', () => {
+  const strict = { ...DASH, rules: { minRR: 2, onlyAPlus: true } };
+  assert.equal(buildForecastPlan({ forecast: forecast([fire({ grade: 'A' })]), ...GOLD, riskBudget: 40, dashboard: strict }).plan.challenge.eligible, true);
+  assert.equal(buildForecastPlan({ forecast: forecast([fire({ grade: 'B' })]), ...GOLD, riskBudget: 40, dashboard: strict }).plan.challenge.eligible, false);
+});

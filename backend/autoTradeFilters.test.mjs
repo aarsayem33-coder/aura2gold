@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { autoTradeCombosAllow, autoTradeSelectionMode, normalizeAutoTradeCombo } from './autoTradeFilters.js';
+import { autoTradeCombosAllow, autoTradeSelectionMode, normalizeAutoTradeCombo, resolveStrategyMode, normalizeStrategyMode } from './autoTradeFilters.js';
 
 const KNOWN_TFS = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
 const ids = new Set(['forex-confluence', 'ict-breaker']);
@@ -139,4 +139,86 @@ test('an unset selectionMode still infers COMBOS when combinations exist', () =>
     assert.equal(autoTradeCombosAllow(cfg, 'ict-breaker', 'XAUUSDM', 'H1'), false,
       'a broad-only strategy must not start trading just because the mode was left unset');
   }
+});
+
+// ── per-strategy approval scoping ────────────────────────────────────────────
+
+const CTX = { symbol: 'XAUUSD', timeframe: 'M5', session: 'LONDON' };
+
+test('OFF and SHADOW are desk interlocks that no per-strategy rule can override', () => {
+  // A per-strategy AUTO must never dispatch while the desk is off or the EA bridge is down.
+  for (const desk of ['OFF', 'SHADOW']) {
+    assert.equal(resolveStrategyMode(desk, { s: 'AUTO' }, 's', CTX), desk);
+    assert.equal(resolveStrategyMode(desk, { s: { mode: 'AUTO' } }, 's', CTX), desk);
+  }
+});
+
+test('the legacy string form still applies everywhere', () => {
+  assert.equal(resolveStrategyMode('ASK', { s: 'AUTO' }, 's', CTX), 'AUTO');
+  assert.equal(resolveStrategyMode('ASK', { s: 'AUTO' }, 's', { symbol: 'EURUSD', timeframe: 'H1', session: 'TOKYO' }), 'AUTO');
+});
+
+test('an unscoped object rule applies everywhere', () => {
+  const modes = { s: { mode: 'AUTO', symbols: [], timeframes: [], sessions: [] } };
+  assert.equal(resolveStrategyMode('ASK', modes, 's', CTX), 'AUTO');
+  assert.equal(resolveStrategyMode('ASK', modes, 's', { symbol: 'EURUSD', timeframe: 'H4', session: 'NEWYORK' }), 'AUTO');
+});
+
+test('a scoped rule applies only inside its scope', () => {
+  const modes = { s: { mode: 'AUTO', symbols: ['XAUUSD'], timeframes: ['M5'], sessions: ['LONDON'] } };
+  assert.equal(resolveStrategyMode('ASK', modes, 's', CTX), 'AUTO', 'inside scope');
+  assert.equal(resolveStrategyMode('ASK', modes, 's', { ...CTX, symbol: 'EURUSD' }), 'ASK', 'wrong symbol');
+  assert.equal(resolveStrategyMode('ASK', modes, 's', { ...CTX, timeframe: 'H1' }), 'ASK', 'wrong timeframe');
+  assert.equal(resolveStrategyMode('ASK', modes, 's', { ...CTX, session: 'TOKYO' }), 'ASK', 'wrong session');
+});
+
+test('a non-matching scope falls back to the DESK mode, never to the other live mode', () => {
+  // The dangerous direction: narrowing an ASK rule must not promote anything to AUTO.
+  const askRule = { s: { mode: 'ASK', symbols: ['XAUUSD'] } };
+  assert.equal(resolveStrategyMode('AUTO', askRule, 's', { ...CTX, symbol: 'EURUSD' }), 'AUTO', 'desk AUTO stands outside the rule');
+  const autoRule = { s: { mode: 'AUTO', symbols: ['XAUUSD'] } };
+  assert.equal(resolveStrategyMode('ASK', autoRule, 's', { ...CTX, symbol: 'EURUSD' }), 'ASK', 'desk ASK stands outside the rule');
+});
+
+test('broker suffixes do not defeat the symbol scope', () => {
+  const modes = { s: { mode: 'AUTO', symbols: ['XAUUSD'] } };
+  assert.equal(resolveStrategyMode('ASK', modes, 's', { ...CTX, symbol: 'XAUUSDm' }), 'AUTO');
+  const idx = { s: { mode: 'AUTO', symbols: ['USTEC'] } };
+  assert.equal(resolveStrategyMode('ASK', idx, 's', { ...CTX, symbol: 'USTEC_X100M' }), 'AUTO');
+  assert.equal(resolveStrategyMode('ASK', modes, 's', { ...CTX, symbol: 'EURUSD' }), 'ASK');
+});
+
+test('a scoped rule with missing context does not match', () => {
+  // No symbol on the candidate cannot satisfy a symbol-scoped rule; falling back is safer
+  // than treating "unknown" as "matches".
+  const modes = { s: { mode: 'AUTO', symbols: ['XAUUSD'] } };
+  assert.equal(resolveStrategyMode('ASK', modes, 's', {}), 'ASK');
+  assert.equal(resolveStrategyMode('ASK', modes, 's'), 'ASK');
+});
+
+test('an unrecognised mode falls back rather than guessing', () => {
+  assert.equal(resolveStrategyMode('ASK', { s: { mode: 'YOLO', symbols: [] } }, 's', CTX), 'ASK');
+  assert.equal(resolveStrategyMode('ASK', { s: 'MAYBE' }, 's', CTX), 'ASK');
+  assert.equal(resolveStrategyMode('ASK', { s: null }, 's', CTX), 'ASK');
+  assert.equal(resolveStrategyMode('ASK', {}, 'missing', CTX), 'ASK');
+});
+
+test('normalizeStrategyMode upgrades the legacy form and drops junk', () => {
+  assert.deepEqual(normalizeStrategyMode('AUTO'), { mode: 'AUTO', symbols: [], timeframes: [], sessions: [] });
+  assert.equal(normalizeStrategyMode('NONSENSE'), null);
+  assert.equal(normalizeStrategyMode({ mode: 'OFF' }), null, 'OFF is not a per-strategy mode');
+  assert.equal(normalizeStrategyMode(null), null);
+});
+
+test('normalizeStrategyMode filters unknown timeframes and sessions', () => {
+  // A value the resolver would never match must not be storable, or the UI shows a rule
+  // that silently does nothing.
+  const out = normalizeStrategyMode(
+    { mode: 'ask', symbols: ['xauusd', 'xauusd', ' eurusd '], timeframes: ['M5', 'M7'], sessions: ['LONDON', 'MARS'] },
+    { knownTimeframes: ['M1', 'M5', 'M15'], knownSessions: ['LONDON', 'NEWYORK'] },
+  );
+  assert.equal(out.mode, 'ASK', 'mode is upper-cased');
+  assert.deepEqual(out.symbols, ['XAUUSD', 'EURUSD'], 'deduped, trimmed, upper-cased');
+  assert.deepEqual(out.timeframes, ['M5'], 'M7 dropped');
+  assert.deepEqual(out.sessions, ['LONDON'], 'MARS dropped');
 });

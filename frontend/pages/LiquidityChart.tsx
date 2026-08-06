@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { Droplets, Loader2, RefreshCw, Wifi, WifiOff, ArrowUp, ArrowDown, ListOrdered, X } from 'lucide-react';
 import Mt5CandlestickChart from '../components/Mt5CandlestickChart';
 import { fetchMt5Candles, fetchLiquidityChart, fetchLiquidityRanking, useMt5Stream } from '../mt5Api';
+import LiquidityEventTable from '../components/LiquidityEventTable';
 import { mergeCandlesByTime } from '../lib/candles';
 import type { Mt5Candle, LiquidityChartResponse, LiquidityLevel, LiquidityRankRow } from '../types';
 
@@ -398,6 +399,12 @@ export default function LiquidityChart() {
           </aside>
         </>
       )}
+
+      {/* The alert log with outcomes. Sits below the live chart because it answers a different
+          question: the chart is what the levels look like NOW, this is what they turned into. */}
+      <div className="mt-4">
+        <LiquidityEventTable symbol={symbol || undefined} />
+      </div>
     </div>
   );
 }
