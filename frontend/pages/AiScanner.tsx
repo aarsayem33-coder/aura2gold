@@ -81,13 +81,13 @@ export default function AiScanner() {
           <div>
             <h1 className="text-xl font-black text-slate-900">AI Scanner</h1>
             <p className="text-xs font-medium text-slate-400">
-              Three engines, {data?.symbols.length ?? 6} symbols on {data?.timeframe || 'H1'}, once an hour — one email, every run kept.
+              Three engines, {data?.symbols.length ?? 6} symbols on {data?.timeframe || 'H1'}, on every hour as the candle closes — one email, every run kept.
             </p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className={`rounded-lg px-2 py-1 text-[11px] font-black ${data?.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-400'}`}>
-            {data?.enabled ? `every ${data.intervalMinutes}m` : 'disabled'}
+            {data?.enabled ? `on the hour${data.nextScanAt ? ` · next ${new Date(data.nextScanAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}` : 'disabled'}
           </span>
           <span className={`rounded-lg px-2 py-1 text-[11px] font-black ${data?.bridgeReady && data?.armedMatch ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
             MT5 {data?.mode || '—'}

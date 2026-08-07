@@ -49,7 +49,7 @@ import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
 import { resolveAtr, buildAiMarketContext, formatAiMarketContext, formatDisciplineAdvisory } from './aiMarketContext.js';
 import {
   AI_SCANNER_SYMBOLS, AI_SCANNER_TIMEFRAME, isOpportunity, rankOpportunities,
-  suggestedEntryTime, buildScannerEmail,
+  suggestedEntryTime, buildScannerEmail, msUntilNextTick, AI_SCANNER_SETTLE_MS,
 } from './aiScanner.js';
 import {
   publicConfig as aiProvidersPublicConfig, applyUpdate as aiProvidersApplyUpdate,
@@ -21549,7 +21549,7 @@ async function aiScannerChartRead(symbol, timeframe) {
   return res.json();
 }
 
-async function runAiScannerCycle({ reason = 'interval' } = {}) {
+async function runAiScannerCycle({ reason = 'interval', email = true } = {}) {
   if (aiScannerBusy) return { skipped: 'busy' };
   aiScannerBusy = true;
   const ranAt = new Date();
@@ -21659,7 +21659,7 @@ async function runAiScannerCycle({ reason = 'interval' } = {}) {
     // ── one email, every hour, whether or not it found anything ──
     // A silent scanner and a broken scanner look identical from the inbox.
     const mail = buildScannerEmail({ items, symbols: AI_SCANNER_SYMBOLS, ranAt, timeframe: AI_SCANNER_TIMEFRAME, scannedCount: reads });
-    const to = signalEmailTo();
+    const to = email ? signalEmailTo() : null;
     let emailed = false;
     if (to) {
       try {
@@ -21681,13 +21681,33 @@ async function runAiScannerCycle({ reason = 'interval' } = {}) {
   }
 }
 
-if (AI_SCANNER_ENABLED) {
-  // First sweep a few minutes after boot so the candle cache and the other scanners have
-  // something to report, then hourly.
-  setTimeout(() => void runAiScannerCycle({ reason: 'boot' }), 4 * 60000);
-  const t = setInterval(() => void runAiScannerCycle({ reason: 'interval' }), AI_SCANNER_INTERVAL_MS);
+/**
+ * Schedule the sweep on the CLOCK, not on uptime.
+ *
+ * setInterval fires relative to whenever the process started, so a restart at 09:37 moved every
+ * scan to :37 — the middle of each H1 candle, reading a bar that is 37 minutes old. Each run
+ * re-derives its own next boundary, so the schedule self-corrects and a slow scan cannot push
+ * the following one off the hour.
+ *
+ * No scan on boot. The brief is one email per hour on the hour, and a restart must not inject
+ * an extra one — nodemon alone would have sent dozens today.
+ */
+function scheduleNextAiScan() {
+  const wait = msUntilNextTick(AI_SCANNER_INTERVAL_MS, AI_SCANNER_SETTLE_MS);
+  const at = new Date(Date.now() + wait);
+  const t = setTimeout(async () => {
+    try { await runAiScannerCycle({ reason: 'interval' }); }
+    finally { scheduleNextAiScan(); }   // re-arm even if the run threw
+  }, wait);
   if (typeof t.unref === 'function') t.unref();
-  console.log(`[AiScanner] Hourly sweep armed — ${AI_SCANNER_SYMBOLS.join(',')} on ${AI_SCANNER_TIMEFRAME} every ${Math.round(AI_SCANNER_INTERVAL_MS / 60000)}m.`);
+  return at;
+}
+
+if (AI_SCANNER_ENABLED) {
+  const first = scheduleNextAiScan();
+  console.log(`[AiScanner] Armed on the clock — ${AI_SCANNER_SYMBOLS.join(',')} on ${AI_SCANNER_TIMEFRAME} `
+    + `every ${Math.round(AI_SCANNER_INTERVAL_MS / 60000)}m. First sweep ${first.toISOString().slice(11, 19)} UTC `
+    + `(${AI_SCANNER_SETTLE_MS / 1000}s after the candle closes).`);
 }
 
 // ─── AI models and API keys ──────────────────────────────────────────────────
@@ -21773,6 +21793,11 @@ app.get('/api/ai-scanner', async (req, res) => {
       ok: true,
       symbols: AI_SCANNER_SYMBOLS, timeframe: AI_SCANNER_TIMEFRAME,
       enabled: AI_SCANNER_ENABLED, intervalMinutes: Math.round(AI_SCANNER_INTERVAL_MS / 60000),
+      // Derived the same way the scheduler derives it, so the page cannot claim a time the
+      // scanner is not actually going to run.
+      nextScanAt: AI_SCANNER_ENABLED
+        ? new Date(Date.now() + msUntilNextTick(AI_SCANNER_INTERVAL_MS, AI_SCANNER_SETTLE_MS)).toISOString()
+        : null,
       bridgeReady: autoTradeBridgeReady(), armedMatch: autoTradeArmedMatch(),
       mode: autoTradeEffectiveMode(autoTradeConfig()),
       runs: runs.map((r) => ({
@@ -21788,8 +21813,11 @@ app.get('/api/ai-scanner', async (req, res) => {
 });
 
 // POST /api/ai-scanner/scan — run the sweep now.
+// POST /api/ai-scanner/scan — run the sweep now.
+// Does NOT email by default: the result appears on the page immediately, and the brief is one
+// email per hour on the hour. Pass ?email=1 to send one anyway (useful for testing delivery).
 app.post('/api/ai-scanner/scan', async (req, res) => {
-  const out = await runAiScannerCycle({ reason: 'manual' });
+  const out = await runAiScannerCycle({ reason: 'manual', email: String(req.query.email || '') === '1' });
   res.json(out);
 });
 

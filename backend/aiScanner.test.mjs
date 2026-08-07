@@ -157,3 +157,58 @@ test('a multi-day ETA is reported in days, not four-digit minutes', () => {
   assert.match(t.label, /1\.3d-5\.4d/);
   assert.ok(!/1942m/.test(t.label));
 });
+
+// ── clock-aligned scheduling ─────────────────────────────────────────────────
+// A plain setInterval fires relative to server uptime, so a boot at 09:37 scans at 10:37,
+// 11:37 — the middle of every H1 candle. These lock the scan to the candle boundary.
+
+const HOUR = 3600000;
+const at = (h, m = 0, s = 0) => Date.UTC(2026, 7, 7, h, m, s);
+
+test('an hourly scan lands on the hour, not on server uptime', async () => {
+  const { msUntilNextTick } = await import('./aiScanner.js');
+  // Booted at 09:37 — the next scan is 10:00, not 10:37.
+  const wait = msUntilNextTick(HOUR, 0, at(9, 37));
+  assert.equal(at(9, 37) + wait, at(10, 0));
+});
+
+test('the settle delay lands just inside the new candle', async () => {
+  const { msUntilNextTick, AI_SCANNER_SETTLE_MS } = await import('./aiScanner.js');
+  const now = at(9, 37);
+  const wait = msUntilNextTick(HOUR, AI_SCANNER_SETTLE_MS, now);
+  assert.equal(now + wait, at(10, 0, 45));
+});
+
+test('a boundary that just passed is not skipped for a whole hour', async () => {
+  const { msUntilNextTick } = await import('./aiScanner.js');
+  // Starting at 10:00:10 must scan at 10:00:45, not wait until 11:00:45.
+  const now = at(10, 0, 10);
+  assert.equal(now + msUntilNextTick(HOUR, 45000, now), at(10, 0, 45));
+});
+
+test('once the settle window has passed, the next hour is taken', async () => {
+  const { msUntilNextTick } = await import('./aiScanner.js');
+  const now = at(10, 5, 0);
+  assert.equal(now + msUntilNextTick(HOUR, 45000, now), at(11, 0, 45));
+});
+
+test('every tick across a day lands exactly on the hour', async () => {
+  const { msUntilNextTick } = await import('./aiScanner.js');
+  let t = at(0, 13, 22);          // an arbitrary, deliberately unaligned start
+  const hours = [];
+  for (let i = 0; i < 24; i++) {
+    t += msUntilNextTick(HOUR, 0, t);
+    hours.push(new Date(t).getUTCHours());
+    assert.equal(new Date(t).getUTCMinutes(), 0, 'a tick drifted off the hour');
+    assert.equal(new Date(t).getUTCSeconds(), 0);
+    t += 1000;                    // the scan itself takes time before rescheduling
+  }
+  assert.deepEqual(hours, [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,0]);
+});
+
+test('sub-hour intervals align to their own clock boundaries', async () => {
+  const { msUntilNextTick } = await import('./aiScanner.js');
+  const now = at(9, 37);
+  assert.equal(now + msUntilNextTick(30 * 60000, 0, now), at(10, 0));
+  assert.equal(now + msUntilNextTick(15 * 60000, 0, now), at(9, 45));
+});

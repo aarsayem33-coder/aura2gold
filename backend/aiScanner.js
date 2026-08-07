@@ -25,6 +25,38 @@
 export const AI_SCANNER_SYMBOLS = ['XAUUSD', 'EURJPY', 'USDCAD', 'EURUSD', 'GBPUSD', 'USDCHF'];
 export const AI_SCANNER_TIMEFRAME = 'H1';
 
+/**
+ * How long to wait after the hour before reading.
+ *
+ * The candle feed publishes CLOSED bars, so at exactly 10:00:00 the 09:00 H1 bar has only just
+ * finished and may not have reached the server yet. Scanning on the stroke of the hour would
+ * analyse the previous bar and call it fresh. Three quarters of a minute is comfortably longer
+ * than the EA's 3-second poll plus the write, and still early in the new hour.
+ */
+export const AI_SCANNER_SETTLE_MS = 45000;
+
+/**
+ * Milliseconds until the next scan, aligned to the clock rather than to server uptime.
+ *
+ * A plain setInterval fires relative to whenever the process happened to start, so a boot at
+ * 09:37 scans at 10:37, 11:37 — the middle of every H1 candle, on data that is 37 minutes stale
+ * by the time it is read. Boundaries are measured from midnight UTC, so a 60-minute interval
+ * lands on the hour, 30 lands on :00/:30, 15 on the quarters. Every whole-hour timezone shares
+ * those instants, so this is correct regardless of the broker's clock offset.
+ *
+ * Re-derived after each run rather than trusted to repeat, so the schedule cannot drift.
+ */
+export function msUntilNextTick(intervalMs, settleMs = 0, now = Date.now()) {
+  const iv = Math.max(1, Number(intervalMs) || 0);
+  const dayStart = Math.floor(now / 86400000) * 86400000;
+  const since = now - dayStart;
+  const prev = dayStart + Math.floor(since / iv) * iv;
+  // A boundary that has only just passed still counts: starting at 10:00:10 should scan at
+  // 10:00:45, not skip an entire hour to 11:00:45.
+  const target = now < prev + settleMs ? prev + settleMs : prev + iv + settleMs;
+  return Math.max(0, target - now);
+}
+
 const num = (v) => {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);

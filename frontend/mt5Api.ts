@@ -1893,6 +1893,7 @@ export interface AiScannerRun {
 export interface AiScannerResponse {
   ok: boolean; symbols: string[]; timeframe: string; enabled: boolean; intervalMinutes: number;
   bridgeReady: boolean; armedMatch: boolean; mode: string;
+  nextScanAt: string | null;
   runs: AiScannerRun[]; note: string;
 }
 
