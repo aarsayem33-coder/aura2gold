@@ -51,6 +51,12 @@ import {
   AI_SCANNER_SYMBOLS, AI_SCANNER_TIMEFRAME, isOpportunity, rankOpportunities,
   suggestedEntryTime, buildScannerEmail,
 } from './aiScanner.js';
+import {
+  publicConfig as aiProvidersPublicConfig, applyUpdate as aiProvidersApplyUpdate,
+  testProvider as aiProvidersTest, recordTest as aiProvidersRecordTest,
+  resolveKey as resolveProviderKey, resolveModel as resolveProviderModel,
+  PROVIDERS as AI_PROVIDERS,
+} from './aiProviders.js';
 import { estimateEtaMinutes, estimateResolveMinutes, rankPredictions } from './strategyPredictions.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
@@ -181,7 +187,18 @@ const DB_PASSWORD = process?.env?.DB_PASSWORD;
 const DB_NAME = process?.env?.DB_NAME;
 const DB_SSL = process?.env?.DB_SSL === 'true';
 const hasDbConfig = Boolean(DB_HOST && DB_USER && DB_PASSWORD && DB_NAME);
-const GEMINI_MODEL = process?.env?.GEMINI_MODEL || 'gemini-2.5-flash';
+// Read through a function, not a const, so changing the model in the settings page takes
+// effect on the next analysis instead of at the next restart. Falls back to the environment,
+// then to flash, so a machine that has never opened the page behaves exactly as before.
+const GEMINI_MODEL_FALLBACK = process?.env?.GEMINI_MODEL || 'gemini-2.5-flash';
+function activeGeminiModel() {
+  try { return resolveProviderModel('gemini') || GEMINI_MODEL_FALLBACK; }
+  catch { return GEMINI_MODEL_FALLBACK; }
+}
+function activeGeminiKey() {
+  try { return resolveProviderKey('gemini') || GEMINI_API_KEY; }
+  catch { return GEMINI_API_KEY; }
+}
 const AI_ANALYSIS_INTERVAL_MS = Number(process?.env?.AI_ANALYSIS_INTERVAL_MS || 300000);
 const AI_MIN_CONFIDENCE = Number(process?.env?.AI_MIN_CONFIDENCE || 60);
 let dbPool = null;
@@ -2930,7 +2947,7 @@ async function runAiAnalysis(symbol, timeframe, { force = false, reason = 'snaps
   const analysis = await analyzeWithGemini({
     projectId: GOOGLE_CLOUD_PROJECT,
     location: GOOGLE_CLOUD_LOCATION,
-    model: GEMINI_MODEL,
+    model: activeGeminiModel(),
     signalSummary,
     trendSummary,
     biasSummary,
@@ -3175,7 +3192,7 @@ function computeMt5Status() {
     latestTrade: liveAccountSnapshot ? latestTrade : null,
     latestAiDecision: liveAccountSnapshot ? latestAiDecisionSummary : null,
     geminiConfigured: Boolean(GEMINI_API_KEY || (GOOGLE_CLOUD_PROJECT && GOOGLE_CLOUD_LOCATION)),
-    geminiModel: GEMINI_MODEL,
+    geminiModel: activeGeminiModel(),
     dbConfigured: hasDbConfig,
     alertDiagnostics,
     processId: process.pid,
@@ -4816,7 +4833,7 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
     const systemAnalysis = buildSystemChartAnalysis({ symbol, timeframe, tradeMode, systemDecision: sd, fttPrediction, breakout, sizing, candles: candleList, strategies, supportResistance: sd.supportResistance, timezone: process.env.APP_TIME_ZONE || 'Asia/Dhaka' });
 
     // ── PRIMARY: Gemini vision ──
-    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: GEMINI_MODEL, imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth, style, bias, marketRead: chartMarketRead, discipline: chartDiscipline });
+    const vision = await analyzeChartImageWithGemini({ projectId: GOOGLE_CLOUD_PROJECT, location: GOOGLE_CLOUD_LOCATION, model: activeGeminiModel(), imageBase64, mimeType, symbol, timeframe, tradeMode, groundTruth, style, bias, marketRead: chartMarketRead, discipline: chartDiscipline });
 
     if (vision.available) {
       // Recompute lots server-side from the vision entry/SL (never trust the model's lot).
@@ -5216,7 +5233,7 @@ ${srMarkdown}
       result = await analyzeAiSignalsWithGemini({
         projectId: GOOGLE_CLOUD_PROJECT,
         location: GOOGLE_CLOUD_LOCATION,
-        model: GEMINI_MODEL,
+        model: activeGeminiModel(),
         symbol,
         tradeMode,
         indicators: calculatedIndicators,
@@ -5360,7 +5377,7 @@ app.delete('/api/ai-signals/track/:id', async (req, res) => {
 
 app.get('/api/ai/health', async (req, res) => {
   try {
-    const model = req.query.model ? String(req.query.model) : GEMINI_MODEL;
+    const model = req.query.model ? String(req.query.model) : activeGeminiModel();
     const health = await checkVertexAiHealth({
       projectId: GOOGLE_CLOUD_PROJECT,
       location: GOOGLE_CLOUD_LOCATION,
@@ -5709,7 +5726,7 @@ app.post('/api/projections/analyze', async (req, res) => {
     const ai = await analyzeProjectionWithGemini({
       projectId: GOOGLE_CLOUD_PROJECT,
       location: GOOGLE_CLOUD_LOCATION,
-      model: GEMINI_MODEL,
+      model: activeGeminiModel(),
       symbol,
       timeframe,
       currentPrice: projection.currentPrice,
@@ -6609,7 +6626,7 @@ app.post('/api/ftt/predict', async (req, res) => {
       const aiResult = await analyzeFttWithGemini({
         projectId: GOOGLE_CLOUD_PROJECT,
         location: GOOGLE_CLOUD_LOCATION,
-        model: GEMINI_MODEL,
+        model: activeGeminiModel(),
         prompt
       });
 
@@ -21673,6 +21690,46 @@ if (AI_SCANNER_ENABLED) {
   console.log(`[AiScanner] Hourly sweep armed — ${AI_SCANNER_SYMBOLS.join(',')} on ${AI_SCANNER_TIMEFRAME} every ${Math.round(AI_SCANNER_INTERVAL_MS / 60000)}m.`);
 }
 
+// ─── AI models and API keys ──────────────────────────────────────────────────
+// Keys live outside the project tree (see aiProviders.js) because everything here is inside
+// OneDrive. Nothing on these routes ever returns a key: reads are masked, and writes accept a
+// sentinel meaning "keep what you already have" so the browser never has to hold the secret.
+
+// GET /api/ai-config — providers, models and masked key stubs.
+app.get('/api/ai-config', (req, res) => {
+  try {
+    res.json({ ok: true, ...aiProvidersPublicConfig(), activeGeminiModel: activeGeminiModel() });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// PUT /api/ai-config — save models and keys.
+app.put('/api/ai-config', (req, res) => {
+  try {
+    const body = parseMt5Body(req.body) || {};
+    aiProvidersApplyUpdate({ activeProvider: body.activeProvider, providers: body.providers || {} });
+    // Log WHAT changed, never the value.
+    const touched = Object.keys(body.providers || {}).join(', ') || 'none';
+    console.log(`[AiProviders] settings updated (${touched}); active=${body.activeProvider || 'unchanged'}`);
+    res.json({ ok: true, ...aiProvidersPublicConfig(), activeGeminiModel: activeGeminiModel() });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ai-config/test — prove a key works by listing that account's models.
+// Costs no tokens, and the answer populates the model dropdown with real access rather than a
+// catalogue that goes stale.
+app.post('/api/ai-config/test', async (req, res) => {
+  try {
+    const body = parseMt5Body(req.body) || {};
+    const id = String(body.provider || '');
+    if (!AI_PROVIDERS[id]) return res.status(400).json({ error: 'unknown provider' });
+    // An unsaved key can be tested before committing it; otherwise use what is in force.
+    const key = body.apiKey && body.apiKey !== '__KEEP__' ? String(body.apiKey) : resolveProviderKey(id);
+    const result = await aiProvidersTest(id, key);
+    aiProvidersRecordTest(id, result);
+    res.json({ ok: result.ok, note: result.note, models: result.models || [], ...aiProvidersPublicConfig() });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // GET /api/ai-scanner — the stored hourly records.
 app.get('/api/ai-scanner', async (req, res) => {
   try {
@@ -22519,7 +22576,7 @@ async function processProjectionReminders() {
               const ai = await analyzeProjectionWithGemini({
                 projectId: GOOGLE_CLOUD_PROJECT,
                 location: GOOGLE_CLOUD_LOCATION,
-                model: GEMINI_MODEL,
+                model: activeGeminiModel(),
                 symbol: rem.symbol,
                 timeframe: rem.timeframe,
                 currentPrice: freshProjection.currentPrice,

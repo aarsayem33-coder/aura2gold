@@ -20,6 +20,7 @@ import SniperMode from './pages/SniperMode.tsx';
 import AiTradeTracker from './pages/AiTradeTracker.tsx';
 import AiResults from './pages/AiResults.tsx';
 import AiScanner from './pages/AiScanner.tsx';
+import AiModelSettings from './pages/AiModelSettings.tsx';
 import AutoTradeApprovals from './pages/AutoTradeApprovals.tsx';
 import ChallengeTracker from './pages/ChallengeTracker.tsx';
 import AutoTrading from './pages/AutoTrading.tsx';
@@ -126,6 +127,7 @@ export default function App() {
           <Route path="rules" element={<RulesManagement />} />
           <Route path="mt5" element={<MT5Connection />} />
           <Route path="notifications" element={<NotificationSettings />} />
+          <Route path="settings/ai-models" element={<AiModelSettings />} />
           <Route path="history" element={<AlertHistory />} />
           <Route path="reports" element={<ReportsOverview />} />
           <Route path="reports/forex" element={<ForexOutcomes />} />

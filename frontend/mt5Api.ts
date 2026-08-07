@@ -1915,6 +1915,47 @@ export async function placeScannerItem(placeUrl: string): Promise<{ ok: boolean;
   return j;
 }
 
+// ── AI models and API keys ──────────────────────────────────────────────────
+/** Sent in place of a secret the browser was never given. */
+export const AI_KEY_KEEP = '__KEEP__';
+
+export interface AiProviderConfig {
+  id: string; label: string; docs: string; vision: boolean; keyLabel: string;
+  hasKey: boolean; keySource: 'saved' | 'environment' | 'none'; keyMasked: string;
+  model: string; models: string[]; modelsAreLive: boolean;
+  lastTestedAt: string | null; lastTestOk: boolean | null; lastTestNote: string | null;
+}
+export interface AiConfigResponse {
+  ok: boolean; activeProvider: string; configFile: string;
+  activeGeminiModel: string; providers: AiProviderConfig[];
+}
+
+export async function fetchAiConfig(): Promise<AiConfigResponse> {
+  return fetchJson<AiConfigResponse>('/api/ai-config');
+}
+
+export async function saveAiConfig(update: {
+  activeProvider?: string;
+  providers?: Record<string, { apiKey?: string; model?: string }>;
+}): Promise<AiConfigResponse> {
+  const r = await fetch('/api/ai-config', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(update),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `save failed: ${r.status}`);
+  return j as AiConfigResponse;
+}
+
+export async function testAiProvider(provider: string, apiKey?: string): Promise<AiConfigResponse & { note: string; models: string[] }> {
+  const r = await fetch('/api/ai-config/test', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, ...(apiKey ? { apiKey } : {}) }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `test failed: ${r.status}`);
+  return j;
+}
+
 // ── ICT Sniper: immediate bare entry on an "enter now" ict-breaker signal ────
 export interface SniperConfig {
   enabled: boolean;

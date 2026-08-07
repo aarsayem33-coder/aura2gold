@@ -4,6 +4,7 @@ import {
   LayoutDashboard,
   Home,
   ScrollText,
+  Cpu,
   Activity,
   Target,
   BarChart3,
@@ -396,6 +397,7 @@ export default function Layout({ onLogout }: LayoutProps) {
         { path: '/reports/backtest', icon: FlaskConical, label: 'Backtest' },
       ],
     },
+    { path: '/settings/ai-models', icon: Cpu, label: 'AI Models & Keys' },
     { path: '/admin', icon: Users, label: 'Admin / Clients' },
   ];
 
