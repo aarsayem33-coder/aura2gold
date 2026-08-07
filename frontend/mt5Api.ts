@@ -1877,6 +1877,9 @@ export interface AiScannerItem {
   entry: number | null; stopLoss: number | null;
   takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
   lots: number | null; riskUsd: number | null; rr: number | null;
+  stopPips: number | null;
+  /** Under 5 pips — measured at -0.496R on this account. */
+  tightStop: boolean;
   score: number | null; grade: string | null; confidence: number | null;
   entryTiming: string | null; note: string | null;
   trackId: string | null; forecastId: string | null; ictPredictionId: string | null;

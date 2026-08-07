@@ -21626,6 +21626,32 @@ async function runAiScannerCycle({ reason = 'interval', email = true } = {}) {
       } catch (e) { console.error(`[AiScanner] ${symbol} ICT read failed:`, e.message); }
     }
 
+    // Size anything that arrived without one.
+    //
+    // Only the chart AI returns a lot size; setup forecasts carry one only when plan_json holds
+    // a sized ticket, and ICT predictions store limit_entry/limit_stop with no sizing at all —
+    // so those rows showed "—" in the Lots column of the very table meant to tell you what to
+    // place. Sized here, once, from the same helper the rest of the system uses, so every
+    // source reports the same number for the same entry and stop.
+    for (const it of items) {
+      if (Number(it.lots) > 0 || !(Number(it.entry) > 0) || !(Number(it.stopLoss) > 0)) continue;
+      const sized = strategyLabSizing(it.symbol, it.entry, it.stopLoss, {
+        tp1: it.takeProfit1, tp2: it.takeProfit2, tp3: it.takeProfit3,
+      });
+      if (!sized) continue;
+      it.lots = sized.suggestedLots ?? null;
+      it.riskUsd = it.riskUsd ?? sized.lossAtStop ?? null;
+      // Only fill R:R when the engine did not state its own — a stored figure is the engine's
+      // claim about its own ticket and must not be silently overwritten.
+      if (it.rr === null || it.rr === undefined) {
+        const target = Number(it.takeProfit3) || Number(it.takeProfit1);
+        const risk = Math.abs(Number(it.entry) - Number(it.stopLoss));
+        if (Number.isFinite(target) && risk > 0) {
+          it.rr = Math.round((Math.abs(target - Number(it.entry)) / risk) * 100) / 100;
+        }
+      }
+    }
+
     // ── persist the run and every opportunity in it ──
     const ops = rankOpportunities(items.filter(isOpportunity));
     await pool.execute(
@@ -21769,8 +21795,22 @@ app.get('/api/ai-scanner', async (req, res) => {
           WHERE i.run_id IN (?) ORDER BY i.score DESC`, [ids]);
       items = rows;
     }
+    // Stop distance in pips, derived rather than stored so existing rows get it too.
+    //
+    // Worth its own column on the page: this account has MEASURED sub-5-pip stops at -0.496R
+    // over 38 trades (-$846), and the ICT engine routinely proposes 2-4 pip stops that then
+    // size into 0.5-1.7 lots. A table with a Place button beside it has to show that.
+    const stopPipsOf = (row) => {
+      const e = Number(row.entry), s = Number(row.stop_loss);
+      if (!Number.isFinite(e) || !Number.isFinite(s)) return null;
+      const pip = forexSizingPipSize(row.symbol);
+      return pip > 0 ? Math.round((Math.abs(e - s) / pip) * 10) / 10 : null;
+    };
+
     const byRun = new Map(runs.map((r) => [r.id, []]));
     for (const it of items) byRun.get(it.run_id)?.push({
+      stopPips: stopPipsOf(it),
+      tightStop: (stopPipsOf(it) ?? 99) < 5,
       id: it.id, symbol: it.symbol, timeframe: it.timeframe, source: it.source,
       direction: it.direction, entry: it.entry, stopLoss: it.stop_loss,
       takeProfit1: it.take_profit_1, takeProfit2: it.take_profit_2, takeProfit3: it.take_profit_3,

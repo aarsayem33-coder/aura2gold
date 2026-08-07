@@ -61,10 +61,19 @@ export default function AiScanner() {
 
   const place = async (item: AiScannerItem) => {
     if (!item.placeUrl) return;
+    // A stop this tight is the one thing this account has measured as reliably losing, and the
+    // sizing turns it into a large position. Confirm rather than let a single click do it.
+    if (item.tightStop && !window.confirm(
+      `${item.symbol}: the stop is only ${item.stopPips} pips.\n\n`
+      + 'Stops under 5 pips returned -0.496R over 38 trades on this account and cost -$846 — '
+      + `and this one sizes to ${item.lots} lots.\n\nPlace it anyway?`,
+    )) return;
+
     setPlacing(item.id); setError(null);
     try {
       const r = await placeScannerItem(item.placeUrl);
-      setPlaced((p) => ({ ...p, [item.id]: `${r.orderType || 'order'} queued · ${r.lots ?? '?'} lots` }));
+      const warn = (r.warnings || []).length ? ` · ${(r.warnings || []).join(' · ')}` : '';
+      setPlaced((p) => ({ ...p, [item.id]: `${r.orderType || 'order'} queued · ${r.lots ?? '?'} lots${warn}` }));
       await load();
     } catch (e) { setError(e instanceof Error ? e.message : 'could not place this order'); }
     finally { setPlacing(null); }
@@ -191,6 +200,12 @@ export default function AiScanner() {
                         <td className="px-3 py-2 text-right">
                           <span className="font-black text-slate-800">{i.lots ?? '—'}</span>
                           <div className="text-[10px] font-bold text-slate-400">{i.riskUsd === null ? '' : `${money(i.riskUsd)} risk`}</div>
+                          {i.stopPips !== null && (
+                            <div className={`text-[10px] font-black ${i.tightStop ? 'text-rose-600' : 'text-slate-400'}`}
+                              title={i.tightStop ? 'Stops under 5 pips measured -0.496R over 38 trades on this account' : undefined}>
+                              {i.tightStop && '⚠ '}{i.stopPips}p stop
+                            </div>
+                          )}
                         </td>
                         <td className="px-3 py-2 text-right">
                           <span className="font-black text-slate-800">{i.score ?? '—'}</span>
