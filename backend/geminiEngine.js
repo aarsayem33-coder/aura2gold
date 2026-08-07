@@ -1074,11 +1074,36 @@ reviewer that agrees with everything has told us nothing. BUT: for any PRICE you
 the arithmetic. If the image looks like a different market from the numbers, the screenshot
 is probably stale — say so, and the live math wins.
 
---- DETERMINISTIC GROUND TRUTH (live ${symbol} ${timeframe}) ---
+--- MEASURED FACTS + THE ENGINE'S CURRENT STANCE (live ${symbol} ${timeframe}) ---
+The PRICES below are measured and authoritative — use them. \`systemDecision.decision\` is NOT:
+it is one conservative rule engine's stance, it reads HOLD most of the time by construction,
+and it is shown to you for context, not for agreement. Reaching your own verdict is the entire
+reason you are being asked. Do not copy that field.
 ${JSON.stringify(gt, null, 2)}
 ${marketRead ? `\n${marketRead}\n` : ''}${discipline ? `\n${discipline}\n` : ''}
+STEP 3 — DECIDE, AND ACTUALLY DECIDE. Your verdict is yours alone.
+
+Call BUY or SELL when ALL FOUR of these hold:
+  1. Direction is clear from the structure and liquidity above — not a guess.
+  2. There is a price that invalidates the idea, so the stop sits beyond structure, not in noise.
+  3. Reward to risk to the FINAL target is at least 2:1.
+  4. Price is at, or within reach of, a level worth acting on.
+
+That is the whole bar. Do NOT hold out for every factor to line up — a setup meeting those four
+is a trade even when something minor is unclear or the engine's stance disagrees. Waiting for
+certainty is how a reviewer ends up calling HOLD on everything and being useless.
+
+Use HOLD only when the setup genuinely fails one of the four. If you find yourself writing HOLD
+while also producing an entry, a stop and targets, you have talked yourself out of a trade you
+actually found — commit to it, or explain in the reasoning which of the four it fails.
+
+The counterweight, and it is not optional: never invent a setup to have something to say. No
+structural invalidation point means no trade, whatever the direction looks like. Do not widen a
+stop to reach 2:1, do not target liquidity price cannot realistically reach, and do not trade
+into a high-impact release. Being wrong is survivable; being reckless is not.
 RULES:
-- Apply the capital-protection doctrine. "NO TRADE / WAIT" is valid. Confidence <= 95, never a guarantee.
+- Apply the capital-protection doctrine. "NO TRADE / WAIT" is valid WHEN THE SETUP FAILS THE BAR ABOVE — it is not a way to avoid committing. Confidence <= 95, never a guarantee.
+- Confidence is your read of THIS setup, not a hedge. A setup clearing all four criteria deserves 70+; scoring everything 30-60 makes the number meaningless.
 - Forex plan: entry, logical stop loss (structural invalidation), TP1/TP2/TP3, reward:risk >= 1.5. (Lot size is recomputed by the server — you may omit it.)
 - FTT plan: direction (UP/DOWN/HOLD), a suitable expiry + timeframe, an estimate of how many candles price tends to stay in that direction (use the ground-truth persistence estimate), and a conditional time trigger ("at <time> trade only if price ABOVE/BELOW <level>, else ignore"). Use the ground-truth timeTrigger when present.
 - Report a breakout read (phase + direction + the level), reconciled with the ground-truth breakout.

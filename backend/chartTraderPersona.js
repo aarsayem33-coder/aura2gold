@@ -37,8 +37,14 @@ export const STYLE_BRIEF = {
       'Entry precision matters more than target size: a late entry destroys the trade even when the direction is right.',
       'Target the NEAREST logical liquidity — the next swing high/low or the next zone edge. Do not reach for a distant target.',
       'Stop goes beyond the structure that would invalidate the idea (the swept extreme or the zone edge), never inside the noise.',
-      'If price is mid-range with no clean level within reach, the answer is NO TRADE. Most minutes are not tradeable.',
       'Prefer setups where you can define invalidation within roughly 1 ATR.',
+      // A scalper's edge is frequency at a positive expectancy, not rarity. Held to a day
+      // trader's patience they would take almost nothing, which is how this path ended up
+      // calling HOLD on every single read.
+      'A scalper trades MORE often than a day trader, not less. You are working the intraday swings, so a clean level with a defined invalidation is a trade even when the higher timeframe is undecided.',
+      'You may take a counter-trend scalp INTO a fresh level — a sweep of an obvious high in an uptrend is a short back to the mean. What you may not do is fade a level that has already broken and been accepted through.',
+      'Spread is a real cost at this size. If the stop is under ~4x the spread the setup is not tradeable however good it looks — say so explicitly rather than shrinking the stop to make it fit.',
+      'If price is mid-range with no clean level within reach, the answer is NO TRADE. But "mid-range" means genuinely between levels, not merely "not yet perfect".',
     ],
   },
   DAY: {

@@ -4835,6 +4835,32 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
         atr: atrValue, spread: brokerSpecFor(symbol)?.spread ?? null,
         dataFresh: fresh.dataFresh,
       });
+      // What the setup WOULD have scored if the model had called it.
+      //
+      // 43 of the first 89 reads produced a full entry/stop/target set and then wrote HOLD in
+      // the decision field — so scoreChartSetup rejected the geometry and the score was thrown
+      // away. That discarded the only evidence of whether those refusals were right. The
+      // direction is inferred from the geometry itself (a stop below entry is a buy), and the
+      // result is reported separately so it can never be mistaken for a live call.
+      let declinedSetup = null;
+      if (setup.score === null && vision.forexPlan?.entry > 0 && vision.forexPlan?.stopLoss > 0) {
+        const implied = Number(vision.forexPlan.stopLoss) < Number(vision.forexPlan.entry) ? 'BUY' : 'SELL';
+        const shadow = scoreChartSetup({
+          direction: implied,
+          entry: vision.forexPlan.entry, stopLoss: vision.forexPlan.stopLoss,
+          takeProfit1: vision.forexPlan.takeProfit1, takeProfit2: vision.forexPlan.takeProfit2,
+          takeProfit3: vision.forexPlan.takeProfit3,
+          aiConfidence: vision.confidence, strategyMatch: vMatch, htfBias: sd.htfBias,
+          atr: atrValue, spread: brokerSpecFor(symbol)?.spread ?? null, dataFresh: fresh.dataFresh,
+        });
+        if (shadow.score !== null) {
+          declinedSetup = {
+            impliedDirection: implied, score: shadow.score, grade: shadow.grade, rr: shadow.rr,
+            breakdown: shadow.breakdown,
+            note: `The model declined this, but the levels it produced score ${shadow.score} (${shadow.grade}). Not a call — a measurement of what was passed on.`,
+          };
+        }
+      }
       const forexPlan = (tradeMode === 'FTT') ? null : {
         ...vision.forexPlan,
         // `lots` stays null when the ticket is not tradeable — printing "0.01 lots" beside a
@@ -4882,6 +4908,8 @@ app.post('/api/ai/analyze-chart', async (req, res) => {
         // to the human about today's risk state. Both are reported, never folded into a score.
         structureAgreement: vision.structureAgreement || [],
         disciplineNote: vision.disciplineNote || null,
+        // Present only when the model declined a setup whose own levels would have scored.
+        declinedSetup,
         system: systemAnalysis, // deterministic read alongside, for comparison
         dataFresh: fresh.dataFresh, sourceReceivedAt: fresh.sourceReceivedAt, staleSeconds: fresh.staleSeconds, marketStatus: fresh.marketStatus,
         honesty: [
