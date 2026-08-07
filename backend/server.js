@@ -47,6 +47,10 @@ import { assessTracked, shouldAlert, TRACK_VERDICT } from './forecastTracking.js
 import { renderCandleChart } from './chartRender.js';
 import { buildLiquidityChart, scoreLiquiditySetup } from './liquidityChart.js';
 import { resolveAtr, buildAiMarketContext, formatAiMarketContext, formatDisciplineAdvisory } from './aiMarketContext.js';
+import {
+  AI_SCANNER_SYMBOLS, AI_SCANNER_TIMEFRAME, isOpportunity, rankOpportunities,
+  suggestedEntryTime, buildScannerEmail,
+} from './aiScanner.js';
 import { estimateEtaMinutes, estimateResolveMinutes, rankPredictions } from './strategyPredictions.js';
 import { computeSnapshot as computeSignalSnapshot, evaluateSignalHealth, DEFAULT_HEALTH_CONFIG } from './signalHealthEngine.js';
 import { listStrategies, evaluateStrategy, strategyTimeframes, computeStage, STRATEGIES as STRATEGY_LAB_REGISTRY } from './strategyLab.js';
@@ -1012,6 +1016,69 @@ async function initializeDatabase() {
         )
       `);
       try { await addColumnIfMissing(pool, 'mt5_auto_trades', 'ict_prediction_id', 'VARCHAR(200) NULL'); } catch { /* pre-existing */ }
+      // Back-link to the AI chart analysis a resting order came from, matching forecast_id and
+      // ict_prediction_id. Without it, an AI plan that was actually TRADED could never be joined
+      // back to what the model predicted, so the only measurable outcome was a candle replay of
+      // a fill that may never have happened at that price.
+      try { await addColumnIfMissing(pool, 'mt5_auto_trades', 'ai_chart_track_id', 'VARCHAR(160) NULL'); } catch { /* pre-existing */ }
+
+      // The hourly AI sweep. Two tables: one row per RUN so a quiet hour is still evidence the
+      // scanner ran, and one row per OPPORTUNITY so the page can list and place them. Narrow
+      // on purpose — 24 runs a day forever, and the indicator table already demonstrated where
+      // a wide row and no retention ends up.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_ai_scanner_runs (
+          id VARCHAR(64) PRIMARY KEY,
+          ran_at DATETIME NOT NULL,
+          finished_at DATETIME NULL,
+          symbols VARCHAR(255) NULL,
+          timeframe VARCHAR(8) NULL,
+          engine_reads INT NOT NULL DEFAULT 0,
+          opportunities INT NOT NULL DEFAULT 0,
+          emailed TINYINT(1) NOT NULL DEFAULT 0,
+          email_to VARCHAR(255) NULL,
+          note VARCHAR(255) NULL,
+          INDEX idx_air_ran (ran_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mt5_ai_scanner_items (
+          id VARCHAR(96) PRIMARY KEY,
+          run_id VARCHAR(64) NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          timeframe VARCHAR(16) NOT NULL,
+          source VARCHAR(20) NOT NULL,
+          direction VARCHAR(8) NULL,
+          entry DOUBLE NULL,
+          stop_loss DOUBLE NULL,
+          take_profit_1 DOUBLE NULL,
+          take_profit_2 DOUBLE NULL,
+          take_profit_3 DOUBLE NULL,
+          lots DOUBLE NULL,
+          risk_usd DOUBLE NULL,
+          rr DOUBLE NULL,
+          score INT NULL,
+          grade VARCHAR(4) NULL,
+          confidence INT NULL,
+          entry_timing VARCHAR(96) NULL,
+          note VARCHAR(255) NULL,
+          track_id VARCHAR(160) NULL,
+          forecast_id VARCHAR(200) NULL,
+          ict_prediction_id VARCHAR(200) NULL,
+          created_at DATETIME NOT NULL,
+          INDEX idx_airi_run (run_id),
+          INDEX idx_airi_created (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+      // Every table migrated from the old MariaDB host is utf8mb4_unicode_ci, but MySQL 8.4
+      // defaults a new table to utf8mb4_0900_ai_ci. Joining a new table to a migrated one then
+      // fails outright with "illegal mix of collations", so any table added from here on must
+      // state the collation explicitly. These two ALTERs repair the ones created before this
+      // was understood; they are no-ops once the collation already matches.
+      for (const t of ['mt5_ai_scanner_runs', 'mt5_ai_scanner_items']) {
+        try { await pool.query(`ALTER TABLE ${t} CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`); }
+        catch { /* already correct, or the table is in use — the CREATE above sets it for new installs */ }
+      }
 
       await pool.query(`
         CREATE TABLE IF NOT EXISTS mt5_execution_forecasts (
@@ -4202,6 +4269,440 @@ app.get('/api/ai/tracks', async (req, res) => {
     console.error('[AiTrack] report failed:', error.message);
     res.status(500).json({ error: 'failed to load AI tracks' });
   }
+});
+
+// ─── Placing an AI chart plan as a real resting order ────────────────────────
+//
+// Same mechanism as the ICT and setup-forecast paths: an order is a status='QUEUED' row in
+// mt5_auto_trades, which the EA's 3-second poll of /api/mt5/trade-bridge collects. Fill
+// tracking, close reporting, history reconciliation and the challenge tracker then work with
+// no changes at all — they key off mt5_auto_trades and never look at where the row came from.
+//
+// MANUAL ONLY. There is no auto-placement path here on purpose: the chart reviewer routinely
+// returns WAIT/NO_TRADE with no ticket, and a model that opens positions unattended off a
+// screenshot read is a different risk profile from one that answers a question you asked.
+
+/**
+ * The shared read + sizing context for both preview and place.
+ *
+ * Two ways to reach a ticket, and they run in opposite directions:
+ *   - DEFAULT: the model already produced real prices, so the ticket IS those prices and the
+ *     only thing to compute is what they cost. No conversion, nothing moved.
+ *   - OVERRIDE: the user names money (risk $X, target $Y), and ictResizeOrder solves prices
+ *     from it — the same money-driven path the ICT resize dialog uses.
+ * Both emit the identical ticket shape so ictValidateResize can judge either.
+ */
+async function aiTrackOrderContext(pool, trackId, override = {}) {
+  const [rows] = await pool.query('SELECT * FROM mt5_ai_chart_tracks WHERE id=? LIMIT 1', [trackId]);
+  if (!rows.length) return { error: { code: 404, body: { error: 'analysis not found' } } };
+  const t = rows[0];
+
+  const dec = String(t.decision || '').toUpperCase();
+  if (!/BUY|SELL/.test(dec)) {
+    return { error: { code: 422, body: { error: `this analysis was a ${dec || 'non-trade'} read — there is nothing to place` } } };
+  }
+  const direction = dec.includes('SELL') ? 'SELL' : 'BUY';
+  if (!(Number(t.entry_price) > 0) || !(Number(t.stop_loss) > 0)) {
+    return { error: { code: 422, body: { error: 'this analysis has no entry/stop to place' } } };
+  }
+  const entry = Number(override.entry) > 0 ? Number(override.entry) : Number(t.entry_price);
+
+  const spec = brokerSpecFor(t.symbol);
+  const pipSize = forexSizingPipSize(t.symbol);
+  const pipValuePerLot = forexSizingPipValuePerLot(t.symbol);
+  const dash = computeChallengeDashboard();
+  // `.budget`, not the whole object. configuredPerTradeRisk returns
+  // { budget, pct, initial, roomWarning }, and handing the object to validateResize made its
+  // num() coerce to null — so the over-budget warning silently never fired. Every other caller
+  // in this file reads .budget for the same reason.
+  const riskInfo = configuredPerTradeRisk(dash);
+  const riskBudget = riskInfo.budget;
+  const digits = spec?.digits ?? null;
+  const volStep = spec?.volStep ?? 0.01, volMin = spec?.volMin ?? 0.01, volMax = spec?.volMax ?? null;
+
+  const stopPips = Math.abs(entry - Number(t.stop_loss)) / pipSize;
+  const moneyDriven = Number(override.slUsd) > 0;
+
+  const lots = Number(override.lots) > 0 ? Number(override.lots)
+    : (moneyDriven
+      ? ictLotsForMoney({ usd: Number(override.slUsd), pips: Number(override.stopPips) || stopPips, pipValuePerLot, volStep, volMin, volMax })
+      : (Number(t.lots) > 0 ? Number(t.lots) : strategyLabSizing(t.symbol, entry, t.stop_loss, {
+        tp1: t.take_profit_1, tp2: t.take_profit_2, tp3: t.take_profit_3,
+      })?.suggestedLots ?? null));
+
+  let ticket;
+  if (moneyDriven) {
+    ticket = ictResizeOrder({
+      entry, direction, lots,
+      slUsd: Number(override.slUsd), tpUsd: Number(override.tpUsd) || null,
+      tp2Usd: Number(override.tp2Usd) || null, tp3Usd: Number(override.tp3Usd) || null,
+      pipValuePerLot, pipSize, digits,
+    });
+  } else if (!(Number(lots) > 0)) {
+    ticket = { ok: false, error: 'could not size this ticket against the current risk budget' };
+  } else {
+    // The model's own prices, kept exactly as read. Costs are derived FROM them rather than the
+    // other way round, so nothing the user reviewed on the chart can move underneath them.
+    const money = (target) => (Number(target) > 0
+      ? Math.round(Math.abs(Number(target) - entry) / pipSize * pipValuePerLot * lots * 100) / 100
+      : null);
+    const riskUsd = Math.round(stopPips * pipValuePerLot * lots * 100) / 100;
+    const rewardUsd = money(t.take_profit_3) ?? money(t.take_profit_1);
+    ticket = {
+      ok: true, lots: Number(lots),
+      stopLoss: Number(t.stop_loss),
+      takeProfit1: Number(t.take_profit_1) > 0 ? Number(t.take_profit_1) : null,
+      takeProfit2: Number(t.take_profit_2) > 0 ? Number(t.take_profit_2) : null,
+      takeProfit3: Number(t.take_profit_3) > 0 ? Number(t.take_profit_3) : null,
+      stopPips: Math.round(stopPips * 100) / 100,
+      tp1Pips: Number(t.take_profit_1) > 0 ? Math.round(Math.abs(Number(t.take_profit_1) - entry) / pipSize * 100) / 100 : null,
+      tp3Pips: Number(t.take_profit_3) > 0 ? Math.round(Math.abs(Number(t.take_profit_3) - entry) / pipSize * 100) / 100 : null,
+      riskUsd, rewardUsd,
+      // Measured to the FINAL target, matching the resize path: TP1 is ~1R by construction on
+      // most ladders, so an R:R computed from it stamps "1" on every ticket.
+      rr: riskUsd > 0 && rewardUsd ? Math.round((rewardUsd / riskUsd) * 100) / 100 : null,
+      lossAtStop: riskUsd,
+    };
+  }
+  if (ticket.ok && ticket.lossAtStop === undefined) ticket.lossAtStop = ticket.riskUsd ?? null;
+
+  const validation = ticket.ok ? ictValidateResize({
+    ticket, symbol: t.symbol, riskBudget, accountEquity: dash?.equity ?? null,
+    minStopDistance: brokerMinStopDistance(t.symbol), pipSize,
+    spreadPips: spec ? (specSpreadPrice(spec) ?? 0) / pipSize : null,
+    volMin, volMax, volStep, entryPrice: entry,
+  }) : { verdict: 'INVALID', errors: [ticket.error || 'the ticket could not be built'], warnings: [], notes: [] };
+
+  return { track: t, direction, entry, spec, pipSize, pipValuePerLot, dash, riskBudget, riskInfo, digits, stopPips, lots, ticket, validation, moneyDriven };
+}
+
+// POST /api/ai/tracks/:id/preview-order — size and validate WITHOUT placing anything.
+// Read-only by construction: converting money to prices always succeeds, so the judgement
+// about whether the resulting ticket is sane is the half worth showing before you commit.
+app.post('/api/ai/tracks/:id/preview-order', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const ctx = await aiTrackOrderContext(pool, req.params.id, req.body || {});
+    if (ctx.error) return res.status(ctx.error.code).json(ctx.error.body);
+    if (!ctx.ticket?.ok) return res.status(422).json({ error: ctx.ticket?.error || 'could not size this ticket' });
+
+    res.json({
+      ok: true, symbol: ctx.track.symbol, timeframe: ctx.track.timeframe,
+      direction: ctx.direction, entry: ctx.entry, ticket: ctx.ticket, validation: ctx.validation,
+      context: {
+        riskBudget: ctx.riskBudget, roomWarning: ctx.riskInfo?.roomWarning ?? null,
+        safePerTradeRisk: ctx.dash?.safePerTradeRisk ?? null,
+        equity: ctx.dash?.equity ?? null, pipValuePerLot: ctx.pipValuePerLot, pipSize: ctx.pipSize,
+        digits: ctx.digits, originalLots: ctx.track.lots ?? null, originalStopPips: Math.round(ctx.stopPips * 10) / 10,
+        confidence: ctx.track.confidence ?? null, setupScore: ctx.track.setup_score ?? null, setupGrade: ctx.track.setup_grade ?? null,
+      },
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ai/tracks/:id/place-order — queue the plan as a real resting order.
+app.post('/api/ai/tracks/:id/place-order', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const override = req.body?.override || {};
+    const ctx = await aiTrackOrderContext(pool, req.params.id, override);
+    if (ctx.error) return res.status(ctx.error.code).json(ctx.error.body);
+    const t = ctx.track;
+
+    // Already placed? Refuse rather than silently double the position. The analysis is a
+    // one-shot read, so a second order from the same id is far more likely a double-click
+    // than a deliberate pyramid.
+    const [dup] = await pool.query(
+      "SELECT id, status FROM mt5_auto_trades WHERE ai_chart_track_id=? AND status NOT IN ('REJECTED','CANCELLED','EXPIRED','ERROR') LIMIT 1",
+      [t.id]);
+    if (dup.length) {
+      return res.status(409).json({ error: `an order from this analysis already exists (${dup[0].id}, ${dup[0].status})`, existingId: dup[0].id });
+    }
+
+    const cfg = autoTradeConfig();
+    const mode = autoTradeEffectiveMode(cfg);
+    if (mode !== 'ASK' && mode !== 'AUTO') {
+      return res.status(409).json({ error: `auto-trading is ${mode} — the EA bridge will not dispatch orders` });
+    }
+    if (!autoTradeArmedMatch()) return res.status(409).json({ error: 'the armed account does not match the account logged into MT5' });
+
+    if (!ctx.ticket?.ok) return res.status(422).json({ error: ctx.ticket?.error || 'could not size this ticket' });
+    const plan = ctx.ticket;
+    if (!(Number(plan.lots) > 0)) {
+      return res.status(422).json({ error: 'this analysis could not be sized against the current risk budget' });
+    }
+
+    // An AI entry can legitimately sit either side of the market: a pullback plan rests below
+    // for a buy (LIMIT), a breakout plan rests above (STOP). Hardcoding LIMIT made every
+    // continuation-style entry unplaceable on the forecast path — 25 of 25 — so the type is
+    // derived from the prices rather than assumed.
+    const [c] = await pool.query(
+      'SELECT close_price FROM mt5_candles WHERE UPPER(symbol)=? AND timeframe=? ORDER BY candle_time DESC LIMIT 1',
+      [String(t.symbol).toUpperCase(), t.timeframe]);
+    const price = c.length ? Number(c[0].close_price) : null;
+    const buy = ctx.direction === 'BUY';
+    const orderType = price === null
+      ? 'LIMIT'
+      : (buy ? (plan.entry < price ? 'LIMIT' : 'STOP') : (plan.entry > price ? 'LIMIT' : 'STOP'));
+    if (price !== null && Math.abs(plan.entry - price) < 1e-12) {
+      return res.status(422).json({ error: `entry ${plan.entry} is exactly at the market — nothing to rest` });
+    }
+
+    const conc = autoTradeConcurrencyBlock(cfg, t.symbol, await autoTradeInFlight(pool));
+    if (conc) return res.status(409).json({ error: conc });
+
+    // Broker minimum stop distance. Sending inside it just earns a 10016 rejection at the EA.
+    const minDist = brokerMinStopDistance(t.symbol);
+    const stopDist = Math.abs(plan.entry - plan.stopLoss);
+    if (minDist !== null && stopDist < minDist) {
+      return res.status(422).json({ error: `the stop is ${stopDist.toFixed(5)} from entry, inside this broker's minimum of ${minDist}` });
+    }
+
+    const overridden = Object.keys(override).length > 0;
+    const validation = ctx.validation;
+    // Only broker-fatal problems block. Exceeding the risk budget is advisory on a ticket the
+    // user has explicitly sized — refusing it would just move the trade into the terminal,
+    // where none of this instrumentation reaches.
+    if (validation.errors.length) return res.status(422).json({ error: validation.errors.join('; '), validation });
+
+    const guard = challengeSignalGuard(plan.lossAtStop, t.setup_grade || null, plan.rr);
+    if (!guard.eligible && !overridden) {
+      return res.status(409).json({ error: `challenge guard: ${guard.warnings.join('; ')}` });
+    }
+
+    const id = `aiorder:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const holdMin = Math.max(15, Math.min(1440, Number(req.body?.expiryMinutes) || 240));
+    await pool.execute(
+      `INSERT INTO mt5_auto_trades
+         (id, ai_chart_track_id, strategy, symbol, timeframe, direction, order_type, entry_price, stop_loss,
+          take_profit_1, take_profit_2, take_profit_3, lots, risk_amount, risk_mode, score, grade, rr,
+          session, mode, status, reason, expires_at, created_at)
+       VALUES (?,?,?,?,?,?, ?, ?,?,?,?,?,?,?,?,?,?,?,?,?, 'QUEUED', ?, ?, ?)`,
+      [id, t.id, 'ai-chart', t.symbol, t.timeframe, ctx.direction, orderType,
+        plan.entry, plan.stopLoss, plan.takeProfit1 ?? null, plan.takeProfit2 ?? null, plan.takeProfit3 ?? null,
+        plan.lots,
+        // risk_amount is the denominator for R in every report. On a hand-sized ticket that is
+        // the user's OWN risk, not the budget they chose to exceed.
+        overridden ? (plan.lossAtStop ?? ctx.riskBudget) : (ctx.riskBudget ?? ctx.dash?.safePerTradeRisk ?? null),
+        'CHALLENGE',
+        Number.isFinite(Number(t.setup_score)) ? Math.round(Number(t.setup_score)) : null,
+        t.setup_grade || null, plan.rr ?? null,
+        strategyLabSession(new Date().toISOString())?.key || null, mode,
+        `resting ${orderType.toLowerCase()} from AI chart read ${t.symbol} ${t.timeframe} (conf ${t.confidence ?? '?'})`.slice(0, 255),
+        toMysqlDate(new Date(Date.now() + holdMin * 60000).toISOString()), toMysqlDate()],
+    );
+
+    res.json({
+      ok: true, id, orderType, direction: ctx.direction,
+      entry: plan.entry, stopLoss: plan.stopLoss, takeProfit1: plan.takeProfit1 ?? null,
+      lots: plan.lots, stopPips: plan.stopPips ?? null, lossAtStop: plan.lossAtStop ?? null,
+      expiresInMinutes: holdMin,
+      warnings: [...guard.warnings, ...(validation.warnings || [])],
+      note: `Queued for the EA. It rests at the broker as a ${orderType.toLowerCase()} order until price reaches it or it expires.`,
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+/**
+ * GET /api/ai/results — predicted vs actually executed, side by side.
+ *
+ * Two different questions, deliberately not merged into one number:
+ *
+ *   PREDICTED comes from replaying candles against the plan (runAiTrackScan). It answers "was
+ *   the read any good?" and covers every analysis, including the ones never traded — which is
+ *   the only unbiased sample of the model's judgement.
+ *
+ *   ACTUAL comes from the broker: real fill price, real P&L, real close. It answers "what did
+ *   this account make?" and exists only for orders that were placed.
+ *
+ * The gap between them is the point of this endpoint. A replay fills at the exact planned
+ * price with no spread, no slippage and no rejected order; reality does not. Reporting only
+ * the replay would flatter the system, and reporting only the fills would throw away the
+ * measurement of every call you chose not to take.
+ */
+app.get('/api/ai/results', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 30));
+    const symbol = req.query.symbol && String(req.query.symbol).toUpperCase() !== 'ALL'
+      ? String(req.query.symbol).toUpperCase() : null;
+
+    // LEFT JOIN: an analysis with no order still belongs in the predicted column.
+    const [rows] = await pool.query(
+      `SELECT t.*,
+              a.id AS order_id, a.status AS order_status, a.order_type, a.ticket, a.position_id,
+              a.entry_price AS ordered_entry, a.stop_loss AS ordered_stop, a.lots AS ordered_lots,
+              a.fill_price, a.close_price, a.profit, a.risk_amount, a.closed_at, a.filled_at,
+              a.created_at AS order_created_at, a.reason AS order_reason
+         FROM mt5_ai_chart_tracks t
+         LEFT JOIN mt5_auto_trades a ON a.ai_chart_track_id = t.id
+        WHERE t.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+          ${symbol ? 'AND UPPER(t.symbol)=?' : ''}
+        ORDER BY t.created_at DESC LIMIT 500`,
+      symbol ? [days, symbol] : [days]);
+
+    const n = (v) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? null : Number(v));
+    const r2 = (v) => (v === null ? null : Math.round(v * 100) / 100);
+
+    const items = rows.map((r) => {
+      const pipSize = forexSizingPipSize(r.symbol);
+      const planned = n(r.entry_price);
+      const filled = n(r.fill_price);
+      // Slippage in pips, signed AGAINST the trade: positive means the fill was worse than the
+      // plan. An unsigned number would average a good fill and a bad one into "no slippage".
+      const buy = String(r.decision || '').toUpperCase().includes('BUY');
+      const slippagePips = planned !== null && filled !== null && pipSize > 0
+        ? r2(((buy ? filled - planned : planned - filled) / pipSize)) : null;
+      const riskAmt = n(r.risk_amount);
+      const profit = n(r.profit);
+      return {
+        id: r.id, symbol: r.symbol, timeframe: r.timeframe, style: r.style,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        verdict: r.verdict, decision: r.decision, confidence: n(r.confidence),
+        setupScore: n(r.setup_score), setupGrade: r.setup_grade,
+        plan: {
+          entry: planned, stopLoss: n(r.stop_loss),
+          takeProfit1: n(r.take_profit_1), takeProfit2: n(r.take_profit_2), takeProfit3: n(r.take_profit_3),
+          lots: n(r.lots), riskReward: n(r.risk_reward),
+        },
+        // What the candles say the plan would have done.
+        predicted: {
+          status: r.status, entered: r.entered === 1,
+          r: n(r.r_multiple), profitUsd: n(r.profit_usd),
+          mfeR: n(r.mfe_r), maeR: n(r.mae_r),
+          exitPrice: n(r.exit_price), barsHeld: n(r.bars_held), note: r.note,
+        },
+        // What the broker actually did. null when this analysis was never placed.
+        actual: r.order_id ? {
+          orderId: r.order_id, status: r.order_status, orderType: r.order_type,
+          ticket: r.ticket, positionId: r.position_id,
+          orderedEntry: n(r.ordered_entry), orderedLots: n(r.ordered_lots),
+          fillPrice: filled, closePrice: n(r.close_price),
+          profitUsd: profit, riskAmount: riskAmt,
+          // Realised R from BROKER money, which is the only R that paid for anything.
+          r: profit !== null && riskAmt !== null && riskAmt > 0 ? r2(profit / riskAmt) : null,
+          slippagePips,
+          filledAt: r.filled_at ? new Date(r.filled_at).toISOString() : null,
+          closedAt: r.closed_at ? new Date(r.closed_at).toISOString() : null,
+          placedAt: r.order_created_at ? new Date(r.order_created_at).toISOString() : null,
+          reason: r.order_reason,
+        } : null,
+      };
+    });
+
+    // ── aggregates, computed over the two populations separately ──
+    const settledPred = items.filter((i) => ['TP1', 'TP2', 'TP3', 'STOPPED'].includes(i.predicted.status) && i.predicted.r !== null);
+    const closedReal = items.filter((i) => i.actual && i.actual.status === 'CLOSED' && i.actual.profitUsd !== null);
+    const sum = (a, f) => a.reduce((s, x) => s + (f(x) || 0), 0);
+    const agg = (arr, rOf) => {
+      const wins = arr.filter((x) => (rOf(x) ?? 0) > 0).length;
+      const net = sum(arr, rOf);
+      return {
+        settled: arr.length, wins, losses: arr.length - wins,
+        winRate: arr.length ? Math.round((wins / arr.length) * 100) : null,
+        netR: r2(net), expectancyR: arr.length ? r2(net / arr.length) : null,
+      };
+    };
+
+    const withBoth = items.filter((i) => i.actual && i.actual.r !== null && i.predicted.r !== null);
+    const slipped = items.filter((i) => i.actual && i.actual.slippagePips !== null);
+
+    res.json({
+      ok: true, days, symbol: symbol || 'ALL', generatedAt: new Date().toISOString(),
+      items,
+      predicted: { ...agg(settledPred, (x) => x.predicted.r), tracked: items.length },
+      actual: {
+        ...agg(closedReal, (x) => x.actual.r),
+        placed: items.filter((i) => i.actual).length,
+        netProfitUsd: r2(sum(closedReal, (x) => x.actual.profitUsd)),
+        open: items.filter((i) => i.actual && ['PLACED', 'SENT', 'FILLED', 'QUEUED'].includes(i.actual.status)).length,
+      },
+      // The execution gap: the same trades measured both ways. Only rows with BOTH numbers
+      // count, or the comparison would be against different samples.
+      gap: {
+        pairs: withBoth.length,
+        predictedR: withBoth.length ? r2(sum(withBoth, (x) => x.predicted.r) / withBoth.length) : null,
+        actualR: withBoth.length ? r2(sum(withBoth, (x) => x.actual.r) / withBoth.length) : null,
+        avgSlippagePips: slipped.length ? r2(sum(slipped, (x) => x.actual.slippagePips) / slipped.length) : null,
+      },
+      calibration: aiScoreCalibration(items.map((i) => ({ score: i.setupScore, r: i.predicted.r }))),
+      notes: [
+        'Predicted comes from replaying candles against the plan — it fills at the exact planned price with no spread or slippage.',
+        'Actual comes from the broker: real fill, real P&L. It exists only for analyses that were placed as orders.',
+        'The gap between the two is execution cost. A replay that beats reality is normal; the size of the gap is what matters.',
+      ],
+    });
+  } catch (error) {
+    console.error('[AiResults] failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/tracks/pending-orders — orders placed from AI chart reads, newest first.
+app.get('/api/ai/tracks/pending-orders', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query(
+      `SELECT a.*, t.confidence, t.setup_score, t.setup_grade, t.verdict, t.style,
+              t.status AS track_status, t.r_multiple AS predicted_r
+         FROM mt5_auto_trades a
+         LEFT JOIN mt5_ai_chart_tracks t ON t.id = a.ai_chart_track_id
+        WHERE a.ai_chart_track_id IS NOT NULL
+        ORDER BY a.created_at DESC LIMIT 60`);
+    res.json({
+      ok: true,
+      bridgeReady: autoTradeBridgeReady(),
+      armedMatch: autoTradeArmedMatch(),
+      mode: autoTradeEffectiveMode(autoTradeConfig()),
+      orders: rows.map((r) => ({
+        id: r.id, trackId: r.ai_chart_track_id, symbol: r.symbol, timeframe: r.timeframe,
+        direction: r.direction, orderType: r.order_type, status: r.status,
+        entry: r.entry_price, stopLoss: r.stop_loss, takeProfit1: r.take_profit_1,
+        lots: r.lots, riskAmount: r.risk_amount, rr: r.rr,
+        ticket: r.ticket, fillPrice: r.fill_price, closePrice: r.close_price,
+        profit: r.profit, closedAt: r.closed_at ? new Date(r.closed_at).toISOString() : null,
+        confidence: r.confidence, setupScore: r.setup_score, setupGrade: r.setup_grade,
+        verdict: r.verdict, style: r.style, trackStatus: r.track_status, predictedR: r.predicted_r,
+        reason: r.reason,
+        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
+        // Only a resting order can be pulled; a filled one is a position, not an order.
+        cancellable: ['QUEUED', 'SENT', 'PLACED'].includes(String(r.status)),
+      })),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ai/tracks/order/:id/cancel — pull a resting AI order off the broker.
+app.post('/api/ai/tracks/order/:id/cancel', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const [rows] = await pool.query('SELECT * FROM mt5_auto_trades WHERE id=? AND ai_chart_track_id IS NOT NULL LIMIT 1', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'order not found' });
+    const r = rows[0];
+    // Never left the server: reject it outright. The guard on status makes a double-click a
+    // no-op rather than a second write.
+    if (r.status === 'QUEUED') {
+      const [u] = await pool.execute(
+        "UPDATE mt5_auto_trades SET status='REJECTED', reason='cancelled before it left the server', updated_at=? WHERE id=? AND status='QUEUED'",
+        [toMysqlDate(), r.id]);
+      return res.json({ ok: true, cancelled: Boolean(u.affectedRows), atBroker: false });
+    }
+    if (!r.ticket) return res.status(409).json({ error: `order is ${r.status} with no broker ticket — nothing to cancel` });
+    if (!['PLACED', 'SENT'].includes(String(r.status))) {
+      return res.status(409).json({ error: `order is ${String(r.status).toLowerCase()} — only a resting order can be cancelled` });
+    }
+    // Already at the broker: the EA owns the removal, so this only marks intent.
+    await pool.execute(
+      "UPDATE mt5_auto_trades SET status='CANCELLING', reason='cancel requested — waiting for the EA', updated_at=? WHERE id=?",
+      [toMysqlDate(), r.id]);
+    res.json({ ok: true, cancelled: false, atBroker: true, note: 'Cancel queued; the EA removes it on its next poll.' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/api/ai/analyze-chart', async (req, res) => {
@@ -20968,6 +21469,244 @@ async function pruneSetupForecasts() {
   } catch (e) { console.error('[SetupForecast] retention prune failed:', e.message); }
 }
 setInterval(pruneSetupForecasts, 6 * 3600 * 1000);
+
+// ─── The hourly AI sweep ─────────────────────────────────────────────────────
+// Asks three engines the same question about the same six symbols and sends ONE email.
+// Chart AI is invoked (nothing else runs it on a schedule); setup forecasts and ICT
+// predictions are READ from the scanners that already produce them, because running them
+// again here would double the Gemini spend and create a second set of rows competing with
+// the first.
+const AI_SCANNER_ENABLED = String(process?.env?.AI_SCANNER_ENABLED ?? '1') !== '0';
+const AI_SCANNER_INTERVAL_MS = Math.max(15, Number(process?.env?.AI_SCANNER_INTERVAL_MIN || 60)) * 60000;
+let aiScannerBusy = false;
+
+/**
+ * Run the chart reviewer through its own HTTP endpoint.
+ *
+ * Deliberately an internal call rather than a refactor: that endpoint is ~200 lines of live
+ * trading path that also writes the mt5_ai_chart_tracks row the Place button needs. Extracting
+ * it to share code would risk the interactive path to save a localhost round trip.
+ */
+/** Round to an int, but keep null/'' null rather than letting Number() coerce them to 0. */
+function intOrNull(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+async function aiScannerChartRead(symbol, timeframe) {
+  const res = await fetch(`http://${API_BACKEND_HOST}:${PORT}/api/ai/analyze-chart`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbol, timeframe, tradeMode: 'FOREX', style: 'DAY' }),
+  });
+  if (!res.ok) throw new Error(`analyze-chart ${res.status}`);
+  return res.json();
+}
+
+async function runAiScannerCycle({ reason = 'interval' } = {}) {
+  if (aiScannerBusy) return { skipped: 'busy' };
+  aiScannerBusy = true;
+  const ranAt = new Date();
+  const runId = `aiscan:${ranAt.getTime()}`;
+  const items = [];
+  let reads = 0;
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return { skipped: 'no database' };
+
+    for (const symbol of AI_SCANNER_SYMBOLS) {
+      // ── 1. the chart reviewer's live read ──
+      try {
+        const r = await aiScannerChartRead(symbol, AI_SCANNER_TIMEFRAME);
+        reads += 1;
+        const fp = r?.forexPlan || {};
+        items.push({
+          source: 'CHART_AI', symbol, timeframe: AI_SCANNER_TIMEFRAME,
+          direction: fp.decision || r?.detection?.trend || null,
+          entry: fp.entry ?? null, stopLoss: fp.stopLoss ?? null,
+          takeProfit1: fp.takeProfit1 ?? null, takeProfit2: fp.takeProfit2 ?? null, takeProfit3: fp.takeProfit3 ?? null,
+          lots: fp.lots ?? fp.suggestedLots ?? null, riskUsd: fp.lossAtStop ?? null, rr: fp.riskReward ?? null,
+          score: fp.setupScore ?? null, grade: fp.setupGrade ?? null, confidence: r?.confidence ?? null,
+          trackId: r?.trackId || null, note: r?.verdict || null,
+        });
+      } catch (e) {
+        console.error(`[AiScanner] ${symbol} chart read failed:`, e.message);
+      }
+
+      // ── 2. the freshest setup forecast for this symbol ──
+      try {
+        const [f] = await pool.query(
+          `SELECT id, timeframe, expected_direction, level, atr, best_score, eta_min, eta_max, plan_json
+             FROM mt5_setup_forecasts
+            WHERE status='WAITING' AND UPPER(symbol)=? ORDER BY best_score DESC, created_at DESC LIMIT 1`,
+          [symbol]);
+        if (f.length) {
+          reads += 1;
+          let plan = null; try { plan = JSON.parse(f[0].plan_json); } catch { /* no sized ticket */ }
+          items.push({
+            source: 'SETUP_FORECAST', symbol, timeframe: f[0].timeframe,
+            direction: plan?.direction || f[0].expected_direction || null,
+            entry: plan?.entry ?? null, stopLoss: plan?.stopLoss ?? null,
+            takeProfit1: plan?.takeProfit ?? null, takeProfit2: plan?.takeProfit2 ?? null, takeProfit3: plan?.takeProfit3 ?? null,
+            lots: plan?.lots ?? null, riskUsd: plan?.lossAtStop ?? null, rr: plan?.rr ?? null,
+            score: f[0].best_score ?? null, grade: plan?.grade ?? null, confidence: null,
+            forecastId: f[0].id, atr: f[0].atr ?? null,
+            etaMinMinutes: f[0].eta_min ?? null, etaMaxMinutes: f[0].eta_max ?? null,
+          });
+        }
+      } catch (e) { console.error(`[AiScanner] ${symbol} forecast read failed:`, e.message); }
+
+      // ── 3. the freshest ICT prediction for this symbol ──
+      try {
+        const [p] = await pool.query(
+          `SELECT id, timeframe, direction, level, atr, best_score, grade, eta_min, eta_max,
+                  limit_entry, limit_stop, limit_tp1, limit_tp2, limit_tp3, limit_rr
+             FROM mt5_ict_predictions
+            WHERE status='WAITING' AND UPPER(symbol)=? ORDER BY best_score DESC, created_at DESC LIMIT 1`,
+          [symbol]);
+        if (p.length) {
+          reads += 1;
+          items.push({
+            source: 'ICT_PREDICT', symbol, timeframe: p[0].timeframe,
+            direction: p[0].direction || null,
+            entry: p[0].limit_entry ?? null, stopLoss: p[0].limit_stop ?? null,
+            takeProfit1: p[0].limit_tp1 ?? null, takeProfit2: p[0].limit_tp2 ?? null, takeProfit3: p[0].limit_tp3 ?? null,
+            lots: null, riskUsd: null, rr: p[0].limit_rr ?? null,
+            score: p[0].best_score ?? null, grade: p[0].grade ?? null, confidence: null,
+            ictPredictionId: p[0].id, atr: p[0].atr ?? null,
+            etaMinMinutes: p[0].eta_min ?? null, etaMaxMinutes: p[0].eta_max ?? null,
+          });
+        }
+      } catch (e) { console.error(`[AiScanner] ${symbol} ICT read failed:`, e.message); }
+    }
+
+    // ── persist the run and every opportunity in it ──
+    const ops = rankOpportunities(items.filter(isOpportunity));
+    await pool.execute(
+      // `engine_reads`, not `reads` — the latter is a reserved word in MySQL 8.4 and fails to parse.
+      `INSERT INTO mt5_ai_scanner_runs (id, ran_at, symbols, timeframe, engine_reads, opportunities, note)
+       VALUES (?,?,?,?,?,?,?)`,
+      [runId, toMysqlDate(ranAt.toISOString()), AI_SCANNER_SYMBOLS.join(','), AI_SCANNER_TIMEFRAME,
+        reads, ops.length, `${reason} scan`]);
+
+    let i = 0;
+    for (const o of ops) {
+      const timing = suggestedEntryTime(o, ranAt.getTime());
+      await pool.execute(
+        `INSERT INTO mt5_ai_scanner_items
+           (id, run_id, symbol, timeframe, source, direction, entry, stop_loss, take_profit_1, take_profit_2,
+            take_profit_3, lots, risk_usd, rr, score, grade, confidence, entry_timing, note, track_id,
+            forecast_id, ict_prediction_id, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [`${runId}:${i++}`, runId, o.symbol, o.timeframe, o.source, String(o.direction).toUpperCase(),
+          o.entry ?? null, o.stopLoss ?? null, o.takeProfit1 ?? null, o.takeProfit2 ?? null, o.takeProfit3 ?? null,
+          o.lots ?? null, o.riskUsd ?? null, o.rr ?? null,
+          // `Number(null) === 0`, so a bare isFinite check turns "not scored" into a scored
+          // zero — which then renders as "conf 0" beside setups that simply do not carry a
+          // confidence. Absent has to stay absent.
+          intOrNull(o.score), o.grade ?? null, intOrNull(o.confidence),
+          timing.label.slice(0, 96), (o.note || '').slice(0, 255) || null,
+          o.trackId ?? null, o.forecastId ?? null, o.ictPredictionId ?? null,
+          toMysqlDate(ranAt.toISOString())]);
+    }
+
+    // ── one email, every hour, whether or not it found anything ──
+    // A silent scanner and a broken scanner look identical from the inbox.
+    const mail = buildScannerEmail({ items, symbols: AI_SCANNER_SYMBOLS, ranAt, timeframe: AI_SCANNER_TIMEFRAME, scannedCount: reads });
+    const to = signalEmailTo();
+    let emailed = false;
+    if (to) {
+      try {
+        await sendNotificationEmail({ to, subject: mail.subject, text: mail.text, html: mail.html, signalId: runId });
+        emailed = true;
+      } catch (e) { console.error('[AiScanner] email failed:', e.message); }
+    }
+    await pool.execute(
+      'UPDATE mt5_ai_scanner_runs SET finished_at=?, emailed=?, email_to=? WHERE id=?',
+      [toMysqlDate(), emailed ? 1 : 0, to || null, runId]);
+
+    console.log(`[AiScanner] ${reason} scan — ${reads} reads, ${ops.length} opportunities, email ${emailed ? 'sent' : 'skipped'}.`);
+    return { ok: true, runId, reads, opportunities: ops.length, emailed };
+  } catch (error) {
+    console.error('[AiScanner] cycle failed:', error.message);
+    return { ok: false, error: error.message };
+  } finally {
+    aiScannerBusy = false;
+  }
+}
+
+if (AI_SCANNER_ENABLED) {
+  // First sweep a few minutes after boot so the candle cache and the other scanners have
+  // something to report, then hourly.
+  setTimeout(() => void runAiScannerCycle({ reason: 'boot' }), 4 * 60000);
+  const t = setInterval(() => void runAiScannerCycle({ reason: 'interval' }), AI_SCANNER_INTERVAL_MS);
+  if (typeof t.unref === 'function') t.unref();
+  console.log(`[AiScanner] Hourly sweep armed — ${AI_SCANNER_SYMBOLS.join(',')} on ${AI_SCANNER_TIMEFRAME} every ${Math.round(AI_SCANNER_INTERVAL_MS / 60000)}m.`);
+}
+
+// GET /api/ai-scanner — the stored hourly records.
+app.get('/api/ai-scanner', async (req, res) => {
+  try {
+    const pool = await initializeDatabase();
+    if (!pool) return res.status(503).json({ error: 'database unavailable' });
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 12));
+    const [runs] = await pool.query('SELECT * FROM mt5_ai_scanner_runs ORDER BY ran_at DESC LIMIT ?', [limit]);
+    const ids = runs.map((r) => r.id);
+    let items = [];
+    if (ids.length) {
+      // Join to the order table so a placed setup shows its real broker state, not just the
+      // plan it started as.
+      const [rows] = await pool.query(
+        `SELECT i.*, a.id AS order_id, a.status AS order_status, a.ticket, a.fill_price, a.profit, a.order_type
+           FROM mt5_ai_scanner_items i
+           LEFT JOIN mt5_auto_trades a ON a.ai_chart_track_id = i.track_id
+          WHERE i.run_id IN (?) ORDER BY i.score DESC`, [ids]);
+      items = rows;
+    }
+    const byRun = new Map(runs.map((r) => [r.id, []]));
+    for (const it of items) byRun.get(it.run_id)?.push({
+      id: it.id, symbol: it.symbol, timeframe: it.timeframe, source: it.source,
+      direction: it.direction, entry: it.entry, stopLoss: it.stop_loss,
+      takeProfit1: it.take_profit_1, takeProfit2: it.take_profit_2, takeProfit3: it.take_profit_3,
+      lots: it.lots, riskUsd: it.risk_usd, rr: it.rr, score: it.score, grade: it.grade,
+      confidence: it.confidence, entryTiming: it.entry_timing, note: it.note,
+      trackId: it.track_id, forecastId: it.forecast_id, ictPredictionId: it.ict_prediction_id,
+      // Each engine already owns a place-order endpoint with its own guard stack. Naming the
+      // route here keeps the page from re-deriving it and from ever posting a forecast id to
+      // the chart-AI path.
+      placeUrl: it.track_id ? `/api/ai/tracks/${encodeURIComponent(it.track_id)}/place-order`
+        : it.forecast_id ? `/api/setup-forecasts/${encodeURIComponent(it.forecast_id)}/place-order`
+          : it.ict_prediction_id ? `/api/ict-predictions/${encodeURIComponent(it.ict_prediction_id)}/place-order`
+            : null,
+      order: it.order_id ? {
+        id: it.order_id, status: it.order_status, orderType: it.order_type,
+        ticket: it.ticket, fillPrice: it.fill_price, profit: it.profit,
+      } : null,
+    });
+    res.json({
+      ok: true,
+      symbols: AI_SCANNER_SYMBOLS, timeframe: AI_SCANNER_TIMEFRAME,
+      enabled: AI_SCANNER_ENABLED, intervalMinutes: Math.round(AI_SCANNER_INTERVAL_MS / 60000),
+      bridgeReady: autoTradeBridgeReady(), armedMatch: autoTradeArmedMatch(),
+      mode: autoTradeEffectiveMode(autoTradeConfig()),
+      runs: runs.map((r) => ({
+        id: r.id, ranAt: r.ran_at ? new Date(r.ran_at).toISOString() : null,
+        finishedAt: r.finished_at ? new Date(r.finished_at).toISOString() : null,
+        symbols: String(r.symbols || '').split(',').filter(Boolean), timeframe: r.timeframe,
+        reads: r.engine_reads, opportunities: r.opportunities, emailed: r.emailed === 1, emailTo: r.email_to,
+        note: r.note, items: byRun.get(r.id) || [],
+      })),
+      note: 'Chart AI is run live each hour. Setup forecasts and ICT predictions are read from their own scanners rather than re-run.',
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// POST /api/ai-scanner/scan — run the sweep now.
+app.post('/api/ai-scanner/scan', async (req, res) => {
+  const out = await runAiScannerCycle({ reason: 'manual' });
+  res.json(out);
+});
 
 // First scan shortly after boot (waits for the candle feed to settle), then on the interval.
 setTimeout(() => { runSetupForecastScan({ reason: 'boot' }).catch((e) => console.error('[SetupForecast] boot scan failed:', e.message)); }, 90 * 1000);

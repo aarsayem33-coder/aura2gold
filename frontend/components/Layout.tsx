@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
-import { 
+import {
   LayoutDashboard,
   Home,
+  ScrollText,
   Activity,
   Target,
   BarChart3,
@@ -334,6 +335,7 @@ export default function Layout({ onLogout }: LayoutProps) {
         { path: '/chart', icon: CandlestickChart, label: 'Price Chart', end: true },
         { path: '/chart/liquidity', icon: Droplets, label: 'Liquidity Chart' },
         { path: '/chart/ai-tracker', icon: Brain, label: 'AI Tracker' },
+        { path: '/chart/results', icon: ScrollText, label: 'AI Results' },
       ],
     },
     {
@@ -365,6 +367,7 @@ export default function Layout({ onLogout }: LayoutProps) {
         { path: '/future-predictions', icon: Brain, label: 'Execution Forecast', end: true },
         { path: '/future-predictions/setups', icon: Crosshair, label: 'Setup Forecasts' },
         { path: '/future-predictions/ict', icon: Target, label: 'ICT Predict' },
+        { path: '/future-predictions/ai-scanner', icon: Radar, label: 'AI Scanner' },
       ],
     },
     { path: '/day-trading', icon: Sunrise, label: 'Pre-Session Brief' },

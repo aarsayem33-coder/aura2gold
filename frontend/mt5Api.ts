@@ -1774,6 +1774,147 @@ export async function fetchAiTracks(options?: { days?: number; symbol?: string }
   return fetchJson<AiTracksResponse>(`/api/ai/tracks${qs ? `?${qs}` : ''}`);
 }
 
+// ── Placing an AI chart plan as a real resting order ────────────────────────
+export interface AiOrderTicket {
+  ok: boolean; lots: number; stopLoss: number;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  stopPips: number | null; riskUsd: number | null; rewardUsd: number | null;
+  rr: number | null; lossAtStop: number | null;
+}
+export interface AiOrderPreview {
+  ok: boolean; symbol: string; timeframe: string; direction: string; entry: number;
+  ticket: AiOrderTicket;
+  validation: { verdict: string; errors: string[]; warnings: string[]; notes: string[] };
+  context: {
+    riskBudget: number | null; roomWarning: string | null; safePerTradeRisk: number | null;
+    equity: number | null; originalLots: number | null; originalStopPips: number | null;
+    confidence: number | null; setupScore: number | null; setupGrade: string | null;
+  };
+}
+export interface AiOrderPlaced {
+  ok: boolean; id: string; orderType: string; direction: string;
+  entry: number; stopLoss: number; takeProfit1: number | null;
+  lots: number; stopPips: number | null; lossAtStop: number | null;
+  expiresInMinutes: number; warnings: string[]; note: string;
+}
+
+/** Size and judge the ticket WITHOUT sending anything. */
+export async function previewAiOrder(trackId: string, override?: Record<string, number>): Promise<AiOrderPreview> {
+  const r = await fetch(`/api/ai/tracks/${encodeURIComponent(trackId)}/preview-order`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(override || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `preview failed: ${r.status}`);
+  return j as AiOrderPreview;
+}
+
+/** Queue the plan for the EA. This places a REAL order. */
+export async function placeAiOrder(trackId: string, body?: { expiryMinutes?: number; override?: Record<string, number> }): Promise<AiOrderPlaced> {
+  const r = await fetch(`/api/ai/tracks/${encodeURIComponent(trackId)}/place-order`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `place failed: ${r.status}`);
+  return j as AiOrderPlaced;
+}
+
+export async function cancelAiOrder(orderId: string): Promise<{ ok: boolean; cancelled: boolean; atBroker: boolean; note?: string }> {
+  const r = await fetch(`/api/ai/tracks/order/${encodeURIComponent(orderId)}/cancel`, { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `cancel failed: ${r.status}`);
+  return j;
+}
+
+// ── Predicted vs actually executed ──────────────────────────────────────────
+export interface AiResultItem {
+  id: string; symbol: string; timeframe: string; style: string | null;
+  createdAt: string | null; verdict: string | null; decision: string | null;
+  confidence: number | null; setupScore: number | null; setupGrade: string | null;
+  plan: {
+    entry: number | null; stopLoss: number | null;
+    takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+    lots: number | null; riskReward: number | null;
+  };
+  predicted: {
+    status: string; entered: boolean; r: number | null; profitUsd: number | null;
+    mfeR: number | null; maeR: number | null; exitPrice: number | null;
+    barsHeld: number | null; note: string | null;
+  };
+  actual: {
+    orderId: string; status: string; orderType: string;
+    ticket: string | null; positionId: string | null;
+    orderedEntry: number | null; orderedLots: number | null;
+    fillPrice: number | null; closePrice: number | null;
+    profitUsd: number | null; riskAmount: number | null; r: number | null;
+    slippagePips: number | null;
+    filledAt: string | null; closedAt: string | null; placedAt: string | null;
+    reason: string | null;
+  } | null;
+}
+export interface AiResultsResponse {
+  ok: boolean; days: number; symbol: string; generatedAt: string;
+  items: AiResultItem[];
+  predicted: { settled: number; wins: number; losses: number; winRate: number | null; netR: number | null; expectancyR: number | null; tracked: number };
+  actual: { settled: number; wins: number; losses: number; winRate: number | null; netR: number | null; expectancyR: number | null; placed: number; netProfitUsd: number | null; open: number };
+  gap: { pairs: number; predictedR: number | null; actualR: number | null; avgSlippagePips: number | null };
+  calibration: Array<{ band: string; n: number; winRate: number | null; expectancyR: number | null; netR: number | null }>;
+  notes: string[];
+}
+
+export async function fetchAiResults(options?: { days?: number; symbol?: string }): Promise<AiResultsResponse> {
+  const p = new URLSearchParams();
+  if (options?.days) p.set('days', String(options.days));
+  if (options?.symbol) p.set('symbol', options.symbol);
+  const qs = p.toString();
+  return fetchJson<AiResultsResponse>(`/api/ai/results${qs ? `?${qs}` : ''}`);
+}
+
+// ── The hourly AI sweep ─────────────────────────────────────────────────────
+export interface AiScannerItem {
+  id: string; symbol: string; timeframe: string;
+  source: 'CHART_AI' | 'SETUP_FORECAST' | 'ICT_PREDICT' | string;
+  direction: string | null;
+  entry: number | null; stopLoss: number | null;
+  takeProfit1: number | null; takeProfit2: number | null; takeProfit3: number | null;
+  lots: number | null; riskUsd: number | null; rr: number | null;
+  score: number | null; grade: string | null; confidence: number | null;
+  entryTiming: string | null; note: string | null;
+  trackId: string | null; forecastId: string | null; ictPredictionId: string | null;
+  /** The engine's own place-order route. Each source owns its guard stack. */
+  placeUrl: string | null;
+  order: { id: string; status: string; orderType: string; ticket: string | null; fillPrice: number | null; profit: number | null } | null;
+}
+export interface AiScannerRun {
+  id: string; ranAt: string | null; finishedAt: string | null;
+  symbols: string[]; timeframe: string;
+  reads: number; opportunities: number; emailed: boolean; emailTo: string | null;
+  note: string | null; items: AiScannerItem[];
+}
+export interface AiScannerResponse {
+  ok: boolean; symbols: string[]; timeframe: string; enabled: boolean; intervalMinutes: number;
+  bridgeReady: boolean; armedMatch: boolean; mode: string;
+  runs: AiScannerRun[]; note: string;
+}
+
+export async function fetchAiScanner(limit = 12): Promise<AiScannerResponse> {
+  return fetchJson<AiScannerResponse>(`/api/ai-scanner?limit=${limit}`);
+}
+
+export async function runAiScannerNow(): Promise<{ ok: boolean; runId?: string; reads?: number; opportunities?: number; emailed?: boolean; error?: string }> {
+  const r = await fetch('/api/ai-scanner/scan', { method: 'POST' });
+  return r.json();
+}
+
+/** Place a scanned opportunity through whichever engine produced it. */
+export async function placeScannerItem(placeUrl: string): Promise<{ ok: boolean; id?: string; orderType?: string; lots?: number; note?: string; warnings?: string[] }> {
+  const r = await fetch(placeUrl, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.error || `place failed: ${r.status}`);
+  return j;
+}
+
 // ── ICT Sniper: immediate bare entry on an "enter now" ict-breaker signal ────
 export interface SniperConfig {
   enabled: boolean;

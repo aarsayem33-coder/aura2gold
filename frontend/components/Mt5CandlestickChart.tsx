@@ -9,7 +9,8 @@ import {
   LineSeries,
   LineStyle,
 } from 'lightweight-charts';
-import { fetchChartAnalysis } from '../mt5Api';
+import { fetchChartAnalysis, previewAiOrder, placeAiOrder } from '../mt5Api';
+import type { AiOrderPreview, AiOrderPlaced } from '../mt5Api';
 import type { ChartAnalysisResponse } from '../types';
 import {
   loadAnalysisHistory, saveAnalysis, deleteAnalysis, clearAnalysisHistory,
@@ -19,6 +20,15 @@ import type { StoredAnalysis } from '../lib/aiAnalysisHistory';
 import { Maximize2, Minimize2, Crosshair, TrendingUp, TrendingDown } from 'lucide-react';
 import { timeframeSeconds, bucketPhase, bucketStart, formingBarFor, secsToNextBar } from '../lib/chartTime.js';
 import type { Alert, Mt5Candle } from '../types';
+
+/**
+ * Minimum model confidence before the AI desk shows actionable trade levels.
+ *
+ * Below this the read is still displayed — verdict, structure, liquidity, reasoning — but the
+ * entry/stop/targets and sizing are withheld. A price on screen is a price someone acts on,
+ * and a 35-confidence entry looks identical to an 85-confidence one once it is rendered.
+ */
+const AI_PLAN_MIN_CONFIDENCE = 60;
 
 /** Optional trade levels drawn as horizontal price lines on the chart. */
 export interface TradeLevels {
@@ -620,7 +630,8 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
   }, [aiOpen, aiOut, aiBusy, symbol, timeframe]);
 
   const runAi = async () => {
-    setAiBusy(true); setAiErr(null); setAiOut(null); setAiViewingId(null);
+    // A new read invalidates any ticket sized against the previous one.
+    setAiBusy(true); setAiErr(null); setAiOut(null); setAiViewingId(null); resetOrderState();
     try {
       // No image is sent: the server renders the chart from the same candles it analyses, so
       // what the model sees and what the maths reconciles against cannot drift apart.
@@ -641,11 +652,39 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
     } finally { setAiBusy(false); }
   };
 
+  // Placing the AI plan as a real resting order. Manual only, and deliberately two-step: the
+  // first click sizes and validates, the second sends. A single button that both sized and
+  // placed would mean the first time you see the risk figure is after the order exists.
+  const [orderBusy, setOrderBusy] = useState(false);
+  const [orderPreview, setOrderPreview] = useState<AiOrderPreview | null>(null);
+  const [orderPlaced, setOrderPlaced] = useState<AiOrderPlaced | null>(null);
+  const [orderErr, setOrderErr] = useState<string | null>(null);
+
+  const resetOrderState = () => { setOrderPreview(null); setOrderPlaced(null); setOrderErr(null); };
+
+  const doPreviewOrder = async (trackId: string) => {
+    setOrderBusy(true); setOrderErr(null); setOrderPlaced(null);
+    try { setOrderPreview(await previewAiOrder(trackId)); }
+    catch (e) { setOrderErr(e instanceof Error ? e.message : 'Could not size this ticket'); }
+    finally { setOrderBusy(false); }
+  };
+
+  const doPlaceOrder = async (trackId: string) => {
+    setOrderBusy(true); setOrderErr(null);
+    try {
+      const placed = await placeAiOrder(trackId);
+      setOrderPlaced(placed);
+      setOrderPreview(null);
+    } catch (e) { setOrderErr(e instanceof Error ? e.message : 'Could not place this order'); }
+    finally { setOrderBusy(false); }
+  };
+
   const openStoredAnalysis = (entry: StoredAnalysis) => {
     setAiOut(entry.result);
     setAiViewingId(entry.id);
     setAiErr(null);
     setAiHistoryOpen(false);
+    resetOrderState();
   };
   const [isFullscreen, setIsFullscreen] = useState(false);
 
@@ -1646,6 +1685,26 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
                       <p className="rounded-lg bg-slate-100 px-2 py-1.5 text-[11px] font-bold text-slate-500">{fp.scoreNote}</p>
                     ) : null;
                   }
+                  // Confidence gate. Below the bar the levels are withheld rather than shown
+                  // greyed out: a price on screen is a price someone acts on, and a low-conviction
+                  // entry/SL/TP reads exactly like a high-conviction one once it is in front of you.
+                  // The reason is always stated — a panel that silently drops its numbers is worse
+                  // than one that shows them, because the user cannot tell it from a bug.
+                  const conf = typeof aiOut.confidence === 'number' ? aiOut.confidence : null;
+                  if (conf === null || conf < AI_PLAN_MIN_CONFIDENCE) {
+                    return (
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                        <p className="text-[11px] font-black text-slate-600">
+                          Trade levels hidden{conf === null ? ' — no confidence reported' : ` — confidence ${conf}`}
+                        </p>
+                        <p className="mt-0.5 text-[10px] font-medium leading-snug text-slate-500">
+                          {conf === null
+                            ? 'The model did not return a confidence value, so this read cannot be shown to clear the bar.'
+                            : `Entry, stop, targets and sizing are shown only at ${AI_PLAN_MIN_CONFIDENCE} or above. The read below still stands — it just is not a ticket.`}
+                        </p>
+                      </div>
+                    );
+                  }
                   const gradeCls = fp.setupGrade === 'A+' || fp.setupGrade === 'A' ? 'bg-emerald-600'
                     : fp.setupGrade === 'B' ? 'bg-sky-600'
                       : fp.setupGrade === 'C' ? 'bg-amber-600' : 'bg-rose-600';
@@ -1689,6 +1748,71 @@ export default function Mt5CandlestickChart({ candles, signals, symbol, timefram
                         {fp.stopPips != null && row('Stop', `${fp.stopPips} pips`)}
                         {fp.lossAtStop != null && row('Risk at stop', `$${fp.lossAtStop}`)}
                       </div>
+                      {/* Send it to MT5. Only for an actionable call on a live read — a saved
+                          read from history describes a chart that has since moved, and its
+                          prices are no longer a ticket. */}
+                      {(() => {
+                        const tradeable = /BUY|SELL/.test(String(fp.decision || '').toUpperCase());
+                        const isSaved = aiViewingId !== null && aiHistory.some((h) => h.id === aiViewingId && Date.now() - new Date(h.savedAt).getTime() > 60000);
+                        if (!tradeable || !aiOut.trackId) return null;
+                        return (
+                          <div className="mt-2 border-t border-slate-200 pt-2">
+                            {isSaved ? (
+                              <p className="text-[10px] font-bold text-slate-400">
+                                Saved read — re-run the analysis to place this on live prices.
+                              </p>
+                            ) : orderPlaced ? (
+                              <div className="rounded-lg border border-emerald-300 bg-emerald-50 px-2 py-1.5">
+                                <p className="text-[11px] font-black text-emerald-800">
+                                  {orderPlaced.orderType} order queued · {orderPlaced.lots} lots @ {orderPlaced.entry}
+                                </p>
+                                <p className="mt-0.5 text-[10px] font-medium text-emerald-700">{orderPlaced.note}</p>
+                                {orderPlaced.warnings.length > 0 && (
+                                  <p className="mt-0.5 text-[10px] font-bold text-amber-700">{orderPlaced.warnings.join(' · ')}</p>
+                                )}
+                              </div>
+                            ) : orderPreview ? (
+                              <div className="rounded-lg border border-violet-300 bg-violet-50 px-2 py-1.5">
+                                <p className="text-[10px] font-black uppercase tracking-wider text-violet-700">
+                                  Confirm · {orderPreview.validation.verdict}
+                                </p>
+                                <p className="mt-0.5 font-mono text-[11px] font-black text-slate-800">
+                                  {orderPreview.direction} {orderPreview.ticket.lots} lots @ {orderPreview.entry} · SL {orderPreview.ticket.stopLoss}
+                                </p>
+                                <p className="text-[10px] font-bold text-slate-600">
+                                  Risk ${orderPreview.ticket.riskUsd} · {orderPreview.ticket.stopPips} pips
+                                  {orderPreview.ticket.rr != null && ` · 1:${orderPreview.ticket.rr}`}
+                                </p>
+                                {/* Warnings are shown BEFORE the confirm button, never after. */}
+                                {orderPreview.validation.warnings.map((w) => (
+                                  <p key={w} className="mt-0.5 text-[10px] font-bold leading-snug text-amber-700">⚠ {w}</p>
+                                ))}
+                                <div className="mt-1.5 flex gap-1.5">
+                                  <button
+                                    type="button" disabled={orderBusy}
+                                    onClick={() => void doPlaceOrder(aiOut.trackId as string)}
+                                    className="flex-1 rounded-lg bg-violet-600 px-2 py-1.5 text-[11px] font-black text-white transition hover:bg-violet-700 disabled:bg-slate-300"
+                                  >{orderBusy ? 'Sending…' : 'Confirm & send to MT5'}</button>
+                                  <button
+                                    type="button" onClick={resetOrderState}
+                                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-[11px] font-bold text-slate-500 hover:bg-white"
+                                  >Cancel</button>
+                                </div>
+                              </div>
+                            ) : (
+                              <button
+                                type="button" disabled={orderBusy}
+                                onClick={() => void doPreviewOrder(aiOut.trackId as string)}
+                                className="w-full rounded-lg border border-violet-300 bg-white px-2 py-1.5 text-[11px] font-black text-violet-700 transition hover:border-violet-500 hover:bg-violet-50 disabled:text-slate-400"
+                              >{orderBusy ? 'Sizing…' : 'Place as resting order →'}</button>
+                            )}
+                            {orderErr && (
+                              <p className="mt-1 rounded-lg bg-rose-50 px-2 py-1 text-[10px] font-bold leading-snug text-rose-700">{orderErr}</p>
+                            )}
+                          </div>
+                        );
+                      })()}
+
                       {/* Why this grade — an unexplained score is indistinguishable from a guess. */}
                       {fp.scoreBreakdown && fp.scoreBreakdown.length > 0 && (
                         <details className="mt-1.5">

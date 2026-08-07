@@ -2158,6 +2158,13 @@ export interface ChartAnalysisResponse {
   reasoning?: string;
   keyFactors?: string[];
   honesty?: string[];
+  /** Row id in mt5_ai_chart_tracks. Present only on the vision path — the deterministic
+   *  fallback is not tracked, so it also cannot be placed as an order. */
+  trackId?: string | null;
+  /** Where the model's visual read agrees or disagrees with the deterministic labels. */
+  structureAgreement?: Array<{ item: string; agree: boolean; note: string }>;
+  /** The model's note to the human about today's risk state. Advisory; never scored. */
+  disciplineNote?: string | null;
   note?: string;
 }
 
